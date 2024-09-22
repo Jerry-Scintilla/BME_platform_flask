@@ -1,6 +1,6 @@
 from flask import Flask
 import config
-from exts import db
+from exts import db, mail
 from flask_migrate import Migrate
 from blueprints.auth import bp as auth_bp
 from flask_cors import CORS
@@ -13,6 +13,7 @@ CORS(app)
 app.config.from_object(config)
 
 db.init_app(app)
+mail.init_app(app)
 
 migrate = Migrate(app, db)
 

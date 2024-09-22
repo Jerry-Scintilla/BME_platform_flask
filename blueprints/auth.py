@@ -7,6 +7,11 @@ from exts import db
 from flask import jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 
+from exts import mail
+from flask_mail import Message
+import string
+import random
+
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 
@@ -80,6 +85,34 @@ def login():
             "message": form.errors,
         }
         return jsonify(data)
+
+
+
+
+# @bp.route("/mail/test")
+# def mail_test():
+#     messages = Message(subject="mail test", recipients=["jerrycaocao@126.com"], body="mail test")
+#     mail.send(messages)
+#     return "mail send succeed"
+
+
+@bp.route("/captcha/email", methods=["POST"])
+def get_email_captcha():
+    mail_list = request.get_json()
+    email = mail_list["User_Email"]
+    source = string.digits*4
+    captcha = random.sample(source, 6)
+    captcha = "".join(captcha)
+    messages = Message(subject="注册验证码", recipients=[email], body=f"您的验证码是:{captcha}")
+    mail.send(messages)
+
+    # print(captcha)
+    data = {
+        "code": 200,
+        "User_Captcha": captcha,
+    }
+    return jsonify(data)
+
 
 
 
