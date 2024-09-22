@@ -2,12 +2,11 @@ from flask import Blueprint, render_template, request ,redirect
 from pyexpat.errors import messages
 
 from .forms import RegisterForm, LoginForm
-from models import UserModel
-from exts import db
+from models import UserModel, EmailCaptchaModel
+from exts import db, mail
 from flask import jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 
-from exts import mail
 from flask_mail import Message
 import string
 import random
@@ -22,13 +21,23 @@ def register():
         email = form.User_Email.data
         password = form.User_Password.data
         username = form.User_Name.data
+        captcha = form.User_Captcha.data
         user = UserModel.query.filter_by(email=email).first()
+        captcha_model = EmailCaptchaModel.query.filter_by(captcha=captcha).first()
+        if not captcha_model:
+            data = {
+                "code": 400,
+                "message": "验证码错误",
+            }
+            return jsonify(data)
+
         if user:
             data = {
                 "code": 400,
                 "message": "邮箱已存在",
             }
             return jsonify(data)
+
         else:
             user = UserModel(email=email, password=password, username=username)
             db.session.add(user)
@@ -40,6 +49,13 @@ def register():
                 "token": token,
                 "User_Name": username,
             }
+
+            # 从数据库中删除验证码
+            db.session.delete(captcha_model)
+            db.session.commit()
+
+
+
         return jsonify(data)
     else:
         data = {
@@ -106,10 +122,15 @@ def get_email_captcha():
     messages = Message(subject="注册验证码", recipients=[email], body=f"您的验证码是:{captcha}")
     mail.send(messages)
 
+    email_captcha = EmailCaptchaModel(email=email, captcha=captcha)
+    db.session.add(email_captcha)
+    db.session.commit()
+
     # print(captcha)
     data = {
         "code": 200,
-        "User_Captcha": captcha,
+        "message": "邮件发送成功"
+        # "User_Captcha": captcha,
     }
     return jsonify(data)
 

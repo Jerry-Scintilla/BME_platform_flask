@@ -1,7 +1,8 @@
 import wtforms
 from wtforms.validators import Email, length, EqualTo ,input_required
-from models import UserModel
+from models import UserModel, EmailCaptchaModel
 from flask import request
+from exts import db
 
 class RegisterForm(wtforms.Form):
     def __init__(self):
@@ -18,13 +19,25 @@ class RegisterForm(wtforms.Form):
 
     User_Name = wtforms.StringField(validators=[length(min=4, max=20, message='Invalid username')])
     User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
-    User_Email = wtforms.StringField(validators=[Email(message='Invalid Email')])
+    User_Email = wtforms.StringField(validators=[Email(message='邮箱格式错误')])
+    User_Captcha = wtforms.StringField(validators=[length(min=6, max=6, message='验证码为6位')])
 
     # def validate_email(self, field):
     #     User_Email = field.data
     #     user = UserModel.query.filter_by(email=User_Email).first()
     #     if user:
     #         raise wtforms.ValidationError(message='Email already registered')
+
+    # def validate_captcha(self, field):
+    #     captcha = field.data
+    #     email = self.User_Email.data
+    #     captcha_model = EmailCaptchaModel.query.filter_by(email=email, captcha=captcha).first()
+    #     if not captcha_model:
+    #         raise wtforms.ValidationError(message="验证码错误")
+    #     else:
+    #         db.session.delete(captcha_model)
+    #         db.session.commit()
+
 
 class LoginForm(wtforms.Form):
     def __init__(self):
