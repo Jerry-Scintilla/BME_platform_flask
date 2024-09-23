@@ -1,5 +1,4 @@
 from flask import Blueprint, render_template, request, redirect
-from pyexpat.errors import messages
 
 from .forms import RegisterForm, LoginForm
 from models import UserModel, EmailCaptchaModel
@@ -14,6 +13,7 @@ import random
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 
+# 注册端口
 @bp.route("/register", methods=["POST"])
 def register():
     form = RegisterForm()
@@ -63,6 +63,7 @@ def register():
         return jsonify(data)
 
 
+# 登录端口
 @bp.route("/login", methods=["POST"])
 def login():
     form = LoginForm()
@@ -108,6 +109,7 @@ def login():
 #     return "mail send succeed"
 
 
+# 邮件验证码获取端口
 @bp.route("/captcha/email", methods=["POST"])
 def get_email_captcha():
     mail_list = request.get_json()

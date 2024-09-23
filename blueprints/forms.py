@@ -4,7 +4,7 @@ from models import UserModel, EmailCaptchaModel
 from flask import request
 from exts import db
 
-
+# 注册表单验证
 class RegisterForm(wtforms.Form):
     def __init__(self):
         if "application/json" in request.headers.get("Content-Type"):
@@ -38,7 +38,7 @@ class RegisterForm(wtforms.Form):
     #         db.session.delete(captcha_model)
     #         db.session.commit()
 
-
+# 登录表单验证
 class LoginForm(wtforms.Form):
     def __init__(self):
         if "application/json" in request.headers.get("Content-Type"):

@@ -11,6 +11,9 @@ class UserModel(db.Model):
     email = db.Column(db.String(100), nullable=False, unique=True)
     join_time = db.Column(db.DateTime, default=datetime.now)
     # 签出测试
+    # 添加勋章，学习阶段
+    medal = db.Column(db.Integer, server_default='0')
+    study_stage = db.Column(db.Text)
 
 
 class EmailCaptchaModel(db.Model):
