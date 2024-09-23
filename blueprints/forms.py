@@ -1,8 +1,9 @@
 import wtforms
-from wtforms.validators import Email, length, EqualTo ,input_required
+from wtforms.validators import Email, length, EqualTo, input_required
 from models import UserModel, EmailCaptchaModel
 from flask import request
 from exts import db
+
 
 class RegisterForm(wtforms.Form):
     def __init__(self):
@@ -15,7 +16,6 @@ class RegisterForm(wtforms.Form):
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(RegisterForm, self).__init__(data=data, **args)
-
 
     User_Name = wtforms.StringField(validators=[length(min=4, max=20, message='Invalid username')])
     User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])

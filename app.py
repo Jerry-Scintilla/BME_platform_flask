@@ -9,7 +9,7 @@ from flask_jwt_extended import JWTManager
 
 app = Flask(__name__)
 CORS(app)
-#绑定配置文件
+# 绑定配置文件
 app.config.from_object(config)
 
 db.init_app(app)
@@ -21,7 +21,6 @@ migrate = Migrate(app, db)
 jwt = JWTManager(app)
 
 app.register_blueprint(auth_bp)
-
 
 
 @app.route('/')

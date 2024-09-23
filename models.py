@@ -1,7 +1,7 @@
 from datetime import datetime
 
-
 from exts import db
+
 
 class UserModel(db.Model):
     __tablename__ = 'user'
@@ -10,6 +10,7 @@ class UserModel(db.Model):
     password = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(100), nullable=False, unique=True)
     join_time = db.Column(db.DateTime, default=datetime.now)
+    # 签出测试
 
 
 class EmailCaptchaModel(db.Model):

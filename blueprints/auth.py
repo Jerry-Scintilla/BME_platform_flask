@@ -1,4 +1,4 @@
-from flask import Blueprint, render_template, request ,redirect
+from flask import Blueprint, render_template, request, redirect
 from pyexpat.errors import messages
 
 from .forms import RegisterForm, LoginForm
@@ -45,7 +45,7 @@ def register():
             token = create_access_token(identity=email)
             data = {
                 "code": 200,
-                "message":"注册成功",
+                "message": "注册成功",
                 "token": token,
                 "User_Name": username,
             }
@@ -54,13 +54,11 @@ def register():
             db.session.delete(captcha_model)
             db.session.commit()
 
-
-
         return jsonify(data)
     else:
         data = {
             "code": 400,
-            "message":form.errors,
+            "message": form.errors,
         }
         return jsonify(data)
 
@@ -103,8 +101,6 @@ def login():
         return jsonify(data)
 
 
-
-
 # @bp.route("/mail/test")
 # def mail_test():
 #     messages = Message(subject="mail test", recipients=["jerrycaocao@126.com"], body="mail test")
@@ -116,7 +112,7 @@ def login():
 def get_email_captcha():
     mail_list = request.get_json()
     email = mail_list["User_Email"]
-    source = string.digits*4
+    source = string.digits * 4
     captcha = random.sample(source, 6)
     captcha = "".join(captcha)
     messages = Message(subject="注册验证码", recipients=[email], body=f"您的验证码是:{captcha}")
@@ -133,7 +129,3 @@ def get_email_captcha():
         # "User_Captcha": captcha,
     }
     return jsonify(data)
-
-
-
-
