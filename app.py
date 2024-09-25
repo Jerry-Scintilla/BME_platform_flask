@@ -1,6 +1,6 @@
 from flask import Flask
 import config
-from exts import db, mail
+from exts import db, mail, limiter
 from flask_migrate import Migrate
 from blueprints.auth import bp as auth_bp
 from blueprints.user import bp as user_bp
@@ -9,18 +9,18 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 
 app = Flask(__name__)
+
 CORS(app)
 # 绑定配置文件
 app.config.from_object(config)
-
+# 拓展初始化
 db.init_app(app)
 mail.init_app(app)
-
+limiter.init_app(app)
 migrate = Migrate(app, db)
-
-# 初始化JWT扩展
 jwt = JWTManager(app)
 
+# 蓝图注册
 app.register_blueprint(auth_bp)
 app.register_blueprint(user_bp)
 
