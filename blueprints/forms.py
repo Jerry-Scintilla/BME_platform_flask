@@ -51,5 +51,5 @@ class LoginForm(wtforms.Form):
             args = request.args.to_dict()
             super(LoginForm, self).__init__(data=data, **args)
 
-    User_Password = wtforms.StringField(validators=[length(min=6, max=20, message='Invalid password')])
+    User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
     User_Email = wtforms.StringField(validators=[Email(message='Invalid Email')])

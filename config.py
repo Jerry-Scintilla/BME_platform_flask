@@ -1,4 +1,5 @@
 # 数据库配置信息
+from datetime import timedelta
 
 HOSTNAME = '127.0.0.1'
 PORT = '3306'
@@ -11,6 +12,7 @@ SQLALCHEMY_DATABASE_URI = DB_URI
 
 # JWT密匙
 JWT_SECRET_KEY = 'askdcjhaijbdsadf'
+JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)
 
 # 邮箱授权码
 # MBWa73BLhWMgkEmJ
