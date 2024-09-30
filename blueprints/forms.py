@@ -53,3 +53,18 @@ class LoginForm(wtforms.Form):
 
     User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
     User_Email = wtforms.StringField(validators=[Email(message='Invalid Email')])
+
+class ArticleForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(ArticleForm, self).__init__(data=data, **args)
+        else:
+            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(ArticleForm, self).__init__(data=data, **args)
+
+    Article_Title = wtforms.StringField(validators=[length(min=1, max=50, message='Invalid title')])
+    Article_Introduction = wtforms.StringField(validators=[length(min=1, max=300, message='Invalid introduction')])

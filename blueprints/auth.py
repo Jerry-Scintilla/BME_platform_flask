@@ -44,7 +44,7 @@ def register():
             return jsonify(data)
 
         else:
-            user = UserModel(email=email, password=password, username=username)
+            user = UserModel(email=email, password=password, username=username, study_stage="未分流")
             db.session.add(user)
             db.session.commit()
             token = create_access_token(identity=email)

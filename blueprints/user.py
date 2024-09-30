@@ -20,7 +20,7 @@ def user_index():
     User_Medal = user.medal
     User_Stage = user.study_stage
     join_time = user.join_time
-    join_time = join_time.strftime('%Y-%m-%d')
+    User_Time = join_time.strftime('%Y-%m-%d')
 
 
     data = {
@@ -30,6 +30,6 @@ def user_index():
         "User_Name": User_Name,
         "User_Medal": User_Medal,
         "User_Stage": User_Stage,
-        "join_time": join_time
+        "join_time": User_Time
     }
     return jsonify(data)
