@@ -65,7 +65,6 @@ def article_detail():
     article_name = article_id + '_' + file.filename
     file.save('./data/article/' + article_name)
 
-
     ArticleModel.query.filter_by(id=article_id).update({'url': article_name})
     db.session.commit()
 
@@ -73,3 +72,43 @@ def article_detail():
         "code": 200,
         'message': "文件上传完成"
     })
+
+
+@bp.route("/article/delete", methods=["POST"])
+@jwt_required()
+def article_delete():
+    data = request.get_json()
+    article_id = data['Article_Id']
+    article = ArticleModel.query.filter_by(id=article_id).first()
+
+    if article is None:
+        return jsonify({
+            "code": 400,
+            'message': "找不到该文章"
+        })
+
+    url = article.url
+    os.remove('./data/article/' + url)
+
+    db.session.delete(article)
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        'message': "文章删除成功"
+    })
+
+
+@bp.route("/article/list")
+def article_list():
+    a_list = ArticleModel.query.all()
+    data = []
+    for article in a_list:
+        b_list = {'Article_Title': article.title,
+                  'Article_Introduction': article.introduction,
+                  'Article_Time': article.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
+                  'Article_Id': article.id,
+                  }
+        data.append(b_list)
+
+    return jsonify(data)
