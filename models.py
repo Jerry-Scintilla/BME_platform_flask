@@ -29,7 +29,7 @@ class ArticleModel(db.Model):
     title = db.Column(db.String(100), nullable=False)
     introduction = db.Column(db.Text, nullable=False)
     publish_time = db.Column(db.DateTime, default=datetime.now)
-    url = db.Column(db.String(10))
+    url = db.Column(db.String(100))
     # 外键
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     author = db.relationship(UserModel, backref="articles")
