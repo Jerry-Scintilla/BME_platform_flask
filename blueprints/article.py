@@ -77,6 +77,17 @@ def article_detail():
 @bp.route("/article/delete", methods=["POST"])
 @jwt_required()
 def article_delete():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    print(mode)
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        })
+
+
     data = request.get_json()
     article_id = data['Article_Id']
     article = ArticleModel.query.filter_by(id=article_id).first()

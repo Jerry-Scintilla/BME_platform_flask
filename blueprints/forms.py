@@ -1,4 +1,5 @@
 import wtforms
+from flask_wtf.file import FileAllowed, FileSize, FileField
 from wtforms.validators import Email, length, EqualTo, input_required
 from models import UserModel, EmailCaptchaModel
 from flask import request
@@ -38,6 +39,7 @@ class RegisterForm(wtforms.Form):
     #         db.session.delete(captcha_model)
     #         db.session.commit()
 
+
 # 登录表单验证
 class LoginForm(wtforms.Form):
     def __init__(self):
@@ -54,6 +56,7 @@ class LoginForm(wtforms.Form):
     User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
     User_Email = wtforms.StringField(validators=[Email(message='Invalid Email')])
 
+
 class ArticleForm(wtforms.Form):
     def __init__(self):
         if "application/json" in request.headers.get("Content-Type"):
@@ -68,3 +71,7 @@ class ArticleForm(wtforms.Form):
 
     Article_Title = wtforms.StringField(validators=[length(min=1, max=50, message='Invalid title')])
     Article_Introduction = wtforms.StringField(validators=[length(min=1, max=300, message='Invalid introduction')])
+
+
+class AvatarForm(wtforms.Form):
+    avatar = FileField(validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])

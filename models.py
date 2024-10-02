@@ -14,6 +14,8 @@ class UserModel(db.Model):
     # 添加勋章，学习阶段
     medal = db.Column(db.Integer, server_default='0')
     study_stage = db.Column(db.Text)
+    user_mode = db.Column(db.String(20))
+    avatar_url = db.Column(db.String(100))
 
 
 class EmailCaptchaModel(db.Model):
