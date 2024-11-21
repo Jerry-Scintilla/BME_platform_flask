@@ -80,7 +80,7 @@ def article_delete():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
     mode = user.user_mode
-    print(mode)
+    # print(mode)
     if mode != 'admin':
         return jsonify({
             "code": 400,

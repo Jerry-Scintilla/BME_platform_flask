@@ -1,6 +1,6 @@
 import wtforms
 from flask_wtf.file import FileAllowed, FileSize, FileField
-from wtforms.validators import Email, length, EqualTo, input_required
+from wtforms.validators import Email, length, EqualTo, input_required, NumberRange
 from models import UserModel, EmailCaptchaModel
 from flask import request
 from exts import db
@@ -69,9 +69,17 @@ class ArticleForm(wtforms.Form):
             args = request.args.to_dict()
             super(ArticleForm, self).__init__(data=data, **args)
 
-    Article_Title = wtforms.StringField(validators=[length(min=1, max=50, message='Invalid title')])
-    Article_Introduction = wtforms.StringField(validators=[length(min=1, max=300, message='Invalid introduction')])
+    Article_Title = wtforms.StringField(validators=[length(min=1, max=50, message='标题格式不对')])
+    Article_Introduction = wtforms.StringField(validators=[length(min=1, max=300, message='简介格式不对')])
 
 
 class AvatarForm(wtforms.Form):
     avatar = FileField(validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
+
+
+class CourseForm(wtforms.Form):
+
+    Course_title = wtforms.StringField('Course_title',validators=[length(min=1, max=50, message='标题格式不对')])
+    Course_Introduction = wtforms.StringField('Course_Introduction',validators=[length(min=1, max=300, message='简介格式不对')])
+    Course_Chapters = wtforms.IntegerField('Course_Chapters',validators=[NumberRange(min=1, max=300, message='章节数需要在1-300之间')])
+    Cover = FileField('Cover',validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
