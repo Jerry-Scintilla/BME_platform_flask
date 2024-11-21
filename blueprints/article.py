@@ -1,4 +1,4 @@
-from flask import Blueprint, request, redirect, jsonify
+from flask import Blueprint, request, redirect, jsonify, send_file
 from wtforms.validators import email
 import calendar, time, os
 
@@ -123,3 +123,19 @@ def article_list():
         data.append(b_list)
 
     return jsonify(data)
+
+
+# 文章内容发送（html）
+@bp.route("/article")
+def article():
+    article_id = request.args.get('Article_Id')
+    if article_id is None:
+        return jsonify({
+            "code": 400,
+            "message": '请求错误，请重试'
+        })
+    article = ArticleModel.query.filter_by(id=article_id).first()
+    path = article.url
+    article_path = './data/article/' + path
+    # print(article_path)
+    return send_file(article_path)
