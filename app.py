@@ -10,6 +10,8 @@ from flask_cors import CORS
 
 from flask_jwt_extended import JWTManager
 
+from flasgger import Swagger
+
 app = Flask(__name__)
 
 CORS(app)
@@ -21,6 +23,7 @@ mail.init_app(app)
 limiter.init_app(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+swagger = Swagger(app)
 
 # 蓝图注册
 app.register_blueprint(auth_bp)

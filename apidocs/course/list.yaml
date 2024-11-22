@@ -1,0 +1,7 @@
+请求课程列表
+---
+tags:
+  - 课程模块
+responses:
+  200:
+    description: 获取课程列表成功

@@ -1,24 +1,28 @@
-from flask import Blueprint, request, redirect, jsonify, send_file
-from wtforms.validators import email
+from flask import Blueprint, request, jsonify, send_file
 
 # 导入拓展
 from exts import db
 
 # 导入数据库表
-from models import ArticleModel, UserModel, CourseModel
+from models import UserModel, CourseModel
 
 # 导入表单验证
 from .forms import CourseForm
 
 # 导入token验证模块
-from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
+from flask_jwt_extended import (get_jwt_identity, jwt_required)
+
+# 导入api文档模块
+from flasgger import swag_from
 
 bp = Blueprint("course", __name__, url_prefix="")
 
 
 @bp.route("/course/public", methods=["POST"])
 @jwt_required()
+@swag_from('../apidocs/course/public.yaml')
 def public():
+
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
     mode = user.user_mode
@@ -36,8 +40,8 @@ def public():
 
         cover = cover_.Cover.data
 
-        print(cover)
-        print(title)
+        # print(cover)
+        # print(title)
 
         course = CourseModel(title=title, introduction=introduction, chapters=chapters)
 
@@ -63,7 +67,24 @@ def public():
 
     else:
         data = {
-            "code": 400,
+            "code": 401,
             "message": form.errors,
         }
+    return jsonify(data)
+
+
+@bp.route("/course/list")
+@swag_from('../apidocs/course/list.yaml')
+def course_list():
+    a_list = CourseModel.query.all()
+    data = []
+    for course in a_list:
+        b_list = {'Course_title': course.title,
+                  'Course_Introduction': course.introduction,
+                  'Course_Chapters': course.chapters,
+                  'Course_Time': course.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
+                  'Course_Id': course.id,
+                  }
+        data.append(b_list)
+
     return jsonify(data)
