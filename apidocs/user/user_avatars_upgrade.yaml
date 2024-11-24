@@ -1,0 +1,24 @@
+更新用户头像
+---
+tags:
+  - 用户模块
+
+consumes:
+  - multipart/form-data
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: avatar
+    in: formData
+    type: file
+    required: true
+    description: 上传头像
+
+responses:
+  400:
+    description: 上传参数有误
+  200:
+    description: 上传完成

@@ -5,18 +5,23 @@ tags:
 consumes:
   - multipart/form-data
 parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
   - name: Course_title
-    in: body
+    in: formData
     type: string
     required: true
     description: 课程名
   - name: Course_Introduction
-    in: body
+    in: formData
     type: string
     required: true
     description: 课程简介
   - name: Course_Chapters
-    in: body
+    in: formData
     type: string
     required: true
     description: 课程章节数

@@ -14,12 +14,16 @@ from .forms import AvatarForm
 # 导入token验证模块
 from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
 
+# 导入api文档模块
+from flasgger import swag_from
+
 bp = Blueprint("user", __name__, url_prefix="/user")
 
 
 # 用户信息请求
 @bp.route("/user_index")
 @jwt_required()
+@swag_from('../apidocs/user/user_index.yaml')
 def user_index():
     User_Email = get_jwt_identity()
     # print(User_Email)
@@ -27,6 +31,7 @@ def user_index():
     User_Name = user.username
     User_Medal = user.medal
     User_Stage = user.study_stage
+    User_Mode = user.user_mode
     join_time = user.join_time
     User_Time = join_time.strftime('%Y-%m-%d')
 
@@ -37,6 +42,7 @@ def user_index():
         "User_Name": User_Name,
         "User_Medal": User_Medal,
         "User_Stage": User_Stage,
+        "User_Mode": User_Mode,
         "join_time": User_Time
     }
     return jsonify(data)
@@ -44,6 +50,7 @@ def user_index():
 
 @bp.route("/user_avatars/upgrade", methods=['POST'])
 @jwt_required()
+@swag_from('../apidocs/user/user_avatars_upgrade.yaml')
 def user_avatars_upgrade():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
@@ -75,6 +82,7 @@ def user_avatars_upgrade():
 
 @bp.route("/user_avatars")
 @jwt_required()
+@swag_from('../apidocs/user/user_avatars.yaml')
 def user_avatars():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()

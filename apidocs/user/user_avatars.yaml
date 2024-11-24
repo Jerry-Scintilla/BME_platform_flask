@@ -1,0 +1,15 @@
+请求头像（以图片流的方式返回base64）
+---
+tags:
+  - 用户模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 头像图片流传输成功

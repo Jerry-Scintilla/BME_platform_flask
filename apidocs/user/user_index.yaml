@@ -1,0 +1,15 @@
+请求用户信息
+---
+tags:
+  - 用户模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取用户数据成功

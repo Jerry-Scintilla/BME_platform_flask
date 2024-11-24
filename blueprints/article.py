@@ -14,6 +14,9 @@ from .forms import ArticleForm
 # 导入token验证模块
 from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
 
+# 导入api文档模块
+from flasgger import swag_from
+
 bp = Blueprint("article", __name__, url_prefix="")
 
 
@@ -127,6 +130,7 @@ def article_list():
 
 # 文章内容发送（html）
 @bp.route("/article")
+@swag_from('../apidocs/article/article.yaml')
 def article():
     article_id = request.args.get('Article_Id')
     if article_id is None:
