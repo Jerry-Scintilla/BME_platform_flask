@@ -48,6 +48,33 @@ def user_index():
     return jsonify(data)
 
 
+@bp.route("/user_list")
+@jwt_required()
+@swag_from('../apidocs/user/user_list.yaml')
+def user_list():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        })
+    a_list = UserModel.query.all()
+    data = []
+    for user in a_list:
+        b_list = {"User_Email": user.email,
+                  "User_Name": user.username,
+                  "User_Medal": user.medal,
+                  "User_Stage": user.study_stage,
+                  "User_Mode": user.user_mode,
+                  "join_time": user.join_time
+                  }
+        data.append(b_list)
+
+    return jsonify(data)
+
+
 @bp.route("/user_avatars/upgrade", methods=['POST'])
 @jwt_required()
 @swag_from('../apidocs/user/user_avatars_upgrade.yaml')
@@ -94,5 +121,5 @@ def user_avatars():
         "code": 200,
         "User_Avatar": image_stream,
         "User_Name": user.username,
-        "message":"头像图片流传输成功"
+        "message": "头像图片流传输成功"
     })

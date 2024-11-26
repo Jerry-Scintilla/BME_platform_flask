@@ -16,10 +16,13 @@ import random
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
+# 导入api文档模块
+from flasgger import swag_from
 
 
 # 注册端口
 @bp.route("/register", methods=["POST"])
+@swag_from('../apidocs/user/register.yaml')
 def register():
     form = RegisterForm()
     if form.validate():
@@ -38,7 +41,7 @@ def register():
 
         if user:
             data = {
-                "code": 400,
+                "code": 401,
                 "message": "邮箱已存在",
             }
             return jsonify(data)
@@ -62,7 +65,7 @@ def register():
         return jsonify(data)
     else:
         data = {
-            "code": 400,
+            "code": 402,
             "message": form.errors,
         }
         return jsonify(data)
@@ -70,41 +73,101 @@ def register():
 
 # 登录端口
 @bp.route("/login", methods=["POST"])
+@swag_from('../apidocs/user/login.yaml')
 def login():
     form = LoginForm()
     if form.validate():
         email = form.User_Email.data
         password = form.User_Password.data
         user = UserModel.query.filter_by(email=email).first()
-        if not user:
-            code = 400
-            msg = "用户不存在，请检查邮箱输入是否正确"
-            token = "Null"
-            User_Name = "Null"
-        if user.password == password:
-            code = 200
-            msg = "登录成功"
-            token = create_access_token(identity=email)
-            User_Name = user.username
-        else:
-            code = 400
-            msg = "密码错误"
-            token = "Null"
-            User_Name = "Null"
-        data = {
-            "code": code,
-            "message": msg,
-            "token": token,
-            "User_Name": User_Name,
-        }
-        return jsonify(data)
+        try:
+            if user.password == password:
+                code = 200
+                msg = "登录成功"
+                token = create_access_token(identity=email)
+                User_Name = user.username
+            else:
+                code = 402
+                msg = "密码错误"
+                token = "Null"
+                User_Name = "Null"
+            data = {
+                "code": code,
+                "message": msg,
+                "token": token,
+                "User_Name": User_Name,
+            }
+            return jsonify(data)
+        except:
+            return jsonify({
+                "code": 400,
+                "message": "用户不存在，请检查邮箱输入是否正确",
+                "token": "Null",
+                "User_Name": "Null",
+            })
 
     else:
         data = {
-            "code": 400,
+            "code": 403,
             "message": form.errors,
         }
         return jsonify(data)
+
+
+@bp.route("/admin_login", methods=["POST"])
+@swag_from('../apidocs/user/admin_login.yaml')
+def admin_login():
+    form = LoginForm()
+    if form.validate():
+        email = form.User_Email.data
+        password = form.User_Password.data
+        admin = UserModel.query.filter_by(email=email).first()
+        # print(email, password)
+        # print(admin)
+        # if admin.is_(None):
+        #     code = 400
+        #     msg = "用户不存在，请检查邮箱输入是否正确"
+        #     token = "Null"
+        #     User_Name = "Null"
+        # # print(mode)
+        try:
+            if admin.user_mode != 'admin':
+                return jsonify({
+                    "code": 401,
+                    'message': "用户权限不够"
+                })
+            if admin.password == password:
+                code = 200
+                msg = "登录成功"
+                token = create_access_token(identity=email)
+                User_Name = admin.username
+            else:
+                code = 402
+                msg = "密码错误"
+                token = "Null"
+                User_Name = "Null"
+            data = {
+                "code": code,
+                "message": msg,
+                "token": token,
+                "User_Name": User_Name,
+            }
+            return jsonify(data)
+        except:
+            return jsonify({
+                "code": 400,
+                "message": "用户不存在，请检查邮箱输入是否正确",
+                "token": "Null",
+                "User_Name": "Null",
+            })
+
+    else:
+        data = {
+            "code": 403,
+            "message": form.errors,
+        }
+        return jsonify(data)
+
 
 
 # @bp.route("/mail/test")
@@ -114,11 +177,13 @@ def login():
 #     return "mail send succeed"
 
 
-
 from exts import limiter
+
+
 # 邮件验证码获取端口
 @bp.route("/captcha/email", methods=["POST"])
 @limiter.limit("1/minute")
+@swag_from('../apidocs/user/get_email_captcha.yaml')
 def get_email_captcha():
     mail_list = request.get_json()
     email = mail_list["User_Email"]
@@ -139,3 +204,5 @@ def get_email_captcha():
         # "User_Captcha": captcha,
     }
     return jsonify(data)
+
+

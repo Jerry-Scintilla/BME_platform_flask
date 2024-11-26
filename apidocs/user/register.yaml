@@ -1,0 +1,36 @@
+用户注册(需要邮箱验证码)
+---
+tags:
+  - 用户模块
+consumes:
+  - application/json
+
+parameters:
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: register
+      required:
+        - name
+      properties:
+        User_Name:
+          type: string
+          description: 用户名
+#          default: "1111"
+        User_Password:
+          type: string
+          description: 注册密码
+#          default: "Guarana"
+        User_Email:
+          type: string
+          description: 注册邮箱（需唯一）
+#          default: "Guarana"
+        User_Captcha:
+          type: string
+          description: 邮箱验证吗
+#          default: "Guarana"
+
+responses:
+  200:
+    description: 邮件发送成功

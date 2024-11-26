@@ -57,14 +57,31 @@ def article_public():
 
 @bp.route("/article/detail", methods=["POST"])
 @jwt_required()
+@swag_from('../apidocs/article/article_detail.yaml')
 def article_detail():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    # print(mode)
+    if mode != 'admin':
+        return jsonify({
+            "code": 401,
+            'message': "用户权限不够"
+        })
+
     file = request.files['Article_Content']
     article_id = request.form.get('Article_Id')
     if file is None:  # 表示没有发送文件
         return jsonify({
             "code": 400,
-            'message': "文件上传失败"
+            'message': "没有发送文件"
         })
+
+    article = ArticleModel.query.filter_by(id=article_id).first()
+    url = article.url
+    if url:
+        os.remove('./data/article/' + url)
+
     article_name = article_id + '_' + file.filename
     file.save('./data/article/' + article_name)
 
@@ -79,6 +96,7 @@ def article_detail():
 
 @bp.route("/article/delete", methods=["POST"])
 @jwt_required()
+@swag_from('../apidocs/article/article_delete.yaml')
 def article_delete():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
@@ -86,10 +104,9 @@ def article_delete():
     # print(mode)
     if mode != 'admin':
         return jsonify({
-            "code": 400,
+            "code": 401,
             'message': "用户权限不够"
         })
-
 
     data = request.get_json()
     article_id = data['Article_Id']
@@ -114,6 +131,7 @@ def article_delete():
 
 
 @bp.route("/article/list")
+@swag_from('../apidocs/article/article_list.yaml')
 def article_list():
     a_list = ArticleModel.query.all()
     data = []

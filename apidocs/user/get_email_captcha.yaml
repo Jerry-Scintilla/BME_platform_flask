@@ -1,0 +1,29 @@
+获取邮箱验证码（每分钟一次请求速率限制）
+---
+tags:
+  - 用户模块
+consumes:
+  - application/json
+
+parameters:
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: captcha
+      required:
+        - name
+      properties:
+        User_Email:
+          type: string
+          description: 邮箱地址
+
+responses:
+  400:
+    description: 验证码错误
+  200:
+    description: 注册成功
+  401:
+    description: 邮箱已存在
+  402:
+    description: 注册参数错误

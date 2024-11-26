@@ -1,0 +1,15 @@
+请求用户列表（需求管理员权限）
+---
+tags:
+  - 用户模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取用户列表成功

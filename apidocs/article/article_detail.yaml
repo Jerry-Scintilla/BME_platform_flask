@@ -1,0 +1,29 @@
+上传文章详情（需要管理员权限，html格式）
+---
+tags:
+  - 文章模块
+consumes:
+  - multipart/form-data
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: Article_Id
+    in: formData
+    type: string
+    required: true
+    description: 文章ID
+  - name: Article_Content
+    in: formData
+    type: file
+    required: true
+    description: 上传文章详情
+
+responses:
+  400:
+    description: 没有发送文件
+  200:
+    description: 文章详情上传完成
