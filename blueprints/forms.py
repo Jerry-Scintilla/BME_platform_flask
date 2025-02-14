@@ -1,6 +1,6 @@
 import wtforms
 from flask_wtf.file import FileAllowed, FileSize, FileField
-from wtforms.validators import Email, length, EqualTo, input_required, NumberRange
+from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional
 from models import UserModel, EmailCaptchaModel
 from flask import request
 from exts import db
@@ -83,3 +83,24 @@ class CourseForm(wtforms.Form):
     Course_Introduction = wtforms.StringField('Course_Introduction',validators=[length(min=1, max=300, message='简介格式不对')])
     Course_Chapters = wtforms.IntegerField('Course_Chapters',validators=[NumberRange(min=1, max=300, message='章节数需要在1-300之间')])
     Cover = FileField('Cover',validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
+
+
+class UserInfoForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(UserInfoForm, self).__init__(data=data, **args)
+        else:
+            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(UserInfoForm, self).__init__(data=data, **args)
+
+    Student_Id = wtforms.IntegerField('Student_Id',validators=[Optional(),NumberRange(min=1, max=99999999, message='学号格式不对')])
+    Sex = wtforms.StringField('Sex',validators=[Optional(),length(min=1, max=10, message='性别格式不对')])
+    Introduction = wtforms.StringField('Introduction',validators=[Optional(),length(min=1, max=300, message='简介超过300字')])
+    Institute = wtforms.StringField('Institute',validators=[Optional(),length(min=1, max=100, message='学院格式不对')])
+    Major = wtforms.StringField('Major',validators=[Optional(),length(min=1, max=100, message='专业格式不对')])
+    Github_Id = wtforms.StringField('Github_Id',validators=[Optional(),length(min=1, max=100, message='Github_id格式不对')])
+    Skill_Tags = wtforms.StringField('Skill_Tags',validators=[Optional(),length(min=1, max=100, message='技能标签格式不对')])

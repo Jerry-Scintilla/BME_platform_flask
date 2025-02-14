@@ -1,0 +1,30 @@
+上传文章简介（需要管理员权限，返回文章id，再通过文章id上传具体内容（html））
+---
+tags:
+  - 文章模块
+consumes:
+  - multipart/form-data
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: Article_Title
+    in: formData
+    type: string
+    required: true
+    description: 文章标题
+  - name: Article_Introduction
+    in: formData
+    type: string
+    required: true
+    description: 文章简介
+
+responses:
+  400:
+    description: 用户权限不足
+  200:
+    description: 文章信息存储成功
+  401:
+    description: 内容格式错误

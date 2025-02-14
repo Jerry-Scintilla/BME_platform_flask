@@ -18,6 +18,15 @@ class UserModel(db.Model):
     study_stage = db.Column(db.Text)
     user_mode = db.Column(db.String(20), default='user')
     avatar_url = db.Column(db.String(100))
+    # 添加详细个人信息
+    student_id = db.Column(db.Integer)
+    introduction = db.Column(db.Text)
+    sex = db.Column(db.String(10))
+    institute = db.Column(db.String(100))
+    major = db.Column(db.String(100))
+    github_id = db.Column(db.String(100))
+    skill_tags = db.Column(db.String(100))
+
 
 
 class EmailCaptchaModel(db.Model):

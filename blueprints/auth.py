@@ -111,7 +111,7 @@ def login():
             "code": 403,
             "message": form.errors,
         }
-        return jsonify(data)
+        return jsonify(data), 403
 
 
 @bp.route("/admin_login", methods=["POST"])

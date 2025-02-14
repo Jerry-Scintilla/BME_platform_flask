@@ -22,7 +22,6 @@ bp = Blueprint("course", __name__, url_prefix="")
 @jwt_required()
 @swag_from('../apidocs/course/public.yaml')
 def public():
-
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
     mode = user.user_mode
@@ -70,7 +69,7 @@ def public():
             "code": 401,
             "message": form.errors,
         }
-    return jsonify(data)
+    return jsonify(data), 401
 
 
 @bp.route("/course/list")

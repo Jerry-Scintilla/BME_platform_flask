@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, redirect
 import config
 from exts import db, mail, limiter
 from flask_migrate import Migrate
@@ -31,9 +31,10 @@ app.register_blueprint(user_bp)
 app.register_blueprint(article_bp)
 app.register_blueprint(course_bp)
 
+
 @app.route('/')
 def hello_world():  # put application's code here
-    return 'Hello World!'
+    return redirect('/apidocs')
 
 
 if __name__ == '__main__':

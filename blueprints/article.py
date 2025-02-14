@@ -22,7 +22,16 @@ bp = Blueprint("article", __name__, url_prefix="")
 
 @bp.route("/article/public", methods=["POST"])
 @jwt_required()
+@swag_from('../apidocs/article/article_public.yaml')
 def article_public():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        })
     form = ArticleForm()
     if form.validate():
         title = form.Article_Title.data

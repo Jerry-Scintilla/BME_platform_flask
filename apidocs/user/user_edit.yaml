@@ -1,0 +1,56 @@
+用户个人信息编辑(需要token)
+---
+tags:
+  - 用户模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: deit
+      required:
+        - name
+      properties:
+        Student_Id:
+          type: string
+          description: 学号
+          default: "11111111"
+        Sex:
+          type: string
+          description: 性别
+#          default: "男"
+        Introduction:
+          type: string
+          description: 个人介绍
+#          default: "134567895"
+        Institute:
+          type: string
+          description: 学院
+#          default: "生物医学工程学院"
+        Major:
+          type: string
+          description: 专业
+#          default: "生物医学工程"
+        Github_Id:
+          type: string
+          description: Github_Id
+#          default: "1701_asdf"
+        Skill_Tags:
+          type: string
+          description: 技能标签
+#          default: "python"
+
+responses:
+  200:
+    description: 用户信息修改完成
+  400:
+    description: 格式不对
