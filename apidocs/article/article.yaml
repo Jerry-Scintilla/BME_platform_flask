@@ -1,4 +1,4 @@
-获取文章详情（需要加参数，如 ?article=xxx, 返回html格式）
+查询文章详情（需要加参数，如 ?article=xxx, 返回html格式）
 ---
 tags:
   - 文章模块

@@ -104,3 +104,22 @@ class UserInfoForm(wtforms.Form):
     Major = wtforms.StringField('Major',validators=[Optional(),length(min=1, max=100, message='专业格式不对')])
     Github_Id = wtforms.StringField('Github_Id',validators=[Optional(),length(min=1, max=100, message='Github_id格式不对')])
     Skill_Tags = wtforms.StringField('Skill_Tags',validators=[Optional(),length(min=1, max=100, message='技能标签格式不对')])
+
+
+class ChapterForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(ChapterForm, self).__init__(data=data, **args)
+        else:
+            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(ChapterForm, self).__init__(data=data, **args)
+
+    Course_Id = wtforms.IntegerField('Course_Id',validators=[NumberRange(min=1, max=99999999, message='课程id格式不对')])
+    Chapter_Name = wtforms.StringField('Chapter_Name')
+
+
+

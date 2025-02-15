@@ -117,7 +117,10 @@ def user_avatars_upgrade():
         # 删除旧头像
         url = user.avatar_url
         if url:
-            os.remove('./data/avatars/' + url)
+            try:
+                os.remove('./data/avatars/' + url)
+            except:
+                print("删除旧头像失败")
         # 保存新头像到data文件
         file = form.avatar.data
         filename = file.filename

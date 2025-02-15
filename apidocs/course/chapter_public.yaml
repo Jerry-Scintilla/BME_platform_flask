@@ -1,0 +1,36 @@
+创建章节
+---
+tags:
+  - 课程模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: chapter_public
+      required:
+        - name
+      properties:
+        Course_Id:
+          type: string
+          description: 课程id
+#          default: "1111"
+        Chapter_Name:
+          type: string
+          description: 课程章节，使用列表嵌套
+#          default: "Guarana"
+
+responses:
+  200:
+    description: 课程创建
+  400:
+    description: 用户权限不足

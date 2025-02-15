@@ -78,3 +78,4 @@ class Chapter(db.Model):
     name = db.Column(db.Text, nullable=False)
     url = db.Column(db.String(100))
     order = db.Column(db.Integer, nullable=False)  # 用于确定章节顺序
+    priority = db.Column(db.Integer, nullable=False)  # 用于确定章节级别
