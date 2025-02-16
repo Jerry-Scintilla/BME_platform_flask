@@ -89,7 +89,7 @@ def user_list():
         return jsonify({
             "code": 400,
             'message': "用户权限不够"
-        })
+        }), 400
     a_list = UserModel.query.all()
     data = []
     for user in a_list:
@@ -137,7 +137,7 @@ def user_avatars_upgrade():
         return jsonify({
             "code": 400,
             'message': form.errors
-        })
+        }), 400
 
 
 @bp.route("/user_avatars")
@@ -146,6 +146,12 @@ def user_avatars_upgrade():
 def user_avatars():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
+    avatar_url = user.avatar_url
+    if avatar_url is None:
+        return jsonify({
+            "code": 400,
+           'message': "用户头像不存在"
+        }), 400
     a_url = './data/avatars/' + user.avatar_url
     with open(a_url, 'rb') as image_file:
         image_stream = image_file.read()
@@ -219,4 +225,4 @@ def user_edit():
         return jsonify({
             "code": 400,
             "message": form.errors
-        })
+        }), 400

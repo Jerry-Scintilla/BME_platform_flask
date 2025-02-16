@@ -1,0 +1,24 @@
+查询课程（需要加参数，如 ?Course_Id=xxx，?Query=xxx）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Course_Id
+    in: query
+    description: 传递课程id
+    type: string
+    required: False
+  - name: Query
+    in: query
+    description: 传递课程名称
+    type: string
+    required: False
+
+responses:
+  200:
+    description: 获取章节详情成功
+  400:
+    description: 传参格式有误
+  401:
+    description: 课程不存在

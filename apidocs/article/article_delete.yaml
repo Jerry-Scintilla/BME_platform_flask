@@ -11,14 +11,18 @@ parameters:
     type: string
     required: true
     description: token
-  - name: Article_Id
+
+  - name: body
     in: body
-    type: string
     required: true
-    description: 文章ID
-    default: {
-    "Article_Id":"33"
-}
+    schema:
+      id: Article_Delete
+      required:
+        - name
+      properties:
+        Article_Id:
+          type: string
+          description: 文章id
 
 
 responses:

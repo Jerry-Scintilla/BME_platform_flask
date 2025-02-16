@@ -31,7 +31,7 @@ def public():
         return jsonify({
             "code": 400,
             'message': "用户权限不够"
-        })
+        }), 400
     form = CourseForm(request.form)
     if form.validate():
         title = form.Course_title.data
@@ -85,13 +85,13 @@ def course_list():
                   'Course_Introduction': course.introduction,
                   'Course_Chapters': course.chapters,
                   'Course_Time': course.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
-                  'Course_Id': course.id,
+                  'Course_Id': str(course.id),
                   }
         data.append(b_list)
 
     return jsonify(data)
 
-
+# 创建章节
 @bp.route("/course/chapter_public", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/course/chapter_public.yaml')
@@ -103,7 +103,7 @@ def chapter_public():
         return jsonify({
             "code": 400,
             'message': "用户权限不够"
-        })
+        }), 400
     form = ChapterForm()
     if form.validate():
         course_id = form.Course_Id.data
@@ -130,10 +130,10 @@ def chapter_public():
         data = {
             "code": 401,
             "message": form.errors,
-        }
+        }, 401
         return jsonify(data)
 
-
+# 查询章节详情（需要加参数，如 ?Course_Id=xxx）
 @bp.route("/course/chapter_list")
 @swag_from('../apidocs/course/chapter_list.yaml')
 def chapter_list():
@@ -142,13 +142,13 @@ def chapter_list():
         return jsonify({
             "code": 400,
             "message": "传参格式有误",
-        })
+        }), 400
     a_list = Chapter.query.filter_by(course_id=course_id).order_by(Chapter.order).all()
     if not a_list:
         return jsonify({
             "code": 401,
             "message": "课程不存在",
-        })
+        }), 401
     data = []
     for chapter in a_list:
         b_list = {'Chapter_Name': chapter.name,
@@ -158,3 +158,83 @@ def chapter_list():
         data.append(b_list)
 
     return jsonify(data)
+
+# 删除课程
+@bp.route("/course/course_delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/course_delete.yaml')
+def course_delete():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+
+    form = ChapterForm()
+    if form.validate():
+        course_id = form.Course_Id.data
+        courses = CourseModel.query.filter_by(id=course_id).first()
+        if courses is None:
+            return jsonify({
+                "code": 401,
+               'message': "课程不存在"
+            }), 401
+        chapter = Chapter.query.filter_by(course_id=course_id).delete()
+        db.session.delete(courses)
+        db.session.commit()
+        return jsonify({
+            "code": 200,
+            "Course_Id": course_id,
+           'message': "课程删除完成"
+        })
+
+# 查询课程（需要加参数，如 ?Course_Id=xxx，?Query=xxx）
+@bp.route("/course/search")
+@swag_from('../apidocs/course/search_courses.yaml')
+def search_courses():
+    search_query = request.args.get('Query')
+    if search_query:
+        courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%')).all()
+        if not courses:
+            return jsonify({
+                "code": 401,
+               'message': "课程不存在"
+            }), 401
+        course_list = []
+        for course in courses:
+            course_info = {
+                'Course_Id': str(course.id),
+                'Course_Title': course.title,
+                'Introduction': course.introduction,
+                'Chapters': course.chapters,
+                # 'Cover': course.cover
+            }
+            course_list.append(course_info)
+        return jsonify({
+            "code": 200,
+            'message': "查询成功",
+            'Course_List': course_list
+        })
+    course_id = request.args.get('Course_Id')
+    if course_id:
+        course = CourseModel.query.filter_by(id=course_id).first()
+        if course is None:
+            return jsonify({
+                "code": 401,
+                'message': "课程不存在"
+            }), 401
+        return jsonify({
+            "code": 200,
+            'Course_Id': str(course.id),
+            'Course_Title': course.title,
+            'Introduction': course.introduction,
+            'Chapters': course.chapters,
+            # 'Cover': course.cover
+        })
+    return jsonify({
+        "code": 402,
+        'message': "参数错误"
+    }), 402

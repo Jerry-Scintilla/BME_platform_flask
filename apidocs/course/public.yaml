@@ -28,7 +28,7 @@ parameters:
   - name: Cover
     in: formData
     type: file
-    required: true
+    required: False
     description: 上传课程封面
 responses:
   400:

@@ -37,14 +37,14 @@ def register():
                 "code": 400,
                 "message": "验证码错误",
             }
-            return jsonify(data)
+            return jsonify(data), 400
 
         if user:
             data = {
                 "code": 401,
                 "message": "邮箱已存在",
             }
-            return jsonify(data)
+            return jsonify(data), 401
 
         else:
             user = UserModel(email=email, password=password, username=username, study_stage="未分流")
@@ -68,7 +68,7 @@ def register():
             "code": 402,
             "message": form.errors,
         }
-        return jsonify(data)
+        return jsonify(data), 402
 
 
 # 登录端口
@@ -104,7 +104,7 @@ def login():
                 "message": "用户不存在，请检查邮箱输入是否正确",
                 "token": "Null",
                 "User_Name": "Null",
-            })
+            }), 400
 
     else:
         data = {
@@ -135,7 +135,7 @@ def admin_login():
                 return jsonify({
                     "code": 401,
                     'message': "用户权限不够"
-                })
+                }), 401
             if admin.password == password:
                 code = 200
                 msg = "登录成功"
@@ -159,13 +159,13 @@ def admin_login():
                 "message": "用户不存在，请检查邮箱输入是否正确",
                 "token": "Null",
                 "User_Name": "Null",
-            })
+            }), 400
 
     else:
         data = {
             "code": 403,
             "message": form.errors,
-        }
+        }, 403
         return jsonify(data)
 
 

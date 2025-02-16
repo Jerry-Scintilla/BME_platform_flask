@@ -31,7 +31,7 @@ def article_public():
         return jsonify({
             "code": 400,
             'message': "用户权限不够"
-        })
+        }), 400
     form = ArticleForm()
     if form.validate():
         title = form.Article_Title.data
@@ -61,7 +61,7 @@ def article_public():
             "code": 400,
             "message": form.errors,
         }
-        return jsonify(data)
+        return jsonify(data), 400
 
 
 @bp.route("/article/detail", methods=["POST"])
@@ -76,7 +76,7 @@ def article_detail():
         return jsonify({
             "code": 401,
             'message': "用户权限不够"
-        })
+        }), 401
 
     file = request.files['Article_Content']
     article_id = request.form.get('Article_Id')
@@ -84,7 +84,7 @@ def article_detail():
         return jsonify({
             "code": 400,
             'message': "没有发送文件"
-        })
+        }), 400
 
     article = ArticleModel.query.filter_by(id=article_id).first()
     url = article.url
@@ -115,7 +115,7 @@ def article_delete():
         return jsonify({
             "code": 401,
             'message': "用户权限不够"
-        })
+        }), 401
 
     data = request.get_json()
     article_id = data['Article_Id']
@@ -125,7 +125,7 @@ def article_delete():
         return jsonify({
             "code": 400,
             'message': "找不到该文章"
-        })
+        }), 400
 
     url = article.url
     os.remove('./data/article/' + url)
@@ -164,7 +164,7 @@ def article():
         return jsonify({
             "code": 400,
             "message": '请求错误，请重试'
-        })
+        }), 400
     article = ArticleModel.query.filter_by(id=article_id).first()
     path = article.url
     article_path = './data/article/' + path
