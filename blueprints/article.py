@@ -102,6 +102,53 @@ def article_detail():
         'message': "文件上传完成"
     })
 
+# 创建文章详情（以json格式接收html）
+@bp.route("/article/detail_json", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/article/article_detail_json.yaml')
+def article_detail_json():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    # print(mode)
+    if mode != 'admin':
+        return jsonify({
+            "code": 401,
+            'message': "用户权限不够"
+        }), 401
+    try:
+        data = request.get_json()
+        html_content = data.get('Html')
+        article_id = data.get('Article_Id')
+
+        if not html_content:
+            return jsonify({
+                "code": 400,
+                'message': '没有发送Html内容'
+            }), 400
+        article = ArticleModel.query.filter_by(id=article_id).first()
+        url = article.url
+        name = article.title
+        if url:
+            os.remove('./data/article/' + url)
+
+        article_name = article_id + '_' + name
+        file_path = os.path.join('./data/article', f"{article_name}.html")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        return jsonify({
+            "code": 200,
+            'message': '文件上传完成',
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "code": 402,
+            'message': str(e)
+        }), 402
+
+
 
 @bp.route("/article/delete", methods=["POST"])
 @jwt_required()

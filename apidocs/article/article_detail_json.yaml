@@ -1,0 +1,40 @@
+创建文章详情（以json格式接收html）
+---
+tags:
+  - 文章模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: article_detail_json
+      required:
+        - name
+      properties:
+        Article_Id:
+          type: string
+          description: 文章id
+#          default: "1111"
+        Html:
+          type: string
+          description: 文章html内容，注意需要转义
+#          default: "Guarana"
+
+responses:
+  200:
+    description: 文件上传完成
+  401:
+    description: 用户权限不足
+  400:
+    description: 没有发送Html内容
+  402:
+    description: 未知错误，联系后端
