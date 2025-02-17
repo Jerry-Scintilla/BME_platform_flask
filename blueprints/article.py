@@ -137,6 +137,9 @@ def article_detail_json():
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
+        ArticleModel.query.filter_by(id=article_id).update({'url': article_name + '.html'})
+        db.session.commit()
+
         return jsonify({
             "code": 200,
             'message': '文件上传完成',
@@ -210,10 +213,23 @@ def article():
     if article_id is None:
         return jsonify({
             "code": 400,
-            "message": '请求错误，请重试'
+            "message": '文章不存在'
         }), 400
     article = ArticleModel.query.filter_by(id=article_id).first()
     path = article.url
+    if path is None:
+        return jsonify({
+            "code": 401,
+            "message": '文章html不存在'
+        }), 401
     article_path = './data/article/' + path
     # print(article_path)
-    return send_file(article_path)
+    # return send_file(article_path)
+    with open(article_path, 'r', encoding='utf-8') as file:
+        html_content = file.read()
+    return jsonify({
+        "code": 200,
+        "message": "获取文章详情成功",
+        "Article_Id": article_id,
+        "html_content": html_content
+    })
