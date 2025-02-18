@@ -79,3 +79,22 @@ class Chapter(db.Model):
     url = db.Column(db.String(100))
     order = db.Column(db.Integer, nullable=False)  # 用于确定章节顺序
     priority = db.Column(db.Integer, nullable=False)  # 用于确定章节级别
+
+
+class MedalModel(db.Model):
+    __tablename__ = 'medal'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+
+class GroupModel(db.Model):
+    __tablename__ = 'group'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+
+
+
+

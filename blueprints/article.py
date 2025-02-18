@@ -199,6 +199,7 @@ def article_list():
                   'Article_Introduction': article.introduction,
                   'Article_Time': article.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
                   'Article_Id': article.id,
+                  'Article_Author': article.author.username,
                   }
         data.append(b_list)
 
@@ -213,15 +214,15 @@ def article():
     if article_id is None:
         return jsonify({
             "code": 400,
-            "message": '文章不存在'
+            "message": '传参格式错误'
         }), 400
     article = ArticleModel.query.filter_by(id=article_id).first()
-    path = article.url
-    if path is None:
+    if article is None:
         return jsonify({
             "code": 401,
-            "message": '文章html不存在'
+            "message": '文章不存在'
         }), 401
+    path = article.url
     article_path = './data/article/' + path
     # print(article_path)
     # return send_file(article_path)
@@ -231,5 +232,8 @@ def article():
         "code": 200,
         "message": "获取文章详情成功",
         "Article_Id": article_id,
+        "Article_Title": article.title,
+        "Article_Author": article.author.username,
+        "Publish_Time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
         "html_content": html_content
     })

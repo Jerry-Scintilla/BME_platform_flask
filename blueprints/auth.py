@@ -59,7 +59,7 @@ def register():
             }
 
             # 从数据库中删除验证码
-            db.session.delete(captcha_model)
+            captcha_list = EmailCaptchaModel.query.filter_by(email=email).delete()
             db.session.commit()
 
         return jsonify(data)
@@ -190,7 +190,7 @@ def get_email_captcha():
     source = string.digits * 4
     captcha = random.sample(source, 6)
     captcha = "".join(captcha)
-    messages = Message(subject="注册验证码", recipients=[email], body=f"您的验证码是:{captcha}")
+    messages = Message(subject="BME卓越工程师在线教育平台", recipients=[email], body=f"您的验证码是:{captcha}")
     mail.send(messages)
 
     email_captcha = EmailCaptchaModel(email=email, captcha=captcha)
@@ -205,4 +205,33 @@ def get_email_captcha():
     }
     return jsonify(data)
 
+
+@bp.route("/find_password", methods=["POST"])
+@swag_from('../apidocs/user/find_password.yaml')
+def find_password():
+    data = request.get_json()
+    email = data['User_Email']
+    password = data['Password']
+    captcha = data['Captcha']
+    user = UserModel.query.filter_by(email=email).first()
+    if user is None:
+        return jsonify({
+            "code": 400,
+            "message": "用户不存在"
+        }), 400
+
+    captcha_model = EmailCaptchaModel.query.filter_by(email=email).first()
+    if captcha_model is None:
+        return jsonify({
+            "code": 401,
+            "message": "验证码不存在"
+        }), 401
+    if captcha_model.captcha == captcha:
+        user.password = password
+        db.session.delete(captcha_model)
+        db.session.commit()
+        return jsonify({
+            "code": 200,
+            "message": "密码修改成功"
+        })
 

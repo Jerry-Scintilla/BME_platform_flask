@@ -1,0 +1,19 @@
+查询小组详情
+---
+tags:
+  - 用户模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取小组成功
+  400:
+    description: 该导师没有小组
+  401:
+    description: 该学生没有加入小组

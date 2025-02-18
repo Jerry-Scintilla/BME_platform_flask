@@ -1,0 +1,38 @@
+创建,修改小组（需要管理员权限）
+---
+tags:
+  - 用户模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: chapter_public
+      required:
+        - name
+      properties:
+        Group_Name:
+          type: string
+          description: 小组名称
+#          default: "1111"
+        Student_Ids:
+          type: string
+          description: 课程章节，使用列表嵌套
+#          default: "Guarana"
+
+responses:
+  200:
+    description: 创建小组成功
+  400:
+    description: 学生不存在
+  401:
+    description: 学生不是普通用户
