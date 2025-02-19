@@ -147,6 +147,8 @@ def article_detail_json():
         data = request.get_json()
         html_content = data.get('Html')
         article_id = data.get('Article_Id')
+        article_title = data.get('Article_Title')
+        introduction = data.get('Article_Introduction')
 
         if not html_content:
             return jsonify({
@@ -155,7 +157,7 @@ def article_detail_json():
             }), 400
         article = ArticleModel.query.filter_by(id=article_id).first()
         url = article.url
-        name = article.title
+        name = article_title
         if url:
             os.remove('./data/article/' + url)
 
@@ -164,7 +166,7 @@ def article_detail_json():
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
-        ArticleModel.query.filter_by(id=article_id).update({'url': article_name + '.html'})
+        ArticleModel.query.filter_by(id=article_id).update({'url': article_name + '.html', 'title': article_title, 'introduction': introduction})
         db.session.commit()
 
         return jsonify({

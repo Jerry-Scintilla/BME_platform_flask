@@ -24,6 +24,12 @@ parameters:
           type: string
           description: 文章id
 #          default: "1111"
+        Article_Title:
+          type: string
+          description: 文章标题
+        Article_Introduction:
+          type: string
+          description: 文章简介
         Html:
           type: string
           description: 文章html内容，注意需要转义
