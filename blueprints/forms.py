@@ -71,6 +71,7 @@ class ArticleForm(wtforms.Form):
 
     Article_Title = wtforms.StringField(validators=[length(min=1, max=50, message='标题格式不对')])
     Article_Introduction = wtforms.StringField(validators=[length(min=1, max=300, message='简介格式不对')])
+    Html = wtforms.StringField('Html')
 
 
 class AvatarForm(wtforms.Form):
@@ -97,6 +98,7 @@ class UserInfoForm(wtforms.Form):
             args = request.args.to_dict()
             super(UserInfoForm, self).__init__(data=data, **args)
 
+    User_Name = wtforms.StringField('User_Name',validators=[Optional(),length(min=1, max=20, message='用户名格式不对')])
     Student_Id = wtforms.IntegerField('Student_Id',validators=[Optional(),NumberRange(min=1, max=99999999, message='学号格式不对')])
     Sex = wtforms.StringField('Sex',validators=[Optional(),length(min=1, max=10, message='性别格式不对')])
     Introduction = wtforms.StringField('Introduction',validators=[Optional(),length(min=1, max=300, message='简介超过300字')])

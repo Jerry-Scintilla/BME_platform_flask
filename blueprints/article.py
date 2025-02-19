@@ -19,7 +19,7 @@ from flasgger import swag_from
 
 bp = Blueprint("article", __name__, url_prefix="")
 
-
+# 创建文章简介
 @bp.route("/article/public", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/article/article_public.yaml')
@@ -36,26 +36,53 @@ def article_public():
     if form.validate():
         title = form.Article_Title.data
         introduction = form.Article_Introduction.data
+        Html = form.Html.data
 
         User_Email = get_jwt_identity()
         user = UserModel.query.filter_by(email=User_Email).first()
         author_id = user.id
 
         article = ArticleModel(title=title, introduction=introduction, author_id=author_id)
-
         db.session.add(article)
-        # 获取文章id
         db.session.flush()
         db.session.refresh(article)
-        # print(article.id)
-        db.session.commit()
 
-        data = {
-            "code": 200,
-            "message": "文章信息存储成功",
-            "Article_Id": article.id,
-        }
-        return jsonify(data)
+        article_id = article.id
+
+        try:
+            html_content = Html
+            if not html_content:
+                return jsonify({
+                    "code": 403,
+                    'message': '没有发送Html内容'
+                }), 400
+            url = article.url
+            name = title
+            if url:
+                os.remove('./data/article/' + url)
+
+            article_name = str(article_id) + '_' + name
+            file_path = os.path.join('./data/article', f"{article_name}.html")
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            ArticleModel.query.filter_by(id=article_id).update({'url': article_name + '.html'})
+            db.session.commit()
+
+            return jsonify({
+                "code": 200,
+                'message': '文章信息存储成功',
+                "Article_Id": article.id,
+                "Article_Title": title,
+                "Article_Introduction": introduction,
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "code": 402,
+                'message': str(e)
+            }), 402
+
     else:
         data = {
             "code": 400,
@@ -235,5 +262,38 @@ def article():
         "Article_Title": article.title,
         "Article_Author": article.author.username,
         "Publish_Time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
+        "Article_Introduction": article.introduction,
         "html_content": html_content
+    })
+
+
+@bp.route("/article/edit", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/article/article_edit.yaml')
+def article_edit():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 401,
+            'message': "用户权限不够"
+        }), 401
+
+    article_id = request.json.get('Article_Id')
+    article_title = request.json.get('Article_Title')
+    article_introduction = request.json.get('Article_Introduction')
+
+    article = ArticleModel.query.filter_by(id=article_id).first()
+    if article is None:
+        return jsonify({
+            "code": 400,
+            "message": '文章不存在'
+        }), 400
+    article.title = article_title
+    article.introduction = article_introduction
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": "文章编辑成功"
     })

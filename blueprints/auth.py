@@ -86,17 +86,67 @@ def login():
                 msg = "登录成功"
                 token = create_access_token(identity=email)
                 User_Name = user.username
+
             else:
                 code = 402
                 msg = "密码错误"
                 token = "Null"
                 User_Name = "Null"
+
+            User_Email = user.email
+            User_Medal = user.medal
+            User_Stage = user.study_stage
+            User_Mode = user.user_mode
+            join_time = user.join_time
+            User_Time = join_time.strftime('%Y-%m-%d')
+            User_Id = str(user.id).zfill(7)
+            Student_Id = user.student_id
+            Introduction = user.introduction
+            User_Sex = user.sex
+            Institute = user.institute
+            Major = user.major
+            Github_Id = user.github_id
+            Skill_Tags = user.skill_tags
+
             data = {
                 "code": code,
                 "message": msg,
                 "token": token,
                 "User_Name": User_Name,
+                "User_Email": User_Email,
+                "User_Medal": User_Medal,
+                "User_Stage": User_Stage,
+                "User_Mode": User_Mode,
+                "join_time": User_Time,
+                "User_Id": User_Id,
+                "Student_Id": Student_Id,
+                "Introduction": Introduction,
+                "User_Sex": User_Sex,
+                "Institute": Institute,
+                "Major": Major,
+                "Github_Id": Github_Id,
+                "Skill_Tags": Skill_Tags,
             }
+
+            # data = {
+            #     "code": code,
+            #     "message": msg,
+            #     "token": token,
+            #     "User_Name": User_Name,
+            #     "User_Email": user.email,
+            #     "User_Medal": user.medal,
+            #     "User_Stage": user.study_stage,
+            #     "User_Mode": user.mode,
+            #     "join_time": user.join_time.strftime("%Y-%m-%d %H:%M:%S"),
+            #     "User_Id": user.id,
+            #     "Student_Id": user.student_id,
+            #     "Introduction": user.introduction,
+            #     "User_Sex": user.sex,
+            #     "Institute": user.institute,
+            #     "Major": user.major,
+            #     "Github_Id": user.github_id,
+            #     "Skill_Tags": user.skill_tags,
+            # }
             return jsonify(data)
         except:
             return jsonify({

@@ -1,4 +1,4 @@
-创建文章简介（需要管理员权限，返回文章id，再通过文章id上传具体内容（html））
+创建文章简介
 ---
 tags:
   - 文章模块
@@ -20,6 +20,11 @@ parameters:
     type: string
     required: true
     description: 文章简介
+  - name: Html
+    in: formData
+    type: string
+    required: true
+    description: 文章内容
 
 responses:
   400:
@@ -28,3 +33,7 @@ responses:
     description: 文章信息存储成功
   401:
     description: 内容格式错误
+  403:
+    description: 没有发送Html内容
+  402:
+    description: 未知错误

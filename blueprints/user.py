@@ -173,6 +173,7 @@ def user_edit():
     form = UserInfoForm()
     if form.validate():
         # 初始化变量为 None
+        user_name = None
         Student_Id = None
         Introduction = None
         Sex = None
@@ -182,6 +183,8 @@ def user_edit():
         Skill_Tags = None
 
         # 检查每个字段是否有值，如果有值则存储到相应的变量中
+        if form.User_Name.data:
+            user_name = form.User_Name.data
         if form.Student_Id.data:
             Student_Id = form.Student_Id.data
         if form.Introduction.data:
@@ -198,6 +201,8 @@ def user_edit():
             Skill_Tags = form.Skill_Tags.data
 
         # 存储到数据库中
+        if user_name is not None:
+            user.username = user_name
         if Student_Id is not None:
             user.student_id = Student_Id
         if Introduction is not None:
