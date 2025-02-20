@@ -79,11 +79,23 @@ class AvatarForm(wtforms.Form):
 
 
 class CourseForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(CourseForm, self).__init__(data=data, **args)
+        else:
+            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(CourseForm, self).__init__(data=data, **args)
 
     Course_title = wtforms.StringField('Course_title',validators=[length(min=1, max=50, message='标题格式不对')])
     Course_Introduction = wtforms.StringField('Course_Introduction',validators=[length(min=1, max=300, message='简介格式不对')])
-    Course_Chapters = wtforms.IntegerField('Course_Chapters',validators=[NumberRange(min=1, max=300, message='章节数需要在1-300之间')])
-    Cover = FileField('Cover',validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
+    Course_Chapters = wtforms.IntegerField('Course_Chapters',validators=[Optional(),NumberRange(min=1, max=300, message='章节数需要在1-300之间')])
+    Course_Tags = wtforms.StringField('Course_Tags',validators=[Optional(),length(min=1, max=100, message='标签格式不对')])
+    Course_Id = wtforms.IntegerField('Course_Id',validators=[Optional(),input_required()])
+    # Cover = FileField('Cover',validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
 
 
 class UserInfoForm(wtforms.Form):

@@ -34,14 +34,14 @@ def public():
             "code": 400,
             'message': "用户权限不够"
         }), 400
-    form = CourseForm(request.form)
+    form = CourseForm()
     if form.validate():
         title = form.Course_title.data
         introduction = form.Course_Introduction.data
         chapters = form.Course_Chapters.data
-        cover_ = CourseForm(request.files)
+        # cover_ = CourseForm(request.files)
 
-        cover = cover_.Cover.data
+        # cover = cover_.Cover.data
 
         # print(cover)
         # print(title)
@@ -53,10 +53,10 @@ def public():
         db.session.flush()
         db.session.refresh(course)
 
-        filename = cover.filename
-        cover.save('./data/cover/' + str(course.id) + '.' + filename.rsplit(".", 1)[1].lower())
-        course.cover = str(course.id) + '.' + filename.rsplit(".", 1)[1].lower()
-
+        # filename = cover.filename
+        # cover.save('./data/cover/' + str(course.id) + '.' + filename.rsplit(".", 1)[1].lower())
+        # course.cover = str(course.id) + '.' + filename.rsplit(".", 1)[1].lower()
+        #
         db.session.commit()
 
         data = {
@@ -74,6 +74,62 @@ def public():
             "message": form.errors,
         }
     return jsonify(data), 401
+
+
+@bp.route("/course/edit", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/course_edit.yaml')
+def course_edit():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+
+    form = CourseForm()
+    if form.validate():
+        course_id = form.Course_Id.data
+        course = CourseModel.query.filter_by(id=course_id).first()
+        title = None
+        introduction = None
+        chapters = None
+        tag = None
+
+        if form.Course_title.data:
+            title = form.Course_title.data
+        if form.Course_Introduction.data:
+            introduction = form.Course_Introduction.data
+        if form.Course_Chapters.data:
+            chapters = form.Course_Chapters.data
+        if form.Course_Tags.data:
+            tag = form.Course_Tags.data
+
+        if title is not None:
+            course.title = title
+        if introduction is not None:
+            course.introduction = introduction
+        if chapters is not None:
+            course.chapters = chapters
+        if tag is not None:
+            course.tags = tag
+
+        db.session.commit()
+
+        return jsonify({
+            "code": 200,
+            "message": "课程信息修改完成"
+        })
+
+    else:
+        data = {
+            "code": 401,
+            "message": form.errors,
+        }
+        return jsonify(data), 401
+
 
 
 # 展示所有课程

@@ -56,6 +56,7 @@ class CourseModel(db.Model):
     chapters = db.Column(db.Integer, nullable=False)
     cover = db.Column(db.String(100))
     url = db.Column(db.String(100))
+    tags = db.Column(db.String(100))
     publish_time = db.Column(db.DateTime, default=datetime.now)
 
 
