@@ -1,0 +1,30 @@
+上传图书pdf
+---
+tags:
+  - 课程模块
+consumes:
+  - multipart/form-data
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: formData
+    type: string
+    required: true
+    description: 课程id
+#          default: "1111"
+  - name: Book
+    in: formData
+    type: file
+    required: true
+    description: 上传pdf
+responses:
+  400:
+    description: 用户权限不够
+  200:
+    description: 上传完成
+

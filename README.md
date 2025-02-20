@@ -14,12 +14,35 @@
 
 ## 安装
 
-1. 克隆项目到本地
+1. 安装MySQL
+3. 安装python3.9
+
+   ```
+   sudo apt install python3.9
+   ```
+4. 克隆项目到本地
 
    ```
    git clone https://github.com/Jerry-Scintilla/BME_platform_flask.git
    ```
-2.  ```
+5. 进入到项目目录,创建虚拟环境
 
    ```
-3.
+   cd /BME_platform_flask
+   mkdir flask_nenv
+   virtualenv -p /usr/bin/python3.9 flask_nenv
+   ```
+6. 激活虚拟环境，安装依赖文件
+
+   ```
+   source flask_nenv/bin/activate
+   pip install -r requirements.txt
+   ```
+7. 启动后端
+
+   ```
+
+   ```
+8.  ```
+
+   ```

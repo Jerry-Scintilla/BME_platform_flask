@@ -1,3 +1,5 @@
+import os
+
 from flask import Blueprint, request, jsonify, send_file
 
 # 导入拓展
@@ -238,3 +240,73 @@ def search_courses():
         "code": 402,
         'message': "参数错误"
     }), 402
+
+
+@bp.route("/course/book_upgrade", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/book_upgrade.yaml')
+def book_upgrade():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+
+    book = request.files['Book']
+    course_id = request.form.get('Course_Id')
+    if book is None:  # 表示没有发送文件
+        return jsonify({
+            "code": 401,
+           'message': "没有发送文件"
+        }), 401
+
+    if course_id is None:  # 表示没有发送课程 ID
+        return jsonify({
+            "code": 402,
+          'message': "没有发送课程 ID"
+        }), 402
+
+
+    course = CourseModel.query.filter_by(id=course_id).first()
+    url = course.url
+    if url:
+        os.remove('./data/course/book/' + url)
+
+    book_name = str(course.id) + '_' + course.title + '.pdf'
+    book.save('./data/course/book/' + book_name)
+
+    # 更新课程的 url
+    course.url = book_name
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        'message': "文件保存成功",
+        'book_name': book_name
+    })
+
+
+@bp.route("/course/book_down")
+@jwt_required()
+@swag_from('../apidocs/course/book_down.yaml')
+def book_down():
+    course_id = request.args.get('Course_Id')
+    if course_id is None:
+        return jsonify({
+            "code": 400,
+           'message': "课程参数错误"
+        }), 400
+
+    course = CourseModel.query.filter_by(id=course_id).first()
+    url = course.url
+    if url is None:
+        return jsonify({
+            "code": 401,
+          'message': "课程pdf不存在"
+        }), 401
+
+    return send_file('./data/course/book/' + url, as_attachment=True)
+

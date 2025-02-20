@@ -1,0 +1,25 @@
+下载pdf资料（需要参数?Course_Id=XXX）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: query
+    description: 传递课程id
+    type: string
+    required: true
+
+responses:
+  200:
+    description: 获取章节详情成功
+  400:
+    description: 传参格式有误
+  401:
+    description: 课程不存在

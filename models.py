@@ -55,7 +55,7 @@ class CourseModel(db.Model):
     introduction = db.Column(db.Text, nullable=False)
     chapters = db.Column(db.Integer, nullable=False)
     cover = db.Column(db.String(100))
-
+    url = db.Column(db.String(100))
     publish_time = db.Column(db.DateTime, default=datetime.now)
 
 
