@@ -1,4 +1,4 @@
-下载pdf资料（需要参数?Course_Id=XXX）
+查询pdf下载链接（需要参数?Course_Id=XXX）
 ---
 tags:
   - 课程模块
@@ -14,12 +14,13 @@ parameters:
     in: query
     description: 传递课程id
     type: string
-    required: true
+    required: False
+
 
 responses:
   200:
-    description: 获取章节详情成功
-  400:
-    description: 传参格式有误
+    description: 下载链接生成成功
   401:
-    description: 课程不存在
+    description: 课程pdf不存在
+  402:
+    description: 参数错误

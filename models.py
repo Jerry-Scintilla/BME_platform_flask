@@ -27,6 +27,9 @@ class UserModel(db.Model):
     github_id = db.Column(db.String(100))
     skill_tags = db.Column(db.String(100))
 
+    down_code = db.Column(db.String(100))
+    down_id = db.Column(db.Integer)
+
 
 
 class EmailCaptchaModel(db.Model):

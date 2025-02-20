@@ -345,24 +345,75 @@ def book_upgrade():
     })
 
 
+
+import random
+import string
+
 @bp.route("/course/book_down")
 @jwt_required()
 @swag_from('../apidocs/course/book_down.yaml')
 def book_down():
     course_id = request.args.get('Course_Id')
-    if course_id is None:
-        return jsonify({
-            "code": 400,
-           'message': "课程参数错误"
-        }), 400
+    # Down_Code = request.args.get('Down_Code')
+    if course_id :
+        course = CourseModel.query.filter_by(id=course_id).first()
+        url = course.url
+        if url is None:
+            return jsonify({
+                "code": 401,
+              'message': "课程pdf不存在"
+            }), 401
+        characters = string.digits + string.ascii_uppercase
+        down_code = ''.join(random.choices(characters, k=12))
+        user_email = get_jwt_identity()
+        user = UserModel.query.filter_by(email=user_email).first()
+        user.down_code = down_code
+        user.down_id = course_id
+        db.session.commit()
 
-    course = CourseModel.query.filter_by(id=course_id).first()
-    url = course.url
-    if url is None:
         return jsonify({
-            "code": 401,
-          'message': "课程pdf不存在"
-        }), 401
+            "code": 200,
+           'message': "下载链接生成成功",
+            'Down_Code': down_code
+        })
 
-    return send_file('./data/course/book/' + url, as_attachment=True)
+    else:
+        return jsonify({
+            "code": 402,
+          'message': "参数错误"
+        })
+
+
+@bp.route("/course/book_download")
+@swag_from('../apidocs/course/book_download.yaml')
+def book_download():
+    Down_Code = request.args.get('Down_Code')
+    if Down_Code:
+        user = UserModel.query.filter_by(down_code=Down_Code).first()
+        if not user:
+            return jsonify({
+                "code": 402,
+              'message': "下载码错误"
+            }), 402
+
+        course_id = user.down_id
+        course = CourseModel.query.filter_by(id=course_id).first()
+        url = course.url
+        if url is None:
+            return jsonify({
+                "code": 403,
+             'message': "课程pdf不存在"
+            }), 403
+
+        user.down_code = None
+        user.down_id = None
+        db.session.commit()
+
+        return send_file('./data/course/book/' + url, as_attachment=True)
+    else:
+        return jsonify({
+            "code": 404,
+         'message': "参数错误"
+        })
+
 
