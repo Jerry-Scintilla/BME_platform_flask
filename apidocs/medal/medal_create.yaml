@@ -24,9 +24,9 @@ parameters:
           type: string
           description: 勋章名称
 #          default: "1111"
-        Medal_Description:
+        Medal_Name_CN:
           type: string
-          description: 勋章说明
+          description: 勋章中文名
 #          default: "Guarana"
         Medal_Tag:
           type: string

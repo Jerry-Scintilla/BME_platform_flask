@@ -16,7 +16,7 @@ parameters:
     in: body
     required: true
     schema:
-      id: medal_create
+      id: medal_edit
       required:
         - name
       properties:

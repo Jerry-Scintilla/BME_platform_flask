@@ -35,7 +35,7 @@ def medal_create():
     form = MedalForm()
     if form.validate():
         medal_name = form.Medal_Name.data
-        description = form.Medal_Description.data
+        description = form.Medal_Name_CN.data
         tag = form.Medal_Tag.data
         medal = MedalModel(medal_name=medal_name, description=description, tags=tag)
         db.session.add(medal)
@@ -111,7 +111,7 @@ def medal_delete():
             'message': str(e)
         }), 402
 
-
+# 修改勋章（需要改什么就传什么key）
 @bp.route("/medal_edit", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/medal/medal_edit.yaml')
@@ -154,4 +154,37 @@ def medal_edit():
     })
 
 
+@bp.route("/user_medal_add", methods=["POST"])
+@jwt_required()
 
+def user_medal_add():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode!= 'admin':
+        return jsonify({
+            "code": 400,
+           'message': "用户权限不够"
+        }), 400
+
+    student_id = request.json.get("Student_Id")
+    medal_name = request.json.get("Medal_Name")
+    user = UserModel.query.filter_by(id=student_id).first()
+    if not user:
+        return jsonify({
+            "code": 401,
+            "message": "用户不存在"
+        }), 401
+    medal = MedalModel.query.filter_by(medal_name=medal_name).first()
+    if not medal:
+        return jsonify({
+            "code": 402,
+            "message": "勋章不存在"
+        })
+    medal_user = MedalUserModel(user_id=user.id, medal_id=medal.id)
+    db.session.add(medal_user)
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": "勋章添加成功"
+    })

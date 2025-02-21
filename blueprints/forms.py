@@ -149,7 +149,7 @@ class MedalForm(wtforms.Form):
             super(MedalForm, self).__init__(data=data, **args)
 
     Medal_Name = wtforms.StringField('Medal_Name',validators=[length(min=1, max=100, message='勋章名称格式不对')])
-    Medal_Description = wtforms.StringField('Medal_Name',validators=[length(min=1, max=100, message='勋章描述格式不对')])
+    Medal_Name_CN = wtforms.StringField('Medal_Name_CN',validators=[length(min=1, max=100, message='勋章中文名格式不对')])
     Medal_Tag = wtforms.StringField('Medal_Tag',validators=[length(min=1, max=100, message='勋章标签格式不对')])
 
 
