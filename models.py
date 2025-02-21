@@ -88,7 +88,16 @@ class Chapter(db.Model):
 class MedalModel(db.Model):
     __tablename__ = 'medal'
     id = db.Column(db.Integer, primary_key=True)
+    medal_name = db.Column(db.String(100))
+    description = db.Column(db.String(100))
+    tags = db.Column(db.String(100))
+
+class MedalUserModel(db.Model):
+    __tablename__ = 'medal_user'
+    id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    medal_id = db.Column(db.Integer, db.ForeignKey('medal.id'), nullable=False)
+    get_time = db.Column(db.DateTime, default=datetime.now)
 
 
 class GroupModel(db.Model):

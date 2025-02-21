@@ -136,5 +136,22 @@ class ChapterForm(wtforms.Form):
     Chapter_Name = wtforms.StringField('Chapter_Name')
 
 
+class MedalForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(MedalForm, self).__init__(data=data, **args)
+        else:
+            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(MedalForm, self).__init__(data=data, **args)
+
+    Medal_Name = wtforms.StringField('Medal_Name',validators=[length(min=1, max=100, message='勋章名称格式不对')])
+    Medal_Description = wtforms.StringField('Medal_Name',validators=[length(min=1, max=100, message='勋章描述格式不对')])
+    Medal_Tag = wtforms.StringField('Medal_Tag',validators=[length(min=1, max=100, message='勋章标签格式不对')])
+
+
 
 

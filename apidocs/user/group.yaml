@@ -1,7 +1,7 @@
 查询小组详情
 ---
 tags:
-  - 用户模块
+  - 小组模块
 
 parameters:
   - name: Authorization
