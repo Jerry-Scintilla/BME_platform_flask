@@ -98,6 +98,10 @@ class MedalUserModel(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     medal_id = db.Column(db.Integer, db.ForeignKey('medal.id'), nullable=False)
     get_time = db.Column(db.DateTime, default=datetime.now)
+    description = db.Column(db.String(100))
+
+    user = db.relationship('UserModel', backref=db.backref('medal_user', lazy=True))
+    medal = db.relationship('MedalModel', backref=db.backref('medal_user', lazy=True))
 
 
 class GroupModel(db.Model):
