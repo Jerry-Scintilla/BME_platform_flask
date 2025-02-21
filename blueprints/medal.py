@@ -262,8 +262,8 @@ def user_medal_show():
                 "Medal_Name": medal_.medal_name,
                 "Medal_Tag": medal_.tags,
                 "Medal_Name_CN": medal_.description,
-                "Get_Time": "Null",
-                "Description": "Null"
+                "Get_Time": None,
+                "Description": None
             })
 
     return jsonify({

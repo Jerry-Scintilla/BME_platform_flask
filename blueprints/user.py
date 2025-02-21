@@ -94,6 +94,7 @@ def user_list():
     data = []
     for user in a_list:
         b_list = {"User_Email": user.email,
+                  "User_Id": user.id,
                   "User_Name": user.username,
                   "User_Medal": user.medal,
                   "User_Stage": user.study_stage,
