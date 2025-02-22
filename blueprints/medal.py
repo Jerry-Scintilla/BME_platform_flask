@@ -189,6 +189,7 @@ def user_medal_add():
             "message": "用户已经拥有该勋章"
         }), 403
     medal_user = MedalUserModel(user_id=user.id, medal_id=medal.id, description=description)
+    user.medal = user.medal + 1
     db.session.add(medal_user)
     db.session.commit()
     return jsonify({

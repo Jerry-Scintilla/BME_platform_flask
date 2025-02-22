@@ -164,6 +164,29 @@ def user_avatars():
         "message": "头像图片流传输成功"
     })
 
+# 查询id头像（以图片流的方式返回base64）
+@bp.route("/user_avatars_id")
+@swag_from('../apidocs/user/user_avatars_id.yaml')
+def user_avatars_id():
+    User_Id = request.args.get("User_Id")
+    user = UserModel.query.filter_by(id=User_Id).first()
+    avatar_url = user.avatar_url
+    if avatar_url is None:
+        return jsonify({
+            "code": 400,
+            'message': "用户头像不存在"
+        }), 400
+    a_url = './data/avatars/' + user.avatar_url
+    with open(a_url, 'rb') as image_file:
+        image_stream = image_file.read()
+        image_stream = base64.b64encode(image_stream).decode()
+    return jsonify({
+        "code": 200,
+        "User_Avatar": image_stream,
+        "User_Name": user.username,
+        "message": "头像图片流传输成功"
+    })
+
 
 @bp.route("/user/edit", methods=['POST'])
 @jwt_required()
@@ -297,16 +320,18 @@ def group():
             }), 400
         data = []
         for group in groups:
-            student_name = UserModel.query.filter_by(id=group.student_id).first().username
+            student = UserModel.query.filter_by(id=group.student_id).first()
             b_list = {
-                    'Student': student_name
-                    }
+                "Student_Id": student.id,
+                'Student': student.username
+            }
             data.append(b_list)
 
         return jsonify({
             "code": 200,
             "message": "获取小组成功",
             "teacher": user.username,
+            "teacher_id": user.id,
             "group": data
         })
 
@@ -318,18 +343,20 @@ def group():
                 "message": "该学生没有加入小组"
             }), 401
         data = []
-        teacher = UserModel.query.filter_by(id=GroupModel.query.filter_by(student_id=user.id).first().teacher_id).first().username
+        teacher = UserModel.query.filter_by(id=GroupModel.query.filter_by(student_id=user.id).first().teacher_id).first()
         for group in groups:
-            student_name = UserModel.query.filter_by(id=group.student_id).first().username
+            student = UserModel.query.filter_by(id=group.student_id).first()
             b_list = {
-                'Student': student_name
+                "Student_Id": student.id,
+                'Student': student.username
             }
             data.append(b_list)
 
         return jsonify({
             "code": 200,
             "message": "获取小组成功",
-            "teacher": teacher,
+            "teacher": teacher.username,
+            "teacher_id": teacher.id,
             "group": data
         })
 
@@ -356,8 +383,8 @@ def group_list():
         # 查询所有小组数据
     query_result = (
         db.session.query(
-            Teacher.username.label('teacher_name'),
-            Student.username.label('student_name')
+            Teacher.id.label('teacher_name'),
+            Student.id.label('student_name')
         )
         .select_from(GroupModel)
         .join(Teacher, GroupModel.teacher_id == Teacher.id)
@@ -370,11 +397,15 @@ def group_list():
     for teacher, student in query_result:
         if teacher not in grouped_data:
             grouped_data[teacher] = []
-        grouped_data[teacher].append({"Student": student})
+        grouped_data[teacher].append({
+            "Student_Id": student,
+            "Student": UserModel.query.filter_by(id=student).first().username
+        })
 
     # 构造最终响应格式
     result = [{
-        "teacher": teacher,
+        "teacher_id": teacher,
+        "teacher": UserModel.query.filter_by(id=teacher).first().username,
         "group": students
     } for teacher, students in grouped_data.items()]
 
