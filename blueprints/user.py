@@ -150,9 +150,11 @@ def user_avatars():
     avatar_url = user.avatar_url
     if avatar_url is None:
         return jsonify({
-            "code": 400,
-           'message': "用户头像不存在"
-        }), 400
+            "code": 200,
+            "User_Avatar": None,
+            "User_Name": user.username,
+            'message': "用户头像不存在"
+        })
     a_url = './data/avatars/' + user.avatar_url
     with open(a_url, 'rb') as image_file:
         image_stream = image_file.read()
@@ -173,9 +175,11 @@ def user_avatars_id():
     avatar_url = user.avatar_url
     if avatar_url is None:
         return jsonify({
-            "code": 400,
+            "code": 200,
+            "User_Avatar": None,
+            "User_Name": user.username,
             'message': "用户头像不存在"
-        }), 400
+        })
     a_url = './data/avatars/' + user.avatar_url
     with open(a_url, 'rb') as image_file:
         image_stream = image_file.read()
