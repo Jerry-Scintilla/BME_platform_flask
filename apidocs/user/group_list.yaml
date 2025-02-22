@@ -1,0 +1,15 @@
+查询小组列表（需求管理员权限）
+---
+tags:
+  - 小组模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取所有小组成功

@@ -263,6 +263,12 @@ def group_add():
                 "code": 401,
                 "message": "学生不是普通用户"
             }), 401
+        student = GroupModel.query.filter_by(student_id=student_id).first()
+        if student:
+            return jsonify({
+                "code": 402,
+                "message": "学生已经加入小组"
+            })
 
         group_exist = GroupModel.query.filter_by(teacher_id=teacher_id).delete()
 
@@ -326,3 +332,54 @@ def group():
             "teacher": teacher,
             "group": data
         })
+
+from sqlalchemy.orm import aliased
+
+
+@bp.route("/group/list")
+@jwt_required()
+@swag_from('../apidocs/user/group_list.yaml')
+def group_list():
+    User_Email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=User_Email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+
+        # 创建别名用于区分导师和学生
+    Student = aliased(UserModel)
+    Teacher = aliased(UserModel)
+
+        # 查询所有小组数据
+    query_result = (
+        db.session.query(
+            Teacher.username.label('teacher_name'),
+            Student.username.label('student_name')
+        )
+        .select_from(GroupModel)
+        .join(Teacher, GroupModel.teacher_id == Teacher.id)
+        .join(Student, GroupModel.student_id == Student.id)
+        .all()
+    )
+
+    # 按导师分组整理数据
+    grouped_data = {}
+    for teacher, student in query_result:
+        if teacher not in grouped_data:
+            grouped_data[teacher] = []
+        grouped_data[teacher].append({"Student": student})
+
+    # 构造最终响应格式
+    result = [{
+        "teacher": teacher,
+        "group": students
+    } for teacher, students in grouped_data.items()]
+
+    return jsonify({
+        "code": 200,
+        "message": "获取所有小组成功",
+        "groups": result
+    }), 200

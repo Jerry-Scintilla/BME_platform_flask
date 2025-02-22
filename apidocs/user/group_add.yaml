@@ -16,7 +16,7 @@ parameters:
     in: body
     required: true
     schema:
-      id: chapter_public
+      id: group_add
       required:
         - name
       properties:
@@ -26,7 +26,7 @@ parameters:
 #          default: "1111"
         Student_Ids:
           type: string
-          description: 课程章节，使用列表嵌套
+          description: 学生id，使用列表嵌套
 #          default: "Guarana"
 
 responses:
@@ -36,3 +36,5 @@ responses:
     description: 学生不存在
   401:
     description: 学生不是普通用户
+  402:
+    description: 学生已经加入小组
