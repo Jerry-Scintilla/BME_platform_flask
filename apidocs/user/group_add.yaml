@@ -24,10 +24,14 @@ parameters:
           type: string
           description: 小组名称
 #          default: "1111"
-        Student_Ids:
+        Group_member:
           type: string
-          description: 学生id，使用列表嵌套
+          description: 小组成员，使用列表嵌套
 #          default: "Guarana"
+        Group_Type:
+          type: string
+          description: 小组类型，分为study和project
+        #          default: "Guarana"
 
 responses:
   200:

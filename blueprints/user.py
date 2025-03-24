@@ -166,6 +166,7 @@ def user_avatars():
         "message": "头像图片流传输成功"
     })
 
+
 # 查询id头像（以图片流的方式返回base64）
 @bp.route("/user_avatars_id")
 @swag_from('../apidocs/user/user_avatars_id.yaml')
@@ -260,6 +261,7 @@ def user_edit():
             "message": form.errors
         }), 400
 
+
 # 创建,修改小组（需要管理员权限）
 @bp.route("/group_add", methods=['POST'])
 @jwt_required()
@@ -268,15 +270,17 @@ def group_add():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
     mode = user.user_mode
-    if mode!= 'admin':
+    if mode != 'admin':
         return jsonify({
             "code": 400,
-           'message': "用户权限不够"
+            'message': "用户权限不够"
         }), 400
 
     group_name = request.json.get('Group_Name')
-    student_ids = request.json.get('Student_Ids')
+    student_ids = request.json.get('Group_member')
+    group_type = request.json.get('Group_Type')
     teacher_id = user.id
+    group_exist = GroupModel.query.filter_by(teacher_id=teacher_id, type=group_type).delete()
     for student in student_ids:
         student_id = student["student_id"]
         student_user = UserModel.query.filter_by(id=student_id).first()
@@ -285,21 +289,19 @@ def group_add():
                 "code": 400,
                 "message": "学生不存在"
             }), 400
-        if student_user.user_mode != 'user':
-            return jsonify({
-                "code": 401,
-                "message": "学生不是普通用户"
-            }), 401
-        student = GroupModel.query.filter_by(student_id=student_id).first()
+        # if student_user.user_mode != 'user':
+        #     return jsonify({
+        #         "code": 401,
+        #         "message": "学生不是普通用户"
+        #     }), 401
+        student = GroupModel.query.filter_by(student_id=student_id, type=group_type).first()
         if student:
             return jsonify({
                 "code": 402,
-                "message": "学生已经加入小组"
+                "message": f"学生{UserModel.query.filter_by(id=student.student_id).first().username}已经加入小组"
             })
 
-        group_exist = GroupModel.query.filter_by(teacher_id=teacher_id).delete()
-
-        group = GroupModel(teacher_id=teacher_id, name=group_name, student_id=student_user.id)
+        group = GroupModel(teacher_id=teacher_id, name=group_name, student_id=student_user.id, type=group_type)
         db.session.add(group)
         db.session.commit()
 
@@ -316,53 +318,83 @@ def group():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
     if user.user_mode == 'admin':
-        groups = GroupModel.query.filter_by(teacher_id=user.id).all()
-        if groups is None:
-            return jsonify({
-                "code": 400,
-                "message": "该导师没有小组"
-            }), 400
-        data = []
-        for group in groups:
-            student = UserModel.query.filter_by(id=group.student_id).first()
-            b_list = {
-                "Student_Id": student.id,
-                'Student': student.username
-            }
-            data.append(b_list)
+        # 查询学习小组
+        groups = GroupModel.query.filter_by(teacher_id=user.id, type="study").all()
+        if groups is not None:
+            data = []
+            for group in groups:
+                student = UserModel.query.filter_by(id=group.student_id).first()
+                b_list = {
+                    "Student_Id": student.id,
+                    'Student': student.username
+                }
+                data.append(b_list)
 
+        # 查询项目小组
+        groups_project = GroupModel.query.filter_by(teacher_id=user.id, type="project").all()
+        if groups_project is not None:
+            data_project = []
+            for group in groups_project:
+                student = UserModel.query.filter_by(id=group.student_id).first()
+                b_list = {
+                    "Student_Id": student.id,
+                    'Student': student.username
+                }
+                data_project.append(b_list)
         return jsonify({
             "code": 200,
             "message": "获取小组成功",
             "teacher": user.username,
             "teacher_id": user.id,
-            "group": data
+            "study_group": data,
+            "project_group": data_project,
+            "study_group_name": groups[0].name,
+            "project_group_name": groups_project[0].name,
         })
 
     if user.user_mode == 'user':
-        groups = GroupModel.query.filter_by(student_id=user.id).all()
-        if groups is None:
-            return jsonify({
-                "code": 401,
-                "message": "该学生没有加入小组"
-            }), 401
-        data = []
-        teacher = UserModel.query.filter_by(id=GroupModel.query.filter_by(student_id=user.id).first().teacher_id).first()
-        for group in groups:
-            student = UserModel.query.filter_by(id=group.student_id).first()
-            b_list = {
-                "Student_Id": student.id,
-                'Student': student.username
-            }
-            data.append(b_list)
+        # 查询学习小组
+        gro = GroupModel.query.filter_by(student_id=user.id, type="study").first()
+        teacher_id = gro.teacher_id
+        groups = GroupModel.query.filter_by(teacher_id=teacher_id, type="study").all()
+        if groups is not None:
+            data = []
+            teacher = UserModel.query.filter_by(
+                id=GroupModel.query.filter_by(student_id=user.id).first().teacher_id).first()
+            for group in groups:
+                student = UserModel.query.filter_by(id=group.student_id).first()
+                b_list = {
+                    "Student_Id": student.id,
+                    'Student': student.username
+                }
+                data.append(b_list)
+
+        # 查询项目小组
+        gro_p = GroupModel.query.filter_by(student_id=user.id, type="project").first()
+        groups_project = GroupModel.query.filter_by(teacher_id=teacher_id, type="project").all()
+        if groups_project is not None:
+            data_project = []
+            teacher = UserModel.query.filter_by(
+                id=GroupModel.query.filter_by(student_id=user.id).first().teacher_id).first()
+            for group in groups_project:
+                student = UserModel.query.filter_by(id=group.student_id).first()
+                b_list = {
+                    "Student_Id": student.id,
+                    'Student': student.username
+                }
+                data_project.append(b_list)
 
         return jsonify({
             "code": 200,
             "message": "获取小组成功",
             "teacher": teacher.username,
             "teacher_id": teacher.id,
-            "group": data
+            "study_group": data,
+            "project_group": data_project,
+            "study_group_name": gro.name,
+            "project_group_name": gro_p.name,
         })
+
 
 from sqlalchemy.orm import aliased
 
@@ -380,15 +412,17 @@ def group_list():
             'message': "用户权限不够"
         }), 400
 
-        # 创建别名用于区分导师和学生
+    # 创建别名用于区分导师和学生
     Student = aliased(UserModel)
     Teacher = aliased(UserModel)
 
-        # 查询所有小组数据
+    # 查询所有小组数据，包含type和name字段
     query_result = (
         db.session.query(
-            Teacher.id.label('teacher_name'),
-            Student.id.label('student_name')
+            Teacher.id.label('teacher_id'),
+            Student.id.label('student_id'),
+            GroupModel.type,
+            GroupModel.name
         )
         .select_from(GroupModel)
         .join(Teacher, GroupModel.teacher_id == Teacher.id)
@@ -396,25 +430,54 @@ def group_list():
         .all()
     )
 
-    # 按导师分组整理数据
-    grouped_data = {}
-    for teacher, student in query_result:
-        if teacher not in grouped_data:
-            grouped_data[teacher] = []
-        grouped_data[teacher].append({
-            "Student_Id": student,
-            "Student": UserModel.query.filter_by(id=student).first().username
+    # 初始化分组字典，键为(teacher_id, group_name)
+    study_groups = {}
+    project_groups = {}
+
+    for teacher_id, student_id, group_type, group_name in query_result:
+        # 获取学生信息
+        student = UserModel.query.get(student_id)
+        student_info = {
+            "Student_Id": student_id,
+            "Student": student.username
+        }
+
+        # 根据类型选择目标字典
+        target_dict = study_groups if group_type == 'study' else project_groups
+
+        # 用元组(teacher_id, group_name)作为唯一键
+        group_key = (teacher_id, group_name)
+
+        # 将学生添加到对应的小组
+        if group_key not in target_dict:
+            target_dict[group_key] = []
+        target_dict[group_key].append(student_info)
+
+    # 构建study_groups响应结构
+    result1 = []
+    for (teacher_id, group_name), students in study_groups.items():
+        teacher = UserModel.query.get(teacher_id)
+        result1.append({
+            "teacher_id": teacher_id,
+            "teacher": teacher.username,
+            "group_name": group_name,
+            "group": students
         })
 
-    # 构造最终响应格式
-    result = [{
-        "teacher_id": teacher,
-        "teacher": UserModel.query.filter_by(id=teacher).first().username,
-        "group": students
-    } for teacher, students in grouped_data.items()]
+    # 构建project_groups响应结构
+    result2 = []
+    for (teacher_id, group_name), students in project_groups.items():
+        teacher = UserModel.query.get(teacher_id)
+        result2.append({
+            "teacher_id": teacher_id,
+            "teacher": teacher.username,
+            "group_name": group_name,
+            "group": students
+        })
 
     return jsonify({
         "code": 200,
         "message": "获取所有小组成功",
-        "groups": result
+        "study_groups": result1,
+        "project_groups": result2
     }), 200
