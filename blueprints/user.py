@@ -329,6 +329,10 @@ def group():
                     'Student': student.username
                 }
                 data.append(b_list)
+            data.append({
+                "teacher": UserModel.query.filter_by(id=groups[0].teacher_id).first().username,
+                "teacher_id": groups[0].teacher_id,
+            })
 
         # 查询项目小组
         groups_project = GroupModel.query.filter_by(teacher_id=user.id, type="project").all()
@@ -341,15 +345,29 @@ def group():
                     'Student': student.username
                 }
                 data_project.append(b_list)
+            data_project.append({
+                "teacher": UserModel.query.filter_by(id=groups_project[0].teacher_id).first().username,
+                "teacher_id": groups_project[0].teacher_id,
+            })
+
+        if groups[0] is not None:
+            study_group_name = groups[0].name
+        else:
+            study_group_name = ""
+        if groups_project[0] is not None:
+            project_group_name = groups_project[0].name
+        else:
+            project_group_name = ""
+
         return jsonify({
             "code": 200,
             "message": "获取小组成功",
-            "teacher": user.username,
-            "teacher_id": user.id,
+            # "teacher": user.username,
+            # "teacher_id": user.id,
             "study_group": data,
             "project_group": data_project,
-            "study_group_name": groups[0].name,
-            "project_group_name": groups_project[0].name,
+            "study_group_name": study_group_name,
+            "project_group_name": project_group_name,
         })
 
     if user.user_mode == 'user':
@@ -368,6 +386,10 @@ def group():
                     'Student': student.username
                 }
                 data.append(b_list)
+            data.append({
+                "teacher": UserModel.query.filter_by(id=teacher.id).first().username,
+                "teacher_id": teacher.id,
+            })
 
         # 查询项目小组
         gro_p = GroupModel.query.filter_by(student_id=user.id, type="project").first()
@@ -383,12 +405,16 @@ def group():
                     'Student': student.username
                 }
                 data_project.append(b_list)
+            data_project.append({
+                "teacher": UserModel.query.filter_by(id=gro_p.teacher_id).first().username,
+                "teacher_id": gro_p.teacher_id,
+            })
 
         return jsonify({
             "code": 200,
             "message": "获取小组成功",
-            "teacher": teacher.username,
-            "teacher_id": teacher.id,
+            # "teacher": teacher.username,
+            # "teacher_id": teacher.id,
             "study_group": data,
             "project_group": data_project,
             "study_group_name": gro.name,
