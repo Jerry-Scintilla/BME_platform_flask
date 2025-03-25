@@ -11,6 +11,9 @@ DB_URI = 'mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8mb4'.format(USERNAME, PASSW
 
 SQLALCHEMY_DATABASE_URI = DB_URI
 
+# redis数据库
+REDIS_URL = "redis://:sdkhujvcbs@localhost:6379/0"
+
 # JWT密匙
 JWT_SECRET_KEY = 'askdcjhaijbdsadf'
 JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)

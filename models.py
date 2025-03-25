@@ -113,6 +113,13 @@ class GroupModel(db.Model):
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
 
-
+class CheckRecord(db.Model):
+    __tablename__ = 'check_record'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    check_in = db.Column(db.DateTime)
+    check_out = db.Column(db.DateTime)
+    duration = db.Column(db.Float)
+    date = db.Column(db.Date, index=True)
 
 

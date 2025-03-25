@@ -6,7 +6,7 @@ from flask_limiter.util import get_remote_address
 
 from .forms import RegisterForm, LoginForm
 from models import UserModel, EmailCaptchaModel
-from exts import db, mail
+from exts import db, mail, redis_client
 from flask import jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 
@@ -31,8 +31,16 @@ def register():
         username = form.User_Name.data
         captcha = form.User_Captcha.data
         user = UserModel.query.filter_by(email=email).first()
-        captcha_model = EmailCaptchaModel.query.filter_by(captcha=captcha).first()
-        if not captcha_model:
+        # captcha_model = EmailCaptchaModel.query.filter_by(captcha=captcha).first()
+
+        # 从Redis中获取验证码
+        redis_captcha = redis_client.get(f"captcha:{email}")
+
+        if redis_captcha:
+            redis_captcha = redis_captcha.decode('utf-8')  # 将bytes解码为字符串
+
+        if not redis_captcha or redis_captcha != captcha:
+            print(redis_captcha)
             data = {
                 "code": 400,
                 "message": "验证码错误",
@@ -59,8 +67,10 @@ def register():
             }
 
             # 从数据库中删除验证码
-            captcha_list = EmailCaptchaModel.query.filter_by(email=email).delete()
-            db.session.commit()
+            # captcha_list = EmailCaptchaModel.query.filter_by(email=email).delete()
+            # db.session.commit()
+            # 从Redis中删除验证码
+            redis_client.delete(f"captcha:{email}")
 
         return jsonify(data)
     else:
@@ -243,9 +253,11 @@ def get_email_captcha():
     messages = Message(subject="BME卓越工程师在线教育平台", recipients=[email], body=f"您的验证码是:{captcha}")
     mail.send(messages)
 
-    email_captcha = EmailCaptchaModel(email=email, captcha=captcha)
-    db.session.add(email_captcha)
-    db.session.commit()
+    # email_captcha = EmailCaptchaModel(email=email, captcha=captcha)
+    # db.session.add(email_captcha)
+    # db.session.commit()
+
+    redis_client.setex(f"captcha:{email}", 300, captcha)
 
     # print(captcha)
     data = {
@@ -270,18 +282,29 @@ def find_password():
             "message": "用户不存在"
         }), 400
 
-    captcha_model = EmailCaptchaModel.query.filter_by(email=email).first()
-    if captcha_model is None:
+    # 从Redis中获取验证码
+    redis_captcha = redis_client.get(f"captcha:{email}")
+    if redis_captcha:
+        redis_captcha = redis_captcha.decode('utf-8')  # 将bytes解码为字符串
+
+    if not redis_captcha:
         return jsonify({
             "code": 401,
             "message": "验证码不存在"
         }), 401
-    if captcha_model.captcha == captcha:
+
+    if redis_captcha == captcha:
         user.password = password
-        db.session.delete(captcha_model)
+        # 从Redis中删除验证码
+        redis_client.delete(f"captcha:{email}")
         db.session.commit()
         return jsonify({
             "code": 200,
             "message": "密码修改成功"
         })
 
+    else:
+        return jsonify({
+            "code": 402,
+            "message": "验证码错误"
+        }), 402

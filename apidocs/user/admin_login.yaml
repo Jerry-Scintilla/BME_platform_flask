@@ -10,7 +10,7 @@ parameters:
     in: body
     required: true
     schema:
-      id: register
+      id: admin_login
       required:
         - name
       properties:

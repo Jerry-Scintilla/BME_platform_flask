@@ -1,0 +1,37 @@
+使用签码签到，签退
+---
+tags:
+  - 考勤模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: check_in_out
+      required:
+        - name
+      properties:
+        check_code:
+          type: string
+          description: 签码
+#          default: "1111"
+
+
+responses:
+  200:
+    description: 签到/签退成功
+  400:
+    description: 不存在的签码
+  401:
+    description: 签码已经使用
+  402:
+    description: 没有签到记录
