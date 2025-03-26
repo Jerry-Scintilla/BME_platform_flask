@@ -1,7 +1,7 @@
 import wtforms
 from flask_wtf.file import FileAllowed, FileSize, FileField
 from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional
-from models import UserModel, EmailCaptchaModel
+from models import UserModel
 from flask import request
 from exts import db
 
@@ -18,7 +18,7 @@ class RegisterForm(wtforms.Form):
             args = request.args.to_dict()
             super(RegisterForm, self).__init__(data=data, **args)
 
-    User_Name = wtforms.StringField(validators=[length(min=4, max=20, message='Invalid username')])
+    User_Name = wtforms.StringField('User_Name')
     User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
     User_Email = wtforms.StringField(validators=[Email(message='邮箱格式错误')])
     User_Captcha = wtforms.StringField(validators=[length(min=6, max=6, message='验证码为6位')])

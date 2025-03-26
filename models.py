@@ -27,16 +27,16 @@ class UserModel(db.Model):
     github_id = db.Column(db.String(100))
     skill_tags = db.Column(db.String(100))
 
-    down_code = db.Column(db.String(100))
-    down_id = db.Column(db.Integer)
+    # down_code = db.Column(db.String(100))
+    # down_id = db.Column(db.Integer)
 
 
-
-class EmailCaptchaModel(db.Model):
-    __tablename__ = 'email_captcha'
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    email = db.Column(db.String(100), nullable=False)
-    captcha = db.Column(db.String(100), nullable=False)
+# 已弃用，改用redis存储
+# class EmailCaptchaModel(db.Model):
+#     __tablename__ = 'email_captcha'
+#     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+#     email = db.Column(db.String(100), nullable=False)
+#     captcha = db.Column(db.String(100), nullable=False)
 
 
 class ArticleModel(db.Model):

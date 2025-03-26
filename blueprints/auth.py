@@ -5,7 +5,7 @@ from flask_limiter.util import get_remote_address
 # import app
 
 from .forms import RegisterForm, LoginForm
-from models import UserModel, EmailCaptchaModel
+from models import UserModel
 from exts import db, mail, redis_client
 from flask import jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity

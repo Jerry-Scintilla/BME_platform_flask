@@ -3,14 +3,14 @@ import os
 from flask import Blueprint, request, jsonify, send_file
 
 # 导入拓展
-from exts import db
+from exts import db, redis_client
 
 # 导入数据库表
 from models import UserModel, CourseModel, Chapter
 
 # 导入表单验证
 from .forms import CourseForm
-from.forms import ChapterForm
+from .forms import ChapterForm
 
 # 导入token验证模块
 from flask_jwt_extended import (get_jwt_identity, jwt_required)
@@ -131,7 +131,6 @@ def course_edit():
         return jsonify(data), 401
 
 
-
 # 展示所有课程
 @bp.route("/course/list")
 @swag_from('../apidocs/course/list.yaml')
@@ -148,6 +147,7 @@ def course_list():
         data.append(b_list)
 
     return jsonify(data)
+
 
 # 创建章节
 @bp.route("/course/chapter_public", methods=["POST"])
@@ -191,6 +191,7 @@ def chapter_public():
         }, 401
         return jsonify(data)
 
+
 # 查询章节详情（需要加参数，如 ?Course_Id=xxx）
 @bp.route("/course/chapter_list")
 @swag_from('../apidocs/course/chapter_list.yaml')
@@ -217,6 +218,7 @@ def chapter_list():
 
     return jsonify(data)
 
+
 # 删除课程
 @bp.route("/course/course_delete", methods=["POST"])
 @jwt_required()
@@ -238,7 +240,7 @@ def course_delete():
         if courses is None:
             return jsonify({
                 "code": 401,
-               'message': "课程不存在"
+                'message': "课程不存在"
             }), 401
         chapter = Chapter.query.filter_by(course_id=course_id).delete()
         db.session.delete(courses)
@@ -246,8 +248,9 @@ def course_delete():
         return jsonify({
             "code": 200,
             "Course_Id": course_id,
-           'message': "课程删除完成"
+            'message': "课程删除完成"
         })
+
 
 # 查询课程（需要加参数，如 ?Course_Id=xxx，?Query=xxx）
 @bp.route("/course/search")
@@ -259,7 +262,7 @@ def search_courses():
         if not courses:
             return jsonify({
                 "code": 401,
-               'message': "课程不存在"
+                'message': "课程不存在"
             }), 401
         course_list = []
         for course in courses:
@@ -316,15 +319,14 @@ def book_upgrade():
     if book is None:  # 表示没有发送文件
         return jsonify({
             "code": 401,
-           'message': "没有发送文件"
+            'message': "没有发送文件"
         }), 401
 
     if course_id is None:  # 表示没有发送课程 ID
         return jsonify({
             "code": 402,
-          'message': "没有发送课程 ID"
+            'message': "没有发送课程 ID"
         }), 402
-
 
     course = CourseModel.query.filter_by(id=course_id).first()
     url = course.url
@@ -345,42 +347,46 @@ def book_upgrade():
     })
 
 
-
 import random
 import string
+import uuid
+import hashlib
+
 
 @bp.route("/course/book_down")
 @jwt_required()
 @swag_from('../apidocs/course/book_down.yaml')
 def book_down():
     course_id = request.args.get('Course_Id')
-    # Down_Code = request.args.get('Down_Code')
-    if course_id :
+    if course_id:
         course = CourseModel.query.filter_by(id=course_id).first()
         url = course.url
         if url is None:
             return jsonify({
                 "code": 401,
-              'message': "课程pdf不存在"
+                'message': "课程pdf不存在"
             }), 401
-        characters = string.digits + string.ascii_uppercase
-        down_code = ''.join(random.choices(characters, k=12))
-        user_email = get_jwt_identity()
-        user = UserModel.query.filter_by(email=user_email).first()
-        user.down_code = down_code
-        user.down_id = course_id
-        db.session.commit()
+        """生成下载码路由（包含所有逻辑）"""
+        # 获取客户端IP
+        if request.headers.getlist("X-Forwarded-For"):
+            ip = request.headers.getlist("X-Forwarded-For")[0]
+        else:
+            ip = request.remote_addr
+        # 生成下载码
+        code = hashlib.sha256(f"{uuid.uuid4()}{ip}{course_id}".encode()).hexdigest()[:16]
+        # 存储到Redis，10秒过期
+        redis_client.setex(f"download_code:{code}", 100, f"{ip}:{course_id}")
 
         return jsonify({
             "code": 200,
-           'message': "下载链接生成成功",
-            'Down_Code': down_code
+            'message': "下载链接生成成功",
+            'Down_Code': code
         })
 
     else:
         return jsonify({
             "code": 402,
-          'message': "参数错误"
+            'message': "参数错误"
         })
 
 
@@ -389,31 +395,38 @@ def book_down():
 def book_download():
     Down_Code = request.args.get('Down_Code')
     if Down_Code:
-        user = UserModel.query.filter_by(down_code=Down_Code).first()
-        if not user:
+        # 获取客户端IP
+        if request.headers.getlist("X-Forwarded-For"):
+            ip = request.headers.getlist("X-Forwarded-For")[0]
+        else:
+            ip = request.remote_addr
+        # 验证下载码
+        stored_value = redis_client.get(f"download_code:{Down_Code}")
+        if stored_value is None:
+            return jsonify({
+                "code": 401,
+               'message': "下载码不存在或已过期"
+            })
+        stored_ip, stored_course_id = stored_value.decode('utf-8').split(':')
+        # print(stored_ip, stored_course_id)
+        if stored_ip != ip :
             return jsonify({
                 "code": 402,
-              'message': "下载码错误"
-            }), 402
+                'message': "下载码错误"
+            })
 
-        course_id = user.down_id
+        course_id = stored_course_id
         course = CourseModel.query.filter_by(id=course_id).first()
         url = course.url
         if url is None:
             return jsonify({
                 "code": 403,
-             'message': "课程pdf不存在"
+                'message': "课程pdf不存在"
             }), 403
-
-        user.down_code = None
-        user.down_id = None
-        db.session.commit()
 
         return send_file('./data/course/book/' + url, as_attachment=True)
     else:
         return jsonify({
             "code": 404,
-         'message': "参数错误"
+            'message': "参数错误"
         })
-
-
