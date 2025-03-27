@@ -326,3 +326,69 @@ def admin_records():
     redis_client.setex(cache_key, timedelta(days=1), json.dumps(result))
 
     return jsonify(result)
+
+
+@bp.route('/records_top10', methods=['GET'])
+@swag_from('../apidocs/codecheck/records_top10.yaml')
+def records_top10():
+    # Redis缓存键
+    now = datetime.now()
+    current_month = now.strftime("%Y-%m")
+    cache_key = "check_records_top10"
+    # 尝试从Redis获取缓存
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        return jsonify(json.loads(cached_data))
+
+    # 获取当前月份的第一天和最后一天
+    first_day = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day = (first_day + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+
+    # 查询所有用户当前月份的考勤记录
+    all_records = CheckRecord.query.filter(
+        CheckRecord.date >= first_day.date(),
+        CheckRecord.date <= last_day.date()
+    ).all()
+
+    # 按用户ID汇总数据
+    from collections import defaultdict
+    user_data = defaultdict(float)
+
+    for record in all_records:
+        if record.duration is not None:  # 只计算已签退的记录
+            user_data[record.user_id] += record.duration
+
+    # 获取所有用户信息用于返回用户名
+    users = UserModel.query.all()
+    user_info = {user.id: {"name": user.username, "id": user.id} for user in users}
+
+    # 按时长排序并取前10
+    top_users = sorted(
+        [(user_id, total_hours) for user_id, total_hours in user_data.items()],
+        key=lambda x: x[1],
+        reverse=True
+    )[:10]
+
+    # 构建返回结果
+    result = []
+    for rank, (user_id, total_hours) in enumerate(top_users, 1):  # 添加排名，从1开始
+        # 格式化时长
+        hours = int(total_hours)
+        minutes = int(round((total_hours - hours) * 60))
+        if minutes >= 60:
+            hours += 1
+            minutes = 0
+        formatted_duration = f"{hours}小时{minutes}分钟"
+
+        result.append({
+            "rank": rank,  # 添加排名字段
+            "user_name": user_info.get(user_id, {}).get("name", ""),
+            "user_id": user_info.get(user_id, {}).get("id", ""),
+            "total_duration": formatted_duration,
+            "total_hours": round(total_hours, 2)
+        })
+
+    # 将结果存入Redis，有效期24小时
+    redis_client.setex(cache_key, timedelta(days=1), json.dumps(result))
+
+    return jsonify(result)

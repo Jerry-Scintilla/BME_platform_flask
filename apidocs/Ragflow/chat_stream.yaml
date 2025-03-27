@@ -1,0 +1,12 @@
+AI接口（未完成）
+---
+tags:
+  - AI模块
+consumes:
+  - application/json
+
+
+responses:
+  200:
+    description: 查询成功
+

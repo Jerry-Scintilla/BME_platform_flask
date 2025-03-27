@@ -10,6 +10,7 @@ from blueprints.article import bp as article_bp
 from blueprints.course import bp as course_bp
 from blueprints.medal import bp as medal_bp
 from blueprints.codecheck import bp as codecheck_bp
+from blueprints.Ragflow import bp as ragflow_bp
 
 
 from flask_cors import CORS
@@ -41,6 +42,7 @@ app.register_blueprint(article_bp)
 app.register_blueprint(course_bp)
 app.register_blueprint(medal_bp)
 app.register_blueprint(codecheck_bp)
+app.register_blueprint(ragflow_bp)
 
 
 @app.route('/')
