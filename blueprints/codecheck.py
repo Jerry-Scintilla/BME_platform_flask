@@ -1,6 +1,7 @@
 import random, json
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from . import format_duration
+from . import format_duration, generate_date_range, build_result
 from flask import Blueprint, request, redirect, jsonify, send_file
 from wtforms.validators import email
 import calendar, time, os
@@ -130,75 +131,65 @@ def get_records():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
     now = datetime.now()
-    today = now.date()  # 获取当前日期
+    today = now.date()
 
-    # 获取当月第一天和最后一天
-    first_day = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    next_month = first_day + timedelta(days=31)
-    last_day = next_month.replace(day=1) - timedelta(days=1)
+    # 获取本月和上个月的第一天和最后一天
+    current_month_first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = current_month_first + timedelta(days=31)
+    current_month_last = next_month.replace(day=1) - timedelta(days=1)
 
-    # 查询当月所有记录（包含已签退和未签退）
+    # 上个月的计算
+    prev_month_last = current_month_first - timedelta(days=1)
+    prev_month_first = prev_month_last.replace(day=1)
+
+    # 查询两个月内的所有记录
     all_records = CheckRecord.query.filter(
         CheckRecord.user_id == user.id,
-        CheckRecord.date >= first_day.date(),
-        CheckRecord.date <= last_day.date()
+        CheckRecord.date >= prev_month_first.date(),
+        CheckRecord.date <= current_month_last.date()
     ).all()
 
-    # 按日期聚合数据（总时长、是否存在未签退）
-    from collections import defaultdict
+    # 按日期聚合数据
     date_info = defaultdict(lambda: {"total": 0.0, "has_open": False, "latest_checkin": None})
 
     for record in all_records:
         date = record.date
-        # 累计已签退的时长
         if record.duration is not None:
             date_info[date]["total"] += record.duration
-        # 检查未签退记录
         if record.check_out is None:
             date_info[date]["has_open"] = True
-            # 更新最新签到时间
             if date == today and (
                     date_info[date]["latest_checkin"] is None or record.check_in > date_info[date]["latest_checkin"]):
                 date_info[date]["latest_checkin"] = record.check_in
 
-    # 生成当月完整日期列表
-    date_range = [first_day + timedelta(days=x) for x in range((last_day - first_day).days + 1)]
+    # 生成两个月完整日期列表
+    current_month_dates = generate_date_range(current_month_first, current_month_last)
+    prev_month_dates = generate_date_range(prev_month_first, prev_month_last)
 
-    # 构建返回结果
-    result = []
-    for day in date_range:
-        current_date = day.date()
-        info = date_info.get(current_date, {"total": 0.0, "has_open": False})
-        total = info["total"]
-        status = "已完成" if total > 0 else "未签到"
-
-        # 只在当天处理未签退逻辑
-        if current_date == today:
-            if info["has_open"]:
-                latest_checkin = info["latest_checkin"]
-                if latest_checkin:
-                    # 计算当前未签退的持续时间（小时）
-                    current_duration = (now - latest_checkin).total_seconds() / 3600
-                    total += current_duration
-                    status = "进行中"
-                else:
-                    # 存在未签退记录但没有check_in时间（理论上不会出现）
-                    status = "进行中"
-            else:
-                status = "未签到" if total == 0 else "已完成"
-
-        # 格式化时长
-        formatted_duration = format_duration(total)
-
-        result.append({
-            "date": current_date.isoformat(),
-            "total_duration": formatted_duration,
-            "total_hours": round(total, 2),
-            "status": status
-        })
-
-    return jsonify(result)
-
+    return jsonify({
+        "current_month": {
+            "month_name": current_month_first.strftime("%Y年%m月"),
+            "records": build_result(
+                dates=current_month_dates,
+                date_info=date_info,
+                today=today,
+                now=now,
+                is_current_month=True,
+                format_duration=format_duration
+            )
+        },
+        "previous_month": {
+            "month_name": prev_month_first.strftime("%Y年%m月"),
+            "records": build_result(
+                dates=prev_month_dates,
+                date_info=date_info,
+                today=today,
+                now=now,
+                is_current_month=False,
+                format_duration=format_duration
+            )
+        }
+    })
 
 @bp.route('/records/yearly', methods=['GET'])
 @jwt_required()
