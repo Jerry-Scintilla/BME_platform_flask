@@ -35,3 +35,5 @@ responses:
     description: 签码已经使用
   402:
     description: 没有签到记录
+  403:
+    description: 已有未签退记录且未超过4小时

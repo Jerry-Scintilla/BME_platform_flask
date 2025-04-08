@@ -91,17 +91,30 @@ def check_in_out():
 
     # 处理签到/签退逻辑
     if code_type == 'check_in':
-        # 查找并删除最近未签退的记录
-        reco = CheckRecord.query.filter(
+        # 查找最近未签退的记录
+        records = CheckRecord.query.filter(
             CheckRecord.user_id == user.id,
             CheckRecord.check_out.is_(None)
-        ).delete()
+        ).order_by(CheckRecord.check_in.desc()).all()
+
+        if records:
+            # 取最近的记录判断时间
+            latest_record = records[0]
+            time_diff = (now - latest_record.check_in).total_seconds() / 3600
+            if time_diff <= 4:
+                return jsonify({"error": "已有未签退记录且未超过4小时"}), 403
+
+            # 超过4小时则删除所有未签退记录
+            for record in records:
+                db.session.delete(record)
+
         record = CheckRecord(
             user_id=user.id,
             check_in=now,
             date=now.date()
         )
         db.session.add(record)
+
     else:
         # 查找最近未签退的记录
         record = CheckRecord.query.filter(
@@ -244,8 +257,8 @@ def get_yearly_records():
             "total_hours": round(total, 2)
         })
 
-    # 将结果存入Redis，设置24小时过期时间
-    redis_client.setex(redis_key, timedelta(days=1), json.dumps(result))
+    # 将结果存入Redis，设置1小时过期时间
+    redis_client.setex(redis_key, timedelta(hours=1), json.dumps(result))
     return jsonify(result)
 
 
@@ -322,8 +335,8 @@ def admin_records():
 
         result.append(user_entry)
 
-    # 将结果存入Redis，有效期24小时
-    redis_client.setex(cache_key, timedelta(days=1), json.dumps(result))
+    # 将结果存入Redis，有效期1小时
+    redis_client.setex(cache_key, timedelta(hours=1), json.dumps(result))
 
     return jsonify(result)
 
@@ -388,7 +401,9 @@ def records_top10():
             "total_hours": round(total_hours, 2)
         })
 
-    # 将结果存入Redis，有效期24小时
-    redis_client.setex(cache_key, timedelta(days=1), json.dumps(result))
+    # 将结果存入Redis，有效期1小时
+    redis_client.setex(cache_key, timedelta(hours=1), json.dumps(result))
 
     return jsonify(result)
+
+

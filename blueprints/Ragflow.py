@@ -11,7 +11,8 @@ bp = Blueprint("Ragflow", __name__, url_prefix="/AI")
 model = "model"
 client = OpenAI(
     api_key="ragflow-NjYzVkZGUwMDMyZDExZjBiYzZjOTZiMD",
-    base_url="http://172.25.56.83:3380/api/v1/chats_openai/c5832400021c11f0bd7e96b002ae6e83"
+    # base_url="http://172.25.56.83:3380/api/v1/chats_openai/c5832400021c11f0bd7e96b002ae6e83"
+    base_url="http://172.25.56.83:3380/api/v1/chats_openai/67cbf16e0ba111f0aadc96b002ae6e83"
 )
 
 # 导入api文档模块
@@ -39,6 +40,7 @@ def chat_stream():
             if chunk.choices and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
                 print(content)  # 调试输出
+                # yield f"data: {content}\n\n"
                 for char in content:
                     yield f"data: {char}\n\n"
 

@@ -425,8 +425,10 @@ def group_list():
     Teacher = aliased(UserModel)
 
     # 查询所有小组数据，包含type和name字段
+    # 修改查询语句，添加GroupModel.id
     query_result = (
         db.session.query(
+            GroupModel.id.label('group_id'),  # 新增小组ID
             Teacher.id.label('teacher_id'),
             Student.id.label('student_id'),
             GroupModel.type,
@@ -438,45 +440,41 @@ def group_list():
         .all()
     )
 
-    # 初始化分组字典，键为(teacher_id, group_name)
-    study_groups = {}
+    # 修改字典结构，保存group_id
+    study_groups = {}  # 键改为(teacher_id, group_name, group_id)
     project_groups = {}
 
-    for teacher_id, student_id, group_type, group_name in query_result:
-        # 获取学生信息
+    for group_id, teacher_id, student_id, group_type, group_name in query_result:
         student = UserModel.query.get(student_id)
         student_info = {
             "Student_Id": student_id,
             "Student": student.username
         }
 
-        # 根据类型选择目标字典
         target_dict = study_groups if group_type == 'study' else project_groups
+        group_key = (teacher_id, group_name, group_id)  # 添加group_id到键
 
-        # 用元组(teacher_id, group_name)作为唯一键
-        group_key = (teacher_id, group_name)
-
-        # 将学生添加到对应的小组
         if group_key not in target_dict:
             target_dict[group_key] = []
         target_dict[group_key].append(student_info)
 
-    # 构建study_groups响应结构
+    # 修改结果构建，添加group_id
     result1 = []
-    for (teacher_id, group_name), students in study_groups.items():
+    for (teacher_id, group_name, group_id), students in study_groups.items():
         teacher = UserModel.query.get(teacher_id)
         result1.append({
+            "group_id": group_id,  # 新增小组ID
             "teacher_id": teacher_id,
             "teacher": teacher.username,
             "group_name": group_name,
             "group": students
         })
 
-    # 构建project_groups响应结构
     result2 = []
-    for (teacher_id, group_name), students in project_groups.items():
+    for (teacher_id, group_name, group_id), students in project_groups.items():
         teacher = UserModel.query.get(teacher_id)
         result2.append({
+            "group_id": group_id,  # 新增小组ID
             "teacher_id": teacher_id,
             "teacher": teacher.username,
             "group_name": group_name,
@@ -489,3 +487,32 @@ def group_list():
         "study_groups": result1,
         "project_groups": result2
     }), 200
+
+
+@bp.route("/group/delete", methods=['POST'])
+@jwt_required()
+@swag_from('../apidocs/user/group_delete.yaml')
+def group_delete():
+    User_Email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=User_Email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+
+    group_id = request.json.get('Group_Id')
+    group = GroupModel.query.get(group_id)
+    if group is None:
+        return jsonify({
+            "code": 401,
+            "message": "小组不存在"
+        }), 401
+    db.session.delete(group)
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": "删除小组成功"
+    })
+

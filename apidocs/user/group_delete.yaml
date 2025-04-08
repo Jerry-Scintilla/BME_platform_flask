@@ -1,0 +1,31 @@
+删除小组（admin）
+---
+tags:
+  - 小组模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: group_delete
+      required:
+        - name
+      properties:
+        Group_Id:
+          type: string
+          description: 小组id
+
+responses:
+  200:
+    description: 删除小组成功
+  400:
+    description: 用户权限不够
+  401:
+    description: 小组不存在
