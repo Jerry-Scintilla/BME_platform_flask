@@ -280,7 +280,14 @@ def group_add():
     student_ids = request.json.get('Group_member')
     group_type = request.json.get('Group_Type')
     teacher_id = user.id
+
+    # 获取当前最大的group_id并加1
+    max_group = db.session.query(db.func.max(GroupModel.group_id)).scalar()
+    new_group_id = (max_group or 0) + 1
+
+    # 删除同名小组
     group_exist = GroupModel.query.filter_by(name=group_name).delete()
+
     for student in student_ids:
         student_id = student["student_id"]
         student_user = UserModel.query.filter_by(id=student_id).first()
@@ -290,11 +297,17 @@ def group_add():
                 "message": "学生不存在"
             }), 400
 
-        student = GroupModel.query.filter_by(student_id=student_id, type=group_type).first()
-
-        group = GroupModel(teacher_id=teacher_id, name=group_name, student_id=student_user.id, type=group_type)
+        # 创建小组时添加group_id
+        group = GroupModel(
+            teacher_id=teacher_id,
+            name=group_name,
+            student_id=student_user.id,
+            type=group_type,
+            group_id=new_group_id  # 新增group_id
+        )
         db.session.add(group)
-        db.session.commit()
+
+    db.session.commit()  # 统一提交
 
     return jsonify({
         "code": 200,
@@ -428,7 +441,7 @@ def group_list():
     # 修改查询语句，添加GroupModel.id
     query_result = (
         db.session.query(
-            GroupModel.id.label('group_id'),  # 新增小组ID
+            GroupModel.group_id.label('group_id'),  # 新增小组ID
             Teacher.id.label('teacher_id'),
             Student.id.label('student_id'),
             GroupModel.type,
@@ -440,8 +453,8 @@ def group_list():
         .all()
     )
 
-    # 修改字典结构，保存group_id
-    study_groups = {}  # 键改为(teacher_id, group_name, group_id)
+    # 修改字典结构，键改为(teacher_id, group_name, group_id)
+    study_groups = {}
     project_groups = {}
 
     for group_id, teacher_id, student_id, group_type, group_name in query_result:
@@ -452,7 +465,7 @@ def group_list():
         }
 
         target_dict = study_groups if group_type == 'study' else project_groups
-        group_key = (teacher_id, group_name, group_id)  # 添加group_id到键
+        group_key = (teacher_id, group_name, group_id)  # 保留group_id
 
         if group_key not in target_dict:
             target_dict[group_key] = []
@@ -503,13 +516,14 @@ def group_delete():
         }), 400
 
     group_id = request.json.get('Group_Id')
-    group = GroupModel.query.get(group_id)
-    if group is None:
+    groups = GroupModel.query.filter_by(group_id=group_id).all()
+    if not groups:
         return jsonify({
             "code": 401,
             "message": "小组不存在"
         }), 401
-    db.session.delete(group)
+    for group in groups:
+        db.session.delete(group)
     db.session.commit()
     return jsonify({
         "code": 200,

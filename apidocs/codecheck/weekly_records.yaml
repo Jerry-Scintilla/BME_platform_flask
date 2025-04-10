@@ -1,0 +1,20 @@
+管理员查询每周签到记录
+---
+tags:
+  - 考勤模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+
+responses:
+  200:
+    description: 查询成功
+
+

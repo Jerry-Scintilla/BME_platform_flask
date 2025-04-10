@@ -111,6 +111,7 @@ class GroupModel(db.Model):
     type = db.Column(db.String(10), nullable=False)
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    group_id = db.Column(db.Integer)
 
 
 class CheckRecord(db.Model):

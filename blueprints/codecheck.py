@@ -1,22 +1,17 @@
 import random, json
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from . import format_duration, generate_date_range, build_result
-from flask import Blueprint, request, redirect, jsonify, send_file
-from wtforms.validators import email
-import calendar, time, os
+from flask import Blueprint, request, jsonify
 
 # 导入拓展
 from exts import db, limiter, redis_client
 
 # 导入数据库
-from models import ArticleModel, UserModel, CheckRecord
-
-# 导入表单验证
-from .forms import ArticleForm
+from models import UserModel, CheckRecord
 
 # 导入token验证模块
-from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
+from flask_jwt_extended import (get_jwt_identity, jwt_required)
 
 # 导入api文档模块
 from flasgger import swag_from
@@ -101,8 +96,8 @@ def check_in_out():
             # 取最近的记录判断时间
             latest_record = records[0]
             time_diff = (now - latest_record.check_in).total_seconds() / 3600
-            if time_diff <= 4:
-                return jsonify({"error": "已有未签退记录且未超过4小时"}), 403
+            if time_diff <= 6:
+                return jsonify({"error": "已有未签退记录且未超过6小时"}), 403
 
             # 超过4小时则删除所有未签退记录
             for record in records:
@@ -204,6 +199,7 @@ def get_records():
         }
     })
 
+
 @bp.route('/records/yearly', methods=['GET'])
 @jwt_required()
 @swag_from('../apidocs/codecheck/get_yearly_records.yaml')
@@ -303,9 +299,9 @@ def admin_records():
             year_month = record.date.strftime("%Y-%m")
             user_monthly_data[record.user_id][year_month] += record.duration
 
-    # 获取所有用户信息用于返回用户名
+    # 获取所有用户信息用于返回用户名和学号
     users = UserModel.query.all()
-    user_info = {user.id: {"name": user.username, "email": user.email} for user in users}
+    user_info = {user.id: {"name": user.username, "email": user.email, "student_id": user.student_id} for user in users}
 
     # 构建返回结果
     result = []
@@ -314,6 +310,7 @@ def admin_records():
             "user_id": user_id,
             "user_name": user_info.get(user_id, {}).get("name", ""),
             "user_email": user_info.get(user_id, {}).get("email", ""),
+            "student_id": user_info.get(user_id, {}).get("student_id", ""),  # 添加学号字段
             "monthly_records": []
         }
 
@@ -407,3 +404,100 @@ def records_top10():
     return jsonify(result)
 
 
+@bp.route('/weekly_records', methods=['GET'])
+@jwt_required()
+@swag_from('../apidocs/codecheck/weekly_records.yaml')
+def weekly_records():
+    # 验证管理员权限
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if user.user_mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+
+    # Redis缓存键
+    cache_key = "weekly_check_records_cache"
+    # 尝试从Redis获取缓存
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        return jsonify(json.loads(cached_data))
+    # 获取当前日期和时间
+    now = datetime.now()
+    # 计算本周的开始日期（周一）和结束日期（周日）
+    current_week_start = now - timedelta(days=now.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+    # 计算上周的开始日期和结束日期
+    last_week_start = current_week_start - timedelta(days=7)
+    last_week_end = last_week_start + timedelta(days=6)
+    # 查询所有用户本周和上周的考勤记录
+    all_records = CheckRecord.query.filter(
+        CheckRecord.date >= last_week_start.date(),
+        CheckRecord.date <= current_week_end.date()
+    ).all()
+
+    # 按用户ID和周分组汇总数据
+    from collections import defaultdict
+    user_weekly_data = defaultdict(lambda: {
+        'current_week': 0.0,
+        'last_week': 0.0
+    })
+    for record in all_records:
+        if record.duration is not None:  # 只计算已签退的记录
+            if last_week_start.date() <= record.date <= last_week_end.date():
+                user_weekly_data[record.user_id]['last_week'] += record.duration
+            elif current_week_start.date() <= record.date <= current_week_end.date():
+                user_weekly_data[record.user_id]['current_week'] += record.duration
+
+    # 获取所有用户信息用于返回用户名和学号
+    users = UserModel.query.all()
+    user_info = {
+        user.id: {
+            "name": user.username,
+            "email": user.email,
+            "student_id": user.student_id  # 添加学号字段
+        }
+        for user in users
+    }
+    # 构建返回结果
+    result = []
+    for user_id, weekly_data in user_weekly_data.items():
+        # 格式化本周时长
+        current_hours = int(weekly_data['current_week'])
+        current_minutes = int(round((weekly_data['current_week'] - current_hours) * 60))
+        if current_minutes >= 60:
+            current_hours += 1
+            current_minutes = 0
+        current_formatted = f"{current_hours}小时{current_minutes}分钟"
+        # 格式化上周时长
+        last_hours = int(weekly_data['last_week'])
+        last_minutes = int(round((weekly_data['last_week'] - last_hours) * 60))
+        if last_minutes >= 60:
+            last_hours += 1
+            last_minutes = 0
+        last_formatted = f"{last_hours}小时{last_minutes}分钟"
+        user_entry = {
+            "user_id": user_id,
+            "user_name": user_info.get(user_id, {}).get("name", ""),
+            "user_email": user_info.get(user_id, {}).get("email", ""),
+            "student_id": user_info.get(user_id, {}).get("student_id", ""),  # 添加学号字段
+            "current_week": {
+                "start_date": current_week_start.strftime("%Y-%m-%d"),
+                "end_date": current_week_end.strftime("%Y-%m-%d"),
+                "total_duration": current_formatted,
+                "total_hours": round(weekly_data['current_week'], 2)
+            },
+            "last_week": {
+                "start_date": last_week_start.strftime("%Y-%m-%d"),
+                "end_date": last_week_end.strftime("%Y-%m-%d"),
+                "total_duration": last_formatted,
+                "total_hours": round(weekly_data['last_week'], 2)
+            }
+        }
+        result.append(user_entry)
+
+    # 将结果存入Redis，有效期1小时
+    redis_client.setex(cache_key, timedelta(hours=1), json.dumps(result))
+
+    return jsonify(result)
