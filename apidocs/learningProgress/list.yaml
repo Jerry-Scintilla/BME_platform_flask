@@ -1,0 +1,17 @@
+获取学生学习进度列表（需要管理员权限）
+---
+tags:
+  - 学习进度模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取学习进度列表成功
+  400:
+    description: 用户权限不够

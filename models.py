@@ -63,7 +63,7 @@ class CourseModel(db.Model):
     publish_time = db.Column(db.DateTime, default=datetime.now)
 
 
-class LearningProgress(db.Model):
+class LearningProgressModel(db.Model):
     __tablename__ = 'learning_progress'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
@@ -122,5 +122,7 @@ class CheckRecord(db.Model):
     check_out = db.Column(db.DateTime)
     duration = db.Column(db.Float)
     date = db.Column(db.Date, index=True)
+
+
 
 

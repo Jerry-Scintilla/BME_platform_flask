@@ -1,0 +1,36 @@
+删除学生学习记录
+---
+tags:
+  - 学习进度模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: learningProgress_delete
+      required:
+        - name
+      properties:
+        User_Id:
+          type: string
+          description: 用户ID
+        Course_Id:
+          type: string
+          description: 课程ID
+
+responses:
+  200:
+    description: 学习记录删除成功
+  400:
+    description: 用户权限不够
+  401:
+    description: 未找到学习记录

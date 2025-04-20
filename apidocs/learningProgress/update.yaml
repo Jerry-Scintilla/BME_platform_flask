@@ -1,0 +1,44 @@
+更新/增加学生学习进度（需要管理员权限）
+---
+tags:
+  - 学习进度模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    description: 如果想要同时更新多个数据，则可以用records进行嵌套，如""Records":{"Progress":...,"User_Id":...,"Course_Id":...},{}..."
+    schema:
+      id: learningProgress_update
+      required:
+        - name
+      properties:
+        Progress:
+          type: string
+          description: 进度（用所学章数表示）
+        User_Id:
+          type: string
+          description: 用户ID
+        Course_Id:
+          type: string
+          description: 课程ID
+
+responses:
+  200:
+    description: 更新学习进度成功
+  400:
+    description: 用户权限不够
+  401:
+    description: 数据类型错误
+  404:
+    description: 各类id不存在的报错
+  500:
+    description: 数据库存储报错

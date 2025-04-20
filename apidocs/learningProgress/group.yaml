@@ -1,0 +1,29 @@
+获取本学生小组组员学习进度(管理员可无视组员限制进行查询）
+---
+tags:
+  - 学习进度模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Group_Id
+    in: query
+    type: string
+    required: true
+    description: 小组ID
+
+responses:
+  200:
+    description: 获取学生小组学习进度成功
+  400:
+    description: 请求用户不存在
+  401:
+    description: Group_Id不能为空
+  402:
+    description: 小组不存在
+  403:
+    description: 本用户不在该小组中
