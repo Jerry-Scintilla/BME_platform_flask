@@ -197,22 +197,22 @@ def admin_login():
                     'message': "用户权限不够"
                 }), 401
             if admin.password == password:
-                code = 200
-                msg = "登录成功"
-                token = create_access_token(identity=email)
-                User_Name = admin.username
+                return jsonify({
+                    "code": 402,
+                    'msg':"密码错误",
+                    'token' : "Null",
+                    'User_Name' : "Null"
+                }),402
+
             else:
-                code = 402
-                msg = "密码错误"
-                token = "Null"
-                User_Name = "Null"
-            data = {
-                "code": code,
-                "message": msg,
-                "token": token,
-                "User_Name": User_Name,
-            }
-            return jsonify(data)
+                return jsonify({
+                'code' : 200,
+                'msg' : "登录成功",
+                'token' : create_access_token(identity=email),
+                'User_Name' : admin.username
+                }),200
+
+
         except:
             return jsonify({
                 "code": 400,
