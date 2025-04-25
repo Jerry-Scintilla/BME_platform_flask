@@ -72,7 +72,7 @@ def register():
             # 从Redis中删除验证码
             redis_client.delete(f"captcha:{email}")
 
-        return jsonify(data)
+        return jsonify(data),200
     else:
         data = {
             "code": 402,
@@ -91,18 +91,6 @@ def login():
         password = form.User_Password.data
         user = UserModel.query.filter_by(email=email).first()
         try:
-            if user.password == password:
-                code = 200
-                msg = "登录成功"
-                token = create_access_token(identity=email)
-                User_Name = user.username
-
-            else:
-                code = 402
-                msg = "密码错误"
-                token = "Null"
-                User_Name = "Null"
-
             User_Email = user.email
             User_Medal = user.medal
             User_Stage = user.study_stage
@@ -118,25 +106,60 @@ def login():
             Github_Id = user.github_id
             Skill_Tags = user.skill_tags
 
-            data = {
-                "code": code,
-                "message": msg,
-                "token": token,
-                "User_Name": User_Name,
-                "User_Email": User_Email,
-                "User_Medal": User_Medal,
-                "User_Stage": User_Stage,
-                "User_Mode": User_Mode,
-                "join_time": User_Time,
-                "User_Id": User_Id,
-                "Student_Id": Student_Id,
-                "Introduction": Introduction,
-                "User_Sex": User_Sex,
-                "Institute": Institute,
-                "Major": Major,
-                "Github_Id": Github_Id,
-                "Skill_Tags": Skill_Tags,
-            }
+
+            if user.password == password:
+                code = 200
+                msg = "登录成功"
+                token = create_access_token(identity=email)
+                User_Name = user.username
+                data = {
+                    "code": code,
+                    "message": msg,
+                    "token": token,
+                    "User_Name": User_Name,
+                    "User_Email": User_Email,
+                    "User_Medal": User_Medal,
+                    "User_Stage": User_Stage,
+                    "User_Mode": User_Mode,
+                    "join_time": User_Time,
+                    "User_Id": User_Id,
+                    "Student_Id": Student_Id,
+                    "Introduction": Introduction,
+                    "User_Sex": User_Sex,
+                    "Institute": Institute,
+                    "Major": Major,
+                    "Github_Id": Github_Id,
+                    "Skill_Tags": Skill_Tags,
+                }
+                return jsonify(data)
+
+            else:
+                code = 402
+                msg = "密码错误"
+                token = "Null"
+                User_Name = "Null"
+                data = {
+                    "code": code,
+                    "message": msg,
+                    "token": token,
+                    "User_Name": User_Name,
+                    "User_Email": User_Email,
+                    "User_Medal": User_Medal,
+                    "User_Stage": User_Stage,
+                    "User_Mode": User_Mode,
+                    "join_time": User_Time,
+                    "User_Id": User_Id,
+                    "Student_Id": Student_Id,
+                    "Introduction": Introduction,
+                    "User_Sex": User_Sex,
+                    "Institute": Institute,
+                    "Major": Major,
+                    "Github_Id": Github_Id,
+                    "Skill_Tags": Skill_Tags,
+                }
+                return jsonify(data),402
+
+
 
             # data = {
             #     "code": code,
@@ -157,7 +180,7 @@ def login():
             #     "Github_Id": user.github_id,
             #     "Skill_Tags": user.skill_tags,
             # }
-            return jsonify(data)
+
         except:
             return jsonify({
                 "code": 400,
@@ -197,22 +220,22 @@ def admin_login():
                     'message': "用户权限不够"
                 }), 401
             if admin.password == password:
-                code = 200
-                msg = "登录成功"
-                token = create_access_token(identity=email)
-                User_Name = admin.username
+                return jsonify({
+                    "code": 402,
+                    'msg':"密码错误",
+                    'token' : "Null",
+                    'User_Name' : "Null"
+                }),402
+
             else:
-                code = 402
-                msg = "密码错误"
-                token = "Null"
-                User_Name = "Null"
-            data = {
-                "code": code,
-                "message": msg,
-                "token": token,
-                "User_Name": User_Name,
-            }
-            return jsonify(data)
+                return jsonify({
+                'code' : 200,
+                'msg' : "登录成功",
+                'token' : create_access_token(identity=email),
+                'User_Name' : admin.username
+                }),200
+
+
         except:
             return jsonify({
                 "code": 400,
@@ -225,8 +248,8 @@ def admin_login():
         data = {
             "code": 403,
             "message": form.errors,
-        }, 403
-        return jsonify(data)
+        }
+        return jsonify(data),403
 
 
 
