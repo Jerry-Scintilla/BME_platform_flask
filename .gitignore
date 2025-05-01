@@ -1,2 +1,16 @@
 /migrations/
 
+/.venv/
+
+# PyCharm IDE 相关文件
+.idea/
+*.iml
+modules.xml
+workspace.xml
+
+.env
+
+# 忽略所有 __pycache__ 文件夹
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
