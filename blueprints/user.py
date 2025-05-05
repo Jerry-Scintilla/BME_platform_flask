@@ -333,7 +333,8 @@ def group():
                 grouped[group_name] = {
                     'students': [],
                     'teacher': teacher.username,
-                    'teacher_id': teacher.id
+                    'teacher_id': teacher.id,
+                    'group_id': group.group_id
                 }
             # 获取学生信息
             student = UserModel.query.get(group.student_id)
@@ -343,6 +344,7 @@ def group():
             })
         # 转换为前端需要的格式
         return [{
+            'group_id': info['group_id'],
             'group_name': name,
             'students': info['students'],
             'teacher': info['teacher'],

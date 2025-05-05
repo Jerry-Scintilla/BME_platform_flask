@@ -1,0 +1,18 @@
+回传照片列表
+---
+tags:
+  - 首页封面模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+
+responses:
+  200:
+    description: 首页封面图片列表传输成功
+  400:
+    description: 图片列表传输失败

@@ -1,0 +1,30 @@
+上传首页图片
+---
+tags:
+  - 首页封面模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Cover_Id
+    in: query
+    type: string
+    required: true
+    description: 封面id
+
+  - name: HomeCover
+    in: formData
+    type: file
+    required: true
+    description: 上传封面
+
+
+responses:
+  200:
+    description: 首页封面图片流传输成功
+  400:
+    description: 图片存储出错
