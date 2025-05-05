@@ -1,6 +1,6 @@
 import wtforms
 from flask_wtf.file import FileAllowed, FileSize, FileField
-from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional
+from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional, DataRequired
 from models import UserModel
 from flask import request
 from exts import db
@@ -169,7 +169,8 @@ class LearningProgressForm(wtforms.Form):
     Course_Id = wtforms.IntegerField('Course_Id', validators=[NumberRange(min=1, max=99999999, message='课程编号格式不对')])
     Progress = wtforms.IntegerField('Progress', validators=[NumberRange(min=0, max=99999999, message='进度格式不对')])
 
-
+class HomeCoverForm(wtforms.Form):
+    HomeCover = FileField('HomeCover', validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024), DataRequired()])
 
 
 

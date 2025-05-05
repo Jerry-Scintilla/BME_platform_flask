@@ -1,0 +1,26 @@
+删除首页图片
+---
+tags:
+  - 首页封面模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: Cover_Id
+    in: query
+    type: string
+    required: true
+    description: 封面id
+
+
+
+responses:
+  200:
+    description: 首页封面图片删除成功
+  400:
+    description: 缺少 Cover_Id 参数
+  404:
+    description: 未找到该 cover_id

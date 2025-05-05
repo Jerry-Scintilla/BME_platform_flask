@@ -123,6 +123,12 @@ class CheckRecord(db.Model):
     duration = db.Column(db.Float)
     date = db.Column(db.Date, index=True)
 
+class HomeCover(db.Model):
+    __tablename__ = 'home_cover'
+    id = db.Column(db.Integer, primary_key=True)
+    url = db.Column(db.String(100))
+    cover_id = db.Column(db.Integer, nullable=False)
+
 
 
 
