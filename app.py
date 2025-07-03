@@ -10,7 +10,6 @@ from blueprints.article import bp as article_bp
 from blueprints.course import bp as course_bp
 from blueprints.medal import bp as medal_bp
 from blueprints.codecheck import bp as codecheck_bp
-from blueprints.Ragflow import bp as ragflow_bp
 from blueprints.learningProgress import bp as learningprogress_bp
 from blueprints.homeCover import bp as homeCover_bp
 
@@ -44,7 +43,6 @@ app.register_blueprint(article_bp)
 app.register_blueprint(course_bp)
 app.register_blueprint(medal_bp)
 app.register_blueprint(codecheck_bp)
-app.register_blueprint(ragflow_bp)
 app.register_blueprint(learningprogress_bp)
 app.register_blueprint(homeCover_bp)
 

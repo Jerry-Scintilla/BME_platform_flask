@@ -21,7 +21,7 @@ parameters:
         - name
       properties:
         Course_Id:
-          type: string
+          type: integer
           description: 课程id
 
 responses:

@@ -233,23 +233,21 @@ def course_delete():
             'message': "用户权限不够"
         }), 400
 
-    form = ChapterForm()
-    if form.validate():
-        course_id = form.Course_Id.data
-        courses = CourseModel.query.filter_by(id=course_id).first()
-        if courses is None:
-            return jsonify({
-                "code": 401,
-                'message': "课程不存在"
-            }), 401
-        chapter = Chapter.query.filter_by(course_id=course_id).delete()
-        db.session.delete(courses)
-        db.session.commit()
+    course_id = request.json.get('Course_Id')
+    courses = CourseModel.query.filter_by(id=course_id).first()
+    if courses is None:
         return jsonify({
-            "code": 200,
-            "Course_Id": course_id,
-            'message': "课程删除完成"
-        })
+            "code": 401,
+            'message': "课程不存在"
+        }), 401
+    chapter = Chapter.query.filter_by(course_id=course_id).delete()
+    db.session.delete(courses)
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "Course_Id": course_id,
+        'message': "课程删除完成"
+    })
 
 
 # 查询课程（需要加参数，如 ?Course_Id=xxx，?Query=xxx）
@@ -333,7 +331,7 @@ def book_upgrade():
     if url:
         os.remove('./data/course/book/' + url)
 
-    book_name = str(course.id) + '_' + course.title + '.pdf'
+    book_name = str(course.id) + '_' + course.title + '.zip'
     book.save('./data/course/book/' + book_name)
 
     # 更新课程的 url

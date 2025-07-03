@@ -219,7 +219,7 @@ def admin_login():
                     "code": 401,
                     'message': "用户权限不够"
                 }), 401
-            if admin.password == password:
+            if admin.password != password:
                 return jsonify({
                     "code": 402,
                     'msg':"密码错误",
