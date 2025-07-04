@@ -143,6 +143,7 @@ def course_list():
                   'Course_Chapters': course.chapters,
                   'Course_Time': course.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
                   'Course_Id': str(course.id),
+                  'Course_Tags': course.tags,
                   }
         data.append(b_list)
 
@@ -291,6 +292,7 @@ def search_courses():
             'Course_Title': course.title,
             'Introduction': course.introduction,
             'Chapters': course.chapters,
+            'Course_Tags': course.tags,
             # 'Cover': course.cover
         })
     return jsonify({
