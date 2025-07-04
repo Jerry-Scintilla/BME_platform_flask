@@ -24,14 +24,23 @@ parameters:
           type: string
           description: 小组名称
 #          default: "1111"
+        Course_Id:
+          type: string
+          description: 课程ID
+
         Group_member:
           type: string
           description: 小组成员，使用列表嵌套
 #          default: "Guarana"
+
         Group_Type:
           type: string
           description: 小组类型，分为study和project
         #          default: "Guarana"
+        Group_Id:
+          type: integer
+          description: 小组ID（修改小组时需要，新增小组则不需要）
+          default: null
 
 responses:
   200:
@@ -42,3 +51,9 @@ responses:
     description: 学生不是普通用户
   402:
     description: 学生已经加入小组
+  403:
+    description: 课程ID不能为空
+  404:
+    description: 课程不存在
+  # 409:
+  #   description: 一个学生不能在多个小组中学习同一课程

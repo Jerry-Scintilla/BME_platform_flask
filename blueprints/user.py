@@ -6,7 +6,7 @@ import base64
 from exts import db
 
 # 导入数据库表
-from models import UserModel, GroupModel
+from models import UserModel, GroupModel, CourseModel, LearningProgressModel
 
 # 导入表单验证
 from .forms import AvatarForm
@@ -279,14 +279,34 @@ def group_add():
     group_name = request.json.get('Group_Name')
     student_ids = request.json.get('Group_member')
     group_type = request.json.get('Group_Type')
+    course_id = request.json.get('Course_Id') 
+    group_id = request.json.get('Group_Id')
     teacher_id = user.id
+
+    # 验证course_id是否提供
+    if not course_id:
+        return jsonify({
+            "code": 403,
+            "message": "课程ID不能为空"
+        }), 403
+    
+    # 验证课程是否存在
+    course = CourseModel.query.get(course_id)
+    if not course:
+        return jsonify({
+            "code": 404,
+            "message": "课程不存在"
+        }), 404
 
     # 获取当前最大的group_id并加1
     max_group = db.session.query(db.func.max(GroupModel.group_id)).scalar()
     new_group_id = (max_group or 0) + 1
 
     # 删除同名小组
-    group_exist = GroupModel.query.filter_by(name=group_name).delete()
+    if(group_id):
+        group_exist = GroupModel.query.filter_by(group_id=group_id).delete()
+        new_group_id = group_id
+
 
     for student in student_ids:
         student_id = student["student_id"]
@@ -296,16 +316,45 @@ def group_add():
                 "code": 400,
                 "message": "学生不存在"
             }), 400
+        
+        # 检查该学生是否已经在学习该课程
+        existing_group = GroupModel.query.filter_by(
+            student_id=student_user.id,
+            course_id=course_id
+        ).first()
+        
+        # 如果已存在且不是同名小组（因为同名小组已经被删除了）
+        if existing_group:
+            return jsonify({
+                "code": 409,
+                "message": f"学生 {student_user.username}(ID:{student_user.id}) 已经在小组 '{existing_group.name}' 中学习该课程，一个学生不能在多个小组中学习同一课程"
+            }), 409
 
-        # 创建小组时添加group_id
+        # 创建小组时添加course_id和group_id
         group = GroupModel(
             teacher_id=teacher_id,
             name=group_name,
             student_id=student_user.id,
             type=group_type,
-            group_id=new_group_id  # 新增group_id
+            course_id=course_id,  # 添加course_id
+            group_id=new_group_id
         )
         db.session.add(group)
+        
+        # 检查学习进度是否存在
+        existing_progress = LearningProgressModel.query.filter_by(
+            user_id=student_user.id,
+            course_id=course_id
+        ).first()
+        
+        # 如果进度不存在或为0，创建新的进度记录
+        if not existing_progress:
+            new_progress = LearningProgressModel(
+                user_id=student_user.id,
+                course_id=course_id,
+                progress=1  # 设置初始进度为1
+            )
+            db.session.add(new_progress)
 
     db.session.commit()  # 统一提交
 
@@ -330,11 +379,17 @@ def group():
             if group_name not in grouped:
                 # 获取教师信息（假设每个小组的 teacher_id 一致）
                 teacher = UserModel.query.get(group.teacher_id)
+                # 获取课程标题
+                course = CourseModel.query.get(group.course_id)
+                course_title = course.title if course else "未知课程"
+                
                 grouped[group_name] = {
                     'students': [],
                     'teacher': teacher.username,
                     'teacher_id': teacher.id,
-                    'group_id': group.group_id
+                    'group_id': group.group_id,
+                    'course_id': group.course_id,
+                    'title': course_title  # 添加课程标题
                 }
             # 获取学生信息
             student = UserModel.query.get(group.student_id)
@@ -345,7 +400,8 @@ def group():
         # 转换为前端需要的格式
         return [{
             'group_id': info['group_id'],
-            'group_name': name,
+            'course_id': info['course_id'],
+            'title': info['title'],  # 添加课程标题
             'students': info['students'],
             'teacher': info['teacher'],
             'teacher_id': info['teacher_id']
@@ -439,11 +495,12 @@ def group_list():
     Student = aliased(UserModel)
     Teacher = aliased(UserModel)
 
-    # 查询所有小组数据，包含type和name字段
-    # 修改查询语句，添加GroupModel.id
+    # 查询所有小组数据，包含type、name和course_id字段
+    # 修改查询语句，添加GroupModel.id和GroupModel.course_id
     query_result = (
         db.session.query(
-            GroupModel.group_id.label('group_id'),  # 新增小组ID
+            GroupModel.group_id.label('group_id'),
+            GroupModel.course_id.label('course_id'),  # 添加course_id
             Teacher.id.label('teacher_id'),
             Student.id.label('student_id'),
             GroupModel.type,
@@ -455,11 +512,11 @@ def group_list():
         .all()
     )
 
-    # 修改字典结构，键改为(teacher_id, group_name, group_id)
+    # 修改字典结构，键改为(teacher_id, group_name, group_id, course_id)
     study_groups = {}
     project_groups = {}
 
-    for group_id, teacher_id, student_id, group_type, group_name in query_result:
+    for group_id, course_id, teacher_id, student_id, group_type, group_name in query_result:
         student = UserModel.query.get(student_id)
         student_info = {
             "Student_Id": student_id,
@@ -467,18 +524,24 @@ def group_list():
         }
 
         target_dict = study_groups if group_type == 'study' else project_groups
-        group_key = (teacher_id, group_name, group_id)  # 保留group_id
+        group_key = (teacher_id, group_name, group_id, course_id)  # 添加course_id到键中
 
         if group_key not in target_dict:
             target_dict[group_key] = []
         target_dict[group_key].append(student_info)
 
-    # 修改结果构建，添加group_id
+    # 修改结果构建，添加group_id、course_id和title
     result1 = []
-    for (teacher_id, group_name, group_id), students in study_groups.items():
+    for (teacher_id, group_name, group_id, course_id), students in study_groups.items():
         teacher = UserModel.query.get(teacher_id)
+        # 获取课程标题
+        course = CourseModel.query.get(course_id)
+        course_title = course.title if course else "未知课程"
+        
         result1.append({
-            "group_id": group_id,  # 新增小组ID
+            "group_id": group_id,
+            "course_id": course_id,
+            "title": course_title,  # 添加课程标题
             "teacher_id": teacher_id,
             "teacher": teacher.username,
             "group_name": group_name,
@@ -486,10 +549,16 @@ def group_list():
         })
 
     result2 = []
-    for (teacher_id, group_name, group_id), students in project_groups.items():
+    for (teacher_id, group_name, group_id, course_id), students in project_groups.items():
         teacher = UserModel.query.get(teacher_id)
+        # 获取课程标题
+        course = CourseModel.query.get(course_id)
+        course_title = course.title if course else "未知课程"
+        
         result2.append({
-            "group_id": group_id,  # 新增小组ID
+            "group_id": group_id,
+            "course_id": course_id,
+            "title": course_title,  # 添加课程标题
             "teacher_id": teacher_id,
             "teacher": teacher.username,
             "group_name": group_name,

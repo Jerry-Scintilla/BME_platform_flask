@@ -8,12 +8,12 @@ parameters:
     in: query
     description: 传递课程id
     type: string
-    required: False
+    required: false
   - name: Query
     in: query
     description: 传递课程名称
     type: string
-    required: False
+    required: false
 
 responses:
   200:

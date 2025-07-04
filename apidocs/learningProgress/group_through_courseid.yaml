@@ -1,0 +1,31 @@
+获取通过课程ID查询用户所在小组成员的学习进度
+---
+tags:
+  - 学习进度模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: query
+    type: string
+    required: true
+    description: 课程ID
+
+responses:
+  200:
+    description: 获取同组学生学习进度成功
+  400:
+    description: 请求用户不存在
+  401:
+    description: Course_Id不能为空
+  402:
+    description: 用户在该课程下没有加入小组
+  404:
+    description: 课程不存在
+  405:
+    description: 无法找到小组成员

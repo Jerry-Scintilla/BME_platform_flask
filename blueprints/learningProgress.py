@@ -335,3 +335,95 @@ def delete():
         }), 401
 
 
+@bp.route("/learningProgress/group_through_courseid", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/learningProgress/group_through_courseid.yaml')  
+def group_through_courseid():
+    # 获取当前用户
+    User_Email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=User_Email).first()
+    if not user:
+        return jsonify({
+            "code": 400,
+            'message': "请求用户不存在"
+        }), 400
+
+    # 获取课程ID参数
+    course_id = request.args.get('Course_Id')
+    if not course_id:
+        return jsonify({
+            "code": 401,
+            'message': "Course_Id不能为空"
+        }), 401
+    
+    # 查询课程是否存在
+    course = CourseModel.query.get(course_id)
+    if not course:
+        return jsonify({
+            "code": 404,
+            'message': "课程不存在"
+        }), 404
+
+    # 查找用户在该课程下所属的小组
+    user_group = GroupModel.query.filter_by(
+        student_id=user.id,
+        course_id=course_id
+    ).first()
+    
+    if not user_group:
+        return jsonify({
+            "code": 402,
+            'message': "用户在该课程下没有加入小组"
+        }), 402
+    
+    # 获取同组成员
+    group_id = user_group.group_id
+    group_members = GroupModel.query.filter_by(
+        group_id=group_id,
+        course_id=course_id
+    ).all()
+    
+    # 如果没有找到同组成员，可能是数据问题
+    if not group_members:
+        return jsonify({
+            "code": 405,
+            'message': "无法找到小组成员"
+        }), 405
+    
+    # 获取小组名称
+    group_name = user_group.name
+    
+    # 获取所有组员的学习进度
+    result = []
+    for member in group_members:
+        # 获取该成员的学习进度
+        progress = LearningProgressModel.query.filter_by(
+            user_id=member.student_id,
+            course_id=course_id
+        ).options(joinedload(LearningProgressModel.course)).first()
+        
+        # 获取成员信息
+        student = UserModel.query.get(member.student_id)
+        
+        # 创建记录
+        progress_data = {
+            'course_id': int(course_id),
+            'progress': progress.progress if progress else 0,
+            'course_name': course.title,
+            'course_chapters': course.chapters
+        }
+        
+        result.append({
+            'user_id': student.id,
+            'username': student.username,
+            'records': [progress_data]  # 由于是针对单个课程，所以只有一条记录
+        })
+    
+    return jsonify({
+        "code": 200,
+        'message': '获取同组学生学习进度成功',
+        'data': {
+            'result': result,
+            'group_name': group_name
+        }
+    }), 200

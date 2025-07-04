@@ -1,20 +1,17 @@
-下载pdf（需要参数?Down_Code=XXX）
+下载电子书（需要加参数，如 ?Book_Id=xxx）
 ---
 tags:
   - 课程模块
 
 parameters:
-  - name: Down_Code
+  - name: Book_Id
     in: query
-    description: 下载码
+    description: 传递书籍id
     type: string
-    required: False
-
+    required: false
 
 responses:
   200:
-    description: 下载链接生成成功
-  403:
-    description: 课程pdf不存在
-  402:
-    description: 下载码错误
+    description: 下载成功
+  400:
+    description: 找不到书籍

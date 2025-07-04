@@ -1,6 +1,8 @@
 from datetime import datetime
 
 from pygments.lexer import default
+from sqlalchemy import and_
+from sqlalchemy.orm import foreign, remote
 
 from exts import db
 
@@ -108,10 +110,22 @@ class GroupModel(db.Model):
     __tablename__ = 'group'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
     type = db.Column(db.String(10), nullable=False)
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     group_id = db.Column(db.Integer)
+
+    progress = db.relationship(
+        'LearningProgressModel',
+        primaryjoin=and_(
+            foreign(student_id) == remote(LearningProgressModel.user_id),
+            foreign(course_id) == remote(LearningProgressModel.course_id)
+        ),
+        uselist=False,  # 设置为False表示返回单个对象而非列表
+        viewonly=True   # 设置为True表示这是只读关系，不会级联保存
+    )
+    course = db.relationship('CourseModel', backref=db.backref('groups', lazy=True))
 
 
 class CheckRecord(db.Model):
