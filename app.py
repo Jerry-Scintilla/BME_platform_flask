@@ -24,7 +24,9 @@ from flask_redis import FlaskRedis
 
 app = Flask(__name__)
 
+# 配置CORS，允许特定域名访问API
 CORS(app)
+
 # 绑定配置文件
 app.config.from_object(config)
 # 拓展初始化
@@ -53,5 +55,5 @@ def hello_world():  # put application's code here
 
 
 if __name__ == '__main__':
-    app.run()
+    app.run(debug = True)
     # app.run(host='0.0.0.0', port=5000)

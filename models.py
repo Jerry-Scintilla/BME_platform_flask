@@ -76,6 +76,54 @@ class LearningProgressModel(db.Model):
     user = db.relationship('UserModel', backref=db.backref('learning_progress', lazy=True))
     course = db.relationship('CourseModel', backref=db.backref('learning_progress', lazy=True))
 
+    def get_chapter_info(self):
+        """
+        获取当前进度对应的章节信息
+        返回: (章数, 节数, 章名, 节名)
+        """
+        # 获取当前课程的所有章节，按order排序
+        chapters = Chapter.query.filter_by(course_id=self.course_id).order_by(Chapter.order).all()
+        
+        # 获取当前进度对应的章节
+        current_chapter = None
+        for chapter in chapters:
+            if chapter.order == self.progress:
+                current_chapter = chapter
+                break
+        
+        if not current_chapter:
+            return None, None, None, None
+        
+        # 判断当前是章还是节
+        if current_chapter.priority == 0:  # 当前是章
+            # 计算是第几章（统计当前章节之前的priority=0的数量 + 1）
+            chapter_num = sum(1 for ch in chapters if ch.priority == 0 and ch.order <= current_chapter.order)
+            return chapter_num, 0, current_chapter.name, None
+        else:  # 当前是节
+            # 找到当前节所属的章
+            parent_chapter = None
+            for i in range(len(chapters)):
+                if chapters[i].id == current_chapter.id:  # 找到当前节
+                    # 向前查找最近的一个priority=0的章
+                    for j in range(i-1, -1, -1):
+                        if chapters[j].priority == 0:
+                            parent_chapter = chapters[j]
+                            break
+                    break
+            
+            if not parent_chapter:
+                return None, None, None, None
+            
+            # 计算是第几章
+            chapter_num = sum(1 for ch in chapters if ch.priority == 0 and ch.order <= parent_chapter.order)
+            
+            # 计算是第几节（从章到当前节之间的priority=1的数量）
+            section_num = sum(1 for ch in chapters 
+                             if ch.priority == 1 
+                             and parent_chapter.order < ch.order <= current_chapter.order)
+            
+            return chapter_num, section_num, parent_chapter.name, current_chapter.name
+
 
 class Chapter(db.Model):
     __tablename__ = 'chapter'

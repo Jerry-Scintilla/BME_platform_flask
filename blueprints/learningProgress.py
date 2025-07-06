@@ -165,10 +165,17 @@ def learningprogress_list():
     # 使用defaultdict来根据user_id对记录进行分组
     grouped_records = defaultdict(list)
     for record in all_records:
+        # 获取章节信息
+        chapter_num, section_num, chapter_name, section_name = record.get_chapter_info()
+        
         grouped_records[record.user_id].append({
             'course_id': record.course_id,
             'progress': record.progress,
-            'course_name': record.course.title
+            'course_name': record.course.title,
+            'chapter_num': chapter_num,
+            'section_num': section_num,
+            'chapter_name': chapter_name,
+            'section_name': section_name
         })
 
     # 构建最终结果
@@ -208,10 +215,17 @@ def student():
 
     records = []
     for record in progress:
+        # 获取章节信息
+        chapter_num, section_num, chapter_name, section_name = record.get_chapter_info()
+        
         records.append({
             'course_id': record.course_id,
             'progress': record.progress,
-            'course_name': record.course.title
+            'course_name': record.course.title,
+            'chapter_num': chapter_num,
+            'section_num': section_num,
+            'chapter_name': chapter_name,
+            'section_name': section_name
         })
 
     result = {
@@ -275,11 +289,18 @@ def group():
 
         records = []
         for record in progress:
+            # 获取章节信息
+            chapter_num, section_num, chapter_name, section_name = record.get_chapter_info()
+            
             records.append({
                 'course_id': record.course_id,
                 'progress': record.progress,
                 'course_name': record.course.title,
-                'course_chapters':record.course.chapters
+                'course_chapters': record.course.chapters,
+                'chapter_num': chapter_num,
+                'section_num': section_num,
+                'chapter_name': chapter_name,
+                'section_name': section_name
             })
 
         user = UserModel.query.get(student_id)
@@ -392,6 +413,8 @@ def group_through_courseid():
     
     # 获取小组名称
     group_name = user_group.name
+
+    teacher = UserModel.query.get(user_group.teacher_id)
     
     # 获取所有组员的学习进度
     result = []
@@ -413,6 +436,23 @@ def group_through_courseid():
             'course_chapters': course.chapters
         }
         
+        # 如果有进度记录，添加章节信息
+        if progress:
+            chapter_num, section_num, chapter_name, section_name = progress.get_chapter_info()
+            progress_data.update({
+                'chapter_num': chapter_num,
+                'section_num': section_num,
+                'chapter_name': chapter_name,
+                'section_name': section_name
+            })
+        else:
+            progress_data.update({
+                'chapter_num': None,
+                'section_num': None,
+                'chapter_name': None,
+                'section_name': None
+            })
+        
         result.append({
             'user_id': student.id,
             'username': student.username,
@@ -424,6 +464,8 @@ def group_through_courseid():
         'message': '获取同组学生学习进度成功',
         'data': {
             'result': result,
-            'group_name': group_name
+            'group_name': group_name,
+            'teacher_id': teacher.id,
+            'teacher_name': teacher.username
         }
     }), 200
