@@ -16,7 +16,7 @@ parameters:
     in: body
     required: true
     schema:
-      id: deit
+      id: user_edit
       required:
         - name
       properties:
@@ -48,6 +48,10 @@ parameters:
           type: string
           description: 技能标签
 #          default: "python"
+        College:
+          type: string
+          description: 院校
+
 
 responses:
   200:

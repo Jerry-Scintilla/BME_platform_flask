@@ -118,6 +118,7 @@ class UserInfoForm(wtforms.Form):
     Major = wtforms.StringField('Major',validators=[Optional(),length(min=1, max=100, message='专业格式不对')])
     Github_Id = wtforms.StringField('Github_Id',validators=[Optional(),length(min=1, max=100, message='Github_id格式不对')])
     Skill_Tags = wtforms.StringField('Skill_Tags',validators=[Optional(),length(min=1, max=100, message='技能标签格式不对')])
+    College = wtforms.StringField('College',validators=[Optional(), length(min=1, max=100, message='院校格式不对')])
 
 
 class ChapterForm(wtforms.Form):

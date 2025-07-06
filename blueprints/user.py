@@ -74,6 +74,7 @@ def user_index():
         "Major": Major,
         "Github_Id": Github_Id,
         "Skill_Tags": Skill_Tags,
+        "College": user.college,
     }
     return jsonify(data)
 
@@ -210,6 +211,7 @@ def user_edit():
         Major = None
         Github_Id = None
         Skill_Tags = None
+        College = None
 
         # 检查每个字段是否有值，如果有值则存储到相应的变量中
         if form.User_Name.data:
@@ -228,6 +230,8 @@ def user_edit():
             Github_Id = form.Github_Id.data
         if form.Skill_Tags.data:
             Skill_Tags = form.Skill_Tags.data
+        if form.College.data:
+            College = form.College.data
 
         # 存储到数据库中
         if user_name is not None:
@@ -246,6 +250,8 @@ def user_edit():
             user.github_id = Github_Id
         if Skill_Tags is not None:
             user.skill_tags = Skill_Tags
+        if College is not None:
+            user.college = College
 
         # 提交更改到数据库
         db.session.commit()
