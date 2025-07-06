@@ -16,7 +16,7 @@ parameters:
     in: body
     required: true
     schema:
-      id: deit
+      id: course_edit
       required:
         - name
       properties:
