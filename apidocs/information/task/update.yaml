@@ -1,0 +1,49 @@
+修改任务信息
+---
+tags:
+  - 信息管理
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: task_update
+      required:
+        - Id
+      properties:
+        Id:
+          type: integer
+          description: 任务ID
+        Title:
+          type: string
+          description: 任务标题
+        Content:
+          type: string
+          description: 任务详细说明
+        End_Time:
+          type: string
+          description: 任务截止时间，格式为 "YYYY-MM-DD HH:MM:SS"
+        Priority:
+          type: integer
+          description: 优先级，1-5之间，数字越小优先级越高
+
+responses:
+  200:
+    description: 任务修改成功
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  403:
+    description: 权限不足，只有组长或管理员可以修改任务
+  404:
+    description: 用户不存在或任务不存在 

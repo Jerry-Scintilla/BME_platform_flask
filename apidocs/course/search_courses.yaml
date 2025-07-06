@@ -18,6 +18,73 @@ parameters:
 responses:
   200:
     description: 获取章节详情成功
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          description: 状态码
+        message:
+          type: string
+          description: 提示信息
+        Course_Id:
+          type: string
+          description: 课程ID
+        Course_Title:
+          type: string
+          description: 课程标题
+        Introduction:
+          type: string
+          description: 课程简介
+        Chapters:
+          type: integer
+          description: 课程章节数
+        Course_Tags:
+          type: string
+          description: 课程标签
+        Course_Class_Hour:
+          type: integer
+          description: 课时数
+        Course_Difficulty:
+          type: integer
+          description: 课程难度（1-5级）
+        Course_Other_Tags:
+          type: array
+          items:
+            type: string
+          description: 其他标签列表
+        Course_List:
+          type: array
+          description: 课程列表（仅当使用Query参数时返回）
+          items:
+            type: object
+            properties:
+              Course_Id:
+                type: string
+                description: 课程ID
+              Course_Title:
+                type: string
+                description: 课程标题
+              Introduction:
+                type: string
+                description: 课程简介
+              Chapters:
+                type: integer
+                description: 课程章节数
+              Course_Tags:
+                type: string
+                description: 课程标签
+              Course_Class_Hour:
+                type: integer
+                description: 课时数
+              Course_Difficulty:
+                type: integer
+                description: 课程难度（1-5级）
+              Course_Other_Tags:
+                type: array
+                items:
+                  type: string
+                description: 其他标签列表
   400:
     description: 传参格式有误
   401:

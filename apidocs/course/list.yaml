@@ -5,3 +5,37 @@ tags:
 responses:
   200:
     description: 获取课程列表成功
+    schema:
+      type: array
+      items:
+        type: object
+        properties:
+          Course_title:
+            type: string
+            description: 课程标题
+          Course_Introduction:
+            type: string
+            description: 课程简介
+          Course_Chapters:
+            type: integer
+            description: 课程章节数
+          Course_Time:
+            type: string
+            description: 发布时间
+          Course_Id:
+            type: string
+            description: 课程ID
+          Course_Tags:
+            type: string
+            description: 课程标签
+          Course_Class_Hour:
+            type: integer
+            description: 课时数
+          Course_Difficulty:
+            type: integer
+            description: 课程难度（1-5级）
+          Course_Other_Tags:
+            type: array
+            items:
+              type: string
+            description: 其他标签列表

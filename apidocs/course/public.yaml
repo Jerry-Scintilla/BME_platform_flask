@@ -25,6 +25,21 @@ parameters:
     type: string
     required: true
     description: 课程章节数
+  - name: Course_Class_Hour
+    in: formData
+    type: integer
+    required: false
+    description: 课时数
+  - name: Course_Difficulty
+    in: formData
+    type: integer
+    required: false
+    description: 课程难度（1-5级）
+  - name: Course_Other_Tags
+    in: formData
+    type: string
+    required: false
+    description: 其他标签（多个标签以英文逗号分隔）
   - name: Cover
     in: formData
     type: file

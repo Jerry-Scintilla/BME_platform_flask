@@ -63,6 +63,10 @@ class CourseModel(db.Model):
     url = db.Column(db.String(100))
     tags = db.Column(db.String(100))
     publish_time = db.Column(db.DateTime, default=datetime.now)
+    class_hour = db.Column(db.Integer, nullable=True)
+    difficulty = db.Column(db.Integer, nullable=True)
+    other_tags = db.Column(db.String(100))
+
 
 
 class LearningProgressModel(db.Model):
@@ -191,6 +195,60 @@ class HomeCover(db.Model):
     url = db.Column(db.String(100))
     cover_id = db.Column(db.Integer, nullable=False)
 
-
+class InformationModel(db.Model):
+    __tablename__ = 'information'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # 公共字段
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=False)
+    type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息
+    title = db.Column(db.String(100), nullable=False)
+    content = db.Column(db.Text)
+    create_time = db.Column(db.DateTime, default=datetime.now)
+    
+    # 请假信息特有字段
+    start_time = db.Column(db.DateTime)
+    end_time = db.Column(db.DateTime)  # 也用于任务信息的截止时间
+    student_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    status = db.Column(db.Integer, default=0)  # 0: 未批准, 1: 已批准
+    
+    # 任务信息特有字段
+    priority = db.Column(db.Integer)  # 1-5, 数字越小优先级越高
+    
+    # 通知信息特有字段
+    range = db.Column(db.String(100)) # 如果对应多个用户id，就用逗号隔开，如果是小组全选，则为0
+    
+    def get_info_by_type(self):
+        """
+        根据类型返回相应的信息
+        """
+        if self.type == 1:  # 请假信息
+            return {
+                'id': self.id,
+                'title': self.title,
+                'content': self.content,
+                'start_time': self.start_time,
+                'end_time': self.end_time,
+                'student_id': self.student_id,
+                'status': self.status,
+                'create_time': self.create_time
+            }
+        elif self.type == 2:  # 任务信息
+            return {
+                'id': self.id,
+                'title': self.title,
+                'content': self.content,
+                'end_time': self.end_time,
+                'priority': self.priority,
+                'create_time': self.create_time
+            }
+        elif self.type == 3:  # 通知信息
+            return {
+                'id': self.id,
+                'title': self.title,
+                'content': self.content,
+                'range': self.range,
+                'create_time': self.create_time
+            }
+        return None
 
 

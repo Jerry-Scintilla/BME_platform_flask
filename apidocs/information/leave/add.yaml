@@ -1,0 +1,50 @@
+添加请假信息
+---
+tags:
+  - 信息管理
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: leave_add
+      required:
+        - Group_Id
+        - Title
+        - Start_Time
+        - End_Time
+      properties:
+        Group_Id:
+          type: integer
+          description: 小组ID
+        Title:
+          type: string
+          description: 请假标题
+        Content:
+          type: string
+          description: 请假详细说明
+        Start_Time:
+          type: string
+          description: 请假开始时间，格式为 "YYYY-MM-DD HH:MM:SS"，如果只提供日期部分（如"YYYY-MM-DD"），则时间默认为23:59:59
+        End_Time:
+          type: string
+          description: 请假结束时间，格式为 "YYYY-MM-DD HH:MM:SS"，如果只提供日期部分（如"YYYY-MM-DD"），则时间默认为23:59:59
+
+responses:
+  200:
+    description: 请假申请提交成功
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  404:
+    description: 用户或小组不存在 

@@ -1,0 +1,101 @@
+查询请假信息
+---
+tags:
+  - 信息管理
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: group_id
+    in: query
+    type: integer
+    required: false
+    description: 小组ID，用于管理员筛选特定小组的请假信息（仅管理员可用）
+  - name: status
+    in: query
+    type: integer
+    required: false
+    description: 请假状态筛选，0表示未批准，1表示已批准，不提供此参数则返回所有状态的请假信息
+
+responses:
+  200:
+    description: 查询成功，返回的数据按批准状态分为已批准(approved)和未批准(pending)两组
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: 查询成功
+        data:
+          type: object
+          properties:
+            approved:
+              type: array
+              description: 已批准的请假信息列表
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  group_id:
+                    type: integer
+                  group_name:
+                    type: string
+                  title:
+                    type: string
+                  content:
+                    type: string
+                  student_id:
+                    type: integer
+                  student_name:
+                    type: string
+                  start_time:
+                    type: string
+                  end_time:
+                    type: string
+                  status:
+                    type: integer
+                    example: 1
+                  create_time:
+                    type: string
+            pending:
+              type: array
+              description: 未批准的请假信息列表
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  group_id:
+                    type: integer
+                  group_name:
+                    type: string
+                  title:
+                    type: string
+                  content:
+                    type: string
+                  student_id:
+                    type: integer
+                  student_name:
+                    type: string
+                  start_time:
+                    type: string
+                  end_time:
+                    type: string
+                  status:
+                    type: integer
+                    example: 0
+                  create_time:
+                    type: string
+  401:
+    description: 未授权
+  403:
+    description: 权限不足，只有管理员可以通过小组ID查询
+  404:
+    description: 用户不存在 

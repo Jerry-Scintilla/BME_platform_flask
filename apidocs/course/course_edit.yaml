@@ -36,6 +36,19 @@ parameters:
           type: string
           description: 课程标签
 #          default: "生物医学工程学院"
+        Course_Class_Hour:
+          type: integer
+          description: 课时数
+          minimum: 1
+          maximum: 1000
+        Course_Difficulty:
+          type: integer
+          description: 课程难度（1-5级）
+          minimum: 1
+          maximum: 5
+        Course_Other_Tags:
+          type: string
+          description: 其他标签（多个标签以英文逗号分隔）
 
 
 responses:

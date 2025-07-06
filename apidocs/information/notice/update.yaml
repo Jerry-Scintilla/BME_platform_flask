@@ -1,0 +1,46 @@
+修改通知信息
+---
+tags:
+  - 信息管理
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: notice_update
+      required:
+        - Id
+      properties:
+        Id:
+          type: integer
+          description: 通知ID
+        Title:
+          type: string
+          description: 通知标题
+        Content:
+          type: string
+          description: 通知内容
+        Range:
+          type: string
+          description: 通知范围，"0"表示全组通知，否则为接收者ID列表，用逗号分隔
+
+responses:
+  200:
+    description: 通知修改成功
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  403:
+    description: 权限不足，只有组长或管理员可以修改通知
+  404:
+    description: 用户不存在或通知不存在 

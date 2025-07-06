@@ -1,0 +1,37 @@
+删除通知信息
+---
+tags:
+  - 信息管理
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: notice_delete
+      required:
+        - id
+      properties:
+        id:
+          type: integer
+          description: 通知信息ID
+
+responses:
+  200:
+    description: 通知删除成功
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  403:
+    description: 权限不足，仅组长或管理员可删除
+  404:
+    description: 用户或通知信息不存在 

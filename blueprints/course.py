@@ -40,13 +40,19 @@ def public():
         introduction = form.Course_Introduction.data
         chapters = form.Course_Chapters.data
         # cover_ = CourseForm(request.files)
+        
+        # 添加对新字段的支持
+        class_hour = form.Course_Class_Hour.data if hasattr(form, 'Course_Class_Hour') else None
+        difficulty = form.Course_Difficulty.data if hasattr(form, 'Course_Difficulty') else None
+        other_tags = form.Course_Other_Tags.data if hasattr(form, 'Course_Other_Tags') else None
 
         # cover = cover_.Cover.data
 
         # print(cover)
         # print(title)
 
-        course = CourseModel(title=title, introduction=introduction, chapters=chapters)
+        course = CourseModel(title=title, introduction=introduction, chapters=chapters, 
+                             class_hour=class_hour, difficulty=difficulty, other_tags=other_tags)
 
         db.session.add(course)
         # 获取文章id
@@ -97,6 +103,9 @@ def course_edit():
         introduction = None
         chapters = None
         tag = None
+        class_hour = None
+        difficulty = None
+        other_tags = None
 
         if form.Course_title.data:
             title = form.Course_title.data
@@ -106,6 +115,12 @@ def course_edit():
             chapters = form.Course_Chapters.data
         if form.Course_Tags.data:
             tag = form.Course_Tags.data
+        if form.Course_Class_Hour.data:
+            class_hour = form.Course_Class_Hour.data
+        if form.Course_Difficulty.data:
+            difficulty = form.Course_Difficulty.data
+        if form.Course_Other_Tags.data:
+            other_tags = form.Course_Other_Tags.data
 
         if title is not None:
             course.title = title
@@ -115,6 +130,12 @@ def course_edit():
             course.chapters = chapters
         if tag is not None:
             course.tags = tag
+        if class_hour is not None:
+            course.class_hour = class_hour
+        if difficulty is not None:
+            course.difficulty = difficulty
+        if other_tags is not None:
+            course.other_tags = other_tags
 
         db.session.commit()
 
@@ -138,12 +159,23 @@ def course_list():
     a_list = CourseModel.query.all()
     data = []
     for course in a_list:
+        # 处理other_tags，将逗号分隔的字符串转为数组
+        # 同时兼容中文逗号和英文逗号
+        other_tags_list = []
+        if course.other_tags:
+            # 先将中文逗号替换为英文逗号，然后分割
+            normalized_tags = course.other_tags.replace('，', ',')
+            other_tags_list = [tag.strip() for tag in normalized_tags.split(',') if tag.strip()]
+        
         b_list = {'Course_title': course.title,
                   'Course_Introduction': course.introduction,
                   'Course_Chapters': course.chapters,
                   'Course_Time': course.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
                   'Course_Id': str(course.id),
                   'Course_Tags': course.tags,
+                  'Course_Class_Hour': course.class_hour,
+                  'Course_Difficulty': course.difficulty,
+                  'Course_Other_Tags': other_tags_list,
                   }
         data.append(b_list)
 
@@ -265,11 +297,23 @@ def search_courses():
             }), 401
         course_list = []
         for course in courses:
+            # 处理other_tags，将逗号分隔的字符串转为数组
+            # 同时兼容中文逗号和英文逗号
+            other_tags_list = []
+            if course.other_tags:
+                # 先将中文逗号替换为英文逗号，然后分割
+                normalized_tags = course.other_tags.replace('，', ',')
+                other_tags_list = [tag.strip() for tag in normalized_tags.split(',') if tag.strip()]
+            
             course_info = {
                 'Course_Id': str(course.id),
                 'Course_Title': course.title,
                 'Introduction': course.introduction,
                 'Chapters': course.chapters,
+                'Course_Tags': course.tags,
+                'Course_Class_Hour': course.class_hour,
+                'Course_Difficulty': course.difficulty,
+                'Course_Other_Tags': other_tags_list,
                 # 'Cover': course.cover
             }
             course_list.append(course_info)
@@ -286,6 +330,15 @@ def search_courses():
                 "code": 401,
                 'message': "课程不存在"
             }), 401
+            
+        # 处理other_tags，将逗号分隔的字符串转为数组
+        # 同时兼容中文逗号和英文逗号
+        other_tags_list = []
+        if course.other_tags:
+            # 先将中文逗号替换为英文逗号，然后分割
+            normalized_tags = course.other_tags.replace('，', ',')
+            other_tags_list = [tag.strip() for tag in normalized_tags.split(',') if tag.strip()]
+            
         return jsonify({
             "code": 200,
             'Course_Id': str(course.id),
@@ -293,6 +346,9 @@ def search_courses():
             'Introduction': course.introduction,
             'Chapters': course.chapters,
             'Course_Tags': course.tags,
+            'Course_Class_Hour': course.class_hour,
+            'Course_Difficulty': course.difficulty,
+            'Course_Other_Tags': other_tags_list,
             # 'Cover': course.cover
         })
     return jsonify({

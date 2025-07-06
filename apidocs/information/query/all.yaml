@@ -1,0 +1,159 @@
+集成式查询所有信息
+---
+tags:
+  - 信息管理
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: group_id
+    in: query
+    type: integer
+    required: false
+    description: 小组ID（可选，用于筛选特定小组的信息）
+  - name: type
+    in: query
+    type: integer
+    required: false
+    description: 信息类型（可选，1:请假信息 2:任务信息 3:通知信息）
+  - name: status
+    in: query
+    type: integer
+    required: false
+    description: 状态（可选，0:未批准 1:已批准，仅对请假信息有效）
+  - name: end_time
+    in: query
+    type: string
+    required: false
+    description: 截止时间（可选，格式为YYYY-MM-DD，查询截止时间不晚于此日期的信息）
+  - name: create_time
+    in: query
+    type: string
+    required: false
+    description: 创建时间（可选，格式为YYYY-MM-DD，查询创建时间不晚于此日期的信息）
+
+responses:
+  200:
+    description: 查询成功
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          properties:
+            leave:
+              type: object
+              properties:
+                approved:
+                  type: array
+                  description: 已批准的请假信息
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      group_id:
+                        type: integer
+                      group_name:
+                        type: string
+                      title:
+                        type: string
+                      content:
+                        type: string
+                      student_id:
+                        type: integer
+                      student_name:
+                        type: string
+                      start_time:
+                        type: string
+                      end_time:
+                        type: string
+                      status:
+                        type: integer
+                      create_time:
+                        type: string
+                pending:
+                  type: array
+                  description: 未批准的请假信息
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      group_id:
+                        type: integer
+                      group_name:
+                        type: string
+                      title:
+                        type: string
+                      content:
+                        type: string
+                      student_id:
+                        type: integer
+                      student_name:
+                        type: string
+                      start_time:
+                        type: string
+                      end_time:
+                        type: string
+                      status:
+                        type: integer
+                      create_time:
+                        type: string
+            task:
+              type: array
+              description: 任务信息
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  group_id:
+                    type: integer
+                  group_name:
+                    type: string
+                  title:
+                    type: string
+                  content:
+                    type: string
+                  end_time:
+                    type: string
+                  priority:
+                    type: integer
+                  create_time:
+                    type: string
+            notice:
+              type: array
+              description: 通知信息
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  group_id:
+                    type: integer
+                  group_name:
+                    type: string
+                  title:
+                    type: string
+                  content:
+                    type: string
+                  recipients:
+                    type: string
+                  create_time:
+                    type: string
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  403:
+    description: 权限不足
+  404:
+    description: 用户或小组不存在 

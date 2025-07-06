@@ -4,6 +4,37 @@ from wtforms.validators import Email, length, EqualTo, input_required, NumberRan
 from models import UserModel
 from flask import request
 from exts import db
+import datetime
+
+# 自定义的日期时间字段，支持多种格式的输入
+class FlexibleDateTimeField(wtforms.Field):
+    """
+    自定义的日期时间字段，支持多种格式的输入，包括：
+    - 完整的日期时间格式：YYYY-MM-DD HH:MM:SS
+    - 只有日期部分的格式：YYYY-MM-DD（自动设置时间为23:59:59）
+    """
+    def _value(self):
+        if self.data:
+            return self.data.strftime('%Y-%m-%d %H:%M:%S')
+        return ''
+
+    def process_formdata(self, valuelist):
+        if not valuelist or not valuelist[0]:
+            self.data = None
+            return
+        
+        date_str = valuelist[0]
+        try:
+            # 尝试解析完整的日期时间格式
+            self.data = datetime.datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            try:
+                # 尝试解析只有日期部分的格式，设置时间为23:59:59
+                date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                self.data = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, 23, 59, 59)
+            except ValueError as e:
+                self.data = None
+                raise ValueError('Invalid date format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS') from e
 
 # 注册表单验证
 class RegisterForm(wtforms.Form):
@@ -13,7 +44,7 @@ class RegisterForm(wtforms.Form):
             args = request.args.to_dict()
             super(RegisterForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(RegisterForm, self).__init__(data=data, **args)
@@ -48,7 +79,7 @@ class LoginForm(wtforms.Form):
             args = request.args.to_dict()
             super(LoginForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(LoginForm, self).__init__(data=data, **args)
@@ -64,7 +95,7 @@ class ArticleForm(wtforms.Form):
             args = request.args.to_dict()
             super(ArticleForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(ArticleForm, self).__init__(data=data, **args)
@@ -85,7 +116,7 @@ class CourseForm(wtforms.Form):
             args = request.args.to_dict()
             super(CourseForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(CourseForm, self).__init__(data=data, **args)
@@ -95,6 +126,10 @@ class CourseForm(wtforms.Form):
     Course_Chapters = wtforms.IntegerField('Course_Chapters',validators=[Optional(),NumberRange(min=1, max=300, message='章节数需要在1-300之间')])
     Course_Tags = wtforms.StringField('Course_Tags',validators=[Optional(),length(min=1, max=100, message='标签格式不对')])
     Course_Id = wtforms.IntegerField('Course_Id',validators=[Optional(),input_required()])
+    # 添加新字段
+    Course_Class_Hour = wtforms.IntegerField('Course_Class_Hour',validators=[Optional(),NumberRange(min=1, max=1000, message='课时数格式不对')])
+    Course_Difficulty = wtforms.IntegerField('Course_Difficulty',validators=[Optional(),NumberRange(min=1, max=5, message='难度需要在1-5之间')])
+    Course_Other_Tags = wtforms.StringField('Course_Other_Tags',validators=[Optional(),length(min=1, max=500, message='其他标签格式不对')])
     # Cover = FileField('Cover',validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
 
 
@@ -105,7 +140,7 @@ class UserInfoForm(wtforms.Form):
             args = request.args.to_dict()
             super(UserInfoForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(UserInfoForm, self).__init__(data=data, **args)
@@ -127,7 +162,7 @@ class ChapterForm(wtforms.Form):
             args = request.args.to_dict()
             super(ChapterForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(ChapterForm, self).__init__(data=data, **args)
@@ -143,7 +178,7 @@ class MedalForm(wtforms.Form):
             args = request.args.to_dict()
             super(MedalForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(MedalForm, self).__init__(data=data, **args)
@@ -160,7 +195,7 @@ class LearningProgressForm(wtforms.Form):
             args = request.args.to_dict()
             super(LearningProgressForm, self).__init__(data=data, **args)
         else:
-            # 获取 “application/x-www-form-urlencoded” 或者 “multipart/form-data” 请求
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
             data = request.form.to_dict()
             args = request.args.to_dict()
             super(LearningProgressForm, self).__init__(data=data, **args)
@@ -171,6 +206,61 @@ class LearningProgressForm(wtforms.Form):
 
 class HomeCoverForm(wtforms.Form):
     HomeCover = FileField('HomeCover', validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024), DataRequired()])
+
+class LeaveForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(LeaveForm, self).__init__(data=data, **args)
+        else:
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(LeaveForm, self).__init__(data=data, **args)
+    
+    Group_Id = wtforms.IntegerField('Group_Id', validators=[DataRequired(message='小组ID不能为空')])
+    Title = wtforms.StringField('Title', validators=[DataRequired(message='请假标题不能为空'), length(min=1, max=100, message='标题长度需在1-100之间')])
+    Content = wtforms.StringField('Content', validators=[Optional(), length(max=500, message='请假内容不能超过500字')])
+    Start_Time = FlexibleDateTimeField('Start_Time', validators=[DataRequired(message='开始时间不能为空')])
+    End_Time = FlexibleDateTimeField('End_Time', validators=[DataRequired(message='结束时间不能为空')])
+
+class TaskForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(TaskForm, self).__init__(data=data, **args)
+        else:
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(TaskForm, self).__init__(data=data, **args)
+    
+    Id = wtforms.IntegerField('Id', validators=[Optional()])  # 非必须，用于更新操作
+    Group_Id = wtforms.IntegerField('Group_Id', validators=[DataRequired(message='小组ID不能为空')])
+    Title = wtforms.StringField('Title', validators=[DataRequired(message='任务标题不能为空'), length(min=1, max=100, message='标题长度需在1-100之间')])
+    Content = wtforms.StringField('Content', validators=[Optional(), length(max=500, message='任务内容不能超过500字')])
+    End_Time = FlexibleDateTimeField('End_Time', validators=[DataRequired(message='截止时间不能为空')])
+    Priority = wtforms.IntegerField('Priority', validators=[Optional(), NumberRange(min=1, max=5, message='优先级必须在1-5之间')])
+
+class NoticeForm(wtforms.Form):
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(NoticeForm, self).__init__(data=data, **args)
+        else:
+            # 获取 "application/x-www-form-urlencoded" 或者 "multipart/form-data" 请求
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(NoticeForm, self).__init__(data=data, **args)
+    
+    Id = wtforms.IntegerField('Id', validators=[Optional()])  # 非必须，用于更新操作
+    Group_Id = wtforms.IntegerField('Group_Id', validators=[DataRequired(message='小组ID不能为空')])
+    Title = wtforms.StringField('Title', validators=[DataRequired(message='通知标题不能为空'), length(min=1, max=100, message='标题长度需在1-100之间')])
+    Content = wtforms.StringField('Content', validators=[Optional(), length(max=500, message='通知内容不能超过500字')])
+    Range = wtforms.StringField('Range', validators=[Optional()])
 
 
 

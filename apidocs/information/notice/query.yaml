@@ -1,0 +1,59 @@
+查询通知信息
+---
+tags:
+  - 信息管理
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: group_id
+    in: query
+    type: integer
+    required: false
+    description: 小组ID（仅管理员可使用此参数查询）
+
+responses:
+  200:
+    description: 查询成功
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+                description: 通知ID
+              group_id:
+                type: integer
+                description: 小组ID
+              group_name:
+                type: string
+                description: 小组名称
+              title:
+                type: string
+                description: 通知标题
+              content:
+                type: string
+                description: 通知内容
+              recipients:
+                type: string
+                description: 接收者描述
+              create_time:
+                type: string
+                description: 创建时间
+  401:
+    description: 未授权
+  403:
+    description: 权限不足（使用group_id参数时）
+  404:
+    description: 用户不存在 

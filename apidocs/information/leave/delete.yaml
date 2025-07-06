@@ -1,0 +1,37 @@
+删除请假信息
+---
+tags:
+  - 信息管理
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: leave_delete
+      required:
+        - id
+      properties:
+        id:
+          type: integer
+          description: 请假信息ID
+
+responses:
+  200:
+    description: 请假信息删除成功
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  403:
+    description: 权限不足，仅请假人或组长可删除
+  404:
+    description: 请假信息不存在 

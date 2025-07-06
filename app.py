@@ -12,6 +12,7 @@ from blueprints.medal import bp as medal_bp
 from blueprints.codecheck import bp as codecheck_bp
 from blueprints.learningProgress import bp as learningprogress_bp
 from blueprints.homeCover import bp as homeCover_bp
+from blueprints.information import bp as information_bp
 
 
 from flask_cors import CORS
@@ -47,6 +48,7 @@ app.register_blueprint(medal_bp)
 app.register_blueprint(codecheck_bp)
 app.register_blueprint(learningprogress_bp)
 app.register_blueprint(homeCover_bp)
+app.register_blueprint(information_bp)
 
 
 @app.route('/')

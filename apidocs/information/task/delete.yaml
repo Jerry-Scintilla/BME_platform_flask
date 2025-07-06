@@ -1,0 +1,37 @@
+删除任务信息
+---
+tags:
+  - 信息管理
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: task_delete
+      required:
+        - id
+      properties:
+        id:
+          type: integer
+          description: 任务信息ID
+
+responses:
+  200:
+    description: 任务删除成功
+  400:
+    description: 请求参数错误
+  401:
+    description: 未授权
+  403:
+    description: 权限不足，仅组长或管理员可删除
+  404:
+    description: 用户或任务信息不存在 
