@@ -304,12 +304,19 @@ def search_courses():
                 # 先将中文逗号替换为英文逗号，然后分割
                 normalized_tags = course.other_tags.replace('，', ',')
                 other_tags_list = [tag.strip() for tag in normalized_tags.split(',') if tag.strip()]
+
+            # 查询章节并统计priority为0的数量
+            sections_count = Chapter.query.filter_by(
+                course_id=course.id,
+                priority=1
+            ).count()
             
             course_info = {
                 'Course_Id': str(course.id),
                 'Course_Title': course.title,
                 'Introduction': course.introduction,
                 'Chapters': course.chapters,
+                'Sections': sections_count,
                 'Course_Tags': course.tags,
                 'Course_Class_Hour': course.class_hour,
                 'Course_Difficulty': course.difficulty,
@@ -330,6 +337,12 @@ def search_courses():
                 "code": 401,
                 'message': "课程不存在"
             }), 401
+
+            # 查询章节并统计priority为0的数量
+        sections_count = Chapter.query.filter_by(
+            course_id=course_id,
+            priority=1
+        ).count()
             
         # 处理other_tags，将逗号分隔的字符串转为数组
         # 同时兼容中文逗号和英文逗号
@@ -345,6 +358,7 @@ def search_courses():
             'Course_Title': course.title,
             'Introduction': course.introduction,
             'Chapters': course.chapters,
+            'Sections': sections_count,
             'Course_Tags': course.tags,
             'Course_Class_Hour': course.class_hour,
             'Course_Difficulty': course.difficulty,

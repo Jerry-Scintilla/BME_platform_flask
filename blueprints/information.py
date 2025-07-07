@@ -272,6 +272,7 @@ def leave_approve():
     # 获取请求数据
     data = request.get_json()
     leave_id = data.get("id")
+    status = data.get("status")
     
     if not leave_id:
         return jsonify({
@@ -316,7 +317,7 @@ def leave_approve():
         }),403
     
     # 更新请假状态为已批准
-    leave.status = 1
+    leave.status = status
     
     # 如果请假开始/结束时间只有日期部分，处理为23:59:59
     if leave.start_time:
@@ -328,7 +329,8 @@ def leave_approve():
     
     return jsonify({
         "code": 200,
-        "message": "请假已批准"
+        "status": status,
+        "message": "请假状态已修改"
     }),200
 
 @bp.route("/information/task/add", methods=["POST"])
