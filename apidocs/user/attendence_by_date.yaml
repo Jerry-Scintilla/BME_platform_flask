@@ -1,0 +1,86 @@
+获取小组成员指定日期区间签到统计
+---
+tags:
+  - 小组管理模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: attendence_by_date
+      required:
+        - group_id
+        - startdate
+      properties:
+        group_id:
+          type: integer
+          description: 小组ID
+        startdate:
+          type: string
+          description: 起始日期，支持格式：年(2024)、年月(2024-03)、年月日(2024-03-15)
+        enddate:
+          type: string
+          description: 结束日期，格式同起始日期，若不提供则根据起始日期格式自动设置：年份格式设为该年最后一天，年月格式设为该月最后一天，完整日期则为当天
+
+responses:
+  200:
+    description: 成功获取签到统计数据
+    schema:
+      properties:
+        code:
+          type: integer
+          description: 状态码
+        message:
+          type: string
+          description: 状态描述
+        data:
+          type: object
+          properties:
+            group_id:
+              type: integer
+              description: 小组ID
+            group_name:
+              type: string
+              description: 小组名称
+            teacher_id:
+              type: integer
+              description: 组长(教师)ID
+            teacher_name:
+              type: string
+              description: 组长(教师)姓名
+            start_date:
+              type: string
+              description: 起始日期，格式为YYYY-MM-DD
+            end_date:
+              type: string
+              description: 结束日期，格式为YYYY-MM-DD
+            members:
+              type: array
+              description: 小组成员签到统计列表
+              items:
+                type: object
+                properties:
+                  student_id:
+                    type: integer
+                    description: 学生ID
+                  student_name:
+                    type: string
+                    description: 学生姓名
+                  check_days:
+                    type: integer
+                    description: 签到天数
+  400:
+    description: 参数错误，可能是小组ID为空、日期格式错误或日期范围无效
+  403:
+    description: 您不是该小组的成员或组长
+  404:
+    description: 用户不存在或小组不存在 

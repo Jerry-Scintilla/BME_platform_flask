@@ -1,0 +1,86 @@
+获取小组成员昨日签到记录
+---
+tags:
+  - 小组管理模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: attendence_yesterday
+      required:
+        - group_id
+      properties:
+        group_id:
+          type: integer
+          description: 小组ID
+
+responses:
+  200:
+    description: 获取小组成员昨日签到记录成功
+    schema:
+      properties:
+        code:
+          type: integer
+          description: 状态码
+        message:
+          type: string
+          description: 状态描述
+        data:
+          type: object
+          properties:
+            group_id:
+              type: integer
+              description: 小组ID
+            group_name:
+              type: string
+              description: 小组名称
+            teacher_id:
+              type: integer
+              description: 组长(教师)ID
+            teacher_name:
+              type: string
+              description: 组长(教师)姓名
+            date:
+              type: string
+              description: 昨日日期，格式为YYYY-MM-DD
+            members:
+              type: array
+              description: 小组成员列表
+              items:
+                type: object
+                properties:
+                  student_id:
+                    type: integer
+                    description: 学生ID
+                  student_name:
+                    type: string
+                    description: 学生姓名
+                  attendance:
+                    type: object
+                    description: 签到记录(如果没有签到记录则为null)
+                    properties:
+                      check_in:
+                        type: string
+                        description: 签到时间，格式为YYYY-MM-DD HH:MM:SS
+                      check_out:
+                        type: string
+                        description: 签退时间，格式为YYYY-MM-DD HH:MM:SS
+                      duration:
+                        type: number
+                        description: 学习时长（小时）
+  400:
+    description: 小组ID不能为空
+  403:
+    description: 您不是该小组的成员或组长
+  404:
+    description: 用户不存在或小组不存在 

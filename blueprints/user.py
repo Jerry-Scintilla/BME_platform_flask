@@ -3,10 +3,10 @@ from flask import Blueprint, request, redirect, jsonify
 import base64
 
 # 导入拓展
-from exts import db
+from exts import db, redis_client
 
 # 导入数据库表
-from models import UserModel, GroupModel, CourseModel, LearningProgressModel
+from models import UserModel, GroupModel, CourseModel, LearningProgressModel, CheckRecord
 
 # 导入表单验证
 from .forms import AvatarForm
@@ -606,4 +606,285 @@ def group_delete():
         "code": 200,
         "message": "删除小组成功"
     })
+
+@bp.route("/group/attendence_yesterday", methods=['POST'])
+@jwt_required()
+@swag_from('../apidocs/user/attendence_yesterday.yaml')
+def attendence_yesterday():
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+
+    # 获取小组ID
+    data = request.get_json()
+    group_id = data.get('group_id')
+    if not group_id:
+        return jsonify({
+            "code": 400,
+            "message": "小组ID不能为空"
+        }), 400
+
+    # 查询小组是否存在
+    group_members = GroupModel.query.filter_by(group_id=group_id).all()
+    if not group_members:
+        return jsonify({
+            "code": 404,
+            "message": "小组不存在"
+        }), 404
+
+    # 获取小组名称和组长信息
+    group_name = group_members[0].name if group_members else "未知小组"
+    teacher_id = group_members[0].teacher_id if group_members else None
+    teacher = UserModel.query.filter_by(id=teacher_id).first()
+    teacher_name = teacher.username if teacher else "未知组长"
+
+    # 验证用户是否为该小组的成员或组长
+    is_teacher = any(group.teacher_id == user.id for group in group_members)
+    is_student = any(group.student_id == user.id for group in group_members)
+
+    if not (is_teacher or is_student):
+        return jsonify({
+            "code": 403,
+            "message": "您不是该小组的成员或组长"
+        }), 403
+
+    # 获取昨天的日期
+    import datetime
+    yesterday = datetime.date.today() - datetime.timedelta(days=1)
+
+    # 收集小组成员信息和签到记录
+    members_attendance = []
+    
+    # 获取所有小组成员
+    student_ids = [group.student_id for group in group_members]
+    
+    # 获取每个成员的信息和签到记录
+    for student_id in student_ids:
+        student = UserModel.query.filter_by(id=student_id).first()
+        if not student:
+            continue
+            
+        # 查找昨天的签到记录
+        check_record = CheckRecord.query.filter_by(
+            user_id=student_id,
+            date=yesterday
+        ).first()
+        
+        # 构建成员信息和签到记录
+        member_info = {
+            "student_id": student_id,
+            "student_name": student.username,
+            "attendance": {
+                "check_in": check_record.check_in.strftime('%Y-%m-%d %H:%M:%S') if check_record and check_record.check_in else None,
+                "check_out": check_record.check_out.strftime('%Y-%m-%d %H:%M:%S') if check_record and check_record.check_out else None,
+                "duration": check_record.duration if check_record else None
+            } if check_record else None
+        }
+        
+        members_attendance.append(member_info)
+    
+    return jsonify({
+        "code": 200,
+        "message": "获取小组成员昨日签到记录成功",
+        "data": {
+            "group_id": group_id,
+            "group_name": group_name,
+            "teacher_id": teacher_id,
+            "teacher_name": teacher_name,
+            "date": yesterday.strftime('%Y-%m-%d'),
+            "members": members_attendance
+        }
+    }), 200
+
+@bp.route("/group/attendence_by_date", methods=['POST'])
+@jwt_required()
+@swag_from('../apidocs/user/attendence_by_date.yaml')
+def attendence_by_date():
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+
+    # 获取请求参数
+    data = request.get_json()
+    group_id = data.get('group_id')
+    start_date_str = data.get('startdate')
+    end_date_str = data.get('enddate')
+
+    if not group_id:
+        return jsonify({
+            "code": 400,
+            "message": "小组ID不能为空"
+        }), 400
+    
+    if not start_date_str:
+        return jsonify({
+            "code": 400,
+            "message": "起始日期不能为空"
+        }), 400
+
+    # 查询小组是否存在
+    group_members = GroupModel.query.filter_by(group_id=group_id).all()
+    if not group_members:
+        return jsonify({
+            "code": 404,
+            "message": "小组不存在"
+        }), 404
+
+    # 获取小组名称和组长信息
+    group_name = group_members[0].name if group_members else "未知小组"
+    teacher_id = group_members[0].teacher_id if group_members else None
+    teacher = UserModel.query.filter_by(id=teacher_id).first()
+    teacher_name = teacher.username if teacher else "未知组长"
+
+    # 验证用户是否为该小组的成员或组长
+    is_teacher = any(group.teacher_id == user.id for group in group_members)
+    is_student = any(group.student_id == user.id for group in group_members)
+
+    if not (is_teacher or is_student):
+        return jsonify({
+            "code": 403,
+            "message": "您不是该小组的成员或组长"
+        }), 403
+
+    # 解析日期
+    import datetime
+    
+    # 处理起始日期
+    try:
+        parts = start_date_str.split('-')
+        if len(parts) == 1:  # 只有年份，如"2024"
+            start_date = datetime.date(int(parts[0]), 1, 1)
+        elif len(parts) == 2:  # 有年份和月份，如"2024-03"
+            start_date = datetime.date(int(parts[0]), int(parts[1]), 1)
+        else:  # 完整日期，如"2024-03-15"
+            start_date = datetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return jsonify({
+            "code": 400,
+            "message": "起始日期格式错误"
+        }), 400
+
+    # 处理结束日期
+    if not end_date_str:
+        # 如果没有提供结束日期，根据起始日期格式决定结束日期
+        start_parts = start_date_str.split('-')
+        if len(start_parts) == 1:  # 只有年份，如"2024"
+            # 使用该年的最后一天
+            end_date = datetime.date(int(start_parts[0]), 12, 31)
+        elif len(start_parts) == 2:  # 有年份和月份，如"2024-03"
+            # 获取该月的最后一天
+            year = int(start_parts[0])
+            month = int(start_parts[1])
+            if month == 12:  # 12月
+                last_day = 31
+            else:
+                # 下个月的第一天减去一天
+                next_month = datetime.date(year, month + 1, 1)
+                last_day = (next_month - datetime.timedelta(days=1)).day
+            end_date = datetime.date(year, month, last_day)
+        else:  # 完整日期，如"2024-03-15"
+            # 使用起始日期当天
+            end_date = start_date
+    else:
+        try:
+            parts = end_date_str.split('-')
+            if len(parts) == 1:  # 只有年份，如"2024"
+                end_date = datetime.date(int(parts[0]), 12, 31)  # 年份的最后一天
+            elif len(parts) == 2:  # 有年份和月份，如"2024-03"
+                # 获取该月的最后一天
+                if int(parts[1]) == 12:  # 12月
+                    last_day = 31
+                else:
+                    # 下个月的第一天减去一天
+                    next_month = datetime.date(int(parts[0]), int(parts[1]) + 1, 1)
+                    last_day = (next_month - datetime.timedelta(days=1)).day
+                end_date = datetime.date(int(parts[0]), int(parts[1]), last_day)
+            else:  # 完整日期，如"2024-03-15"
+                end_date = datetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+        except ValueError:
+            return jsonify({
+                "code": 400,
+                "message": "结束日期格式错误"
+            }), 400
+
+    # 检查日期范围是否有效
+    if start_date > end_date:
+        return jsonify({
+            "code": 400,
+            "message": "起始日期不能晚于结束日期"
+        }), 400
+    
+    # 构建缓存键
+    cache_key = f"group_{group_id}_{start_date}_{end_date}"
+    
+    # 尝试从缓存获取数据
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        import json
+        return jsonify({
+            "code": 200,
+            "message": "成功获取缓存的签到统计数据",
+            "data": json.loads(cached_data)
+        }), 200
+    
+    # 获取所有小组成员
+    student_ids = [group.student_id for group in group_members]
+    
+    # 统计每个成员在日期范围内的签到情况
+    members_attendance = []
+    for student_id in student_ids:
+        student = UserModel.query.filter_by(id=student_id).first()
+        if not student:
+            continue
+            
+        # 查询该学生在日期范围内的签到记录
+        check_records = CheckRecord.query.filter(
+            CheckRecord.user_id == student_id,
+            CheckRecord.date >= start_date,
+            CheckRecord.date <= end_date
+        ).all()
+        
+        # 统计签到天数
+        check_days = len(check_records)
+        
+        # 构建成员签到统计
+        member_info = {
+            "student_id": student_id,
+            "student_name": student.username,
+            "check_days": check_days
+        }
+        
+        members_attendance.append(member_info)
+    
+    # 构建返回数据
+    result = {
+        "group_id": group_id,
+        "group_name": group_name,
+        "teacher_id": teacher_id,
+        "teacher_name": teacher_name,
+        "start_date": start_date.strftime('%Y-%m-%d'),
+        "end_date": end_date.strftime('%Y-%m-%d'),
+        "members": members_attendance
+    }
+    
+    # 缓存数据（设置30分钟过期）
+    import json
+    redis_client.setex(cache_key, 1800, json.dumps(result))
+    
+    return jsonify({
+        "code": 200,
+        "message": "成功获取签到统计数据",
+        "data": result
+    }), 200
+
 
