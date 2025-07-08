@@ -200,7 +200,7 @@ class InformationModel(db.Model):
     __tablename__ = 'information'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     # 公共字段
-    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=False)
+    group_id = db.Column(db.Integer, nullable=False)
     type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息
     title = db.Column(db.String(100), nullable=False)
     content = db.Column(db.Text)

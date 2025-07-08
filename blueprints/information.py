@@ -195,16 +195,19 @@ def leave_query():
         query = query.filter_by(group_id=group_id)
     else:
         # 先尝试作为学生查询
-        student_query = query.filter_by(student_id=user.id)
-        student_leaves = student_query.all()
-        
+        student_groups = GroupModel.query.filter_by(student_id=user.id).all()
+        student_group_ids = [group.group_id for group in student_groups]
 
-        # 用户没有请假记录，尝试作为教师查询
+        # 再查询作为教师负责的小组
         teacher_groups = GroupModel.query.filter_by(teacher_id=user.id).all()
-        if teacher_groups:
-            # 如果是教师，查询所有负责小组的请假信息
-            group_ids = [group.group_id for group in teacher_groups]
-            query = query.filter(InformationModel.group_id.in_(group_ids))
+        teacher_group_ids = [group.group_id for group in teacher_groups]
+        
+        # 合并学生和教师的小组ID
+        all_group_ids = list(set(student_group_ids + teacher_group_ids))
+        
+        if all_group_ids:
+            # 如果用户有相关小组，查询这些小组的请假信息
+            query = query.filter(InformationModel.group_id.in_(all_group_ids))
         else:
             # 既不是学生也不是教师，返回空列表
             return jsonify({
@@ -216,6 +219,9 @@ def leave_query():
     # 根据状态筛选
     if status is not None:  # 0和1都是有效值
         query = query.filter_by(status=status)
+
+    if group_id is not None:
+        query = query.filter_by(group_id=group_id)
     
     # 执行查询并按创建时间倒序排序
     leaves = query.order_by(InformationModel.create_time.desc()).all()
@@ -556,9 +562,11 @@ def task_query():
     tasks = query.order_by(InformationModel.create_time.desc()).all()
     
     # 构建返回数据，按优先级分组
-    high_priority = []   # 优先级1-2
+    urgent_priority = [] # 优先级1
+    high_priority = []   # 优先级2
     medium_priority = [] # 优先级3
-    low_priority = []    # 优先级4-5
+    low_priority = []    # 优先级4
+    unimportant_priority = [] # 优先级5
     
     for task in tasks:
         # 获取所属小组信息
@@ -583,20 +591,26 @@ def task_query():
             priority_value = 3  # 默认为中等优先级
         
         # 根据优先级分组
-        if priority_value <= 2:
+        if priority_value == 1:
+            urgent_priority.append(task_data)
+        elif priority_value == 2:
             high_priority.append(task_data)
         elif priority_value == 3:
             medium_priority.append(task_data)
-        else:
+        elif priority_value == 4:
             low_priority.append(task_data)
+        elif priority_value == 5:
+            unimportant_priority.append(task_data)
     
     return jsonify({
         "code": 200,
         "message": "查询成功",
         "data": {
+            "urgent_priority": urgent_priority,
             "high_priority": high_priority,
             "medium_priority": medium_priority,
-            "low_priority": low_priority
+            "low_priority": low_priority,
+            "unimportant_priority": unimportant_priority
         }
     }),200
 

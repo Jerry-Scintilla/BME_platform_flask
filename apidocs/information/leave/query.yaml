@@ -13,7 +13,7 @@ parameters:
     in: query
     type: integer
     required: false
-    description: 小组ID，用于管理员筛选特定小组的请假信息（仅管理员可用）
+    description: 小组ID，用于管理员和用户筛选特定小组的请假信息
   - name: status
     in: query
     type: integer
