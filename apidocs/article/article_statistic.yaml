@@ -1,0 +1,124 @@
+文章浏览点赞统计模块
+---
+tags:
+  - 文章模块
+
+get:
+  tags:
+    - 文章模块
+  summary: 获取文章统计信息
+  parameters:
+    - name: Authorization
+      in: header
+      type: string
+      required: false
+      description: token (可选)
+    - name: Article_Id
+      in: query
+      type: string
+      required: true
+      description: 文章ID
+    - name: user
+      in: query
+      type: string
+      required: false
+      description: 是否检查用户状态
+  responses:
+    200:
+      description: 统计数据获取成功
+      schema:
+        type: object
+        properties:
+          code:
+            type: integer
+            example: 200
+          message:
+            type: string
+            example: "统计数据获取成功"
+          view_count:
+            type: integer
+            description: 浏览总数
+          like_count:
+            type: integer
+            description: 点赞总数
+          user_viewed:
+            type: boolean
+            description: 用户是否浏览过
+          user_liked:
+            type: boolean
+            description: 用户是否点赞过
+    400:
+      description: 参数错误或文章不存在
+      schema:
+        type: object
+        properties:
+          code:
+            type: integer
+            example: 400
+          message:
+            type: string
+            example: "缺少Article_Id参数"
+
+post:
+  tags:
+    - 文章模块
+  summary: 更新文章统计信息
+  consumes:
+    - application/json
+  parameters:
+    - name: Authorization
+      in: header
+      type: string
+      required: true
+      description: token
+    - name: body
+      in: body
+      required: true
+      schema:
+        type: object
+        required:
+          - Article_Id
+        properties:
+          Article_Id:
+            type: string
+            description: 文章ID
+          like:
+            type: boolean
+            description: 是否点赞
+          view:
+            type: boolean
+            description: 是否浏览
+  responses:
+    200:
+      description: 文章统计成功
+      schema:
+        type: object
+        properties:
+          code:
+            type: integer
+            example: 200
+          message:
+            type: string
+            example: "文章统计成功"
+    400:
+      description: 参数错误或文章不存在
+      schema:
+        type: object
+        properties:
+          code:
+            type: integer
+            example: 400
+          message:
+            type: string
+            example: "不能先点赞再浏览文章"
+    401:
+      description: 用户未认证或不存在
+      schema:
+        type: object
+        properties:
+          code:
+            type: integer
+            example: 401
+          message:
+            type: string
+            example: "用户未认证"

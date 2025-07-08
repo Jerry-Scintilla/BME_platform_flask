@@ -76,10 +76,10 @@ def public():
 
     else:
         data = {
-            "code": 401,
+            "code": 402,
             "message": form.errors,
         }
-    return jsonify(data), 401
+    return jsonify(data), 402
 
 
 @bp.route("/course/edit", methods=["POST"])
@@ -146,10 +146,10 @@ def course_edit():
 
     else:
         data = {
-            "code": 401,
+            "code": 402,
             "message": form.errors,
         }
-        return jsonify(data), 401
+        return jsonify(data), 402
 
 
 # 展示所有课程
@@ -219,9 +219,9 @@ def chapter_public():
         })
     else:
         data = {
-            "code": 401,
+            "code": 402,
             "message": form.errors,
-        }, 401
+        }, 402
         return jsonify(data)
 
 
@@ -238,9 +238,9 @@ def chapter_list():
     a_list = Chapter.query.filter_by(course_id=course_id).order_by(Chapter.order).all()
     if not a_list:
         return jsonify({
-            "code": 401,
+            "code": 402,
             "message": "课程不存在",
-        }), 401
+        }), 402
     data = []
     for chapter in a_list:
         b_list = {'Chapter_Name': chapter.name,
@@ -270,9 +270,9 @@ def course_delete():
     courses = CourseModel.query.filter_by(id=course_id).first()
     if courses is None:
         return jsonify({
-            "code": 401,
+            "code": 402,
             'message': "课程不存在"
-        }), 401
+        }), 402
     chapter = Chapter.query.filter_by(course_id=course_id).delete()
     db.session.delete(courses)
     db.session.commit()
@@ -292,9 +292,9 @@ def search_courses():
         courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%')).all()
         if not courses:
             return jsonify({
-                "code": 401,
+                "code": 402,
                 'message': "课程不存在"
-            }), 401
+            }), 402
         course_list = []
         for course in courses:
             # 处理other_tags，将逗号分隔的字符串转为数组
@@ -334,9 +334,9 @@ def search_courses():
         course = CourseModel.query.filter_by(id=course_id).first()
         if course is None:
             return jsonify({
-                "code": 401,
+                "code": 402,
                 'message': "课程不存在"
-            }), 401
+            }), 402
 
             # 查询章节并统计priority为0的数量
         sections_count = Chapter.query.filter_by(
@@ -388,9 +388,9 @@ def book_upgrade():
     course_id = request.form.get('Course_Id')
     if book is None:  # 表示没有发送文件
         return jsonify({
-            "code": 401,
+            "code": 402,
             'message': "没有发送文件"
-        }), 401
+        }), 402
 
     if course_id is None:  # 表示没有发送课程 ID
         return jsonify({
@@ -433,9 +433,9 @@ def book_down():
         url = course.url
         if url is None:
             return jsonify({
-                "code": 401,
+                "code": 402,
                 'message': "课程pdf不存在"
-            }), 401
+            }), 402
         """生成下载码路由（包含所有逻辑）"""
         # 获取客户端IP
         if request.headers.getlist("X-Forwarded-For"):
@@ -474,7 +474,7 @@ def book_download():
         stored_value = redis_client.get(f"download_code:{Down_Code}")
         if stored_value is None:
             return jsonify({
-                "code": 401,
+                "code": 402,
                'message': "下载码不存在或已过期"
             })
         stored_ip, stored_course_id = stored_value.decode('utf-8').split(':')

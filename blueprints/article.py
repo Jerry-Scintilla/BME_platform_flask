@@ -6,7 +6,7 @@ import calendar, time, os
 from exts import db
 
 # 导入数据库表
-from models import ArticleModel, UserModel
+from models import ArticleModel, UserModel, ArticleComment
 
 # 导入表单验证
 from .forms import ArticleForm
@@ -209,6 +209,11 @@ def article_delete():
     url = article.url
     os.remove('./data/article/' + url)
 
+    # 删除文章统计量
+    comments = ArticleComment.query.filter_by(article_id=article_id).all()
+    for comment in comments:
+        db.session.delete(comment)
+        db.session.commit()
     db.session.delete(article)
     db.session.commit()
 
@@ -299,3 +304,113 @@ def article_edit():
         "code": 200,
         "message": "文章编辑成功"
     })
+
+
+@bp.route("/article/statistic", methods=["GET", "POST"])
+@jwt_required(optional=True)
+@swag_from('../apidocs/article/article_statistic.yaml')
+def article_statistic():
+    if request.method == 'GET':
+        # 获取文章ID
+        article_id = request.args.get('Article_Id')
+        user = request.args.get('user')
+        if not article_id:
+            return jsonify({
+                "code": 400,
+                "message": "缺少Article_Id参数"
+            }), 400
+        # 查询统计数据
+        article_ = ArticleModel.query.filter_by(id=article_id).first()
+        if article_ is None:
+            return jsonify({
+                "code": 400,
+                "message": "文章不存在"
+            }), 400
+        comments = ArticleComment.query.filter_by(article_id=article_id).all()
+        view_count = len(comments)
+        like_count = sum(1 for comment in comments if comment.like_time is not None)
+
+        # 初始化用户相关状态
+        user_viewed = False
+        user_liked = False
+
+        if user:
+            user_email = get_jwt_identity()
+            user_ = UserModel.query.filter_by(email=user_email).first()
+            if user_:
+                # 查询用户对该文章的记录
+                user_comment = ArticleComment.query.filter_by(
+                    article_id=article_id,
+                    user_id=user_.id
+                ).first()
+
+                if user_comment:
+                    user_viewed = user_comment.view_time is not None
+                    user_liked = user_comment.like_time is not None
+        return jsonify({
+            "code": 200,
+            "message": "统计数据获取成功",
+            "view_count": view_count,
+            "like_count": like_count,
+            "user_viewed": user_viewed,
+            "user_liked": user_liked
+        }), 200
+
+    else:
+        # POST请求处理
+        user_email = get_jwt_identity()
+        if not user_email:
+            return jsonify({
+                "code": 401,
+                "message": "用户未认证"
+            }), 401
+            
+        user = UserModel.query.filter_by(email=user_email).first()
+        if not user:
+            return jsonify({
+                "code": 401,
+                "message": "用户不存在"
+            }), 401
+
+        like = request.json.get('like')
+        view = request.json.get('view')
+        article_id = request.json.get('Article_Id')
+
+        article_ = ArticleModel.query.filter_by(id=article_id).first()
+        if article_ is None:
+            return jsonify({
+                "code": 400,
+                "message": "文章不存在"
+            }), 400
+
+        if view:
+            # 先检查是否已存在浏览记录
+            existing_comment = ArticleComment.query.filter_by(
+                article_id=article_id,
+                user_id=user.id
+            ).first()
+            if not existing_comment:
+                view_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                article_comment = ArticleComment(view_time=view_time, article_id=article_id, user_id=user.id)
+                db.session.add(article_comment)
+                db.session.commit()
+
+        article_comment = ArticleComment.query.filter_by(article_id=article_id, user_id=user.id).first()
+        article_comment.like_time = None
+        db.session.commit()
+        if like:
+            like_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+            statistic = ArticleComment.query.filter_by(article_id=article_id, user_id=user.id).first()
+            if statistic is None:
+                return jsonify({
+                    "code": 400,
+                    "message": '不能先点赞再浏览文章'
+                }), 400
+            statistic.like_time = like_time
+            db.session.commit()
+            
+        return jsonify({
+            "code": 200,
+            "message": "文章统计成功"
+        }), 200
+

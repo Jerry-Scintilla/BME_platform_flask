@@ -16,7 +16,7 @@ parameters:
     in: body
     required: true
     schema:
-      id: article_detail_json
+      id: article_statistic
       required:
         - name
       properties:

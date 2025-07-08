@@ -253,3 +253,12 @@ class InformationModel(db.Model):
         return None
 
 
+class ArticleComment(db.Model):
+    __tablename__ = 'article_comment'
+    id = db.Column(db.Integer, primary_key=True)
+    like_time = db.Column(db.DateTime)  # 点赞时间
+    view_time = db.Column(db.DateTime)  # 浏览时间
+    article_id = db.Column(db.Integer, db.ForeignKey('article.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+
+
