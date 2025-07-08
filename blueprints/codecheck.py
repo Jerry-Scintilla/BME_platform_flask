@@ -110,6 +110,9 @@ def check_in_out():
         )
         db.session.add(record)
 
+        # 签到成功后删除该用户的最新记录缓存
+        redis_client.delete(f"latest_check:{user.id}")
+
     else:
         # 查找最近未签退的记录
         record = CheckRecord.query.filter(
@@ -123,6 +126,9 @@ def check_in_out():
 
         record.check_out = now
         record.duration = (now - record.check_in).total_seconds() / 3600
+        
+        # 签退成功后删除该用户的最新记录缓存
+        redis_client.delete(f"latest_check:{user.id}")
 
     # 标记验证码已使用
     redis_client.hset(code_key, 'used', '1')
@@ -500,4 +506,51 @@ def weekly_records():
     # 将结果存入Redis，有效期1小时
     redis_client.setex(cache_key, timedelta(hours=1), json.dumps(result))
 
+    return jsonify(result)
+
+
+@bp.route('/lateset_checktime', methods=['GET'])
+@jwt_required()
+@swag_from('../apidocs/codecheck/lateset_checktime.yaml')
+def lateset_checktime():
+    # 从JWT中获取用户邮箱
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    
+    # 定义Redis缓存键
+    cache_key = f"latest_check:{user.id}"
+    
+    # 尝试从Redis获取缓存
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        # 如果缓存存在，直接返回缓存数据
+        return jsonify(json.loads(cached_data))
+    
+    # 缓存未命中，从数据库查询
+    latest_record = CheckRecord.query.filter(
+        CheckRecord.user_id == user.id
+    ).order_by(CheckRecord.check_in.desc()).first()
+    
+    # 如果没有记录，返回空结果
+    if not latest_record:
+        result = {
+            "user_id": user.id,
+            "username": user.username,
+            "has_record": False
+        }
+    else:
+        # 构建结果
+        result = {
+            "user_id": user.id,
+            "username": user.username,
+            "has_record": True,
+            "check_in_time": latest_record.check_in.strftime("%Y-%m-%d %H:%M:%S") if latest_record.check_in else None,
+            "check_out_time": latest_record.check_out.strftime("%Y-%m-%d %H:%M:%S") if latest_record.check_out else None,
+            "duration": round(latest_record.duration, 2) if latest_record.duration else None,
+            "date": latest_record.date.strftime("%Y-%m-%d") if latest_record.date else None
+        }
+    
+    # 将结果存入Redis，设置1小时过期时间
+    redis_client.setex(cache_key, timedelta(hours=24), json.dumps(result))
+    
     return jsonify(result)

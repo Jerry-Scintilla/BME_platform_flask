@@ -1,2 +1,13 @@
 /migrations/
 
+# PyCharm项目文件
+.idea/
+.idea/*
+
+# Python编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
