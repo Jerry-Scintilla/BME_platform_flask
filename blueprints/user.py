@@ -725,7 +725,7 @@ def attendence_by_date():
             "code": 400,
             "message": "小组ID不能为空"
         }), 400
-    
+
     if not start_date_str:
         return jsonify({
             "code": 400,
@@ -758,7 +758,7 @@ def attendence_by_date():
 
     # 解析日期
     import datetime
-    
+
     # 处理起始日期
     try:
         parts = start_date_str.split('-')
@@ -823,10 +823,10 @@ def attendence_by_date():
             "code": 400,
             "message": "起始日期不能晚于结束日期"
         }), 400
-    
+
     # 构建缓存键
     cache_key = f"group_{group_id}_{start_date}_{end_date}"
-    
+
     # 尝试从缓存获取数据
     cached_data = redis_client.get(cache_key)
     if cached_data:
@@ -836,36 +836,91 @@ def attendence_by_date():
             "message": "成功获取缓存的签到统计数据",
             "data": json.loads(cached_data)
         }), 200
-    
+
     # 获取所有小组成员
     student_ids = [group.student_id for group in group_members]
-    
+
     # 统计每个成员在日期范围内的签到情况
     members_attendance = []
     for student_id in student_ids:
         student = UserModel.query.filter_by(id=student_id).first()
         if not student:
             continue
-            
+
         # 查询该学生在日期范围内的签到记录
         check_records = CheckRecord.query.filter(
             CheckRecord.user_id == student_id,
             CheckRecord.date >= start_date,
             CheckRecord.date <= end_date
         ).all()
+
+        # 按日期分组签到记录
+        from collections import defaultdict
+        daily_checkins = defaultdict(list)
+        for record in check_records:
+            date_str = record.date.strftime('%Y-%m-%d')
+            daily_checkins[date_str].append(record)
         
+        # 计算每天的签到签退时间差并累加
+        daily_attendance = []
+        for date_str, records in daily_checkins.items():
+            total_duration_seconds = 0
+            checkin_records = []
+            checkout_records = []
+            
+            # 分离签到和签退记录
+            for record in records:
+                if record.check_in:
+                    checkin_records.append(record.check_in)
+                if record.check_out:
+                    checkout_records.append(record.check_out)
+            
+            # 确保签到和签退记录成对出现
+            pair_count = min(len(checkin_records), len(checkout_records))
+            
+            # 计算每对签到签退的时间差并累加
+            for i in range(pair_count):
+                checkin_time = checkin_records[i]
+                checkout_time = checkout_records[i]
+                
+                # 转换为datetime对象以便计算
+                checkin_dt = datetime.datetime.strptime(checkin_time.strftime('%H:%M:%S'), '%H:%M:%S')
+                checkout_dt = datetime.datetime.strptime(checkout_time.strftime('%H:%M:%S'), '%H:%M:%S')
+                
+                # 计算时间差
+                duration = checkout_dt - checkin_dt
+                total_duration_seconds += duration.total_seconds()
+            
+            # 格式化总时长
+            total_minutes = total_duration_seconds // 60
+            hours = int(total_minutes // 60)
+            minutes = int(total_minutes % 60)
+            duration_str = f"{hours}小时{minutes}分钟"
+            
+            # 获取最早签到和最晚签退时间
+            earliest_checkin = min(checkin_records).strftime('%H:%M:%S') if checkin_records else None
+            latest_checkout = max(checkout_records).strftime('%H:%M:%S') if checkout_records else None
+            
+            daily_attendance.append({
+                "date": date_str,
+                "earliest_checkin_time": earliest_checkin,
+                "latest_checkout_time": latest_checkout,
+                "total_checkin_duration": duration_str
+            })
+
         # 统计签到天数
         check_days = len(check_records)
-        
+
         # 构建成员签到统计
         member_info = {
             "student_id": student_id,
             "student_name": student.username,
-            "check_days": check_days
+            "check_days": check_days,
+            "daily_attendance": daily_attendance
         }
-        
+
         members_attendance.append(member_info)
-    
+
     # 构建返回数据
     result = {
         "group_id": group_id,
@@ -876,15 +931,13 @@ def attendence_by_date():
         "end_date": end_date.strftime('%Y-%m-%d'),
         "members": members_attendance
     }
-    
+
     # 缓存数据（设置30分钟过期）
     import json
     redis_client.setex(cache_key, 1800, json.dumps(result))
-    
+
     return jsonify({
         "code": 200,
         "message": "成功获取签到统计数据",
         "data": result
     }), 200
-
-

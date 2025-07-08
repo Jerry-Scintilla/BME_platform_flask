@@ -99,7 +99,7 @@ def check_in_out():
             if time_diff <= 6:
                 return jsonify({"error": "已有未签退记录且未超过6小时"}), 403
 
-            # 超过4小时则删除所有未签退记录
+            # 超过6小时则删除所有未签退记录
             for record in records:
                 db.session.delete(record)
 
@@ -124,8 +124,13 @@ def check_in_out():
         if not record:
             return jsonify({"error": "没有签到记录"}), 402
 
-        record.check_out = now
         record.duration = (now - record.check_in).total_seconds() / 3600
+
+        # 如果时长超过6小时则删除记录，否则更新签退时间
+        if record.duration > 6:
+            db.session.delete(record)
+        else:
+            record.check_out = now
         
         # 签退成功后删除该用户的最新记录缓存
         redis_client.delete(f"latest_check:{user.id}")
