@@ -141,21 +141,6 @@ def login():
                 data = {
                     "code": code,
                     "message": msg,
-                    "token": token,
-                    "User_Name": User_Name,
-                    "User_Email": User_Email,
-                    "User_Medal": User_Medal,
-                    "User_Stage": User_Stage,
-                    "User_Mode": User_Mode,
-                    "join_time": User_Time,
-                    "User_Id": User_Id,
-                    "Student_Id": Student_Id,
-                    "Introduction": Introduction,
-                    "User_Sex": User_Sex,
-                    "Institute": Institute,
-                    "Major": Major,
-                    "Github_Id": Github_Id,
-                    "Skill_Tags": Skill_Tags,
                 }
                 return jsonify(data),402
 

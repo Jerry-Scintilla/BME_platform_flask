@@ -1,0 +1,31 @@
+删除报错信息
+---
+tags:
+  - 信息管理
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: 报错信息ID
+
+responses:
+  200:
+    description: 报错信息删除成功
+  400:
+    description: 报错ID不能为空
+  403:
+    description: 无权删除此报错信息，仅报错人本人可删除
+  404:
+    description: 报错信息不存在 

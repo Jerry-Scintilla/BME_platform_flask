@@ -1,5 +1,6 @@
 import os
 import datetime
+import base64 # Added for error image handling
 
 from flask import Blueprint, request, jsonify
 
@@ -1162,3 +1163,211 @@ def information_query_all():
             "notice": notices
         }
     }), 200
+
+@bp.route("/information/error/add", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/error/add.yaml')
+def error_add():
+    """
+    添加报错信息
+    """
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 获取表单数据
+    title = request.form.get('title')
+    content = request.form.get('content')
+    
+    if not title:
+        return jsonify({
+            "code": 400,
+            "message": "报错标题不能为空"
+        }), 400
+    
+    # 创建报错信息
+    error_info = InformationModel(
+        group_id=0,  # 报错信息不属于任何小组
+        type=4,  # 4代表报错信息
+        title=title,
+        content=content,
+        student_id=user.id,  # 记录报错用户ID
+        resource=None  # 初始时没有图片资源
+    )
+    
+    db.session.add(error_info)
+    db.session.commit()
+    
+    # 处理图片上传
+    if 'image' in request.files:
+        file = request.files['image']
+        if file and file.filename:
+            # 确保目录存在
+            os.makedirs('./data/error_images', exist_ok=True)
+            
+            # 保存图片
+            filename = f"{error_info.id}.{file.filename.rsplit('.', 1)[1].lower()}"
+            file_path = os.path.join('./data/error_images', filename)
+            file.save(file_path)
+            
+            # 更新数据库中的资源路径
+            error_info.resource = filename
+            db.session.commit()
+            
+            # 将图片缓存到Redis
+            try:
+                with open(file_path, 'rb') as image_file:
+                    image_stream = image_file.read()
+                    image_base64 = base64.b64encode(image_stream).decode()
+                    
+                    # 缓存到Redis（7天过期）
+                    cache_key = f"error_image:base64:{error_info.id}"
+                    redis_client.setex(cache_key, 60*60*24*7, image_base64)
+            except Exception as e:
+                print(f"图片缓存失败: {str(e)}")
+    
+    return jsonify({
+        "code": 200,
+        "message": "报错信息提交成功",
+        "data": {
+            "id": error_info.id
+        }
+    })
+
+@bp.route("/information/error/query", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/information/error/query.yaml')
+def error_query():
+    """
+    查询用户自己的报错信息
+    """
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查询用户的报错信息
+    errors = InformationModel.query.filter_by(
+        type=4,  # 4代表报错信息
+        student_id=user.id  # 只能查看自己的报错
+    ).order_by(InformationModel.create_time.desc()).all()
+    
+    result = []
+    for error in errors:
+        error_data = {
+            "id": error.id,
+            "title": error.title,
+            "content": error.content,
+            "create_time": error.create_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "has_image": bool(error.resource)
+        }
+        
+        # 如果有图片资源，获取图片的Base64编码
+        if error.resource:
+            # 定义Redis缓存键
+            cache_key = f"error_image:base64:{error.id}"
+            
+            # 尝试从Redis缓存中获取Base64编码
+            cached_base64 = redis_client.get(cache_key)
+            
+            if cached_base64:
+                error_data["image"] = cached_base64.decode('utf-8')
+            else:
+                # 如果缓存未命中，从文件系统读取
+                image_path = os.path.join('./data/error_images', error.resource)
+                if os.path.exists(image_path):
+                    try:
+                        with open(image_path, 'rb') as image_file:
+                            image_stream = image_file.read()
+                            image_base64 = base64.b64encode(image_stream).decode()
+                            
+                            # 缓存到Redis
+                            redis_client.setex(cache_key, 60*60*24*7, image_base64)
+                            
+                            error_data["image"] = image_base64
+                    except Exception as e:
+                        print(f"读取图片失败: {str(e)}")
+        
+        result.append(error_data)
+    
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": result
+    })
+
+@bp.route("/information/error/delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/error/delete.yaml')
+def error_delete():
+    """
+    删除报错信息
+    """
+    # 获取请求数据
+    data = request.get_json()
+    error_id = data.get("id")
+    
+    if not error_id:
+        return jsonify({
+            "code": 400,
+            "message": "报错ID不能为空"
+        }), 400
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查找报错信息
+    error = InformationModel.query.filter_by(id=error_id, type=4).first()
+    
+    if not error:
+        return jsonify({
+            "code": 404,
+            "message": "报错信息不存在"
+        }), 404
+    
+    # 验证删除权限：只有报错人自己可以删除
+    if error.student_id != user.id:
+        return jsonify({
+            "code": 403,
+            "message": "无权删除此报错信息，仅报错人本人可删除"
+        }), 403
+    
+    # 如果有图片资源，删除相关文件和缓存
+    if error.resource:
+        # 删除图片文件
+        image_path = os.path.join('./data/error_images', error.resource)
+        if os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                print(f"删除图片文件失败: {str(e)}")
+        
+        # 删除Redis缓存
+        cache_key = f"error_image:base64:{error.id}"
+        redis_client.delete(cache_key)
+    
+    # 删除报错信息
+    db.session.delete(error)
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "报错信息删除成功"
+    })
+
+

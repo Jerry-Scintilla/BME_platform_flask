@@ -39,20 +39,28 @@ def generate_check_code():
         return jsonify({"error": "不正确的签码类型，类型需为check_in, check_out"}), 401
 
     # 生成并存储到Redis（自动过期）
+    # 使用时间戳+随机数确保唯一性
+    import time
+    timestamp = int(time.time())
     code = str(random.randint(100000, 999999))
+    unique_key = f'check_code:{code_type}:{timestamp}:{code}'
+    
     pipe = redis_client.pipeline()
-    pipe.hset(f'check_code:{code}', mapping={
+    pipe.hset(unique_key, mapping={
         'type': code_type,
         'generator_id': user.id,
-        'used': '0'
+        'used': '0',
+        'timestamp': timestamp
     })
-    pipe.expire(f'check_code:{code}', 300)  # 5分钟过期
+    # 添加一个额外的键用于反查，将简单验证码映射到完整键名
+    pipe.set(f'check_code_lookup:{code}', unique_key, ex=300)  # 5分钟过期
+    pipe.expire(unique_key, 300)  # 5分钟过期
     pipe.execute()
 
     return jsonify({
         "code": 200,
         "message": "签码生成成功",
-        "check_code": code,
+        "check_code": code,  # 只返回简单的6位数字码
         "expires_in": "5min",
         "type": code_type
     })
@@ -67,12 +75,22 @@ def check_in_out():
     user = UserModel.query.filter_by(email=user_email).first()
     code = request.json.get('check_code')
 
-    # 从Redis获取验证码
-    code_key = f'check_code:{code}'
-    code_data = redis_client.hgetall(code_key)
+    # 通过查找表获取完整的键名
+    lookup_key = f'check_code_lookup:{code}'
+    full_key = redis_client.get(lookup_key)
+    
+    if not full_key:
+        return jsonify({"error": "不存在的签码或签码已过期"}), 400
+        
+    # 解码为字符串
+    if isinstance(full_key, bytes):
+        full_key = full_key.decode()
+    
+    # 从Redis获取验证码详细信息
+    code_data = redis_client.hgetall(full_key)
 
     if not code_data:
-        return jsonify({"error": "不存在的签码"}), 400
+        return jsonify({"error": "不存在的签码或签码已过期"}), 400
 
     # 转换为字符串
     code_data = {k.decode(): v.decode() for k, v in code_data.items()}
@@ -118,20 +136,19 @@ def check_in_out():
         record = CheckRecord.query.filter(
             CheckRecord.user_id == user.id,
             CheckRecord.check_out.is_(None),
-            CheckRecord.date == now.date()
         ).order_by(CheckRecord.check_in.desc()).first()
 
         if not record:
-            return jsonify({"error": "没有签到记录"}), 402
+            return jsonify({"error": "没有签到记录"}), 409
 
         record.check_out = now
         record.duration = (now - record.check_in).total_seconds() / 3600
         
         # 签退成功后删除该用户的最新记录缓存
         redis_client.delete(f"latest_check:{user.id}")
+        # 标记验证码已使用
+        redis_client.hset(full_key, 'used', '1')
 
-    # 标记验证码已使用
-    redis_client.hset(code_key, 'used', '1')
     db.session.commit()
 
     return jsonify({"message": "签到/签退成功"})

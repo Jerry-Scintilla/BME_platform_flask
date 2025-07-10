@@ -201,7 +201,7 @@ class InformationModel(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     # 公共字段
     group_id = db.Column(db.Integer, nullable=False)
-    type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息
+    type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息, 4: 报错信息
     title = db.Column(db.String(100), nullable=False)
     content = db.Column(db.Text)
     create_time = db.Column(db.DateTime, default=datetime.now)
@@ -217,6 +217,9 @@ class InformationModel(db.Model):
     
     # 通知信息特有字段
     range = db.Column(db.String(100)) # 如果对应多个用户id，就用逗号隔开，如果是小组全选，则为0
+
+    # 报错信息特有字段
+    resource = db.Column(db.String(100)) # 资源链接
     
     def get_info_by_type(self):
         """
@@ -248,6 +251,15 @@ class InformationModel(db.Model):
                 'title': self.title,
                 'content': self.content,
                 'range': self.range,
+                'create_time': self.create_time
+            }
+        elif self.type == 4:  # 报错信息
+            return {
+                'id': self.id,
+                'title': self.title,
+                'content': self.content,
+                'resource': self.resource,
+                'student_id': self.student_id,
                 'create_time': self.create_time
             }
         return None
