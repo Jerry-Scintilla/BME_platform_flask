@@ -214,6 +214,7 @@ class InformationModel(db.Model):
     
     # 任务信息特有字段
     priority = db.Column(db.Integer)  # 1-5, 数字越小优先级越高
+    students_id = db.Column(db.String(100)) # 如果对应多个用户id，就用逗号隔开
     
     # 通知信息特有字段
     range = db.Column(db.String(100)) # 如果对应多个用户id，就用逗号隔开，如果是小组全选，则为0
@@ -243,7 +244,8 @@ class InformationModel(db.Model):
                 'content': self.content,
                 'end_time': self.end_time,
                 'priority': self.priority,
-                'create_time': self.create_time
+                'create_time': self.create_time,
+                'students_id': self.students_id
             }
         elif self.type == 3:  # 通知信息
             return {
@@ -262,6 +264,18 @@ class InformationModel(db.Model):
                 'student_id': self.student_id,
                 'create_time': self.create_time
             }
+        elif self.type == 5:  # 作业信息
+            return {
+                'id': self.id,
+                'title': self.title,
+                'content': self.content,
+                'student_id': self.student_id,
+                'resource': self.resource,          #作业链接
+                'create_time': self.create_time,
+                'status': self.status,               #批改情况
+                'range': self.range                  #作业对应的任务信息id
+            }
+        
         return None
 
 

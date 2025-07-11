@@ -1,0 +1,77 @@
+tags:
+  - 作业信息模块
+summary: 批改作业
+description: 组长对学生提交的作业进行批改，设置批改状态
+consumes:
+  - application/json
+parameters:
+  - name: Authorization
+    in: header
+    description: 用户登录token
+    required: true
+    type: string
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      required:
+        - id
+        - status
+      properties:
+        id:
+          type: integer
+          description: 作业ID
+        status:
+          type: boolean
+          description: 批改状态，true为已批改，false为未批改
+responses:
+  200:
+    description: 作业批改成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: 作业批改成功
+        data:
+          type: object
+          properties:
+            id:
+              type: integer
+              example: 1
+            status:
+              type: integer
+              example: 1
+  400:
+    description: 请求参数错误
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 400
+        message:
+          type: string
+          example: 作业ID不能为空
+  403:
+    description: 权限不足
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 403
+        message:
+          type: string
+          example: 无权批改作业，仅组长可批改
+  404:
+    description: 资源不存在
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 404
+        message:
+          type: string
+          example: 作业信息不存在 

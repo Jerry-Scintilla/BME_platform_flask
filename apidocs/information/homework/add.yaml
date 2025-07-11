@@ -1,0 +1,80 @@
+tags:
+  - 作业信息模块
+summary: 提交作业
+description: 学生提交作业，可上传多个文件（总大小限制20MB）
+consumes:
+  - multipart/form-data
+parameters:
+  - name: Authorization
+    in: header
+    description: 用户登录token
+    required: true
+    type: string
+  - name: task_id
+    in: formData
+    description: 关联的任务ID
+    required: true
+    type: integer
+  - name: title
+    in: formData
+    description: 作业标题
+    required: true
+    type: string
+  - name: content
+    in: formData
+    description: 作业内容/说明
+    required: false
+    type: string
+  - name: files
+    in: formData
+    description: 作业文件（可多选，总大小限制20MB）
+    required: false
+    type: file
+    allowMultiple: true
+responses:
+  200:
+    description: 作业提交成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: 作业提交成功
+        data:
+          type: object
+          properties:
+            id:
+              type: integer
+              example: 1
+  400:
+    description: 请求参数错误
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 400
+        message:
+          type: string
+          example: 任务ID不能为空
+  404:
+    description: 资源不存在
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 404
+        message:
+          type: string
+          example: 对应的任务信息不存在
+  409:
+    description: 冲突
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 409
+        message:
+          type: string
+          example: 您已提交过该任务的作业，请使用修改功能 

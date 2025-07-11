@@ -860,6 +860,7 @@ def attendence_by_date():
         for record in check_records:
             date_str = record.date.strftime('%Y-%m-%d')
             daily_checkins[date_str].append(record)
+            
         
         # 计算每天的签到签退时间差并累加
         daily_attendance = []
@@ -908,8 +909,14 @@ def attendence_by_date():
                 "total_checkin_duration": duration_str
             })
 
-        # 统计签到天数
-        check_days = len(check_records)
+        # 统计签到天数（按不同的日期计算，而非签到次数）
+        check_days = len(daily_checkins)
+        
+        # 打印统计汇总信息
+        print(f"学生 {student.username} 在指定时间段内的签到统计:")
+        print(f"  总签到天数: {check_days}")
+        print(f"  总签到次数: {len(check_records)}")
+        print(f"  日均签到次数: {len(check_records)/check_days if check_days > 0 else 0:.2f}")
 
         # 构建成员签到统计
         member_info = {

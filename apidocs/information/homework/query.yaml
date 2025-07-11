@@ -1,0 +1,132 @@
+tags:
+  - 作业信息模块
+summary: 查询作业
+description: 查询作业信息（支持按任务ID、小组ID、学生ID筛选，学生只能查看自己的作业，组长可以查看组内所有学生的作业）
+parameters:
+  - name: Authorization
+    in: header
+    description: 用户登录token
+    required: true
+    type: string
+  - name: task_id
+    in: query
+    description: 任务ID（可选，根据特定任务筛选作业）
+    required: false
+    type: integer
+  - name: group_id
+    in: query
+    description: 小组ID（可选，根据小组筛选作业）
+    required: false
+    type: integer
+  - name: student_id
+    in: query
+    description: 学生ID（可选，根据学生筛选作业，只有组长或管理员可使用此参数）
+    required: false
+    type: integer
+responses:
+  200:
+    description: 查询成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: 查询成功
+        data:
+          type: object
+          properties:
+            graded:
+              type: array
+              description: 已批改的作业列表
+              items:
+                $ref: '#/definitions/HomeworkItem'
+            ungraded:
+              type: array
+              description: 未批改的作业列表
+              items:
+                $ref: '#/definitions/HomeworkItem'
+            all:
+              type: array
+              description: 所有作业列表
+              items:
+                $ref: '#/definitions/HomeworkItem'
+  403:
+    description: 权限不足
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 403
+        message:
+          type: string
+          example: 无权查看其他学生的作业
+  404:
+    description: 资源不存在
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 404
+        message:
+          type: string
+          example: 小组不存在
+definitions:
+  HomeworkItem:
+    type: object
+    properties:
+      id:
+        type: integer
+        example: 1
+      group_id:
+        type: integer
+        example: 1
+      title:
+        type: string
+        example: 第一周作业
+      content:
+        type: string
+        example: 这是我的第一周作业内容
+      student_id:
+        type: integer
+        example: 10
+      student_name:
+        type: string
+        example: 张三
+      task_id:
+        type: integer
+        example: 5
+      task_title:
+        type: string
+        example: 第一周任务
+      status:
+        type: integer
+        example: 0
+        description: 批改状态（0未批改，1已批改）
+      create_time:
+        type: string
+        example: 2023-07-10 15:30:45
+      files:
+        type: array
+        items:
+          type: object
+          properties:
+            name:
+              type: string
+              example: report.pdf
+            size:
+              type: integer
+              example: 1048576
+            size_readable:
+              type: string
+              example: 1.00 MB
+      files_count:
+        type: integer
+        example: 2
+      total_size:
+        type: integer
+        example: 1572864
+      total_size_readable:
+        type: string
+        example: 1.50 MB 

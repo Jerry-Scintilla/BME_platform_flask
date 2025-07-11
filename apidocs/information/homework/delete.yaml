@@ -1,0 +1,64 @@
+tags:
+  - 作业信息模块
+summary: 删除作业
+description: 删除作业信息（提交人或组长可删除）
+consumes:
+  - application/json
+parameters:
+  - name: Authorization
+    in: header
+    description: 用户登录token
+    required: true
+    type: string
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: integer
+          description: 作业ID
+responses:
+  200:
+    description: 作业删除成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: 作业删除成功
+  400:
+    description: 请求参数错误
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 400
+        message:
+          type: string
+          example: 作业ID不能为空
+  403:
+    description: 权限不足
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 403
+        message:
+          type: string
+          example: 无权删除此作业，仅提交人或组长可删除
+  404:
+    description: 资源不存在
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 404
+        message:
+          type: string
+          example: 作业信息不存在 

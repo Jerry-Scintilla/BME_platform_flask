@@ -546,9 +546,11 @@ def task_query():
                 "code": 200,
                 "message": "查询成功，但无相关任务信息",
                 "data": {
+                    "urgent_priority": [],
                     "high_priority": [],
                     "medium_priority": [],
-                    "low_priority": []
+                    "low_priority": [],
+                    "unimportant_priority": []
                 }
             }),200
         
@@ -574,6 +576,39 @@ def task_query():
         group = GroupModel.query.filter_by(group_id=task.group_id).first()
         group_name = group.name if group else "未知小组"
         
+        # 获取小组成员信息
+        submitted_students = []
+        not_submitted_students = []
+        
+        if group:
+            # 获取小组所有学生
+            students_in_group = GroupModel.query.filter_by(group_id=task.group_id).all()
+            student_ids = [student.student_id for student in students_in_group if student.student_id]
+            
+            # 获取已提交作业的学生ID列表
+            submitted_student_ids = []
+            if task.students_id is not None:
+                # 处理task.students_id，确保正确解析
+                if isinstance(task.students_id, str) and task.students_id.strip():
+                    # 解析逗号分隔的字符串
+                    submitted_student_ids = [int(sid.strip()) for sid in task.students_id.split(",") if sid.strip().isdigit()]
+            
+            # 构建已提交和未提交的学生列表
+            for student_id in student_ids:
+                student = UserModel.query.filter_by(id=student_id).first()
+                if not student:
+                    continue
+                
+                student_info = {
+                    "id": student.id,
+                    "name": student.username
+                }
+                
+                if student.id in submitted_student_ids:
+                    submitted_students.append(student_info)
+                else:
+                    not_submitted_students.append(student_info)
+        
         task_data = {
             "id": task.id,
             "group_id": task.group_id,
@@ -582,7 +617,9 @@ def task_query():
             "content": task.content,
             "end_time": task.end_time.strftime("%Y-%m-%d %H:%M:%S") if task.end_time else None,
             "priority": task.priority,
-            "create_time": task.create_time.strftime("%Y-%m-%d %H:%M:%S")
+            "create_time": task.create_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "submitted_students": submitted_students,
+            "not_submitted_students": not_submitted_students
         }
         
         # 确保优先级是整数类型
@@ -1368,6 +1405,675 @@ def error_delete():
     return jsonify({
         "code": 200,
         "message": "报错信息删除成功"
+    })
+
+@bp.route("/information/homework/add", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/homework/add.yaml')
+def homework_add():
+    """
+    添加作业信息
+    """
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 获取表单数据
+    task_id = request.form.get('task_id')  # 对应的任务ID
+    title = request.form.get('title')  # 作业标题
+    content = request.form.get('content')  # 作业内容/说明
+    
+    if not task_id:
+        return jsonify({
+            "code": 400,
+            "message": "任务ID不能为空"
+        }), 400
+        
+    if not title:
+        return jsonify({
+            "code": 400,
+            "message": "作业标题不能为空"
+        }), 400
+    
+    # 检查任务是否存在
+    task = InformationModel.query.filter_by(id=task_id, type=2).first()
+    if not task:
+        return jsonify({
+            "code": 404,
+            "message": "对应的任务信息不存在"
+        }), 404
+    
+    # 检查用户是否已经提交过该任务的作业
+    existing_homework = InformationModel.query.filter_by(
+        type=5,  # 作业信息
+        student_id=user.id,
+        range=task_id
+    ).first()
+    
+    if existing_homework:
+        return jsonify({
+            "code": 409,
+            "message": "您已提交过该任务的作业，请使用修改功能"
+        }), 409
+    
+    # 检查是否有文件上传（非必需）
+    files = []
+    saved_files = []
+    
+    if 'files' in request.files:
+        files = request.files.getlist('files')
+        if files and files[0].filename != '':
+            # 检查文件大小总和
+            total_size = 0
+            for file in files:
+                file.seek(0, os.SEEK_END)
+                total_size += file.tell()
+                file.seek(0)
+            
+            if total_size > 20 * 1024 * 1024:  # 20MB限制
+                return jsonify({
+                    "code": 400,
+                    "message": "文件总大小超过20MB限制"
+                }), 400
+    
+    # 创建作业信息
+    homework = InformationModel(
+        group_id=task.group_id,  # 使用任务的小组ID
+        type=5,  # 5代表作业信息
+        title=title,
+        content=content,
+        student_id=user.id,  # 记录提交作业的学生ID
+        status=0,  # 0表示未批改
+        range=task_id  # 存储关联的任务ID
+    )
+    
+    db.session.add(homework)
+    db.session.commit()
+    
+    # 更新任务的students_id字段，添加当前学生ID
+    # 检查用户是否为组长（组长不应该被添加到students_id中）
+    is_group_leader = GroupModel.query.filter_by(group_id=task.group_id, teacher_id=user.id).first() is not None
+    
+    # 只有当用户不是组长时，才添加其ID到任务的students_id中
+    if not is_group_leader:
+        # 处理task.students_id，确保它是字符串格式
+        current_student_ids = task.students_id or ""
+        
+        # 解析已有的学生ID列表
+        student_id_list = []
+        if current_student_ids:
+            student_id_list = [sid.strip() for sid in current_student_ids.split(",") if sid.strip()]
+        
+        # 检查学生ID是否已存在
+        student_id_str = str(user.id)
+        if student_id_str not in student_id_list:
+            student_id_list.append(student_id_str)
+            # 更新任务的students_id字段
+            task.students_id = ",".join(student_id_list)
+            db.session.commit()
+    
+    # 如果有文件，保存文件
+    if files and files[0].filename != '':
+        # 创建作业文件目录
+        homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+        os.makedirs(homework_dir, exist_ok=True)
+        
+        # 保存文件
+        for file in files:
+            filename = file.filename
+            file_path = os.path.join(homework_dir, filename)
+            file.save(file_path)
+            saved_files.append(filename)
+        
+        # 更新数据库中的资源路径，存储文件名列表
+        homework.resource = ",".join(saved_files)
+        db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "作业提交成功",
+        "data": {
+            "id": homework.id
+        }
+    })
+
+@bp.route("/information/homework/update", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/homework/update.yaml')
+def homework_update():
+    """
+    修改作业信息
+    """
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 获取表单数据
+    homework_id = request.form.get('homework_id')  # 作业ID
+    title = request.form.get('title')  # 作业标题
+    content = request.form.get('content')  # 作业内容/说明
+    
+    if not homework_id:
+        return jsonify({
+            "code": 400,
+            "message": "作业ID不能为空"
+        }), 400
+    
+    # 查找作业信息
+    homework = InformationModel.query.filter_by(id=homework_id, type=5).first()
+    if not homework:
+        return jsonify({
+            "code": 404,
+            "message": "作业信息不存在"
+        }), 404
+    
+    # 验证修改权限：只有作业提交人可以修改
+    if homework.student_id != user.id:
+        return jsonify({
+            "code": 403,
+            "message": "无权修改此作业，仅提交人可修改"
+        }), 403
+    
+    # 更新标题和内容
+    if title:
+        homework.title = title
+    if content:
+        homework.content = content
+    
+    # 如果有新文件上传
+    if 'files' in request.files and request.files.getlist('files')[0].filename != '':
+        files = request.files.getlist('files')
+        
+        # 检查文件大小总和
+        total_size = 0
+        for file in files:
+            file.seek(0, os.SEEK_END)
+            total_size += file.tell()
+            file.seek(0)
+        
+        if total_size > 20 * 1024 * 1024:  # 20MB限制
+            return jsonify({
+                "code": 400,
+                "message": "文件总大小超过20MB限制"
+            }), 400
+        
+        # 删除旧文件
+        homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+        if os.path.exists(homework_dir):
+            for filename in os.listdir(homework_dir):
+                os.remove(os.path.join(homework_dir, filename))
+        else:
+            os.makedirs(homework_dir, exist_ok=True)
+        
+        # 保存新文件
+        saved_files = []
+        for file in files:
+            filename = file.filename
+            file_path = os.path.join(homework_dir, filename)
+            file.save(file_path)
+            saved_files.append(filename)
+        
+        # 更新数据库中的资源路径
+        homework.resource = ",".join(saved_files)
+    
+    # 清除Redis缓存
+    cache_key = f"homework_zip:{homework_id}"
+    redis_client.delete(cache_key)
+    print(f"已清除作业ID {homework_id} 的Redis缓存")
+    
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "作业修改成功"
+    })
+
+@bp.route("/information/homework/delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/homework/delete.yaml')
+def homework_delete():
+    """
+    删除作业信息
+    """
+    # 获取请求数据
+    data = request.get_json()
+    homework_id = data.get("id")
+    
+    if not homework_id:
+        return jsonify({
+            "code": 400,
+            "message": "作业ID不能为空"
+        }), 400
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查找作业信息
+    homework = InformationModel.query.filter_by(id=homework_id, type=5).first()
+    if not homework:
+        return jsonify({
+            "code": 404,
+            "message": "作业信息不存在"
+        }), 404
+    
+    # 验证删除权限：提交人或组长可删除
+    is_submitter = (homework.student_id == user.id)
+    is_group_leader = False
+    
+    # 查询小组信息，检查用户是否为小组组长
+    group = GroupModel.query.filter_by(group_id=homework.group_id).first()
+    if group and group.teacher_id == user.id:
+        is_group_leader = True
+    
+    if not (is_submitter or is_group_leader):
+        return jsonify({
+            "code": 403,
+            "message": "无权删除此作业，仅提交人或组长可删除"
+        }), 403
+    
+    # 删除作业文件
+    homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+    if os.path.exists(homework_dir):
+        import shutil
+        shutil.rmtree(homework_dir)
+    
+    # 清除Redis缓存
+    cache_key = f"homework_zip:{homework_id}"
+    redis_client.delete(cache_key)
+    print(f"已清除作业ID {homework_id} 的Redis缓存")
+    
+    # 从关联任务的students_id中移除该学生ID
+    if homework.range:
+        task = InformationModel.query.filter_by(id=homework.range, type=2).first()
+        if task and task.students_id is not None:
+            # 处理task.students_id，确保正确解析
+            current_student_ids = task.students_id or ""
+            if current_student_ids.strip():
+                # 解析逗号分隔的字符串
+                student_id_list = [sid.strip() for sid in current_student_ids.split(",") if sid.strip()]
+                student_id_str = str(homework.student_id)
+                if student_id_str in student_id_list:
+                    student_id_list.remove(student_id_str)
+                    task.students_id = ",".join(student_id_list)
+                    db.session.commit()
+    
+    # 删除作业信息
+    db.session.delete(homework)
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "作业删除成功"
+    })
+
+@bp.route("/information/homework/query", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/information/homework/query.yaml')
+def homework_query():
+    """
+    查询作业信息
+    """
+    # 获取查询参数
+    task_id = request.args.get("task_id", type=int)
+    group_id = request.args.get("group_id", type=int)
+    student_id = request.args.get("student_id", type=int)
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 构建基础查询条件
+    query = InformationModel.query.filter_by(type=5)  # 类型5为作业信息
+    
+    # 确定用户权限和查询范围
+    if user.user_mode == 'admin':
+        # 管理员可以查看所有作业
+        pass
+    elif task_id:
+        # 检查任务是否存在
+        task = InformationModel.query.filter_by(id=task_id, type=2).first()
+        if not task:
+            return jsonify({
+                "code": 404,
+                "message": "任务信息不存在"
+            }), 404
+            
+        # 添加任务ID筛选
+        query = query.filter_by(range=task_id)
+        
+        # 检查用户权限
+        # 如果是组长，可以查看该组的所有作业
+        is_group_leader = GroupModel.query.filter_by(
+            group_id=task.group_id, 
+            teacher_id=user.id
+        ).first() is not None
+        
+        if not is_group_leader and student_id != user.id:
+            # 非组长只能查看自己的作业
+            query = query.filter_by(student_id=user.id)
+    elif group_id:
+        # 检查组是否存在
+        group = GroupModel.query.filter_by(group_id=group_id).first()
+        if not group:
+            return jsonify({
+                "code": 404,
+                "message": "小组不存在"
+            }), 404
+            
+        # 添加小组ID筛选
+        query = query.filter_by(group_id=group_id)
+        
+        # 检查用户权限
+        is_group_leader = GroupModel.query.filter_by(
+            group_id=group_id, 
+            teacher_id=user.id
+        ).first() is not None
+        
+        if not is_group_leader and student_id != user.id:
+            # 非组长只能查看自己的作业
+            query = query.filter_by(student_id=user.id)
+    else:
+        # 学生默认只能查看自己的作业
+        if user.user_mode != 'admin':
+            query = query.filter_by(student_id=user.id)
+    
+    # 如果指定了学生ID，并且用户有权限查看该学生的作业
+    if student_id:
+        # 管理员或组长可以查看指定学生的作业
+        if user.user_mode == 'admin' or GroupModel.query.filter_by(teacher_id=user.id).first():
+            query = query.filter_by(student_id=student_id)
+        # 普通用户只能查看自己的作业
+        elif student_id != user.id:
+            return jsonify({
+                "code": 403,
+                "message": "无权查看其他学生的作业"
+            }), 403
+    
+    # 执行查询
+    homeworks = query.order_by(InformationModel.create_time.desc()).all()
+    
+    # 构建返回数据
+    result = []
+    for homework in homeworks:
+        # 获取提交学生信息
+        student = UserModel.query.filter_by(id=homework.student_id).first()
+        student_name = student.username if student else "未知用户"
+        
+        # 获取关联任务信息
+        task = InformationModel.query.filter_by(id=homework.range, type=2).first()
+        task_title = task.title if task else "未知任务"
+        
+        # 获取文件信息
+        files_info = []
+        if homework.resource:
+            file_names = homework.resource.split(',')
+            homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+            
+            for file_name in file_names:
+                file_path = os.path.join(homework_dir, file_name)
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    files_info.append({
+                        "name": file_name,
+                        "size": file_size,
+                        "size_readable": f"{file_size / 1024:.2f} KB" if file_size < 1024 * 1024 else f"{file_size / 1024 / 1024:.2f} MB"
+                    })
+        
+        homework_data = {
+            "id": homework.id,
+            "group_id": homework.group_id,
+            "title": homework.title,
+            "content": homework.content,
+            "student_id": homework.student_id,
+            "student_name": student_name,
+            "task_id": int(homework.range) if homework.range else None,
+            "task_title": task_title,
+            "status": homework.status,  # 0未批改，1已批改
+            "create_time": homework.create_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "files": files_info,
+            "files_count": len(files_info),
+            "total_size": sum(f["size"] for f in files_info),
+            "total_size_readable": f"{sum(f['size'] for f in files_info) / 1024:.2f} KB" if sum(f["size"] for f in files_info) < 1024 * 1024 else f"{sum(f['size'] for f in files_info) / 1024 / 1024:.2f} MB"
+        }
+        
+        result.append(homework_data)
+    
+    # 按批改状态分组返回
+    graded_homeworks = [hw for hw in result if hw["status"] == 1]
+    ungraded_homeworks = [hw for hw in result if hw["status"] == 0]
+    
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": {
+            "graded": graded_homeworks,
+            "ungraded": ungraded_homeworks,
+            "all": result  # 保留原有的所有作业列表
+        }
+    })
+
+@bp.route("/information/homework/download", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/information/homework/download.yaml')
+def homework_download():
+    """
+    下载作业文件（打包为zip）
+    """
+    # 确保导入所需模块
+    import os
+    import tempfile
+    import zipfile
+    import shutil
+    from flask import send_file
+    
+    # 获取作业ID
+    homework_id = request.args.get("id", type=int)
+    
+    if not homework_id:
+        return jsonify({
+            "code": 400,
+            "message": "作业ID不能为空"
+        }), 400
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查找作业信息
+    homework = InformationModel.query.filter_by(id=homework_id, type=5).first()
+    if not homework:
+        return jsonify({
+            "code": 404,
+            "message": "作业信息不存在"
+        }), 404
+    
+    # 定义Redis缓存键
+    cache_key = f"homework_zip:{homework_id}"
+    
+    # 尝试从Redis缓存中获取ZIP文件
+    cached_zip = redis_client.get(cache_key)
+    
+    # 如果缓存命中，直接返回缓存的ZIP文件
+    if cached_zip:
+        print(f"Redis缓存命中：作业ID {homework_id}")
+        
+        # 创建临时文件保存缓存的ZIP数据
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_file.write(cached_zip)
+        temp_file.close()
+        
+        # 发送缓存的ZIP文件
+        return send_file(
+            temp_file.name,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"homework_{homework_id}.zip"
+        )
+    
+    # 检查权限
+    is_owner = (homework.student_id == user.id)
+    is_group_leader = GroupModel.query.filter_by(
+        group_id=homework.group_id, 
+        teacher_id=user.id
+    ).first() is not None
+    is_admin = (user.user_mode == 'admin')
+    
+    if not (is_owner or is_group_leader or is_admin):
+        return jsonify({
+            "code": 403,
+            "message": "无权下载此作业"
+        }), 403
+    
+    # 检查作业是否有文件
+    if not homework.resource:
+        return jsonify({
+            "code": 404,
+            "message": "该作业没有上传文件"
+        }), 404
+    
+    # 准备文件目录
+    homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+    if not os.path.exists(homework_dir):
+        return jsonify({
+            "code": 404,
+            "message": "作业文件不存在"
+        }), 404
+    
+    # 创建临时目录用于存放zip文件
+    temp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(temp_dir, f"homework_{homework_id}.zip")
+    
+    try:
+        # 创建zip文件
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            for file_name in homework.resource.split(','):
+                file_path = os.path.join(homework_dir, file_name)
+                if os.path.exists(file_path):
+                    zipf.write(file_path, file_name)
+        
+        # 缓存ZIP文件到Redis（1天过期）
+        with open(zip_path, 'rb') as zip_file:
+            zip_data = zip_file.read()
+            redis_client.setex(cache_key, 60*60*24, zip_data)
+            print(f"已缓存作业ID {homework_id} 的ZIP文件到Redis")
+        
+        # 发送zip文件
+        return send_file(
+            zip_path,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"homework_{homework_id}.zip"
+        )
+    finally:
+        # 延迟删除临时目录（通过后台任务）
+        def cleanup_temp_dir(directory):
+            import time
+            time.sleep(60)  # 等待60秒后删除
+            shutil.rmtree(directory, ignore_errors=True)
+        
+        import threading
+        cleanup_thread = threading.Thread(target=cleanup_temp_dir, args=(temp_dir,))
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+
+@bp.route("/information/homework/grade", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/homework/grade.yaml')
+def homework_grade():
+    """
+    批改作业
+    """
+    # 获取请求数据
+    data = request.get_json()
+    homework_id = data.get("id")
+    grade_status = data.get("status")
+    
+    if not homework_id:
+        return jsonify({
+            "code": 400,
+            "message": "作业ID不能为空"
+        }), 400
+        
+    if grade_status is None:
+        return jsonify({
+            "code": 400,
+            "message": "批改状态不能为空"
+        }), 400
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查找作业信息
+    homework = InformationModel.query.filter_by(id=homework_id, type=5).first()
+    if not homework:
+        return jsonify({
+            "code": 404,
+            "message": "作业信息不存在"
+        }), 404
+    
+    # 验证批改权限：只有组长可以批改作业
+    is_group_leader = False
+    
+    # 检查是否为组长
+    group = GroupModel.query.filter_by(group_id=homework.group_id).first()
+    if not group:
+        return jsonify({
+            "code": 404,
+            "message": "小组不存在"
+        }), 404
+    
+    is_group_leader = (group.teacher_id == user.id)
+    
+    # 检查是否有权限批改
+    if not is_group_leader:
+        return jsonify({
+            "code": 403,
+            "message": "无权批改作业，仅组长可批改"
+        }), 403
+    
+    # 更新作业批改状态
+    homework.status = 1 if grade_status else 0
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "作业批改成功",
+        "data": {
+            "id": homework.id,
+            "status": homework.status
+        }
     })
 
 

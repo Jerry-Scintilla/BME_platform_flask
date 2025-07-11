@@ -1,0 +1,74 @@
+tags:
+  - 作业信息模块
+summary: 修改作业
+description: 学生修改已提交的作业，可更新内容及重新上传文件（总大小限制20MB）
+consumes:
+  - multipart/form-data
+parameters:
+  - name: Authorization
+    in: header
+    description: 用户登录token
+    required: true
+    type: string
+  - name: homework_id
+    in: formData
+    description: 作业ID
+    required: true
+    type: integer
+  - name: title
+    in: formData
+    description: 作业标题
+    required: false
+    type: string
+  - name: content
+    in: formData
+    description: 作业内容/说明
+    required: false
+    type: string
+  - name: files
+    in: formData
+    description: 作业文件（可多选，总大小限制20MB，如不上传则保留原文件）
+    required: false
+    type: file
+    allowMultiple: true
+responses:
+  200:
+    description: 作业修改成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: 作业修改成功
+  400:
+    description: 请求参数错误
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 400
+        message:
+          type: string
+          example: 作业ID不能为空
+  403:
+    description: 权限不足
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 403
+        message:
+          type: string
+          example: 无权修改此作业，仅提交人可修改
+  404:
+    description: 资源不存在
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 404
+        message:
+          type: string
+          example: 作业信息不存在 
