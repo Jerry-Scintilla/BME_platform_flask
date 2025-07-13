@@ -257,9 +257,11 @@ def leave_query():
         # 根据status分组
         if leave.status == 1:  # 已批准
             approved_leaves.append(leave_data)
+            print(f"添加到已批准请假列表，当前数量: {len(leave_approved)}")
         else:  # 未批准
             pending_leaves.append(leave_data)
-    
+            print(f"添加到未批准请假列表，当前数量: {len(leave_pending)}")
+                    
     return jsonify({
         "code": 200,
         "message": "查询成功",
@@ -421,7 +423,8 @@ def task_add():
                 title=title,
                 content=content,
                 end_time=end_time,
-                priority=priority
+                priority=priority,
+                student_id=0  # 设置默认值为0，避免数据库错误
                 # 不再记录student_id
             )
             
@@ -528,12 +531,6 @@ def task_query():
     
     # 如果通过小组ID查询，检查用户是否为管理员
     if group_id:
-        if user.user_mode != 'admin':
-            return jsonify({
-                "code": 403,
-                "message": "权限不足，只有管理员可以通过小组ID查询"
-            }),403
-        # 管理员可以查询特定小组
         query = query.filter_by(group_id=group_id)
     else:
         # 查询用户所在的小组
@@ -836,12 +833,6 @@ def notice_query():
     
     # 如果通过小组ID查询，检查用户是否为管理员
     if group_id:
-        if user.user_mode != 'admin':
-            return jsonify({
-                "code": 403,
-                "message": "权限不足，只有管理员可以通过小组ID查询"
-            }),403
-        # 管理员可以查询特定小组
         query = query.filter_by(group_id=group_id)
     else:
         # 查询用户所在的小组
@@ -1743,14 +1734,77 @@ def homework_query():
             "message": "用户不存在"
         }), 404
     
-    # 构建基础查询条件
-    query = InformationModel.query.filter_by(type=5)  # 类型5为作业信息
+        # 查询用户作为组长的组
+    teacher_groups = GroupModel.query.filter_by(teacher_id=user.id).all()
+    teacher_group_ids = [group.group_id for group in teacher_groups]
     
-    # 确定用户权限和查询范围
-    if user.user_mode == 'admin':
-        # 管理员可以查看所有作业
-        pass
-    elif task_id:
+    # 查询用户作为组员的组
+    student_groups = GroupModel.query.filter_by(student_id=user.id).all()
+    student_group_ids = [group.group_id for group in student_groups]
+    
+    # 如果用户没有任何组关联
+    if not teacher_group_ids and not student_groups:
+        return jsonify({
+            "code": 200,
+            "message": "查询成功，但用户不属于任何组",
+            "data": {
+                "graded": [],
+                "ungraded": [],
+                "all": []
+            }
+        }), 200
+    
+    # 初始化最终查询结果（使用union）
+    final_query = None
+    
+    # 处理用户作为组长的组
+    if teacher_group_ids:
+        # 获取这些组中的所有任务
+        tasks_in_teacher_groups = InformationModel.query.filter(
+            InformationModel.group_id.in_(teacher_group_ids),
+            InformationModel.type == 2
+        ).all()
+        task_ids_as_teacher = [str(task.id) for task in tasks_in_teacher_groups]
+        
+        if task_ids_as_teacher:
+            # 组长可查看所有作业
+            teacher_query = InformationModel.query.filter(
+                InformationModel.type == 5,
+                InformationModel.range.in_(task_ids_as_teacher)
+            )
+            
+            if final_query is None:
+                final_query = teacher_query
+            else:
+                final_query = final_query.union(teacher_query)
+    
+    # 处理用户作为组员的组
+    if student_group_ids:
+        # 获取这些组中的所有任务
+        tasks_in_student_groups = InformationModel.query.filter(
+            InformationModel.group_id.in_(student_group_ids),
+            InformationModel.type == 2
+        ).all()
+        task_ids_as_student = [str(task.id) for task in tasks_in_student_groups]
+        
+        if task_ids_as_student:
+            # 组员只能查看自己的作业
+            student_query = InformationModel.query.filter(
+                InformationModel.type == 5,
+                InformationModel.range.in_(task_ids_as_student),
+                InformationModel.student_id == user.id
+            )
+            
+            if final_query is None:
+                final_query = student_query
+            else:
+                final_query = final_query.union(student_query)
+    
+    # 如果有final_query，则使用它，否则使用空查询
+    if final_query is not None:
+        query = final_query
+    
+    if task_id:
         # 检查任务是否存在
         task = InformationModel.query.filter_by(id=task_id, type=2).first()
         if not task:
@@ -1772,8 +1826,9 @@ def homework_query():
         if not is_group_leader and student_id != user.id:
             # 非组长只能查看自己的作业
             query = query.filter_by(student_id=user.id)
-    elif group_id:
+    if group_id:
         # 检查组是否存在
+
         group = GroupModel.query.filter_by(group_id=group_id).first()
         if not group:
             return jsonify({
@@ -1781,8 +1836,24 @@ def homework_query():
                 "message": "小组不存在"
             }), 404
             
-        # 添加小组ID筛选
-        query = query.filter_by(group_id=group_id)
+        # 先查询该小组的所有任务
+        tasks = InformationModel.query.filter_by(group_id=group_id, type=2).all()
+        task_ids = [str(task.id) for task in tasks]
+        
+        if not task_ids:
+            # 如果小组没有任何任务，返回空结果
+            return jsonify({
+                "code": 200,
+                "message": "查询成功，但该小组没有任何任务相关的作业",
+                "data": {
+                    "graded": [],
+                    "ungraded": [],
+                    "all": []
+                }
+            }), 200
+        
+        # 使用任务ID筛选作业
+        query = query.filter(InformationModel.range.in_(task_ids))
         
         # 检查用户权限
         is_group_leader = GroupModel.query.filter_by(
@@ -1793,11 +1864,7 @@ def homework_query():
         if not is_group_leader and student_id != user.id:
             # 非组长只能查看自己的作业
             query = query.filter_by(student_id=user.id)
-    else:
-        # 学生默认只能查看自己的作业
-        if user.user_mode != 'admin':
-            query = query.filter_by(student_id=user.id)
-    
+
     # 如果指定了学生ID，并且用户有权限查看该学生的作业
     if student_id:
         # 管理员或组长可以查看指定学生的作业
@@ -1850,6 +1917,8 @@ def homework_query():
             "task_id": int(homework.range) if homework.range else None,
             "task_title": task_title,
             "status": homework.status,  # 0未批改，1已批改
+            "comment": homework.comment,  # 评语
+            "score": homework.score,  # 分数
             "create_time": homework.create_time.strftime("%Y-%m-%d %H:%M:%S"),
             "files": files_info,
             "files_count": len(files_info),
@@ -2013,6 +2082,8 @@ def homework_grade():
     data = request.get_json()
     homework_id = data.get("id")
     grade_status = data.get("status")
+    comment = data.get("comment")  # 获取评语
+    score = data.get("score")      # 获取分数
     
     if not homework_id:
         return jsonify({
@@ -2065,6 +2136,13 @@ def homework_grade():
     
     # 更新作业批改状态
     homework.status = 1 if grade_status else 0
+    
+    # 更新评语和分数（如果提供了）
+    if comment is not None:
+        homework.comment = comment
+    if score is not None:
+        homework.score = score
+    
     db.session.commit()
     
     return jsonify({
@@ -2072,7 +2150,9 @@ def homework_grade():
         "message": "作业批改成功",
         "data": {
             "id": homework.id,
-            "status": homework.status
+            "status": homework.status,
+            "comment": homework.comment,
+            "score": homework.score
         }
     })
 

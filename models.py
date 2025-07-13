@@ -201,7 +201,7 @@ class InformationModel(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     # 公共字段
     group_id = db.Column(db.Integer, nullable=False)
-    type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息, 4: 报错信息
+    type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息, 4: 报错信息 5: 作业信息
     title = db.Column(db.String(100), nullable=False)
     content = db.Column(db.Text)
     create_time = db.Column(db.DateTime, default=datetime.now)
@@ -221,6 +221,10 @@ class InformationModel(db.Model):
 
     # 报错信息特有字段
     resource = db.Column(db.String(100)) # 资源链接
+
+    # 作业信息特有字段
+    comment = db.Column(db.Text) # 批改意见
+    score = db.Column(db.String(100)) # 作业分数
     
     def get_info_by_type(self):
         """
@@ -273,7 +277,9 @@ class InformationModel(db.Model):
                 'resource': self.resource,          #作业链接
                 'create_time': self.create_time,
                 'status': self.status,               #批改情况
-                'range': self.range                  #作业对应的任务信息id
+                'range': self.range,                 #作业对应的任务信息id
+                'comment': self.comment,             #批改意见
+                'score': self.score                  #作业分数
             }
         
         return None
