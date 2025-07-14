@@ -92,6 +92,12 @@ def medal_query_by_user_id():
             "code": 404,
             "message": "用户不存在"
         }), 404
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
     
     medals = MedalUserModel.query.filter_by(user_id=user.id).all()
 
@@ -155,33 +161,54 @@ def medal_edit():
             'message': "用户权限不够"
         }), 400
 
+    # 获取请求中的参数
     Medal_Id = request.json.get("Medal_Id")
+    
+    # 检查是否提供了Medal_Id
+    if not Medal_Id:
+        return jsonify({
+            "code": 401,
+            "message": "未提供勋章ID"
+        }), 401
+    
+    # 获取要修改的属性
     Medal_Name = request.json.get("Medal_Name")
     Medal_Description = request.json.get("Medal_Description")
     Medal_Tag = request.json.get("Medal_Tag")
-
+    
+    # 查找勋章
     medal = MedalModel.query.filter_by(id=Medal_Id).first()
     if not medal:
         return jsonify({
             "code": 401,
             "message": "勋章不存在"
         }), 401
-
-    if Medal_Name:
-        medal.medal_name = Medal_Name
-    if Medal_Tag:
-        medal.tags = Medal_Tag
-    if Medal_Description:
-        medal.description = Medal_Description
-
-    db.session.commit()
-    return jsonify({
-        "code": 200,
-        "message": "勋章修改成功",
-        "Medal_Name": medal.medal_name,
-        "Medal_Tag": medal.tags,
-        "Medal_Description": medal.description
-    })
+    
+    try:
+        # 直接修改勋章属性（如果提供了相应的参数）
+        if Medal_Name is not None:
+            medal.medal_name = Medal_Name
+        if Medal_Tag is not None:
+            medal.tags = Medal_Tag
+        if Medal_Description is not None:
+            medal.description = Medal_Description
+        
+        # 保存修改
+        db.session.commit()
+        
+        return jsonify({
+            "code": 200,
+            "message": "勋章修改成功",
+            "Medal_Name": medal.medal_name,
+            "Medal_Tag": medal.tags,
+            "Medal_Description": medal.description
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            "code": 500,
+            "message": f"勋章修改失败: {str(e)}"
+        }), 500
 
 # 创建用户勋章
 @bp.route("/user_medal_add", methods=["POST"])
