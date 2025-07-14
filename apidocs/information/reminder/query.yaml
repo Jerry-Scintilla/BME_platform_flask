@@ -1,0 +1,184 @@
+查询当前用户的提醒信息(需要token)
+---
+tags:
+  - 信息提醒模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: 用户token
+
+responses:
+  200:
+    description: 查询成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: "查询成功"
+        data:
+          type: object
+          properties:
+            total_unread:
+              type: integer
+              description: 未读提醒总数
+              example: 10
+            reminders:
+              type: object
+              description: 按原始信息类型分类的提醒列表
+              properties:
+                leave:
+                  type: array
+                  description: 请假相关提醒 (source_type=1)
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 1
+                      title:
+                        type: string
+                        example: "新的请假申请: 病假"
+                      content:
+                        type: string
+                        example: "张三提交了请假申请，起止时间: 2023-06-01 08:00:00 - 2023-06-03 18:00:00"
+                      related_info_id:
+                        type: string
+                        example: "123"
+                      source_type:
+                        type: integer
+                        description: 原始信息类型 (1:请假 2:任务 3:通知 4:报错 5:作业)
+                        example: 1
+                      create_time:
+                        type: string
+                        example: "2023-06-01 10:23:45"
+                task:
+                  type: array
+                  description: 任务相关提醒 (source_type=2)
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 2
+                      title:
+                        type: string
+                        example: "新任务: 周报"
+                      content:
+                        type: string
+                        example: "组长李四发布了一个高优先级任务: 周报, 截止时间: 2023-06-05 23:59:59"
+                      related_info_id:
+                        type: string
+                        example: "456"
+                      source_type:
+                        type: integer
+                        description: 原始信息类型
+                        example: 2
+                      create_time:
+                        type: string
+                        example: "2023-06-02 09:30:00"
+                notice:
+                  type: array
+                  description: 通知相关提醒 (source_type=3)
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 3
+                      title:
+                        type: string
+                        example: "新通知: 会议通知"
+                      content:
+                        type: string
+                        example: "李四发布了一条新通知: 会议通知"
+                      related_info_id:
+                        type: string
+                        example: "789"
+                      source_type:
+                        type: integer
+                        example: 3
+                      create_time:
+                        type: string
+                        example: "2023-06-03 14:15:30"
+                error:
+                  type: array
+                  description: 报错相关提醒 (source_type=4)
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 4
+                      title:
+                        type: string
+                        example: "系统错误报告"
+                      content:
+                        type: string
+                        example: "您的错误报告已收到"
+                      related_info_id:
+                        type: string
+                        example: "101"
+                      source_type:
+                        type: integer
+                        example: 4
+                      create_time:
+                        type: string
+                        example: "2023-06-04 16:20:10"
+                homework:
+                  type: array
+                  description: 作业相关提醒 (source_type=5)
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 5
+                      title:
+                        type: string
+                        example: "作业已批改"
+                      content:
+                        type: string
+                        example: "您提交的作业\"周报总结\"已被批改，分数: 95"
+                      related_info_id:
+                        type: string
+                        example: "202"
+                      source_type:
+                        type: integer
+                        example: 5
+                      create_time:
+                        type: string
+                        example: "2023-06-05 18:30:00"
+                other:
+                  type: array
+                  description: 其他类型提醒 (source_type=0或未知)
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 6
+                      title:
+                        type: string
+                        example: "系统通知"
+                      content:
+                        type: string
+                        example: "系统维护通知"
+                      related_info_id:
+                        type: string
+                        example: "999"
+                      source_type:
+                        type: integer
+                        example: 0
+                      create_time:
+                        type: string
+                        example: "2023-06-06 20:00:00"
+  404:
+    description: 用户不存在 

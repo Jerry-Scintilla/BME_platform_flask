@@ -201,7 +201,7 @@ class InformationModel(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     # 公共字段
     group_id = db.Column(db.Integer, nullable=False)
-    type = db.Column(db.Integer, nullable=False)  # 1: 请假信息, 2: 任务信息, 3: 通知信息, 4: 报错信息 5: 作业信息
+    type = db.Column(db.Integer, nullable=False)  # 0:信息提醒信息, 1: 请假信息, 2: 任务信息, 3: 通知信息, 4: 报错信息 5: 作业信息
     title = db.Column(db.String(100), nullable=False)
     content = db.Column(db.Text)
     create_time = db.Column(db.DateTime, default=datetime.now)

@@ -1,0 +1,44 @@
+删除单个提醒信息(需要token)
+---
+tags:
+  - 信息提醒模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: 用户token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: reminder_delete
+      required:
+        - id
+      properties:
+        id:
+          type: integer
+          description: 提醒信息ID
+          example: 123
+
+responses:
+  200:
+    description: 提醒删除成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: "提醒删除成功"
+  400:
+    description: 提醒ID不能为空
+  403:
+    description: 无权删除此提醒，仅接收者可删除
+  404:
+    description: 用户不存在或提醒信息不存在 

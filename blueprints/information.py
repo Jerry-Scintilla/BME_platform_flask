@@ -21,6 +21,37 @@ from blueprints.forms import LeaveForm, TaskForm, NoticeForm
 
 bp = Blueprint("information", __name__, url_prefix="")
 
+# 辅助函数：创建提醒信息
+def create_reminder(title, content, related_info_id, student_id, group_id, source_type=0):
+    """
+    创建提醒信息
+    
+    参数:
+    - title: 提醒标题
+    - content: 提醒内容
+    - related_info_id: 关联的原始信息ID
+    - student_id: 接收提醒的用户ID
+    - group_id: 所属小组ID
+    - source_type: 原始信息类型 (1:请假 2:任务 3:通知 4:报错 5:作业)
+    
+    返回:
+    - 创建的提醒信息对象
+    """
+    reminder = InformationModel(
+        group_id=group_id,
+        type=0,  # 0代表提醒信息
+        title=title,
+        content=content,
+        range=str(related_info_id),  # 存储关联的信息ID
+        student_id=student_id,
+        priority=source_type  # 使用priority字段存储原始信息类型
+    )
+    
+    db.session.add(reminder)
+    db.session.commit()
+    
+    return reminder
+
 # 辅助函数：处理日期时间格式，如果只有日期部分，则设置时间为23:59:59
 def process_datetime(dt):
     """
@@ -37,6 +68,36 @@ def process_datetime(dt):
         return datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59)
     
     return dt
+
+# 辅助函数：删除与指定信息关联的所有提醒
+def delete_related_reminders(info_id):
+    """
+    删除与指定信息ID关联的所有提醒
+    
+    参数:
+    - info_id: 原始信息的ID
+    
+    返回:
+    - 删除的提醒数量
+    """
+    # 查找所有关联该信息的提醒
+    reminders = InformationModel.query.filter_by(
+        type=0,  # 提醒信息
+        range=str(info_id)  # 关联的信息ID
+    ).all()
+    
+    # 记录删除数量
+    deleted_count = len(reminders)
+    
+    # 批量删除
+    for reminder in reminders:
+        db.session.delete(reminder)
+    
+    # 提交到数据库
+    if deleted_count > 0:
+        db.session.commit()
+    
+    return deleted_count
 
 @bp.route("/information/leave/add", methods=["POST"])
 @jwt_required()
@@ -85,6 +146,19 @@ def leave_add():
         
         db.session.add(information)
         db.session.commit()
+        
+        # 创建提醒给组长（如果有组长）
+        if group.teacher_id:
+            reminder_title = f"新的请假申请: {title}"
+            reminder_content = f"{user.username}提交了请假申请，起止时间: {start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time else '未设置'} - {end_time.strftime('%Y-%m-%d %H:%M:%S') if end_time else '未设置'}"
+            create_reminder(
+                title=reminder_title,
+                content=reminder_content,
+                related_info_id=information.id,
+                student_id=group.teacher_id,
+                group_id=group_id,
+                source_type=1  # 1代表请假信息
+            )
         
         return jsonify({
             "code": 200,
@@ -150,13 +224,19 @@ def leave_delete():
             "message": "无权删除此请假信息，仅请假人或组长可删除"
         }),403
     
+    # 删除关联的提醒信息
+    reminders_deleted = delete_related_reminders(leave_id)
+    
     # 删除请假信息
     db.session.delete(leave)
     db.session.commit()
     
     return jsonify({
         "code": 200,
-        "message": "请假信息删除成功"
+        "message": "请假信息删除成功",
+        "data": {
+            "reminders_deleted": reminders_deleted
+        }
     }),200
 
 @bp.route("/information/leave/query", methods=["GET"])
@@ -326,6 +406,7 @@ def leave_approve():
         }),403
     
     # 更新请假状态为已批准
+    previous_status = leave.status  # 记录之前的状态
     leave.status = status
     
     # 如果请假开始/结束时间只有日期部分，处理为23:59:59
@@ -335,6 +416,22 @@ def leave_approve():
         leave.end_time = process_datetime(leave.end_time)
     
     db.session.commit()
+    
+    # 创建提醒给请假的学生
+    student = UserModel.query.filter_by(id=leave.student_id).first()
+    if student:
+        status_text = "已批准" if status == 1 else "已拒绝"
+        reminder_title = f"请假申请{status_text}: {leave.title}"
+        reminder_content = f"您的请假申请\"{leave.title}\"已被{user.username}{status_text}"
+        
+        create_reminder(
+            title=reminder_title,
+            content=reminder_content,
+            related_info_id=leave_id,
+            student_id=student.id,
+            group_id=leave.group_id,
+            source_type=1  # 1代表请假信息
+        )
     
     return jsonify({
         "code": 200,
@@ -408,6 +505,28 @@ def task_add():
             
             db.session.commit()
             
+            # 创建任务更新提醒，通知所有组内成员
+            priority_text = ["", "紧急", "高优先级", "中优先级", "低优先级", "普通"][priority] if 1 <= priority <= 5 else "普通"
+            
+            # 查询小组内的所有学生
+            students = GroupModel.query.filter_by(group_id=group_id).all()
+            student_ids = set([s.student_id for s in students if s.student_id])
+            
+            for student_id in student_ids:
+                reminder_title = f"任务已更新: {title}"
+                reminder_content = f"组长{user.username}已更新了一个{priority_text}任务: {title}"
+                if end_time:
+                    reminder_content += f", 截止时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                
+                create_reminder(
+                    title=reminder_title,
+                    content=reminder_content,
+                    related_info_id=task_id,
+                    student_id=student_id,
+                    group_id=group_id,
+                    source_type=2  # 2代表任务信息
+                )
+            
             return jsonify({
                 "code": 200,
                 "message": "任务修改成功",
@@ -430,6 +549,28 @@ def task_add():
             
             db.session.add(information)
             db.session.commit()
+            
+            # 创建新任务提醒，通知所有组内成员
+            priority_text = ["", "紧急", "高", "中", "低", "不重要"][priority] if 1 <= priority <= 5 else "鬼都不管"
+            
+            # 查询小组内的所有学生
+            students = GroupModel.query.filter_by(group_id=group_id).all()
+            student_ids = set([s.student_id for s in students if s.student_id])
+            
+            for student_id in student_ids:
+                reminder_title = f"新任务: {title}"
+                reminder_content = f"组长{user.username}发布了一个{priority_text}任务: {title}"
+                if end_time:
+                    reminder_content += f", 截止时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                
+                create_reminder(
+                    title=reminder_title,
+                    content=reminder_content,
+                    related_info_id=information.id,
+                    student_id=student_id,
+                    group_id=group_id,
+                    source_type=2  # 2代表任务信息
+                )
             
             return jsonify({
                 "code": 200,
@@ -495,13 +636,19 @@ def task_delete():
             "message": "无权删除此任务，仅组长或管理员可删除"
         }),403
     
+    # 删除关联的提醒信息
+    reminders_deleted = delete_related_reminders(task_id)
+    
     # 删除任务信息
     db.session.delete(task)
     db.session.commit()
     
     return jsonify({
         "code": 200,
-        "message": "任务删除成功"
+        "message": "任务删除成功",
+        "data": {
+            "reminders_deleted": reminders_deleted
+        }
     }),200
 
 @bp.route("/information/task/query", methods=["GET"])
@@ -713,6 +860,31 @@ def notice_add():
             
             db.session.commit()
             
+            # 创建通知更新提醒
+            # 确定通知的接收者
+            if range_str == "0":
+                # 全组通知，查询小组内的所有学生
+                students = GroupModel.query.filter_by(group_id=group_id).all()
+                recipient_ids = set([s.student_id for s in students if s.student_id])
+            else:
+                # 指定用户通知
+                recipient_ids = set([int(uid.strip()) for uid in range_str.split(",") if uid.strip().isdigit()])
+            
+            # 为每个接收者创建提醒
+            for recipient_id in recipient_ids:
+                if recipient_id:  # 确保接收者ID不为空
+                    reminder_title = f"通知已更新: {title}"
+                    reminder_content = f"{user.username}已更新了一条通知: {title}"
+                    
+                    create_reminder(
+                        title=reminder_title,
+                        content=reminder_content,
+                        related_info_id=notice_id,
+                        student_id=recipient_id,
+                        group_id=group_id,
+                        source_type=3  # 3代表通知信息
+                    )
+            
             return jsonify({
                 "code": 200,
                 "message": "通知修改成功",
@@ -727,12 +899,37 @@ def notice_add():
                 type=3,  # 3代表通知信息
                 title=title,
                 content=content,
-                range=range_str
-                # 不再记录student_id
+                range=range_str,
+                student_id=user.id  # 设置创建者ID，避免student_id为null
             )
             
             db.session.add(information)
             db.session.commit()
+            
+            # 创建新通知提醒
+            # 确定通知的接收者
+            if range_str == "0":
+                # 全组通知，查询小组内的所有学生
+                students = GroupModel.query.filter_by(group_id=group_id).all()
+                recipient_ids = set([s.student_id for s in students if s.student_id])
+            else:
+                # 指定用户通知
+                recipient_ids = set([int(uid.strip()) for uid in range_str.split(",") if uid.strip().isdigit()])
+            
+            # 为每个接收者创建提醒
+            for recipient_id in recipient_ids:
+                if recipient_id:  # 确保接收者ID不为空
+                    reminder_title = f"新通知: {title}"
+                    reminder_content = f"{user.username}发布了一条新通知: {title}"
+                    
+                    create_reminder(
+                        title=reminder_title,
+                        content=reminder_content,
+                        related_info_id=information.id,
+                        student_id=recipient_id,
+                        group_id=group_id,
+                        source_type=3  # 3代表通知信息
+                    )
             
             return jsonify({
                 "code": 200,
@@ -798,13 +995,19 @@ def notice_delete():
             "message": "无权删除此通知，仅组长或管理员可删除"
         }),403
     
+    # 删除关联的提醒信息
+    reminders_deleted = delete_related_reminders(notice_id)
+    
     # 删除通知信息
     db.session.delete(notice)
     db.session.commit()
     
     return jsonify({
         "code": 200,
-        "message": "通知删除成功"
+        "message": "通知删除成功",
+        "data": {
+            "reminders_deleted": reminders_deleted
+        }
     }),200
 
 @bp.route("/information/notice/query", methods=["GET"])
@@ -1525,6 +1728,22 @@ def homework_add():
         homework.resource = ",".join(saved_files)
         db.session.commit()
     
+    # 创建提醒给组长
+    # 查找组长
+    group = GroupModel.query.filter_by(group_id=task.group_id).first()
+    if group and group.teacher_id:
+        reminder_title = f"新作业提交: {title}"
+        reminder_content = f"{user.username}提交了任务\"{task.title}\"的作业"
+        
+        create_reminder(
+            title=reminder_title,
+            content=reminder_content,
+            related_info_id=homework.id,
+            student_id=group.teacher_id,
+            group_id=task.group_id,
+            source_type=5  # 5代表作业信息
+        )
+    
     return jsonify({
         "code": 200,
         "message": "作业提交成功",
@@ -1678,6 +1897,9 @@ def homework_delete():
             "message": "无权删除此作业，仅提交人或组长可删除"
         }), 403
     
+    # 删除关联的提醒信息
+    reminders_deleted = delete_related_reminders(homework_id)
+    
     # 删除作业文件
     homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
     if os.path.exists(homework_dir):
@@ -1710,7 +1932,10 @@ def homework_delete():
     
     return jsonify({
         "code": 200,
-        "message": "作业删除成功"
+        "message": "作业删除成功",
+        "data": {
+            "reminders_deleted": reminders_deleted
+        }
     })
 
 @bp.route("/information/homework/query", methods=["GET"])
@@ -2134,6 +2359,9 @@ def homework_grade():
             "message": "无权批改作业，仅组长可批改"
         }), 403
     
+    # 记录之前的状态
+    previous_status = homework.status
+    
     # 更新作业批改状态
     homework.status = 1 if grade_status else 0
     
@@ -2145,6 +2373,25 @@ def homework_grade():
     
     db.session.commit()
     
+    # 如果是首次批改或状态从未批改变为已批改，则创建提醒给学生
+    if previous_status == 0 and homework.status == 1:
+        # 创建提醒给提交作业的学生
+        reminder_title = "作业已批改"
+        
+        # 构建提醒内容
+        reminder_content = f"您提交的作业\"{homework.title}\"已被批改"
+        if score:
+            reminder_content += f"，分数: {score}"
+        
+        create_reminder(
+            title=reminder_title,
+            content=reminder_content,
+            related_info_id=homework_id,
+            student_id=homework.student_id,
+            group_id=homework.group_id,
+            source_type=5  # 5代表作业信息
+        )
+    
     return jsonify({
         "code": 200,
         "message": "作业批改成功",
@@ -2155,5 +2402,209 @@ def homework_grade():
             "score": homework.score
         }
     })
+
+# 提醒信息查询接口
+@bp.route("/information/reminder/query", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/information/reminder/query.yaml')
+def reminder_query():
+    """
+    查询当前用户的提醒信息
+    """
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查询该用户的所有提醒信息
+    reminders = InformationModel.query.filter_by(
+        type=0,  # 0代表提醒信息
+        student_id=user.id
+    ).order_by(InformationModel.create_time.desc()).all()
+    
+    # 初始化分类结果
+    total_unread = len(reminders)  # 所有提醒都是未读的，读完后会被删除
+    categorized_reminders = {
+        "leave": [],      # 请假相关提醒
+        "task": [],       # 任务相关提醒
+        "notice": [],     # 通知相关提醒
+        "error": [],      # 报错相关提醒
+        "homework": [],   # 作业相关提醒
+        "other": []       # 其他提醒
+    }
+    
+    # 处理每个提醒，直接根据priority字段进行分类
+    for reminder in reminders:
+        # 构建基本提醒数据
+        reminder_data = {
+            "id": reminder.id,
+            "title": reminder.title,
+            "content": reminder.content,
+            "related_info_id": reminder.range,  # 关联的原始信息ID
+            "source_type": reminder.priority,   # 原始信息类型
+            "create_time": reminder.create_time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # 根据原始信息类型直接分类
+        source_type = reminder.priority
+        if source_type == 1:
+            categorized_reminders["leave"].append(reminder_data)
+        elif source_type == 2:
+            categorized_reminders["task"].append(reminder_data)
+        elif source_type == 3:
+            categorized_reminders["notice"].append(reminder_data)
+        elif source_type == 4:
+            categorized_reminders["error"].append(reminder_data)
+        elif source_type == 5:
+            categorized_reminders["homework"].append(reminder_data)
+        else:
+            categorized_reminders["other"].append(reminder_data)
+    
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": {
+            "total_unread": total_unread,  # 未读提醒总数
+            "reminders": categorized_reminders  # 按类型分类的提醒
+        }
+    }), 200
+
+# 单个提醒信息删除接口
+@bp.route("/information/reminder/delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/reminder/delete.yaml')
+def reminder_delete():
+    """
+    删除单个提醒信息
+    """
+    # 获取请求数据
+    data = request.get_json()
+    reminder_id = data.get("id")
+    
+    if not reminder_id:
+        return jsonify({
+            "code": 400,
+            "message": "提醒ID不能为空"
+        }), 400
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 查找提醒信息
+    reminder = InformationModel.query.filter_by(id=reminder_id, type=0).first()
+    
+    if not reminder:
+        return jsonify({
+            "code": 404,
+            "message": "提醒信息不存在"
+        }), 404
+    
+    # 验证删除权限：只有提醒的接收者可以删除
+    if reminder.student_id != user.id:
+        return jsonify({
+            "code": 403,
+            "message": "无权删除此提醒，仅接收者可删除"
+        }), 403
+    
+    # 删除提醒信息
+    db.session.delete(reminder)
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "提醒删除成功"
+    }), 200
+
+# 批量删除提醒信息接口
+@bp.route("/information/reminder/batch_delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/information/reminder/batch_delete.yaml')
+def reminder_batch_delete():
+    """
+    批量删除提醒信息，支持多种条件
+    """
+    # 获取请求数据
+    data = request.get_json()
+    
+    # 支持的筛选条件
+    user_id = data.get("user_id")       # 指定接收者ID
+    info_id = data.get("info_id")       # 关联的原始信息ID
+    ids = data.get("ids")               # 指定要删除的提醒ID列表
+    source_type = data.get("type")      # 提醒源的类型(1:请假 2:任务 3:通知 4:报错 5:作业)
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 构建查询条件
+    query = InformationModel.query.filter_by(type=0)  # 筛选提醒信息
+    
+    # 只有管理员可以按接收者ID删除其他用户的提醒
+    if user_id and user_id != user.id:
+        if user.user_mode != 'admin':
+            return jsonify({
+                "code": 403,
+                "message": "权限不足，只有管理员可以删除其他用户的提醒"
+            }), 403
+        query = query.filter_by(student_id=user_id)
+    else:
+        # 非管理员或未指定用户ID时，只能删除自己的提醒
+        query = query.filter_by(student_id=user.id)
+    
+    # 如果提供了原始信息ID，筛选关联该信息的提醒
+    if info_id:
+        query = query.filter_by(range=str(info_id))
+    
+    # 如果提供了提醒ID列表，筛选这些ID的提醒
+    if ids and isinstance(ids, list):
+        query = query.filter(InformationModel.id.in_(ids))
+    
+    # 如果提供了提醒源类型，按类型筛选
+    if source_type:
+        query = query.filter_by(priority=source_type)
+    
+    # 查找所有符合条件的提醒
+    reminders = query.all()
+    
+    if not reminders:
+        return jsonify({
+            "code": 200,
+            "message": "未找到符合条件的提醒",
+            "data": {
+                "deleted_count": 0
+            }
+        }), 200
+    
+    # 记录删除数量
+    deleted_count = len(reminders)
+    
+    # 批量删除
+    for reminder in reminders:
+        db.session.delete(reminder)
+    
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "批量删除提醒成功",
+        "data": {
+            "deleted_count": deleted_count
+        }
+    }), 200
 
 

@@ -1,0 +1,15 @@
+查询勋章列表
+---
+tags:
+  - 勋章模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取用户勋章成功

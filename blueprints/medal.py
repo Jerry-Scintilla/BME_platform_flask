@@ -81,6 +81,36 @@ def medal_list():
         "medal": data
     })
 
+@bp.route("/medal_query_by_user_id")
+@jwt_required()
+@swag_from('../apidocs/medal/medal_query_by_user_id.yaml')
+def medal_query_by_user_id():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    medals = MedalUserModel.query.filter_by(user_id=user.id).all()
+
+    result = []
+
+    for medal in medals:
+        medal_info = MedalModel.query.filter_by(id=medal.medal_id).first()
+        result.append({
+            "Medal_Id": medal.medal_id,
+            "Medal_Name": medal_info.medal_name
+        })
+
+    return jsonify({
+        "code": 200,
+        "message": "获取用户勋章成功",
+        "medals": result
+    })
+
+
 # 删除勋章
 @bp.route("/medal_delete", methods=["POST"])
 @jwt_required()

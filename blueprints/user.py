@@ -377,108 +377,94 @@ def group():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
 
-    def process_groups(groups):
-        """处理小组数据并按名称分组"""
-        grouped = {}
-        for group in groups:
-            group_name = group.name
-            if group_name not in grouped:
-                # 获取教师信息（假设每个小组的 teacher_id 一致）
-                teacher = UserModel.query.get(group.teacher_id)
-                # 获取课程标题
-                course = CourseModel.query.get(group.course_id)
-                course_title = course.title if course else "未知课程"
+    def process_groups(groups_by_id):
+        """处理小组数据，确保每个小组包含完整成员列表"""
+        result = []
+        for group_key, groups in groups_by_id.items():
+            if not groups:
+                continue
                 
-                grouped[group_name] = {
-                    'students': [],
-                    'teacher': teacher.username,
-                    'teacher_id': teacher.id,
-                    'group_id': group.group_id,
-                    'course_id': group.course_id,
-                    'title': course_title  # 添加课程标题
-                }
-            # 获取学生信息
-            student = UserModel.query.get(group.student_id)
-            grouped[group_name]['students'].append({
-                'Student_Id': student.id,
-                'Student': student.username
-            })
-        # 转换为前端需要的格式
-        return [{
-            'group_id': info['group_id'],
-            'course_id': info['course_id'],
-            'title': info['title'],  # 添加课程标题
-            'students': info['students'],
-            'teacher': info['teacher'],
-            'teacher_id': info['teacher_id']
-        } for name, info in grouped.items()]
+            # 获取第一个组项来提取共同信息
+            first_group = groups[0]
+            group_id = first_group.group_id
+            group_name = first_group.name
+            course_id = first_group.course_id
+            
+            # 获取教师信息
+            teacher = UserModel.query.get(first_group.teacher_id)
+            teacher_name = teacher.username if teacher else "未知"
+            teacher_id = teacher.id if teacher else 0
+            
+            # 获取课程信息
+            course = CourseModel.query.get(course_id)
+            course_title = course.title if course else "未知课程"
+            
+            # 收集所有学生信息
+            students = []
+            for g in groups:
+                student = UserModel.query.get(g.student_id)
+                if student:
+                    students.append({
+                        'Student_Id': student.id,
+                        'Student': student.username
+                    })
+            
+            # 构建小组完整信息
+            group_info = {
+                'group_id': group_id,
+                'course_id': course_id,
+                'title': course_title,
+                'students': students,
+                'teacher': teacher_name,
+                'teacher_id': teacher_id,
+                'group_name': group_name
+            }
+            
+            result.append(group_info)
+            
+        return result
 
-    # 管理员视角
-    if user.user_mode == 'admin':
-        # 处理学习小组
-        study_groups = GroupModel.query.filter_by(
-            teacher_id=user.id,
-            type="study"
-        ).all()
-        study_data = process_groups(study_groups)
-
-        # 处理项目小组
-        project_groups = GroupModel.query.filter_by(
-            teacher_id=user.id,
-            type="project"
-        ).all()
-        project_data = process_groups(project_groups)
-
-        return jsonify({
-            "code": 200,
-            "message": "获取小组成功",
-            "study_group": study_data,
-            "project_group": project_data
-        })
-
-    # 学生视角
-    elif user.user_mode == 'user':
-        def get_user_groups(group_type):
-            """获取学生所属小组并分组"""
-            # 1. 找到学生加入的所有该类型小组
-            user_groups = GroupModel.query.filter_by(
-                student_id=user.id,
-                type=group_type
-            ).all()
-
-            # 2. 按教师分组（假设学生可能加入不同教师的小组）
-            teachers_map = {}
-            for ug in user_groups:
-                teacher_id = ug.teacher_id
-                if teacher_id not in teachers_map:
-                    teachers_map[teacher_id] = []
-                teachers_map[teacher_id].append(ug)
-
-            # 3. 处理每个教师的小组
-            result = []
-            for teacher_id, groups in teachers_map.items():
-                # 获取该教师创建的所有该类型小组
-                all_groups = GroupModel.query.filter_by(
-                    teacher_id=teacher_id,
-                    type=group_type
-                ).all()
-                # 按名称分组处理
-                result.extend(process_groups(all_groups))
-
-            return result
-
-        # 获取学习型小组（按类型分别处理）
-        study_data = get_user_groups("study")
-        project_data = get_user_groups("project")
-
-        return jsonify({
-            "code": 200,
-            "message": "获取小组成功",
-            "study_group": study_data,
-            "project_group": project_data
-        })
-
-    return jsonify({"code": 403, "message": "权限不足"})
+    # 先获取用户可能相关的所有小组ID
+    relevant_group_ids = set()
+    
+    # 1. 用户作为教师的小组
+    teacher_groups = GroupModel.query.filter_by(teacher_id=user.id).all()
+    for group in teacher_groups:
+        relevant_group_ids.add(group.group_id)
+    
+    # 2. 用户作为学生的小组
+    student_groups = GroupModel.query.filter_by(student_id=user.id).all()
+    for group in student_groups:
+        relevant_group_ids.add(group.group_id)
+    
+    # 查询所有相关小组的完整信息
+    all_groups = {}
+    for group_id in relevant_group_ids:
+        # 获取这个group_id的所有组成员记录
+        complete_group = GroupModel.query.filter_by(group_id=group_id).all()
+        
+        # 按类型分组
+        for group in complete_group:
+            key = (group.group_id, group.type)
+            if key not in all_groups:
+                all_groups[key] = []
+            all_groups[key].append(group)
+    
+    # 分离学习小组和项目小组
+    study_groups = {k: v for k, v in all_groups.items() if k[1] == "study"}
+    project_groups = {k: v for k, v in all_groups.items() if k[1] == "project"}
+    
+    # 处理分组数据
+    study_data = process_groups(study_groups)
+    project_data = process_groups(project_groups)
+    
+    # 返回结果，与原来的格式一致
+    return jsonify({
+        "code": 200,
+        "message": "获取小组成功",
+        "study_group": study_data,
+        "project_group": project_data
+    })
 
 
 from sqlalchemy.orm import aliased
