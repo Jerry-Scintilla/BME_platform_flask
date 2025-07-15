@@ -19,22 +19,35 @@ parameters:
     required: true
     description: 包含JWT的Bearer令牌，用于验证用户权限
 
-requestBody:
-  required: true
-  content:
-    application/json:
-      schema:
-        type: object
-        properties:
-          User_Id:
-            type: integer
-            description: 用户ID，用于指定要删除勋章的用户
-          Group_Id:
-            type: integer
-            description: 小组ID，用于指定要删除勋章的小组成员
-          Medal_Id:
-            type: integer
-            description: 勋章ID，用于指定要删除的勋章类型
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: user_medal_delete
+      required:
+        - User_Id
+        - Medal_Id
+        - Group_Id
+      properties:
+        User_Id:
+          type: integer
+          description: 学生id
+#          default: "1111"
+        Medal_Id:
+          type: integer
+          description: 勋章id
+#          default: "Guarana"
+        Group_Id:
+          type: integer
+          description: 小组id
+        #          default: "Guarana"
 
 responses:
   200:

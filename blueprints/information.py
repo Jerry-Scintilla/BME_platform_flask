@@ -62,6 +62,21 @@ def process_datetime(dt):
     if not dt:
         return dt
     
+    # 处理字符串格式
+    if isinstance(dt, str):
+        try:
+            # 尝试解析常见的日期时间格式
+            if 'T' in dt:  # ISO格式 如 "2023-07-15T00:00:00"
+                dt = datetime.datetime.fromisoformat(dt)
+            elif ' ' in dt:  # 带空格的格式 如 "2023-07-15 00:00:00"
+                dt = datetime.datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
+            else:  # 仅日期格式 如 "2023-07-15"
+                dt = datetime.datetime.strptime(dt, '%Y-%m-%d')
+                return datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59)
+        except (ValueError, TypeError):
+            # 如果无法解析，则原样返回
+            return dt
+    
     # 如果是datetime对象，检查是否只有日期部分
     if hasattr(dt, 'hour') and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
         # 只有日期部分，设置时间为23:59:59
@@ -337,10 +352,10 @@ def leave_query():
         # 根据status分组
         if leave.status == 1:  # 已批准
             approved_leaves.append(leave_data)
-            print(f"添加到已批准请假列表，当前数量: {len(leave_approved)}")
+            print(f"添加到已批准请假列表，当前数量: {len(approved_leaves)}")
         else:  # 未批准
             pending_leaves.append(leave_data)
-            print(f"添加到未批准请假列表，当前数量: {len(leave_pending)}")
+            print(f"添加到未批准请假列表，当前数量: {len(pending_leaves)}")
                     
     return jsonify({
         "code": 200,
