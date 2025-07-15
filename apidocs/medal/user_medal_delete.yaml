@@ -1,0 +1,133 @@
+tags:
+  - 勋章模块
+summary: 删除用户勋章记录
+description: |
+  根据提供的参数删除用户勋章记录。
+  支持以下删除方式：
+  1. 只传入User_Id：删除该用户的所有勋章记录
+  2. 只传入Group_Id：删除该小组内所有成员的所有勋章记录
+  3. 只传入Medal_Id：删除所有拥有该勋章的记录
+  4. 传入User_Id和Medal_Id：删除特定用户的特定勋章记录
+  5. 传入Group_Id和Medal_Id：删除该小组内所有成员的特定勋章记录
+  
+  注意：User_Id和Group_Id不能同时使用
+
+parameters:
+  - in: header
+    name: Authorization
+    type: string
+    required: true
+    description: 包含JWT的Bearer令牌，用于验证用户权限
+
+requestBody:
+  required: true
+  content:
+    application/json:
+      schema:
+        type: object
+        properties:
+          User_Id:
+            type: integer
+            description: 用户ID，用于指定要删除勋章的用户
+          Group_Id:
+            type: integer
+            description: 小组ID，用于指定要删除勋章的小组成员
+          Medal_Id:
+            type: integer
+            description: 勋章ID，用于指定要删除的勋章类型
+
+responses:
+  200:
+    description: 删除成功
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 200
+            message:
+              type: string
+              example: 勋章记录删除成功
+            deleted_count:
+              type: integer
+              description: 删除的记录数量
+              example: 5
+            affected_users:
+              type: array
+              description: 受影响的用户列表
+              items:
+                type: object
+                properties:
+                  User_Id:
+                    type: integer
+                    example: 1
+                  User_Name:
+                    type: string
+                    example: 张三
+  400:
+    description: 用户权限不足
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 400
+            message:
+              type: string
+              example: 用户权限不够
+  401:
+    description: 参数错误 - 未提供任何参数
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 401
+            message:
+              type: string
+              example: 至少需要提供一个参数：User_Id、Group_Id或Medal_Id
+  402:
+    description: 参数错误 - User_Id和Group_Id不能同时使用
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 402
+            message:
+              type: string
+              example: User_Id和Group_Id不能同时使用
+  404:
+    description: 资源不存在错误
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 404
+            message:
+              type: string
+              example: 指定的用户不存在
+  500:
+    description: 服务器错误
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 500
+            message:
+              type: string
+              example: 删除勋章记录失败 

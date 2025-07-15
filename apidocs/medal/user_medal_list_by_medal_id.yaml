@@ -10,6 +10,12 @@ parameters:
     required: true
     description: token
 
+  - name: Medal_Id
+    in: query
+    type: integer
+    required: true
+    description: 奖牌ID
+
 responses:
   200:
-    description: 获取用户勋章成功
+    description: 获取勋章成功

@@ -150,7 +150,7 @@ def leave_add():
         # 创建提醒给组长（如果有组长）
         if group.teacher_id:
             reminder_title = f"新的请假申请: {title}"
-            reminder_content = f"{user.username}提交了请假申请，起止时间: {start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time else '未设置'} - {end_time.strftime('%Y-%m-%d %H:%M:%S') if end_time else '未设置'}"
+            reminder_content = f"{user.username}提交了请假申请，起止时间: {start_time.strftime('%Y-%m-%d %H:%M:%S') if isinstance(start_time, datetime.datetime) else start_time if start_time else '未设置'} - {end_time.strftime('%Y-%m-%d %H:%M:%S') if isinstance(end_time, datetime.datetime) else end_time if end_time else '未设置'}"
             create_reminder(
                 title=reminder_title,
                 content=reminder_content,
@@ -516,7 +516,11 @@ def task_add():
                 reminder_title = f"任务已更新: {title}"
                 reminder_content = f"组长{user.username}已更新了一个{priority_text}任务: {title}"
                 if end_time:
-                    reminder_content += f", 截止时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    # 检查end_time是否为字符串类型，若是则直接使用，否则调用strftime
+                    if isinstance(end_time, str):
+                        reminder_content += f", 截止时间: {end_time}"
+                    else:
+                        reminder_content += f", 截止时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 create_reminder(
                     title=reminder_title,
@@ -561,7 +565,11 @@ def task_add():
                 reminder_title = f"新任务: {title}"
                 reminder_content = f"组长{user.username}发布了一个{priority_text}任务: {title}"
                 if end_time:
-                    reminder_content += f", 截止时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    # 检查end_time是否为字符串类型，若是则直接使用，否则调用strftime
+                    if isinstance(end_time, str):
+                        reminder_content += f", 截止时间: {end_time}"
+                    else:
+                        reminder_content += f", 截止时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 create_reminder(
                     title=reminder_title,
@@ -1896,6 +1904,24 @@ def homework_delete():
             "code": 403,
             "message": "无权删除此作业，仅提交人或组长可删除"
         }), 403
+        
+    # 如果是组长删除学生作业，发送通知给学生
+    if is_group_leader and not is_submitter:
+        # 获取学生信息
+        student = UserModel.query.filter_by(id=homework.student_id).first()
+        if student:
+            reminder_title = f"作业被退回: {homework.title}"
+            reminder_content = f"您的作业\"{homework.title}\"已被{user.username}退回，请修改后再次提交"
+            
+            # 创建提醒给学生
+            create_reminder(
+                title=reminder_title,
+                content=reminder_content,
+                related_info_id=homework_id,
+                student_id=homework.student_id,
+                group_id=homework.group_id,
+                source_type=5  # 5代表作业信息
+            )
     
     # 删除关联的提醒信息
     reminders_deleted = delete_related_reminders(homework_id)
@@ -2451,15 +2477,15 @@ def reminder_query():
         
         # 根据原始信息类型直接分类
         source_type = reminder.priority
-        if source_type == 1:
+        if source_type == "1":
             categorized_reminders["leave"].append(reminder_data)
-        elif source_type == 2:
+        elif source_type == "2":
             categorized_reminders["task"].append(reminder_data)
-        elif source_type == 3:
+        elif source_type == "3":
             categorized_reminders["notice"].append(reminder_data)
-        elif source_type == 4:
+        elif source_type == "4":
             categorized_reminders["error"].append(reminder_data)
-        elif source_type == 5:
+        elif source_type == "5":
             categorized_reminders["homework"].append(reminder_data)
         else:
             categorized_reminders["other"].append(reminder_data)

@@ -4,7 +4,7 @@ from flask import Blueprint, request, redirect, jsonify
 from exts import db
 
 # 导入数据库表
-from models import MedalModel, MedalUserModel, UserModel
+from models import MedalModel, MedalUserModel, UserModel, GroupModel
 
 # 导入表单验证
 from .forms import MedalForm
@@ -81,40 +81,40 @@ def medal_list():
         "medal": data
     })
 
-@bp.route("/medal_query_by_user_id")
-@jwt_required()
-@swag_from('../apidocs/medal/medal_query_by_user_id.yaml')
-def medal_query_by_user_id():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    if not user:
-        return jsonify({
-            "code": 404,
-            "message": "用户不存在"
-        }), 404
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
+# @bp.route("/medal_query_by_user_id")
+# @jwt_required()
+# @swag_from('../apidocs/medal/medal_query_by_user_id.yaml')
+# def medal_query_by_user_id():
+#     user_email = get_jwt_identity()
+#     user = UserModel.query.filter_by(email=user_email).first()
+#     if not user:
+#         return jsonify({
+#             "code": 404,
+#             "message": "用户不存在"
+#         }), 404
+#     mode = user.user_mode
+#     if mode != 'admin':
+#         return jsonify({
+#             "code": 400,
+#             'message': "用户权限不够"
+#         }), 400
     
-    medals = MedalUserModel.query.filter_by(user_id=user.id).all()
+#     medals = MedalUserModel.query.filter_by(user_id=user.id).all()
 
-    result = []
+#     result = []
 
-    for medal in medals:
-        medal_info = MedalModel.query.filter_by(id=medal.medal_id).first()
-        result.append({
-            "Medal_Id": medal.medal_id,
-            "Medal_Name": medal_info.medal_name
-        })
+#     for medal in medals:
+#         medal_info = MedalModel.query.filter_by(id=medal.medal_id).first()
+#         result.append({
+#             "Medal_Id": medal.medal_id,
+#             "Medal_Name": medal_info.medal_name
+#         })
 
-    return jsonify({
-        "code": 200,
-        "message": "获取用户勋章成功",
-        "medals": result
-    })
+#     return jsonify({
+#         "code": 200,
+#         "message": "获取用户勋章成功",
+#         "medals": result
+#     })
 
 
 # 删除勋章
@@ -332,3 +332,279 @@ def user_medal_show():
     })
 
 
+
+@bp.route("/user_medal_list_by_medal_id")
+@jwt_required()
+@swag_from('../apidocs/medal/user_medal_list_by_medal_id.yaml')
+def user_medal_list_by_medal_id():
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode!= 'admin':
+        return jsonify({
+            "code": 400,
+           'message': "用户权限不够"
+        }), 400    
+    
+    medal_id = request.args.get("Medal_Id")
+    if not medal_id:
+        return jsonify({
+            "code": 401,
+            "message": "未提供奖牌ID"
+        }), 401
+    
+    # 检查奖牌是否存在
+    medal = MedalModel.query.filter_by(id=medal_id).first()
+    if not medal:
+        return jsonify({
+            "code": 402,
+            "message": "奖牌不存在"
+        }), 402
+    
+    # 查询所有获得该奖牌的用户记录
+    medal_users = MedalUserModel.query.filter_by(medal_id=medal_id).all()
+    
+    users_data = []
+    for medal_user in medal_users:
+        user_info = UserModel.query.filter_by(id=medal_user.user_id).first()
+        if user_info:
+            users_data.append({
+                "User_Id": user_info.id,
+                "User_Name": user_info.username,
+                "Get_Time": medal_user.get_time.strftime('%Y-%m-%d'),
+                "Description": medal_user.description
+            })
+    
+    return jsonify({
+        "code": 200,
+        "message": "查询获得该奖牌的用户列表成功",
+        "Medal_Name": medal.medal_name,
+        "Medal_Description": medal.description,
+        "Users": users_data
+    })
+    
+
+@bp.route("/user_medal_delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/medal/user_medal_delete.yaml')
+def user_medal_delete():
+    # 验证用户权限
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    mode = user.user_mode
+    if mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+    
+    # 获取请求参数
+    user_id = request.json.get("User_Id")
+    group_id = request.json.get("Group_Id")
+    medal_id = request.json.get("Medal_Id")
+    
+    # 参数验证
+    if user_id is None and group_id is None and medal_id is None:
+        return jsonify({
+            "code": 401,
+            "message": "至少需要提供一个参数：User_Id、Group_Id或Medal_Id"
+        }), 401
+    
+    if user_id is not None and group_id is not None:
+        return jsonify({
+            "code": 402,
+            "message": "User_Id和Group_Id不能同时使用"
+        }), 402
+    
+    try:
+        # 根据参数组合执行不同的删除逻辑
+        records_to_delete = []
+        affected_users = []
+        deleted_count = 0
+        
+        # 情况1: 只有user_id - 删除该用户的所有勋章
+        if user_id is not None and medal_id is None:
+            # 验证用户存在
+            target_user = UserModel.query.filter_by(id=user_id).first()
+            if not target_user:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的用户不存在"
+                }), 404
+                
+            # 获取该用户的所有勋章记录
+            records_to_delete = MedalUserModel.query.filter_by(user_id=user_id).all()
+            affected_users.append({
+                "User_Id": target_user.id,
+                "User_Name": target_user.username
+            })
+            
+            # 更新用户的勋章数量
+            if records_to_delete:
+                target_user.medal = 0
+                db.session.commit()
+        
+        # 情况2: 只有group_id - 删除该组所有成员的所有勋章
+        elif group_id is not None and medal_id is None:
+            # 查询组内所有成员
+            group_members = GroupModel.query.filter_by(group_id=group_id).all()
+            if not group_members:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的组不存在或组内没有成员"
+                }), 404
+                
+            # 获取组内所有成员ID
+            member_ids = [member.student_id for member in group_members]
+            
+            # 对每个成员，删除其所有勋章记录
+            for member_id in member_ids:
+                member = UserModel.query.filter_by(id=member_id).first()
+                if member:
+                    member_records = MedalUserModel.query.filter_by(user_id=member_id).all()
+                    records_to_delete.extend(member_records)
+                    if member_records:
+                        affected_users.append({
+                            "User_Id": member.id,
+                            "User_Name": member.username
+                        })
+                        # 重置该成员的勋章数量
+                        member.medal = 0
+            
+            if affected_users:
+                db.session.commit()
+        
+        # 情况3: 只有medal_id - 删除所有拥有该勋章的记录
+        elif medal_id is not None and user_id is None and group_id is None:
+            # 验证勋章存在
+            target_medal = MedalModel.query.filter_by(id=medal_id).first()
+            if not target_medal:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的勋章不存在"
+                }), 404
+                
+            # 获取拥有该勋章的所有记录
+            records_to_delete = MedalUserModel.query.filter_by(medal_id=medal_id).all()
+            
+            # 收集受影响的用户
+            for record in records_to_delete:
+                user_info = UserModel.query.filter_by(id=record.user_id).first()
+                if user_info:
+                    affected_users.append({
+                        "User_Id": user_info.id,
+                        "User_Name": user_info.username
+                    })
+                    # 减少用户的勋章数量
+                    if user_info.medal > 0:
+                        user_info.medal -= 1
+            
+            if affected_users:
+                db.session.commit()
+        
+        # 情况4: user_id和medal_id - 删除特定用户的特定勋章
+        elif user_id is not None and medal_id is not None:
+            # 验证用户和勋章存在
+            target_user = UserModel.query.filter_by(id=user_id).first()
+            target_medal = MedalModel.query.filter_by(id=medal_id).first()
+            
+            if not target_user:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的用户不存在"
+                }), 404
+                
+            if not target_medal:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的勋章不存在"
+                }), 404
+            
+            # 获取该用户的特定勋章记录
+            records_to_delete = MedalUserModel.query.filter_by(
+                user_id=user_id, 
+                medal_id=medal_id
+            ).all()
+            
+            if records_to_delete:
+                affected_users.append({
+                    "User_Id": target_user.id,
+                    "User_Name": target_user.username
+                })
+                
+                # 减少用户的勋章数量
+                if target_user.medal > 0:
+                    target_user.medal -= 1
+                    db.session.commit()
+        
+        # 情况5: group_id和medal_id - 删除组内所有成员的特定勋章
+        elif group_id is not None and medal_id is not None:
+            # 验证组和勋章存在
+            group_members = GroupModel.query.filter_by(group_id=group_id).all()
+            target_medal = MedalModel.query.filter_by(id=medal_id).first()
+            
+            if not group_members:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的组不存在或组内没有成员"
+                }), 404
+                
+            if not target_medal:
+                return jsonify({
+                    "code": 404,
+                    "message": "指定的勋章不存在"
+                }), 404
+            
+            # 获取组内所有成员ID
+            member_ids = [member.student_id for member in group_members]
+            
+            # 对每个成员，删除其特定勋章记录
+            for member_id in member_ids:
+                member_records = MedalUserModel.query.filter_by(
+                    user_id=member_id, 
+                    medal_id=medal_id
+                ).all()
+                
+                if member_records:
+                    records_to_delete.extend(member_records)
+                    member = UserModel.query.filter_by(id=member_id).first()
+                    if member:
+                        affected_users.append({
+                            "User_Id": member.id,
+                            "User_Name": member.username
+                        })
+                        # 减少用户的勋章数量
+                        if member.medal > 0:
+                            member.medal -= 1
+            
+            if affected_users:
+                db.session.commit()
+        
+        # 执行删除操作
+        if records_to_delete:
+            deleted_count = len(records_to_delete)
+            for record in records_to_delete:
+                db.session.delete(record)
+            db.session.commit()
+            
+            return jsonify({
+                "code": 200,
+                "message": "勋章记录删除成功",
+                "deleted_count": deleted_count,
+                "affected_users": affected_users
+            })
+        else:
+            return jsonify({
+                "code": 200,
+                "message": "没有找到符合条件的勋章记录",
+                "deleted_count": 0
+            })
+            
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            "code": 500,
+            "message": f"删除勋章记录失败: {str(e)}"
+        }), 500
+    
+    
