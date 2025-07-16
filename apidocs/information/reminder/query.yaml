@@ -11,6 +11,13 @@ parameters:
     type: string
     required: true
     description: 用户token
+  
+  - name: only_unread
+    in: query
+    type: integer
+    required: false
+    description: 是否只返回未读提醒(0:返回所有提醒 1:只返回未读提醒)
+    default: 0
 
 responses:
   200:
@@ -59,6 +66,10 @@ responses:
                       create_time:
                         type: string
                         example: "2023-06-01 10:23:45"
+                      status:
+                        type: integer
+                        description: 提醒状态 (0:未读 1:已读)
+                        example: 0
                 task:
                   type: array
                   description: 任务相关提醒 (source_type=2)
@@ -84,6 +95,10 @@ responses:
                       create_time:
                         type: string
                         example: "2023-06-02 09:30:00"
+                      status:
+                        type: integer
+                        description: 提醒状态 (0:未读 1:已读)
+                        example: 0
                 notice:
                   type: array
                   description: 通知相关提醒 (source_type=3)
@@ -108,6 +123,10 @@ responses:
                       create_time:
                         type: string
                         example: "2023-06-03 14:15:30"
+                      status:
+                        type: integer
+                        description: 提醒状态 (0:未读 1:已读)
+                        example: 0
                 error:
                   type: array
                   description: 报错相关提醒 (source_type=4)
@@ -132,6 +151,10 @@ responses:
                       create_time:
                         type: string
                         example: "2023-06-04 16:20:10"
+                      status:
+                        type: integer
+                        description: 提醒状态 (0:未读 1:已读)
+                        example: 0
                 homework:
                   type: array
                   description: 作业相关提醒 (source_type=5)
@@ -156,6 +179,10 @@ responses:
                       create_time:
                         type: string
                         example: "2023-06-05 18:30:00"
+                      status:
+                        type: integer
+                        description: 提醒状态 (0:未读 1:已读)
+                        example: 0
                 other:
                   type: array
                   description: 其他类型提醒 (source_type=0或未知)
@@ -180,5 +207,9 @@ responses:
                       create_time:
                         type: string
                         example: "2023-06-06 20:00:00"
+                      status:
+                        type: integer
+                        description: 提醒状态 (0:未读 1:已读)
+                        example: 0
   404:
     description: 用户不存在 

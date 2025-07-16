@@ -1,0 +1,53 @@
+彻底删除已读提醒信息(需要token)
+---
+tags:
+  - 信息提醒模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: 用户token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: reminder_remove
+      properties:
+        ids:
+          type: array
+          description: 指定要删除的已读提醒ID列表
+          items:
+            type: integer
+          example: [123, 456, 789]
+        all_read:
+          type: boolean
+          description: 是否删除所有已读提醒
+          example: false
+
+responses:
+  200:
+    description: 删除已读提醒成功
+    schema:
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: "删除已读提醒成功"
+        data:
+          type: object
+          properties:
+            deleted_count:
+              type: integer
+              description: 已删除的提醒数量
+              example: 3
+  400:
+    description: 请指定要删除的提醒ID列表，或设置all_read=true删除所有已读提醒
+  404:
+    description: 用户不存在 

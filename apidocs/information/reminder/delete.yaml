@@ -1,4 +1,4 @@
-删除单个提醒信息(需要token)
+标记提醒信息为已读(需要token)
 ---
 tags:
   - 信息提醒模块
@@ -27,7 +27,7 @@ parameters:
 
 responses:
   200:
-    description: 提醒删除成功
+    description: 提醒已标记为已读
     schema:
       properties:
         code:
@@ -35,10 +35,10 @@ responses:
           example: 200
         message:
           type: string
-          example: "提醒删除成功"
+          example: "提醒已标记为已读"
   400:
     description: 提醒ID不能为空
   403:
-    description: 无权删除此提醒，仅接收者可删除
+    description: 无权标记此提醒为已读，仅接收者可操作
   404:
     description: 用户不存在或提醒信息不存在 

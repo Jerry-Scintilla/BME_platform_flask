@@ -44,7 +44,8 @@ def create_reminder(title, content, related_info_id, student_id, group_id, sourc
         content=content,
         range=str(related_info_id),  # 存储关联的信息ID
         student_id=student_id,
-        priority=source_type  # 使用priority字段存储原始信息类型
+        priority=source_type,  # 使用priority字段存储原始信息类型
+        status=0  # 0代表未读状态
     )
     
     db.session.add(reminder)
@@ -2452,6 +2453,9 @@ def reminder_query():
     """
     查询当前用户的提醒信息
     """
+    # 获取查询参数，是否只返回未读提醒
+    only_unread = request.args.get("only_unread", type=int, default=0)
+    
     # 获取当前用户
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
@@ -2461,14 +2465,27 @@ def reminder_query():
             "message": "用户不存在"
         }), 404
     
-    # 查询该用户的所有提醒信息
-    reminders = InformationModel.query.filter_by(
+    # 查询该用户的提醒信息
+    query = InformationModel.query.filter_by(
         type=0,  # 0代表提醒信息
         student_id=user.id
-    ).order_by(InformationModel.create_time.desc()).all()
+    )
+    
+    # 如果只查询未读提醒
+    if only_unread:
+        query = query.filter_by(status=0)  # 未读提醒status=0
+    
+    # 按创建时间倒序排序
+    reminders = query.order_by(InformationModel.create_time.desc()).all()
+    
+    # 获取未读提醒数量
+    unread_count = InformationModel.query.filter_by(
+        type=0,  # 0代表提醒信息
+        student_id=user.id,
+        status=0  # 未读状态
+    ).count()
     
     # 初始化分类结果
-    total_unread = len(reminders)  # 所有提醒都是未读的，读完后会被删除
     categorized_reminders = {
         "leave": [],      # 请假相关提醒
         "task": [],       # 任务相关提醒
@@ -2487,7 +2504,8 @@ def reminder_query():
             "content": reminder.content,
             "related_info_id": reminder.range,  # 关联的原始信息ID
             "source_type": reminder.priority,   # 原始信息类型
-            "create_time": reminder.create_time.strftime("%Y-%m-%d %H:%M:%S")
+            "create_time": reminder.create_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": reminder.status  # 添加状态字段：0未读，1已读
         }
         
         # 根据原始信息类型直接分类
@@ -2509,7 +2527,7 @@ def reminder_query():
         "code": 200,
         "message": "查询成功",
         "data": {
-            "total_unread": total_unread,  # 未读提醒总数
+            "total_unread": unread_count,  # 未读提醒总数
             "reminders": categorized_reminders  # 按类型分类的提醒
         }
     }), 200
@@ -2520,7 +2538,7 @@ def reminder_query():
 @swag_from('../apidocs/information/reminder/delete.yaml')
 def reminder_delete():
     """
-    删除单个提醒信息
+    标记单个提醒信息为已读
     """
     # 获取请求数据
     data = request.get_json()
@@ -2550,20 +2568,20 @@ def reminder_delete():
             "message": "提醒信息不存在"
         }), 404
     
-    # 验证删除权限：只有提醒的接收者可以删除
+    # 验证权限：只有提醒的接收者可以标记为已读
     if reminder.student_id != user.id:
         return jsonify({
             "code": 403,
-            "message": "无权删除此提醒，仅接收者可删除"
+            "message": "无权标记此提醒为已读，仅接收者可操作"
         }), 403
     
-    # 删除提醒信息
-    db.session.delete(reminder)
+    # 标记提醒信息为已读，而不是删除
+    reminder.status = 1  # 标记为已读
     db.session.commit()
     
     return jsonify({
         "code": 200,
-        "message": "提醒删除成功"
+        "message": "提醒已标记为已读"
     }), 200
 
 # 批量删除提醒信息接口
@@ -2572,7 +2590,7 @@ def reminder_delete():
 @swag_from('../apidocs/information/reminder/batch_delete.yaml')
 def reminder_batch_delete():
     """
-    批量删除提醒信息，支持多种条件
+    批量标记提醒信息为已读，支持多种条件
     """
     # 获取请求数据
     data = request.get_json()
@@ -2580,7 +2598,7 @@ def reminder_batch_delete():
     # 支持的筛选条件
     user_id = data.get("user_id")       # 指定接收者ID
     info_id = data.get("info_id")       # 关联的原始信息ID
-    ids = data.get("ids")               # 指定要删除的提醒ID列表
+    ids = data.get("ids")               # 指定要标记为已读的提醒ID列表
     source_type = data.get("type")      # 提醒源的类型(1:请假 2:任务 3:通知 4:报错 5:作业)
     
     # 获取当前用户
@@ -2593,18 +2611,18 @@ def reminder_batch_delete():
         }), 404
     
     # 构建查询条件
-    query = InformationModel.query.filter_by(type=0)  # 筛选提醒信息
+    query = InformationModel.query.filter_by(type=0, status=0)  # 筛选未读提醒信息
     
-    # 只有管理员可以按接收者ID删除其他用户的提醒
+    # 只有管理员可以按接收者ID标记其他用户的提醒为已读
     if user_id and user_id != user.id:
         if user.user_mode != 'admin':
             return jsonify({
                 "code": 403,
-                "message": "权限不足，只有管理员可以删除其他用户的提醒"
+                "message": "权限不足，只有管理员可以标记其他用户的提醒为已读"
             }), 403
         query = query.filter_by(student_id=user_id)
     else:
-        # 非管理员或未指定用户ID时，只能删除自己的提醒
+        # 非管理员或未指定用户ID时，只能标记自己的提醒为已读
         query = query.filter_by(student_id=user.id)
     
     # 如果提供了原始信息ID，筛选关联该信息的提醒
@@ -2625,7 +2643,73 @@ def reminder_batch_delete():
     if not reminders:
         return jsonify({
             "code": 200,
-            "message": "未找到符合条件的提醒",
+            "message": "未找到符合条件的未读提醒",
+            "data": {
+                "marked_read_count": 0
+            }
+        }), 200
+    
+    # 记录标记数量
+    marked_read_count = len(reminders)
+    
+    # 批量标记为已读
+    for reminder in reminders:
+        reminder.status = 1  # 标记为已读
+    
+    db.session.commit()
+    
+    return jsonify({
+        "code": 200,
+        "message": "批量标记提醒为已读成功",
+        "data": {
+            "marked_read_count": marked_read_count
+        }
+    }), 200
+
+# 彻底删除已读提醒信息接口
+@bp.route("/information/reminder/remove", methods=["POST"])
+@jwt_required()
+def reminder_remove():
+    """
+    彻底删除已读提醒信息
+    """
+    # 获取请求数据
+    data = request.get_json()
+    reminder_ids = data.get("ids")  # 可选，指定要删除的已读提醒ID列表
+    all_read = data.get("all_read", False)  # 是否删除所有已读提醒
+    
+    # 获取当前用户
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    # 构建查询条件 - 已读提醒(status=1)
+    query = InformationModel.query.filter_by(
+        type=0,  # 提醒信息
+        student_id=user.id,
+        status=1  # 已读状态
+    )
+    
+    # 如果指定了ID列表
+    if reminder_ids and isinstance(reminder_ids, list):
+        query = query.filter(InformationModel.id.in_(reminder_ids))
+    elif not all_read:
+        return jsonify({
+            "code": 400,
+            "message": "请指定要删除的提醒ID列表，或设置all_read=true删除所有已读提醒"
+        }), 400
+    
+    # 查找符合条件的已读提醒
+    reminders = query.all()
+    
+    if not reminders:
+        return jsonify({
+            "code": 200,
+            "message": "未找到符合条件的已读提醒",
             "data": {
                 "deleted_count": 0
             }
@@ -2640,6 +2724,17 @@ def reminder_batch_delete():
     
     db.session.commit()
     
+    return jsonify({
+        "code": 200,
+        "message": "删除已读提醒成功",
+        "data": {
+            "deleted_count": deleted_count
+        }
+    }), 200
+
+
+
+
     return jsonify({
         "code": 200,
         "message": "批量删除提醒成功",
