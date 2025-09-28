@@ -6,7 +6,7 @@ import base64
 from exts import db, redis_client
 
 # 导入数据库表
-from models import UserModel, GroupModel, CourseModel, LearningProgressModel, CheckRecord
+from models import UserModel, GroupModel, CourseModel, LearningProgressModel, CheckRecord,MedalUserModel
 
 # 导入表单验证
 from .forms import AvatarForm
