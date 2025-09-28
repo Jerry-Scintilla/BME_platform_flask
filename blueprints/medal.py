@@ -51,6 +51,33 @@ def medal_create():
             "error": form.errors
         }), 401
 
+@bp.route("/my_medal_count")
+@jwt_required()
+@swag_from('../apidocs/medal/my_medal_count.yaml')
+def my_medal_count():
+    """返回当前登录用户拥有的奖牌数量"""
+    try:
+        user_email = get_jwt_identity()
+        user = UserModel.query.filter_by(email=user_email).first()
+        if not user:
+            return jsonify({
+                "code": 401,
+                "message": "用户不存在"
+            }), 401
+        count = MedalUserModel.query.filter_by(user_id=user.id).count()
+
+        return jsonify({
+            "code": 200,
+            "message": "查询成功",
+            "medal_count": count
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e)
+        }), 500
+    
 # 查询勋章列表
 @bp.route("/medal_list")
 @jwt_required()

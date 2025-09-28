@@ -20,6 +20,55 @@ from flasgger import swag_from
 
 bp = Blueprint("user", __name__, url_prefix="/user")
 
+@bp.route("/medal_wear", methods=['POST'])
+@jwt_required()
+@swag_from('../apidocs/user/medal_wear.yaml')
+def medal_wear():
+    """用户佩戴已拥有的奖牌
+
+    前端需传入 JSON: { "Medal_Id": <int> }
+    """
+    try:
+        user_email = get_jwt_identity()
+        user = UserModel.query.filter_by(email=user_email).first()
+        if not user:
+            return jsonify({
+                "code": 401,
+                "message": "用户不存在"
+            }), 401
+
+        medal_id = request.json.get('Medal_Id')
+        if medal_id is None:
+            return jsonify({
+                "code": 400,
+                "message": "缺少 Medal_Id 参数"
+            }), 400
+
+        # 检查用户是否拥有该奖牌记录
+        medal_user = MedalUserModel.query.filter_by(user_id=user.id, medal_id=medal_id).first()
+        if not medal_user:
+            return jsonify({
+                "code": 404,
+                "message": "该用户未拥有该奖牌"
+            }), 404
+
+        # 更新 user 的当前佩戴奖牌字段
+        user.medal = medal_id
+        db.session.commit()
+
+        return jsonify({
+            "code": 200,
+            "message": "佩戴奖牌成功",
+            "Medal_Id": medal_id
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            "code": 500,
+            "message": str(e)
+        }), 500
+
 
 # 用户信息请求
 @bp.route("/user_index")
