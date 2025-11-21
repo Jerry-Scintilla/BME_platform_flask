@@ -1,10 +1,11 @@
 import wtforms
 from flask_wtf.file import FileAllowed, FileSize, FileField
-from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional, DataRequired
+from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional, DataRequired, ValidationError
 from models import UserModel
 from flask import request
 from exts import db
 import datetime
+import re
 
 # 自定义的日期时间字段，支持多种格式的输入
 class FlexibleDateTimeField(wtforms.Field):
@@ -36,6 +37,31 @@ class FlexibleDateTimeField(wtforms.Field):
                 self.data = None
                 raise ValueError('Invalid date format. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS') from e
 
+# 自定义密码验证器
+class PasswordValidator:
+    def __init__(self, message=None):
+        self.message = message or '密码必须至少包含8个字符，且必须包含大写字母、小写字母、数字和特殊字符'
+    
+    def __call__(self, form, field):
+        password = field.data
+        if not password:
+            raise ValidationError('密码不能为空')
+        # 检查长度
+        if len(password) < 8:
+            raise ValidationError('密码中至少包含8个字符，且必须包含大小写字母、数字、特殊字符')
+        # 检查是否包含大写字母
+        if not re.search(r'[A-Z]', password):
+            raise ValidationError('密码中至少包含8个字符，且必须包含大小写字母、数字、特殊字符')
+        # 检查是否包含小写字母
+        if not re.search(r'[a-z]', password):
+            raise ValidationError('密码中至少包含8个字符，且必须包含大小写字母、数字、特殊字符')
+        # 检查是否包含数字
+        if not re.search(r'\d', password):
+            raise ValidationError('密码中至少包含8个字符，且必须包含大小写字母、数字、特殊字符')
+        # 检查是否包含特殊字符
+        if not re.search(r'[^A-Za-z0-9]', password):
+            raise ValidationError('密码中至少包含8个字符，且必须包含大小写字母、数字、特殊字符')
+
 # 注册表单验证
 class RegisterForm(wtforms.Form):
     def __init__(self):
@@ -50,7 +76,7 @@ class RegisterForm(wtforms.Form):
             super(RegisterForm, self).__init__(data=data, **args)
 
     User_Name = wtforms.StringField('User_Name')
-    User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
+    User_Password = wtforms.StringField(validators=[PasswordValidator()])
     User_Email = wtforms.StringField(validators=[Email(message='邮箱格式错误')])
     User_Captcha = wtforms.StringField(validators=[length(min=6, max=6, message='验证码为6位')])
 
@@ -84,7 +110,7 @@ class LoginForm(wtforms.Form):
             args = request.args.to_dict()
             super(LoginForm, self).__init__(data=data, **args)
 
-    User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
+    User_Password = wtforms.StringField(validators=[length(min=8, max=100, message='Invalid password')])
     User_Email = wtforms.StringField(validators=[Email(message='Invalid Email')])
 
 

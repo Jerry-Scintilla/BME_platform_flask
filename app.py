@@ -26,7 +26,7 @@ from flask_redis import FlaskRedis
 app = Flask(__name__)
 
 # 配置CORS，允许特定域名访问API
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # 绑定配置文件
 app.config.from_object(config)
