@@ -17,11 +17,14 @@ from flask_jwt_extended import (get_jwt_identity, jwt_required)
 # 导入api文档模块
 from flasgger import swag_from
 
+from . import audit_log
+
 bp = Blueprint("homeCover", __name__, url_prefix="")
 
 @bp.route("/homeCover/update", methods=['POST'])
 @jwt_required()
 @swag_from('../apidocs/homeCover/update.yaml')
+@audit_log(operation="更新首页封面")
 def upgrade():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
@@ -98,6 +101,7 @@ def upgrade():
 @bp.route("/homeCover/delete", methods=['POST'])
 @jwt_required()
 @swag_from('../apidocs/homeCover/delete.yaml')
+@audit_log(operation="删除首页封面")
 def delete():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()

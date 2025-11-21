@@ -19,10 +19,14 @@ bp = Blueprint("auth", __name__, url_prefix="/auth")
 # 导入api文档模块
 from flasgger import swag_from
 
+# 导入审计装饰器
+from . import audit_log
+
 
 # 注册端口
 @bp.route("/register", methods=["POST"])
 @swag_from('../apidocs/user/register.yaml')
+@audit_log(operation="用户注册")
 def register():
     form = RegisterForm()
     if form.validate():
@@ -84,6 +88,7 @@ def register():
 # 登录端口
 @bp.route("/login", methods=["POST"])
 @swag_from('../apidocs/user/login.yaml')
+@audit_log(operation="用户登录")
 def login():
     form = LoginForm()
     if form.validate():
@@ -184,6 +189,7 @@ def login():
 
 @bp.route("/admin_login", methods=["POST"])
 @swag_from('../apidocs/user/admin_login.yaml')
+@audit_log(operation="管理员登录")
 def admin_login():
     form = LoginForm()
     if form.validate():
@@ -252,6 +258,7 @@ from exts import limiter
 @bp.route("/captcha/email", methods=["POST"])
 @limiter.limit("1/minute")
 @swag_from('../apidocs/user/get_email_captcha.yaml')
+@audit_log(operation="获取邮件验证码")
 def get_email_captcha():
     mail_list = request.get_json()
     email = mail_list["User_Email"]
@@ -278,6 +285,7 @@ def get_email_captcha():
 
 @bp.route("/find_password", methods=["POST"])
 @swag_from('../apidocs/user/find_password.yaml')
+@audit_log(operation="找回密码")
 def find_password():
     data = request.get_json()
     email = data['User_Email']

@@ -18,7 +18,7 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 from flasgger import swag_from
 
 # 导入权限检查模块
-from . import check_permission
+from . import check_permission, audit_log
 
 bp = Blueprint("article", __name__, url_prefix="")
 
@@ -26,6 +26,7 @@ bp = Blueprint("article", __name__, url_prefix="")
 @bp.route("/article/public", methods=["POST"])
 @jwt_required()
 @check_permission('article_management')
+@audit_log(operation="创建文章")
 @swag_from('../apidocs/article/article_public.yaml')
 def article_public():
     form = ArticleForm()
@@ -164,6 +165,7 @@ def article_detail_json():
 @bp.route("/article/delete", methods=["POST"])
 @jwt_required()
 @check_permission('article_management')
+@audit_log(operation="删除文章")
 @swag_from('../apidocs/article/article_delete.yaml')
 def article_delete():
     data = request.get_json()
@@ -247,6 +249,7 @@ def article():
 @bp.route("/article/edit", methods=["POST"])
 @jwt_required()
 @check_permission('article_management')
+@audit_log(operation="编辑文章")
 @swag_from('../apidocs/article/article_edit.yaml')
 def article_edit():
     article_id = request.json.get('Article_Id')

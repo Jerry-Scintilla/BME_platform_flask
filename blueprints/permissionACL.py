@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from models import db, UserModel, PermissionModel, UserPermissionModel
 
-from . import check_permission
+from . import check_permission, audit_log
 
 # 导入api文档模块
 from flasgger import swag_from
@@ -34,6 +34,7 @@ def list_permissions():
 @bp.route("/assign", methods=["POST"])
 @jwt_required()
 @check_permission('system_management')
+@audit_log(operation="分配用户权限")
 @swag_from('../apidocs/permissions/assign.yaml')
 def assign_permission():
     """
@@ -110,6 +111,7 @@ def assign_permission():
 @bp.route("/revoke", methods=["POST"])
 @jwt_required()
 @check_permission('system_management')
+@audit_log(operation="撤销用户权限")
 @swag_from('../apidocs/permissions/revoke.yaml')
 def revoke_permission():
     """

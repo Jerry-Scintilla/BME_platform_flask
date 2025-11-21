@@ -16,7 +16,7 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 from flasgger import swag_from
 
 # 导入权限检查模块
-from . import check_permission
+from . import check_permission, audit_log
 
 bp = Blueprint("medal", __name__, url_prefix="/medal")
 
@@ -26,6 +26,7 @@ bp = Blueprint("medal", __name__, url_prefix="/medal")
 @jwt_required()
 @check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_create.yaml')
+@audit_log(operation="创建勋章")
 def medal_create():
     form = MedalForm()
     if form.validate():
@@ -101,6 +102,7 @@ def medal_list():
 @jwt_required()
 @check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_delete.yaml')
+@audit_log(operation="删除勋章")
 def medal_delete():
     medal_id = request.json.get("Medal_Id")
     medal = MedalModel.query.filter_by(id=medal_id).first()
@@ -123,6 +125,7 @@ def medal_delete():
 @jwt_required()
 @check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_edit.yaml')
+@audit_log(operation="编辑勋章")
 def medal_edit():
     # 获取请求中的参数
     Medal_Id = request.json.get("Medal_Id")
@@ -178,6 +181,7 @@ def medal_edit():
 @jwt_required()
 @check_permission('medal_management')
 @swag_from('../apidocs/medal/user_medal_add.yaml')
+@audit_log(operation="为用户添加勋章")
 def user_medal_add():
     student_id = request.json.get("Student_Id")
     medal_name = request.json.get("Medal_Name")
@@ -327,6 +331,7 @@ def user_medal_list_by_medal_id():
 @jwt_required()
 @check_permission('medal_management')
 @swag_from('../apidocs/medal/user_medal_delete.yaml')
+@audit_log(operation="删除用户勋章")
 def user_medal_delete():
     # 获取请求参数
     user_id = request.json.get("User_Id")

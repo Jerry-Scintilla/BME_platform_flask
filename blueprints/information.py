@@ -19,6 +19,8 @@ from flasgger import swag_from
 # 导入表单验证
 from blueprints.forms import LeaveForm, TaskForm, NoticeForm
 
+from . import audit_log
+
 bp = Blueprint("information", __name__, url_prefix="")
 
 # 辅助函数：创建提醒信息
@@ -118,6 +120,7 @@ def delete_related_reminders(info_id):
 @bp.route("/information/leave/add", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/leave/add.yaml')
+@audit_log(operation="添加请假信息")
 def leave_add():
     """
     添加请假信息
@@ -192,6 +195,7 @@ def leave_add():
 @bp.route("/information/leave/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/leave/delete.yaml')
+@audit_log(operation="删除请假信息")
 def leave_delete():
     """
     删除请假信息
@@ -370,6 +374,7 @@ def leave_query():
 @bp.route("/information/leave/approve", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/leave/approve.yaml')
+@audit_log(operation="审批请假信息")
 def leave_approve():
     """
     批准请假申请
@@ -458,6 +463,7 @@ def leave_approve():
 @bp.route("/information/task/add", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/task/add.yaml')
+@audit_log(operation="添加任务信息")
 def task_add():
     """
     添加或修改任务信息
@@ -612,6 +618,7 @@ def task_add():
 @bp.route("/information/task/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/task/delete.yaml')
+@audit_log(operation="删除任务信息")
 def task_delete():
     """
     删除任务信息
@@ -823,6 +830,7 @@ def task_query():
 @bp.route("/information/notice/add", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/notice/add.yaml')
+@audit_log(operation="添加通知信息")
 def notice_add():
     """
     添加或修改通知信息
@@ -971,6 +979,7 @@ def notice_add():
 @bp.route("/information/notice/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/notice/delete.yaml')
+@audit_log(operation="删除通知信息")
 def notice_delete():
     """
     删除通知信息
@@ -1422,6 +1431,7 @@ def information_query_all():
 @bp.route("/information/error/add", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/error/add.yaml')
+@audit_log(operation="添加错误报告")
 def error_add():
     """
     添加报错信息
@@ -1563,6 +1573,7 @@ def error_query():
 @bp.route("/information/error/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/error/delete.yaml')
+@audit_log(operation="删除错误报告")
 def error_delete():
     """
     删除报错信息
@@ -1628,6 +1639,7 @@ def error_delete():
 @bp.route("/information/homework/add", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/homework/add.yaml')
+@audit_log(operation="添加作业信息")
 def homework_add():
     """
     添加作业信息
@@ -1779,6 +1791,7 @@ def homework_add():
 @bp.route("/information/homework/update", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/homework/update.yaml')
+@audit_log(operation="更新作业信息")
 def homework_update():
     """
     修改作业信息
@@ -1875,6 +1888,7 @@ def homework_update():
 @bp.route("/information/homework/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/homework/delete.yaml')
+@audit_log(operation="删除作业信息")
 def homework_delete():
     """
     删除作业信息
@@ -2536,6 +2550,7 @@ def reminder_query():
 @bp.route("/information/reminder/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/reminder/delete.yaml')
+@audit_log(operation="删除提醒信息")
 def reminder_delete():
     """
     标记单个提醒信息为已读
@@ -2588,6 +2603,7 @@ def reminder_delete():
 @bp.route("/information/reminder/batch_delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/information/reminder/batch_delete.yaml')
+@audit_log(operation="批量删除提醒信息")
 def reminder_batch_delete():
     """
     批量标记提醒信息为已读，支持多种条件
@@ -2669,6 +2685,7 @@ def reminder_batch_delete():
 # 彻底删除已读提醒信息接口
 @bp.route("/information/reminder/remove", methods=["POST"])
 @jwt_required()
+@audit_log(operation="移除提醒信息")
 def reminder_remove():
     """
     彻底删除已读提醒信息

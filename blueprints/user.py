@@ -19,12 +19,13 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 from flasgger import swag_from
 
 # 导入权限检查模块
-from . import check_permission
+from . import check_permission, audit_log
 
 bp = Blueprint("user", __name__, url_prefix="/user")
 
 @bp.route("/medal_wear", methods=['POST'])
 @jwt_required()
+@audit_log(operation="用户佩戴奖牌")
 @swag_from('../apidocs/user/medal_wear.yaml')
 def medal_wear():
     """用户佩戴已拥有的奖牌
@@ -154,6 +155,7 @@ def user_list():
 
 @bp.route("/user_avatars/upgrade", methods=['POST'])
 @jwt_required()
+@audit_log(operation="用户上传头像")
 @swag_from('../apidocs/user/user_avatars_upgrade.yaml')
 def user_avatars_upgrade():
     User_Email = get_jwt_identity()
@@ -241,6 +243,7 @@ def user_avatars_id():
 
 @bp.route("/user/edit", methods=['POST'])
 @jwt_required()
+@audit_log(operation="用户编辑个人信息")
 @swag_from('../apidocs/user/user_edit.yaml')
 def user_edit():
     User_Email = get_jwt_identity()
@@ -317,6 +320,7 @@ def user_edit():
 @bp.route("/group_add", methods=['POST'])
 @jwt_required()
 @check_permission('user_management')
+@audit_log(operation="创建或修改小组")
 @swag_from('../apidocs/user/group_add.yaml')
 def group_add():
     group_name = request.json.get('Group_Name')
@@ -599,6 +603,7 @@ def group_list():
 @bp.route("/group/delete", methods=['POST'])
 @jwt_required()
 @check_permission('user_management')
+@audit_log(operation="删除小组")
 @swag_from('../apidocs/user/group_delete.yaml')
 def group_delete():
     group_id = request.json.get('Group_Id')
