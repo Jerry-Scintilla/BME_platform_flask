@@ -1,10 +1,95 @@
 from datetime import datetime, timedelta
 from collections import defaultdict
 from functools import wraps
-from flask import jsonify
+from flask import jsonify, request
 from flask_jwt_extended import get_jwt_identity
 
+from exts import db
 from models import UserModel, PermissionModel, UserPermissionModel
+
+# 安全审计装饰器
+def audit_log(operation=None):
+    """
+    安全审计装饰器
+    记录用户操作日志
+    operation: 操作描述（可选）
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 获取当前用户
+            user_email = get_jwt_identity()
+            user = UserModel.query.filter_by(email=user_email).first()
+            
+            # 记录操作开始前的状态
+            start_time = datetime.utcnow()
+            operation_data = None
+            result = '失败'
+            
+            try:
+                # 执行原函数
+                response = func(*args, **kwargs)
+                
+                # 如果返回的是元组，提取响应对象
+                if isinstance(response, tuple) and len(response) == 2:
+                    response_obj = response[0]
+                    status_code = response[1]
+                else:
+                    response_obj = response
+                    status_code = 200
+                
+                # 解析响应数据
+                if hasattr(response_obj, 'get_json'):
+                    operation_data = response_obj.get_json()
+                elif isinstance(response_obj, dict):
+                    operation_data = response_obj
+                elif isinstance(response_obj, str):
+                    operation_data = {'message': response_obj}
+                
+                # 设置操作结果
+                result = '成功' if status_code < 400 else '失败'
+                
+                # 记录审计日志
+                if user:
+                    from models import AuditLog
+                    log_entry = AuditLog(
+                        user_id=user.id,
+                        username=user.username,
+                        ip_address=request.remote_addr,
+                        user_agent=request.headers.get('User-Agent', ''),
+                        operation=operation or func.__name__,
+                        operation_url=request.url,
+                        operation_data=str(operation_data),
+                        result=result,
+                        timestamp=start_time
+                    )
+                    db.session.add(log_entry)
+                    db.session.commit()
+                
+                return response
+            except Exception as e:
+                # 记录异常情况
+                if user:
+                    from models import AuditLog
+                    log_entry = AuditLog(
+                        user_id=user.id,
+                        username=user.username,
+                        ip_address=request.remote_addr,
+                        user_agent=request.headers.get('User-Agent', ''),
+                        operation=operation or func.__name__,
+                        operation_url=request.url,
+                        operation_data=str({'error': str(e)}),
+                        result='失败',
+                        timestamp=start_time
+                    )
+                    db.session.add(log_entry)
+                    db.session.commit()
+                
+                raise
+        return wrapper
+    return decorator
+
+
 
 
 # 辅助函数：格式化时长
@@ -169,57 +254,6 @@ def check_multiple_permissions(permission_names, require_all=False):
             return func(*args, **kwargs)
         return wrapper
     return decorator
-
-
-def has_permission(user_id, permission_name):
-    """
-    检查用户是否具有特定权限（供内部调用）
-    """
-    user = UserModel.query.get(user_id)
-    if not user:
-        return False
-    
-    # 管理员拥有所有权限
-    if user.user_mode == 'admin':
-        return True
-        
-    permission = PermissionModel.query.filter_by(name=permission_name).first()
-    if not permission:
-        return False
-        
-    user_permission = UserPermissionModel.query.filter_by(
-        user_id=user.id,
-        permission_id=permission.id
-    ).first()
-    
-    return user_permission is not None
-
-
-def init_permissions():
-    """
-    初始化默认权限
-    """
-    from models import db, PermissionModel
-    
-    default_permissions = [
-        ('course_management', '课程管理权限'),
-        ('user_management', '用户管理权限'),
-        ('article_management', '文章管理权限'),
-        ('medal_management', '勋章管理权限'),
-        ('system_management', '系统管理权限')
-    ]
-    
-    for name, description in default_permissions:
-        perm = PermissionModel.query.filter_by(name=name).first()
-        if not perm:
-            perm = PermissionModel(name=name, description=description)
-            db.session.add(perm)
-    
-    try:
-        db.session.commit()
-    except:
-        db.session.rollback()
-
 
 
 # 确保所有蓝图模块都被导入

@@ -294,6 +294,24 @@ class ArticleComment(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
 
 
+# 审计日志模型
+class AuditLog(db.Model):
+    __tablename__ = 'audit_log'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    username = db.Column(db.String(100), nullable=False)
+    ip_address = db.Column(db.String(45), nullable=False)  # 支持IPv4和IPv6
+    user_agent = db.Column(db.Text)  # 浏览器信息
+    operation = db.Column(db.String(200), nullable=False)  # 操作内容
+    operation_url = db.Column(db.String(200))  # 操作的URL
+    operation_data = db.Column(db.Text)  # 操作的数据（JSON格式）
+    result = db.Column(db.String(50))  # 操作结果（成功/失败）
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # 关联用户
+    user = db.relationship('UserModel', backref=db.backref('audit_logs', lazy='dynamic'))
+
+
 # 权限模块表
 class PermissionModel(db.Model):
     __tablename__ = 'permission'
