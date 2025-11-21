@@ -4,16 +4,7 @@ from exts import db, mail, limiter, redis_client
 from flask_migrate import Migrate
 
 # 导入蓝图模块
-from blueprints.auth import bp as auth_bp
-from blueprints.user import bp as user_bp
-from blueprints.article import bp as article_bp
-from blueprints.course import bp as course_bp
-from blueprints.medal import bp as medal_bp
-from blueprints.codecheck import bp as codecheck_bp
-from blueprints.learningProgress import bp as learningprogress_bp
-from blueprints.homeCover import bp as homeCover_bp
-from blueprints.information import bp as information_bp
-
+from blueprints import *
 
 from flask_cors import CORS
 
@@ -49,6 +40,7 @@ app.register_blueprint(codecheck_bp)
 app.register_blueprint(learningprogress_bp)
 app.register_blueprint(homeCover_bp)
 app.register_blueprint(information_bp)
+app.register_blueprint(permission_bp)
 
 
 @app.route('/')

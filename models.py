@@ -294,3 +294,23 @@ class ArticleComment(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
 
 
+# 权限模块表
+class PermissionModel(db.Model):
+    __tablename__ = 'permission'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)  # 权限名称
+    description = db.Column(db.String(200))  # 权限描述
+
+
+# 用户权限关联表
+class UserPermissionModel(db.Model):
+    __tablename__ = 'user_permission'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    permission_id = db.Column(db.Integer, db.ForeignKey('permission.id'), nullable=False)
+    
+    # 添加联合唯一约束，防止重复分配相同权限
+    __table_args__ = (db.UniqueConstraint('user_id', 'permission_id'),)
+    
+    user = db.relationship('UserModel', backref=db.backref('user_permissions', lazy=True))
+    permission = db.relationship('PermissionModel', backref=db.backref('user_permissions', lazy=True))

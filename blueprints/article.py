@@ -17,21 +17,17 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 # 导入api文档模块
 from flasgger import swag_from
 
+# 导入权限检查模块
+from . import check_permission
+
 bp = Blueprint("article", __name__, url_prefix="")
 
 # 创建文章简介
 @bp.route("/article/public", methods=["POST"])
 @jwt_required()
+@check_permission('article_management')
 @swag_from('../apidocs/article/article_public.yaml')
 def article_public():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
     form = ArticleForm()
     if form.validate():
         title = form.Article_Title.data
@@ -93,18 +89,9 @@ def article_public():
 
 @bp.route("/article/detail", methods=["POST"])
 @jwt_required()
+@check_permission('article_management')
 @swag_from('../apidocs/article/article_detail.yaml')
 def article_detail():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    # print(mode)
-    if mode != 'admin':
-        return jsonify({
-            "code": 401,
-            'message': "用户权限不够"
-        }), 401
-
     file = request.files['Article_Content']
     article_id = request.form.get('Article_Id')
     if file is None:  # 表示没有发送文件
@@ -132,17 +119,9 @@ def article_detail():
 # 创建文章详情（以json格式接收html）
 @bp.route("/article/detail_json", methods=["POST"])
 @jwt_required()
+@check_permission('article_management')
 @swag_from('../apidocs/article/article_detail_json.yaml')
 def article_detail_json():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    # print(mode)
-    if mode != 'admin':
-        return jsonify({
-            "code": 401,
-            'message': "用户权限不够"
-        }), 401
     try:
         data = request.get_json()
         html_content = data.get('Html')
@@ -184,18 +163,9 @@ def article_detail_json():
 
 @bp.route("/article/delete", methods=["POST"])
 @jwt_required()
+@check_permission('article_management')
 @swag_from('../apidocs/article/article_delete.yaml')
 def article_delete():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    # print(mode)
-    if mode != 'admin':
-        return jsonify({
-            "code": 401,
-            'message': "用户权限不够"
-        }), 401
-
     data = request.get_json()
     article_id = data['Article_Id']
     article = ArticleModel.query.filter_by(id=article_id).first()
@@ -276,17 +246,9 @@ def article():
 
 @bp.route("/article/edit", methods=["POST"])
 @jwt_required()
+@check_permission('article_management')
 @swag_from('../apidocs/article/article_edit.yaml')
 def article_edit():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 401,
-            'message': "用户权限不够"
-        }), 401
-
     article_id = request.json.get('Article_Id')
     article_title = request.json.get('Article_Title')
     article_introduction = request.json.get('Article_Introduction')

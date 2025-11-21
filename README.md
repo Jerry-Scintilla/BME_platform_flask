@@ -12,6 +12,28 @@
 * 前端使用了Vue+Vite框架和Javascript语言
 * 形成训练营自己的知识库和交流平台
 
+## 权限系统
+
+本项目实现了基于模块的细粒度权限控制系统，替代了原有的简单角色权限模型。
+
+### 权限模块
+
+系统包含以下权限模块：
+- `course_management`: 课程管理权限
+- `user_management`: 用户管理权限
+- `article_management`: 文章管理权限
+- `medal_management`: 勋章管理权限
+- `system_management`: 系统管理权限
+
+### 权限API
+
+提供以下权限管理接口：
+- `/permissions/init`: 初始化权限系统
+- `/permissions/list`: 列出所有权限
+- `/permissions/assign`: 为用户分配权限
+- `/permissions/revoke`: 撤销用户权限
+- `/permissions/user/<user_id>`: 获取用户权限列表
+
 ## 安装
 
 1. 安装MySQL8.0.39

@@ -18,22 +18,18 @@ from flask_jwt_extended import (get_jwt_identity, jwt_required)
 # 导入api文档模块
 from flasgger import swag_from
 
+# 导入权限检查模块
+from . import check_permission
+
 bp = Blueprint("course", __name__, url_prefix="")
 
 
 # 发布课程
 @bp.route("/course/public", methods=["POST"])
 @jwt_required()
+@check_permission('course_management')
 @swag_from('../apidocs/course/public.yaml')
 def public():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
     form = CourseForm()
     if form.validate():
         title = form.Course_title.data
@@ -84,17 +80,9 @@ def public():
 
 @bp.route("/course/edit", methods=["POST"])
 @jwt_required()
+@check_permission('course_management')
 @swag_from('../apidocs/course/course_edit.yaml')
 def course_edit():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     form = CourseForm()
     if form.validate():
         course_id = form.Course_Id.data

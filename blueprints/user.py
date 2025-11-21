@@ -18,6 +18,9 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 # 导入api文档模块
 from flasgger import swag_from
 
+# 导入权限检查模块
+from . import check_permission
+
 bp = Blueprint("user", __name__, url_prefix="/user")
 
 @bp.route("/medal_wear", methods=['POST'])
@@ -130,16 +133,9 @@ def user_index():
 
 @bp.route("/user_list")
 @jwt_required()
+@check_permission('user_management')
 @swag_from('../apidocs/user/user_list.yaml')
 def user_list():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
     a_list = UserModel.query.all()
     data = []
     for user in a_list:
@@ -320,22 +316,16 @@ def user_edit():
 # 创建,修改小组（需要管理员权限）
 @bp.route("/group_add", methods=['POST'])
 @jwt_required()
+@check_permission('user_management')
 @swag_from('../apidocs/user/group_add.yaml')
 def group_add():
-    User_Email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=User_Email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     group_name = request.json.get('Group_Name')
     student_ids = request.json.get('Group_member')
     group_type = request.json.get('Group_Type')
     course_id = request.json.get('Course_Id') 
     group_id = request.json.get('Group_Id')
+    User_Email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=User_Email).first()
     teacher_id = user.id
 
     # 验证course_id是否提供
@@ -521,17 +511,9 @@ from sqlalchemy.orm import aliased
 
 @bp.route("/group/list")
 @jwt_required()
+@check_permission('user_management')
 @swag_from('../apidocs/user/group_list.yaml')
 def group_list():
-    User_Email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=User_Email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     # 创建别名用于区分导师和学生
     Student = aliased(UserModel)
     Teacher = aliased(UserModel)
@@ -616,17 +598,9 @@ def group_list():
 
 @bp.route("/group/delete", methods=['POST'])
 @jwt_required()
+@check_permission('user_management')
 @swag_from('../apidocs/user/group_delete.yaml')
 def group_delete():
-    User_Email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=User_Email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     group_id = request.json.get('Group_Id')
     groups = GroupModel.query.filter_by(group_id=group_id).all()
     if not groups:

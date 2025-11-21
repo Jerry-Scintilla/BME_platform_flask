@@ -1,0 +1,44 @@
+tags:
+  - 权限管理
+summary: 列出所有权限
+description: 获取系统中所有可用的权限模块列表
+parameters:
+  - name: Authorization
+    in: header
+    description: JWT token
+    required: true
+    type: string
+responses:
+  '200':
+    description: 成功获取权限列表
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 200
+        permissions:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+                example: 1
+              name:
+                type: string
+                example: "course_management"
+              description:
+                type: string
+                example: "课程管理权限"
+  '401':
+    description: 用户未认证
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 401
+        message:
+          type: string
+          example: "用户未认证"
