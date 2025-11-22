@@ -52,10 +52,14 @@ def audit_log(operation=None):
                 # 记录审计日志
                 if user:
                     from models import AuditLog
+                    # 尝试从代理头获取真实IP地址
+                    real_ip = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                    client_ip = real_ip or request.remote_addr
+                                    
                     log_entry = AuditLog(
                         user_id=user.id,
                         username=user.username,
-                        ip_address=request.remote_addr,
+                        ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
                         operation_url=request.url,
@@ -71,10 +75,14 @@ def audit_log(operation=None):
                 # 记录异常情况
                 if user:
                     from models import AuditLog
+                    # 尝试从代理头获取真实IP地址
+                    real_ip = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                    client_ip = real_ip or request.remote_addr
+                                    
                     log_entry = AuditLog(
                         user_id=user.id,
                         username=user.username,
-                        ip_address=request.remote_addr,
+                        ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
                         operation_url=request.url,
