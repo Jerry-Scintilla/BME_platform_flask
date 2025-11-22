@@ -8,36 +8,60 @@ from exts import db
 from models import UserModel, PermissionModel, UserPermissionModel
 
 # 安全审计装饰器
-def audit_log(operation=None):
+def audit_log(operation=None, is_login=False):
     """
     安全审计装饰器
     记录用户操作日志
     operation: 操作描述（可选）
+    is_login: 是否为登录操作（特殊处理）
     """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # 获取当前用户
-            user_email = get_jwt_identity()
-            user = UserModel.query.filter_by(email=user_email).first()
-            
+            print(is_login)
+            # 对于登录操作，延迟获取用户信息
+            user = None
+            user_email = None
+            # 如果不是登录操作，则提前获取用户身份
+            if not is_login:
+                try:
+                    user_email = get_jwt_identity()
+                    user = UserModel.query.filter_by(email=user_email).first()
+                except:
+                    # JWT验证失败的情况
+                    pass
+
             # 记录操作开始前的状态
             start_time = datetime.utcnow()
             operation_data = None
             result = '失败'
-            
+
             try:
                 # 执行原函数
                 response = func(*args, **kwargs)
-                
-                # 如果返回的是元组，提取响应对象
+                # 如果是登录操作，在执行后获取用户信息
+                if is_login:
+                    user_email = request.json.get('User_Email') if request.json else None
+                    status_code = 200
+                    print(user_email)
+
+                    # # 从登录响应中提取用户信息
+                    # if hasattr(response, 'get_json'):
+                    #     json_data = response.get_json()
+                    #     print(json_data)
+                    #     if isinstance(json_data, dict) and json_data.get('User_Email'):
+                    #         user_email = json_data['User_Email']
+                    user = UserModel.query.filter_by(email=user_email).first()
+                    print(user_email)
+
+                # 处理普通响应
                 if isinstance(response, tuple) and len(response) == 2:
                     response_obj = response[0]
                     status_code = response[1]
                 else:
                     response_obj = response
                     status_code = 200
-                
+
                 # 解析响应数据
                 if hasattr(response_obj, 'get_json'):
                     operation_data = response_obj.get_json()
@@ -45,20 +69,24 @@ def audit_log(operation=None):
                     operation_data = response_obj
                 elif isinstance(response_obj, str):
                     operation_data = {'message': response_obj}
-                
+
                 # 设置操作结果
                 result = '成功' if status_code < 400 else '失败'
-                
+
                 # 记录审计日志
-                if user:
+                if user or user_email:
                     from models import AuditLog
                     # 尝试从代理头获取真实IP地址
-                    real_ip = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                    real_ip = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[
+                        0].strip()
                     client_ip = real_ip or request.remote_addr
-                                    
+
+                    username = user.username if user else '未知用户'
+                    user_id = user.id if user else None
+
                     log_entry = AuditLog(
-                        user_id=user.id,
-                        username=user.username,
+                        user_id=user_id,
+                        username=username,
                         ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
@@ -69,19 +97,23 @@ def audit_log(operation=None):
                     )
                     db.session.add(log_entry)
                     db.session.commit()
-                
+
                 return response
             except Exception as e:
                 # 记录异常情况
-                if user:
+                username = user.username if user else '未知用户'
+                user_id = user.id if user else None
+
+                if user or is_login:
                     from models import AuditLog
                     # 尝试从代理头获取真实IP地址
-                    real_ip = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                    real_ip = request.headers.get('X-Real-IP') or request.headers.get('X-Forwarded-For', '').split(',')[
+                        0].strip()
                     client_ip = real_ip or request.remote_addr
-                                    
+
                     log_entry = AuditLog(
-                        user_id=user.id,
-                        username=user.username,
+                        user_id=user_id,
+                        username=username,
                         ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
@@ -92,12 +124,9 @@ def audit_log(operation=None):
                     )
                     db.session.add(log_entry)
                     db.session.commit()
-                
                 raise
         return wrapper
     return decorator
-
-
 
 
 # 辅助函数：格式化时长

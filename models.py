@@ -298,7 +298,7 @@ class ArticleComment(db.Model):
 class AuditLog(db.Model):
     __tablename__ = 'audit_log'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     username = db.Column(db.String(100), nullable=False)
     ip_address = db.Column(db.String(45), nullable=False)  # 支持IPv4和IPv6
     user_agent = db.Column(db.Text)  # 浏览器信息

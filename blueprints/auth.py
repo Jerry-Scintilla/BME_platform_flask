@@ -91,7 +91,7 @@ def register():
 # 登录端口
 @bp.route("/login", methods=["POST"])
 @swag_from('../apidocs/user/login.yaml')
-@audit_log(operation="用户登录")
+@audit_log(operation="用户登录", is_login=True)
 def login():
     form = LoginForm()
     if form.validate():
