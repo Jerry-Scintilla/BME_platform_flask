@@ -18,7 +18,6 @@ def audit_log(operation=None, is_login=False):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            print(is_login)
             # 对于登录操作，延迟获取用户信息
             user = None
             user_email = None
@@ -43,17 +42,7 @@ def audit_log(operation=None, is_login=False):
                 if is_login:
                     user_email = request.json.get('User_Email') if request.json else None
                     status_code = 200
-                    print(user_email)
-
-                    # # 从登录响应中提取用户信息
-                    # if hasattr(response, 'get_json'):
-                    #     json_data = response.get_json()
-                    #     print(json_data)
-                    #     if isinstance(json_data, dict) and json_data.get('User_Email'):
-                    #         user_email = json_data['User_Email']
                     user = UserModel.query.filter_by(email=user_email).first()
-                    print(user_email)
-
                 # 处理普通响应
                 if isinstance(response, tuple) and len(response) == 2:
                     response_obj = response[0]

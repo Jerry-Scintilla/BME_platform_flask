@@ -5,7 +5,7 @@ from flask_limiter.util import get_remote_address
 # import app
 
 from .forms import RegisterForm, LoginForm
-from models import UserModel
+from models import UserModel, UserPermissionModel
 from exts import db, mail, redis_client
 from flask import jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -208,11 +208,16 @@ def admin_login():
         #     User_Name = "Null"
         # # print(mode)
         try:
-            if admin.user_mode != 'admin':
+            user_permission = UserPermissionModel.query.filter_by(
+                user_id=admin.id,
+            ).first()
+
+            if not user_permission and admin.user_mode != 'admin':
                 return jsonify({
                     "code": 401,
                     'message': "用户权限不够"
                 }), 401
+
             if admin.password != password:
                 return jsonify({
                     "code": 402,

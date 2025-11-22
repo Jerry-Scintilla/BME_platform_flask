@@ -16,23 +16,20 @@ from flask_jwt_extended import (get_jwt_identity, jwt_required)
 # 导入api文档模块
 from flasgger import swag_from
 
+from . import check_permission
+
 bp = Blueprint("codecheck", __name__, url_prefix="")
 
 
-# 生成验证码（管理员）
+# 生成签码（管理员）
 @bp.route('/generate-code', methods=['POST'])
 @jwt_required()
+@check_permission('user_management')
 @limiter.limit("1 per 5 seconds")
 @swag_from('../apidocs/codecheck/generate_check_code.yaml')
 def generate_check_code():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
 
     code_type = request.json.get('type')
     if code_type not in ['check_in', 'check_out']:
@@ -288,17 +285,9 @@ def get_yearly_records():
 
 @bp.route('/admin_records', methods=['GET'])
 @jwt_required()
+@check_permission('user_management')
 @swag_from('../apidocs/codecheck/admin_records.yaml')
 def admin_records():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     # Redis缓存键
     cache_key = "annual_check_records_cache"
     # 尝试从Redis获取缓存
@@ -434,17 +423,9 @@ def records_top10():
 
 @bp.route('/weekly_records', methods=['GET'])
 @jwt_required()
+@check_permission('user_management')
 @swag_from('../apidocs/codecheck/weekly_records.yaml')
 def weekly_records():
-    # 验证管理员权限
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    if user.user_mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     # Redis缓存键
     cache_key = "weekly_check_records_cache"
     # 尝试从Redis获取缓存
