@@ -14,6 +14,9 @@ from flask_mail import Message
 import string
 import random
 
+from models import AuditLog
+from . import check_permission
+
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 # 导入api文档模块
@@ -324,3 +327,61 @@ def find_password():
             "code": 402,
             "message": "验证码错误"
         }), 402
+
+# 管理员获取审计日志记录
+@bp.route("/audit_records", methods=["GET"])
+@jwt_required()
+@check_permission('system_management')
+@swag_from('../apidocs/user/audit_records.yaml')
+def get_admin_audit_logs():
+    # 获取分页参数
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 10, type=int), 100)
+    
+    # 获取筛选参数
+    user_id = request.args.get('user_id', type=int)
+    operation = request.args.get('operation', type=str)
+    
+    # 查询审计日志
+    query = AuditLog.query
+    
+    # 应用筛选条件
+    if user_id:
+        query = query.filter_by(user_id=user_id)
+    
+    if operation:
+        query = query.filter(AuditLog.operation.contains(operation))
+    
+    logs_pagination = query.order_by(AuditLog.timestamp.desc()).paginate(
+        page=page, per_page=per_page, error_out=False)
+    
+    # 格式化返回数据
+    logs_data = []
+    for log in logs_pagination.items:
+        user = UserModel.query.get(log.user_id)
+        logs_data.append({
+            "id": log.id,
+            "user_id": log.user_id,
+            "username": log.username,
+            "ip_address": log.ip_address,
+            "user_agent": log.user_agent,
+            "operation": log.operation,
+            "operation_url": log.operation_url,
+            "operation_data": log.operation_data,
+            "result": log.result,
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None
+        })
+    
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": {
+            "logs": logs_data,
+            "pagination": {
+                "page": logs_pagination.page,
+                "per_page": logs_pagination.per_page,
+                "total": logs_pagination.total,
+                "pages": logs_pagination.pages
+            }
+        }
+    })

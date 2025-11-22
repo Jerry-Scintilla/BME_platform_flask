@@ -209,7 +209,7 @@ class InformationModel(db.Model):
     # 请假信息特有字段
     start_time = db.Column(db.DateTime)
     end_time = db.Column(db.DateTime)  # 也用于任务信息的截止时间
-    student_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    student_id = db.Column(db.String(100))
     status = db.Column(db.Integer, default=0)  # 0: 未批准, 1: 已批准
     
     # 任务信息特有字段
