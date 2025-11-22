@@ -81,7 +81,7 @@ def audit_log(operation=None, is_login=False):
                         0].strip()
                     client_ip = real_ip or request.remote_addr
 
-                    username = user.username if user else '未知用户'
+                    username = user.username if user else user_email
                     user_id = user.id if user else None
 
                     log_entry = AuditLog(
