@@ -173,6 +173,39 @@ def revoke_permission():
     })
 
 
+@bp.route("/user/self", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/permissions/self_permissions.yaml')
+def get_self_permissions():
+    """
+    获取当前用户的所有权限
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({
+            "code": 404,
+            "message": "用户不存在"
+        }), 404
+    
+    user_permissions = UserPermissionModel.query.filter_by(user_id=user.id).all()
+    permissions = []
+    for up in user_permissions:
+        permission = PermissionModel.query.get(up.permission_id)
+        permissions.append({
+            "id": permission.id,
+            "name": permission.name,
+            "description": permission.description
+        })
+    
+    return jsonify({
+        "code": 200,
+        "user": user.username,
+        "user_mode": user.user_mode,
+        "permissions": permissions
+    })
+
+
 @bp.route("/user/<int:user_id>", methods=["GET"])
 @jwt_required()
 @check_permission('user_management')

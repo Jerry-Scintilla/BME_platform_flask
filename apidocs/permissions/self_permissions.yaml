@@ -1,0 +1,61 @@
+tags:
+  - 权限管理
+summary: 获取当前用户权限列表
+description: 获取当前用户的所有权限列表
+parameters:
+  - name: Authorization
+    in: header
+    description: JWT token
+    required: true
+    type: string
+responses:
+  '200':
+    description: 成功获取用户权限列表
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 200
+        user:
+          type: string
+          example: "admin"
+        user_mode:
+          type: string
+          example: "admin/user"
+        permissions:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+                example: 1
+              name:
+                type: string
+                example: "course_management"
+              description:
+                type: string
+                example: "课程管理权限"
+  '403':
+    description: 权限不足
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 403
+        message:
+          type: string
+          example: "用户权限不足"
+  '404':
+    description: 用户不存在
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 404
+        message:
+          type: string
+          example: "用户不存在"
