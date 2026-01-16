@@ -206,10 +206,10 @@ def chapter_public():
 
         for chapters in chapter_name:
             chapter = chapters["name"]
-            order = chapters["order"]
-            priority = chapters["priority"]
+            parent_id = chapters["parent_id"]
+            sort_id = chapters["sort_id"]
 
-            chapter = Chapter(name=chapter, order=order, course_id=course_id, priority=priority)
+            chapter = Chapter(name=chapter, parent_id=parent_id, course_id=course_id, sort_id=sort_id)
             db.session.add(chapter)
             db.session.commit()
 
