@@ -1,0 +1,21 @@
+获取课时详情
+---
+tags:
+  - 课程模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Lesson_Id
+    in: query
+    type: integer
+    required: true
+    description: 课时ID
+
+responses:
+  200:
+    description: 查询成功
+  400:
+    description: 参数错误
+  404:
+    description: 课时不存在

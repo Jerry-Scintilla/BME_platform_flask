@@ -1,0 +1,21 @@
+获取课程下所有课时
+---
+tags:
+  - 课程模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Course_Id
+    in: query
+    type: integer
+    required: true
+    description: 课程ID
+
+responses:
+  200:
+    description: 查询成功
+  400:
+    description: 参数错误
+  404:
+    description: 课程不存在

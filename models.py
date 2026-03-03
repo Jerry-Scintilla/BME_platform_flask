@@ -68,6 +68,9 @@ class CourseModel(db.Model):
     difficulty = db.Column(db.Integer, nullable=True)
     other_tags = db.Column(db.String(100))
 
+    # 课程创建者，用于权限管理
+    creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+
 
 
 class LearningProgressModel(db.Model):
@@ -75,11 +78,14 @@ class LearningProgressModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    lesson_id = db.Column(db.Integer, db.ForeignKey('lesson.id'))  # 当前学习到的课时ID
 
-    progress = db.Column(db.Integer, nullable=False)  # 假设进度是一个整数
+    # 保留旧的 progress 字段用于兼容，优先使用 lesson_id
+    progress = db.Column(db.Integer, nullable=False, default=0)
 
     user = db.relationship('UserModel', backref=db.backref('learning_progress', lazy=True))
     course = db.relationship('CourseModel', backref=db.backref('learning_progress', lazy=True))
+    lesson = db.relationship('LessonModel', backref=db.backref('learning_progress', lazy=True))
 
     def get_chapter_info(self):
         """
@@ -136,8 +142,56 @@ class Chapter(db.Model):
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
     name = db.Column(db.Text, nullable=False)
     url = db.Column(db.String(100))
-    parent_id = db.Column(db.Integer)  # 用于确定章节级别
-    sort_id = db.Column(db.Integer)  # 用于确定章节顺序
+    order = db.Column(db.Integer, nullable=False, default=0)  # 排序字段
+    priority = db.Column(db.Integer, nullable=False, default=0)  # 0=章(Chapter), 1=节(Section)
+
+    # 关联课时
+    lessons = db.relationship('LessonModel', backref='chapter', lazy=True, cascade='all, delete-orphan')
+
+
+class LessonModel(db.Model):
+    """课时模型 - 课程的最小学习单元"""
+    __tablename__ = 'lesson'
+
+    # 课时类型常量
+    TYPE_VIDEO = 'video'      # 视频
+    TYPE_TEXT = 'text'        # 图文
+    TYPE_LINK = 'link'        # 外链
+    TYPE_QUIZ = 'quiz'        # 测验
+    TYPE_HOMEWORK = 'homework'  # 作业
+
+    id = db.Column(db.Integer, primary_key=True)
+    chapter_id = db.Column(db.Integer, db.ForeignKey('chapter.id'), nullable=False)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)  # 课时标题
+
+    # 课时类型: video=视频, text=图文, link=外链, quiz=测验, homework=作业
+    type = db.Column(db.String(20), nullable=False, default=TYPE_TEXT)
+
+    content = db.Column(db.Text)  # 图文内容或外链URL
+    duration = db.Column(db.Integer, default=0)  # 时长（分钟）
+    order = db.Column(db.Integer, nullable=False, default=0)  # 排序
+    is_preview = db.Column(db.Boolean, default=False)  # 是否可免费预览
+    resource_url = db.Column(db.String(200))  # 附件/视频资源URL
+
+    create_time = db.Column(db.DateTime, default=datetime.now)
+
+    def to_dict(self):
+        """转换为字典格式"""
+        return {
+            'id': self.id,
+            'chapter_id': self.chapter_id,
+            'course_id': self.course_id,
+            'title': self.title,
+            'type': self.type,
+            'content': self.content,
+            'duration': self.duration,
+            'order': self.order,
+            'is_preview': self.is_preview,
+            'resource_url': self.resource_url,
+            'create_time': self.create_time.strftime('%Y-%m-%d %H:%M:%S') if self.create_time else None
+        }
+
 
 class MedalModel(db.Model):
     __tablename__ = 'medal'

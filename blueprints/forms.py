@@ -172,6 +172,29 @@ class ChapterForm(wtforms.Form):
     Chapter_Name = wtforms.StringField('Chapter_Name')
 
 
+class LessonForm(wtforms.Form):
+    """课时表单验证"""
+    def __init__(self):
+        if "application/json" in request.headers.get("Content-Type"):
+            data = request.get_json(silent=True)
+            args = request.args.to_dict()
+            super(LessonForm, self).__init__(data=data, **args)
+        else:
+            data = request.form.to_dict()
+            args = request.args.to_dict()
+            super(LessonForm, self).__init__(data=data, **args)
+
+    Course_Id = wtforms.IntegerField('Course_Id', validators=[NumberRange(min=1, max=99999999, message='课程id格式不对')])
+    Chapter_Id = wtforms.IntegerField('Chapter_Id', validators=[NumberRange(min=1, max=99999999, message='章节id格式不对')])
+    Lesson_Title = wtforms.StringField('Lesson_Title', validators=[DataRequired(message='课时标题不能为空'), length(min=1, max=200, message='课时标题长度不正确')])
+    Lesson_Type = wtforms.StringField('Lesson_Type', validators=[DataRequired(message='课时类型不能为空')])
+    Lesson_Content = wtforms.TextAreaField('Lesson_Content')
+    Lesson_Duration = wtforms.IntegerField('Lesson_Duration', validators=[NumberRange(min=0, max=9999, message='时长格式不对')])
+    Lesson_Order = wtforms.IntegerField('Lesson_Order', validators=[NumberRange(min=0, max=9999, message='排序格式不对')])
+    Is_Preview = wtforms.BooleanField('Is_Preview')
+    Resource_Url = wtforms.StringField('Resource_Url')
+
+
 class MedalForm(wtforms.Form):
     def __init__(self):
         if "application/json" in request.headers.get("Content-Type"):

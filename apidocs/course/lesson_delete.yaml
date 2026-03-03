@@ -1,0 +1,35 @@
+删除课时
+---
+tags:
+  - 课程模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: lesson_delete
+      required:
+        - lesson_id
+      properties:
+        lesson_id:
+          type: integer
+          description: 课时ID
+
+responses:
+  200:
+    description: 删除成功
+  400:
+    description: 参数错误
+  403:
+    description: 无权限
+  404:
+    description: 课时不存在

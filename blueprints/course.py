@@ -6,7 +6,7 @@ from flask import Blueprint, request, jsonify, send_file
 from exts import db, redis_client
 
 # 导入数据库表
-from models import UserModel, CourseModel, Chapter
+from models import UserModel, CourseModel, Chapter, LessonModel
 
 # 导入表单验证
 from .forms import CourseForm
@@ -51,8 +51,9 @@ def public():
         # print(cover)
         # print(title)
 
-        course = CourseModel(title=title, introduction=introduction, chapters=chapters, 
-                             class_hour=class_hour, difficulty=difficulty, other_tags=other_tags)
+        course = CourseModel(title=title, introduction=introduction, chapters=chapters,
+                             class_hour=class_hour, difficulty=difficulty, other_tags=other_tags,
+                             creator_id=user.id)
 
         db.session.add(course)
         # 获取文章id
@@ -205,11 +206,11 @@ def chapter_public():
         db.session.commit()
 
         for chapters in chapter_name:
-            chapter = chapters["name"]
-            parent_id = chapters["parent_id"]
-            sort_id = chapters["sort_id"]
+            chapter_name = chapters["name"]
+            order = chapters.get("order", 0)
+            priority = chapters.get("priority", 0)
 
-            chapter = Chapter(name=chapter, parent_id=parent_id, course_id=course_id, sort_id=sort_id)
+            chapter = Chapter(name=chapter_name, order=order, priority=priority, course_id=course_id)
             db.session.add(chapter)
             db.session.commit()
 
@@ -500,3 +501,206 @@ def book_download():
             "code": 404,
             'message': "参数错误"
         })
+
+
+# ==================== 课时管理 API ====================
+
+@bp.route("/course/lesson/add", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/lesson_add.yaml')
+def lesson_add():
+    """添加课时"""
+    from .forms import LessonForm
+
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+
+    form = LessonForm()
+    if not form.validate():
+        return jsonify({"code": 402, "message": form.errors}), 402
+
+    course_id = form.Course_Id.data
+    chapter_id = form.Chapter_Id.data
+    title = form.Lesson_Title.data
+    lesson_type = form.Lesson_Type.data
+
+    # 验证课程存在
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+
+    # 权限检查：课程创建者或管理员可添加课时
+    if course.creator_id != user.id and user.user_mode != 'admin':
+        return jsonify({"code": 403, "message": "无课程管理权限"}), 403
+
+    # 验证章节存在且属于该课程
+    chapter = Chapter.query.filter_by(id=chapter_id, course_id=course_id).first()
+    if not chapter:
+        return jsonify({"code": 404, "message": "章节不存在"}), 404
+
+    # 验证课时类型
+    valid_types = ['video', 'text', 'link', 'quiz', 'homework']
+    if lesson_type not in valid_types:
+        return jsonify({"code": 400, "message": f"课时类型必须为: {', '.join(valid_types)}"}), 400
+
+    # 创建课时
+    lesson = LessonModel(
+        chapter_id=chapter_id,
+        course_id=course_id,
+        title=title,
+        type=lesson_type,
+        content=form.Lesson_Content.data or '',
+        duration=form.Lesson_Duration.data or 0,
+        order=form.Lesson_Order.data or 0,
+        is_preview=form.Is_Preview.data or False,
+        resource_url=form.Resource_Url.data
+    )
+
+    db.session.add(lesson)
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "课时添加成功",
+        "lesson": lesson.to_dict()
+    })
+
+
+@bp.route("/course/lesson/edit", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/lesson_edit.yaml')
+def lesson_edit():
+    """编辑课时"""
+    from .forms import LessonForm
+
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+
+    lesson_id = request.json.get('lesson_id')
+    if not lesson_id:
+        return jsonify({"code": 400, "message": "缺少课时ID"}), 400
+
+    lesson = LessonModel.query.filter_by(id=lesson_id).first()
+    if not lesson:
+        return jsonify({"code": 404, "message": "课时不存在"}), 404
+
+    # 权限检查：课程创建者或管理员可编辑
+    course = CourseModel.query.filter_by(id=lesson.course_id).first()
+    if course.creator_id != user.id and user.user_mode != 'admin':
+        return jsonify({"code": 403, "message": "无课程管理权限"}), 403
+
+    form = LessonForm()
+    if not form.validate():
+        return jsonify({"code": 402, "message": form.errors}), 402
+
+    # 可更新的字段
+    if form.Lesson_Title.data:
+        lesson.title = form.Lesson_Title.data
+    if form.Lesson_Type.data:
+        valid_types = ['video', 'text', 'link', 'quiz', 'homework']
+        if form.Lesson_Type.data not in valid_types:
+            return jsonify({"code": 400, "message": f"课时类型必须为: {', '.join(valid_types)}"}), 400
+        lesson.type = form.Lesson_Type.data
+    if form.Lesson_Content.data is not None:
+        lesson.content = form.Lesson_Content.data
+    if form.Lesson_Duration.data is not None:
+        lesson.duration = form.Lesson_Duration.data
+    if form.Lesson_Order.data is not None:
+        lesson.order = form.Lesson_Order.data
+    if form.Is_Preview.data is not None:
+        lesson.is_preview = form.Is_Preview.data
+    if form.Resource_Url.data is not None:
+        lesson.resource_url = form.Resource_Url.data
+
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "课时更新成功",
+        "lesson": lesson.to_dict()
+    })
+
+
+@bp.route("/course/lesson/delete", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/lesson_delete.yaml')
+def lesson_delete():
+    """删除课时"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+
+    lesson_id = request.json.get('lesson_id')
+    if not lesson_id:
+        return jsonify({"code": 400, "message": "缺少课时ID"}), 400
+
+    lesson = LessonModel.query.filter_by(id=lesson_id).first()
+    if not lesson:
+        return jsonify({"code": 404, "message": "课时不存在"}), 404
+
+    # 权限检查：课程创建者或管理员可删除
+    course = CourseModel.query.filter_by(id=lesson.course_id).first()
+    if course.creator_id != user.id and user.user_mode != 'admin':
+        return jsonify({"code": 403, "message": "无课程管理权限"}), 403
+
+    db.session.delete(lesson)
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "课时删除成功"
+    })
+
+
+@bp.route("/course/lesson/list")
+@swag_from('../apidocs/course/lesson_list.yaml')
+def lesson_list():
+    """获取课程下的所有课时"""
+    course_id = request.args.get('Course_Id')
+    if not course_id:
+        return jsonify({"code": 400, "message": "缺少课程ID"}), 400
+
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+
+    # 获取所有章节
+    chapters = Chapter.query.filter_by(course_id=course_id).order_by(Chapter.order).all()
+
+    result = []
+    for chapter in chapters:
+        # 获取该章节下的所有课时
+        lessons = LessonModel.query.filter_by(chapter_id=chapter.id).order_by(LessonModel.order).all()
+
+        chapter_data = {
+            'chapter_id': chapter.id,
+            'chapter_name': chapter.name,
+            'chapter_order': chapter.order,
+            'chapter_priority': chapter.priority,
+            'lessons': [lesson.to_dict() for lesson in lessons]
+        }
+        result.append(chapter_data)
+
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": result
+    })
+
+
+@bp.route("/course/lesson/detail")
+@swag_from('../apidocs/course/lesson_detail.yaml')
+def lesson_detail():
+    """获取单个课时详情"""
+    lesson_id = request.args.get('Lesson_Id')
+    if not lesson_id:
+        return jsonify({"code": 400, "message": "缺少课时ID"}), 400
+
+    lesson = LessonModel.query.filter_by(id=lesson_id).first()
+    if not lesson:
+        return jsonify({"code": 404, "message": "课时不存在"}), 404
+
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "lesson": lesson.to_dict()
+    })
