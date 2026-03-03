@@ -156,6 +156,87 @@ def check_in_out():
     return jsonify({"message": "签到/签退成功"})
 
 
+# 人脸签到/签退（第三方服务接入）
+@bp.route('/face_check', methods=['POST'])
+@swag_from('../apidocs/codecheck/face_check.yaml')
+def face_check():
+    # 获取请求参数
+    request_email = request.json.get('email')
+    check_status = request.json.get('status')  # 'check_in' 或 'check_out'
+    third_party_token = request.json.get('token')  # 第三方凭据
+
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+
+    if os.getenv("FACE_SECRET") != third_party_token:
+        return jsonify({"error": "第三方凭据无效"}), 401
+
+    user = UserModel.query.filter_by(email=request_email).first()
+    if not user:
+        return jsonify({"error": "用户不存在"}), 404
+    
+    # 验证签到状态参数
+    if check_status not in ['check_in', 'check_out']:
+        return jsonify({"error": "不正确的签到状态，状态需为 check_in 或 check_out"}), 401
+
+    now = datetime.now()
+    
+    # 处理签到/签退逻辑
+    if check_status == 'check_in':
+        # 查找最近未签退的记录
+        records = CheckRecord.query.filter(
+            CheckRecord.user_id == user.id,
+            CheckRecord.check_out.is_(None)
+        ).order_by(CheckRecord.check_in.desc()).all()
+        
+        if records:
+            # 取最近的记录判断时间
+            latest_record = records[0]
+            time_diff = (now - latest_record.check_in).total_seconds() / 3600
+            if time_diff <= 6:
+                return jsonify({"error": "已有未签退记录且未超过 6 小时"}), 403
+            
+            # 超过 6 小时则删除所有未签退记录
+            for record in records:
+                db.session.delete(record)
+        
+        record = CheckRecord(
+            user_id=user.id,
+            check_in=now,
+            date=now.date()
+        )
+        db.session.add(record)
+        
+        # 签到成功后删除该用户的最新记录缓存
+        redis_client.delete(f"latest_check:{user.id}")
+        
+    else:
+        # 查找最近未签退的记录
+        record = CheckRecord.query.filter(
+            CheckRecord.user_id == user.id,
+            CheckRecord.check_out.is_(None),
+        ).order_by(CheckRecord.check_in.desc()).first()
+        
+        if not record:
+            return jsonify({"error": "没有签到记录"}), 409
+        
+        record.duration = (now - record.check_in).total_seconds() / 3600
+        
+        # 如果时长超过 6 小时则删除记录，否则更新签退时间
+        if record.duration > 6:
+            db.session.delete(record)
+        else:
+            record.check_out = now
+        
+        # 签退成功后删除该用户的最新记录缓存
+        redis_client.delete(f"latest_check:{user.id}")
+    
+    db.session.commit()
+    
+    return jsonify({"message": "人脸签到/签退成功"})
+
+
 # 获取记录
 @bp.route('/records', methods=['GET'])
 @jwt_required()
