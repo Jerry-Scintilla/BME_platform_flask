@@ -5,7 +5,7 @@ from flask_limiter.util import get_remote_address
 # import app
 
 from .forms import RegisterForm, LoginForm
-from models import UserModel
+from models import UserModel, UserPermissionModel
 from exts import db, mail, redis_client
 from flask import jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -14,15 +14,22 @@ from flask_mail import Message
 import string
 import random
 
+from models import AuditLog
+from . import check_permission
+
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 # 导入api文档模块
 from flasgger import swag_from
 
+# 导入审计装饰器
+from . import audit_log
+
 
 # 注册端口
 @bp.route("/register", methods=["POST"])
 @swag_from('../apidocs/user/register.yaml')
+@audit_log(operation="用户注册", is_login=True)
 def register():
     form = RegisterForm()
     if form.validate():
@@ -84,6 +91,7 @@ def register():
 # 登录端口
 @bp.route("/login", methods=["POST"])
 @swag_from('../apidocs/user/login.yaml')
+@audit_log(operation="用户登录", is_login=True)
 def login():
     form = LoginForm()
     if form.validate():
@@ -184,6 +192,7 @@ def login():
 
 @bp.route("/admin_login", methods=["POST"])
 @swag_from('../apidocs/user/admin_login.yaml')
+@audit_log(operation="管理员登录", is_login=True)
 def admin_login():
     form = LoginForm()
     if form.validate():
@@ -199,11 +208,16 @@ def admin_login():
         #     User_Name = "Null"
         # # print(mode)
         try:
-            if admin.user_mode != 'admin':
+            user_permission = UserPermissionModel.query.filter_by(
+                user_id=admin.id,
+            ).first()
+
+            if not user_permission and admin.user_mode != 'admin':
                 return jsonify({
                     "code": 401,
                     'message': "用户权限不够"
                 }), 401
+
             if admin.password != password:
                 return jsonify({
                     "code": 402,
@@ -252,6 +266,7 @@ from exts import limiter
 @bp.route("/captcha/email", methods=["POST"])
 @limiter.limit("1/minute")
 @swag_from('../apidocs/user/get_email_captcha.yaml')
+@audit_log(operation="获取邮件验证码", is_login=True)
 def get_email_captcha():
     mail_list = request.get_json()
     email = mail_list["User_Email"]
@@ -278,6 +293,7 @@ def get_email_captcha():
 
 @bp.route("/find_password", methods=["POST"])
 @swag_from('../apidocs/user/find_password.yaml')
+@audit_log(operation="找回密码", is_login=True)
 def find_password():
     data = request.get_json()
     email = data['User_Email']
@@ -316,3 +332,61 @@ def find_password():
             "code": 402,
             "message": "验证码错误"
         }), 402
+
+# 管理员获取审计日志记录
+@bp.route("/audit_records", methods=["GET"])
+@jwt_required()
+@check_permission('system_management')
+@swag_from('../apidocs/user/audit_records.yaml')
+def get_admin_audit_logs():
+    # 获取分页参数
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 10, type=int), 100)
+    
+    # 获取筛选参数
+    user_id = request.args.get('user_id', type=int)
+    operation = request.args.get('operation', type=str)
+    
+    # 查询审计日志
+    query = AuditLog.query
+    
+    # 应用筛选条件
+    if user_id:
+        query = query.filter_by(user_id=user_id)
+    
+    if operation:
+        query = query.filter(AuditLog.operation.contains(operation))
+    
+    logs_pagination = query.order_by(AuditLog.timestamp.desc()).paginate(
+        page=page, per_page=per_page, error_out=False)
+    
+    # 格式化返回数据
+    logs_data = []
+    for log in logs_pagination.items:
+        user = UserModel.query.get(log.user_id)
+        logs_data.append({
+            "id": log.id,
+            "user_id": log.user_id,
+            "username": log.username,
+            "ip_address": log.ip_address,
+            "user_agent": log.user_agent,
+            "operation": log.operation,
+            "operation_url": log.operation_url,
+            "operation_data": log.operation_data,
+            "result": log.result,
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None
+        })
+    
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": {
+            "logs": logs_data,
+            "pagination": {
+                "page": logs_pagination.page,
+                "per_page": logs_pagination.per_page,
+                "total": logs_pagination.total,
+                "pages": logs_pagination.pages
+            }
+        }
+    })

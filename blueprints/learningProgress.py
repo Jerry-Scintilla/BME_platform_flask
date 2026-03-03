@@ -18,12 +18,15 @@ from flask_jwt_extended import (get_jwt_identity, jwt_required)
 # 导入api文档模块
 from flasgger import swag_from
 
+from . import audit_log
+
 bp = Blueprint("learningProgress", __name__, url_prefix="")
 
 
 @bp.route("/learningProgress/update", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/learningProgress/update.yaml')
+@audit_log(operation="更新学习进度")
 def update():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
@@ -323,6 +326,7 @@ def group():
 @bp.route("/learningProgress/delete", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/learningProgress/delete.yaml')
+@audit_log(operation="删除学习进度")
 def delete():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()

@@ -4,16 +4,7 @@ from exts import db, mail, limiter, redis_client
 from flask_migrate import Migrate
 
 # 导入蓝图模块
-from blueprints.auth import bp as auth_bp
-from blueprints.user import bp as user_bp
-from blueprints.article import bp as article_bp
-from blueprints.course import bp as course_bp
-from blueprints.medal import bp as medal_bp
-from blueprints.codecheck import bp as codecheck_bp
-from blueprints.learningProgress import bp as learningprogress_bp
-from blueprints.homeCover import bp as homeCover_bp
-from blueprints.information import bp as information_bp
-
+from blueprints import *
 
 from flask_cors import CORS
 
@@ -26,7 +17,7 @@ from flask_redis import FlaskRedis
 app = Flask(__name__)
 
 # 配置CORS，允许特定域名访问API
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # 绑定配置文件
 app.config.from_object(config)
@@ -49,6 +40,7 @@ app.register_blueprint(codecheck_bp)
 app.register_blueprint(learningprogress_bp)
 app.register_blueprint(homeCover_bp)
 app.register_blueprint(information_bp)
+app.register_blueprint(permission_bp)
 
 
 @app.route('/')
@@ -57,5 +49,5 @@ def hello_world():  # put application's code here
 
 
 if __name__ == '__main__':
-    app.run(debug = True)
-    # app.run(host='0.0.0.0', port=5000)
+    # app.run(debug = True)
+    app.run(host='0.0.0.0', port=5000)

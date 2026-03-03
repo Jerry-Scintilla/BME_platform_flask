@@ -15,23 +15,19 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 # 导入api文档模块
 from flasgger import swag_from
 
+# 导入权限检查模块
+from . import check_permission, audit_log
+
 bp = Blueprint("medal", __name__, url_prefix="/medal")
 
 
 # 创建勋章
 @bp.route("/medal_create", methods=["POST"])
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_create.yaml')
+@audit_log(operation="创建勋章")
 def medal_create():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     form = MedalForm()
     if form.validate():
         medal_name = form.Medal_Name.data
@@ -51,20 +47,39 @@ def medal_create():
             "error": form.errors
         }), 401
 
+@bp.route("/my_medal_count")
+@jwt_required()
+@swag_from('../apidocs/medal/my_medal_count.yaml')
+def my_medal_count():
+    """返回当前登录用户拥有的奖牌数量"""
+    try:
+        user_email = get_jwt_identity()
+        user = UserModel.query.filter_by(email=user_email).first()
+        if not user:
+            return jsonify({
+                "code": 401,
+                "message": "用户不存在"
+            }), 401
+        count = MedalUserModel.query.filter_by(user_id=user.id).count()
+
+        return jsonify({
+            "code": 200,
+            "message": "查询成功",
+            "medal_count": count
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e)
+        }), 500
+    
 # 查询勋章列表
 @bp.route("/medal_list")
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_list.yaml')
 def medal_list():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     medals = MedalModel.query.all()
     data = []
     for medal in medals:
@@ -81,56 +96,14 @@ def medal_list():
         "medal": data
     })
 
-# @bp.route("/medal_query_by_user_id")
-# @jwt_required()
-# @swag_from('../apidocs/medal/medal_query_by_user_id.yaml')
-# def medal_query_by_user_id():
-#     user_email = get_jwt_identity()
-#     user = UserModel.query.filter_by(email=user_email).first()
-#     if not user:
-#         return jsonify({
-#             "code": 404,
-#             "message": "用户不存在"
-#         }), 404
-#     mode = user.user_mode
-#     if mode != 'admin':
-#         return jsonify({
-#             "code": 400,
-#             'message': "用户权限不够"
-#         }), 400
-    
-#     medals = MedalUserModel.query.filter_by(user_id=user.id).all()
-
-#     result = []
-
-#     for medal in medals:
-#         medal_info = MedalModel.query.filter_by(id=medal.medal_id).first()
-#         result.append({
-#             "Medal_Id": medal.medal_id,
-#             "Medal_Name": medal_info.medal_name
-#         })
-
-#     return jsonify({
-#         "code": 200,
-#         "message": "获取用户勋章成功",
-#         "medals": result
-#     })
-
 
 # 删除勋章
 @bp.route("/medal_delete", methods=["POST"])
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_delete.yaml')
+@audit_log(operation="删除勋章")
 def medal_delete():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     medal_id = request.json.get("Medal_Id")
     medal = MedalModel.query.filter_by(id=medal_id).first()
     try:
@@ -150,17 +123,10 @@ def medal_delete():
 # 修改勋章（需要改什么就传什么key）
 @bp.route("/medal_edit", methods=["POST"])
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/medal_edit.yaml')
+@audit_log(operation="编辑勋章")
 def medal_edit():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-
     # 获取请求中的参数
     Medal_Id = request.json.get("Medal_Id")
     
@@ -213,17 +179,10 @@ def medal_edit():
 # 创建用户勋章
 @bp.route("/user_medal_add", methods=["POST"])
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/user_medal_add.yaml')
+@audit_log(operation="为用户添加勋章")
 def user_medal_add():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode!= 'admin':
-        return jsonify({
-            "code": 400,
-           'message': "用户权限不够"
-        }), 400
-
     student_id = request.json.get("Student_Id")
     medal_name = request.json.get("Medal_Name")
     description = request.json.get("Medal_Description")
@@ -257,17 +216,9 @@ def user_medal_add():
 # 查询勋章列表
 @bp.route("/user_medal_list")
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/user_medal_list.yaml')
 def user_medal_list():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode!= 'admin':
-        return jsonify({
-            "code": 400,
-           'message': "用户权限不够"
-        }), 400
-
     student_id = request.args.get("Student_Id")
     student_name = UserModel.query.filter_by(id=student_id).first().username
     medals = MedalUserModel.query.filter_by(user_id=student_id).all()
@@ -335,17 +286,9 @@ def user_medal_show():
 
 @bp.route("/user_medal_list_by_medal_id")
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/user_medal_list_by_medal_id.yaml')
 def user_medal_list_by_medal_id():
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode!= 'admin':
-        return jsonify({
-            "code": 400,
-           'message': "用户权限不够"
-        }), 400    
-    
     medal_id = request.args.get("Medal_Id")
     if not medal_id:
         return jsonify({
@@ -386,18 +329,10 @@ def user_medal_list_by_medal_id():
 
 @bp.route("/user_medal_delete", methods=["POST"])
 @jwt_required()
+@check_permission('medal_management')
 @swag_from('../apidocs/medal/user_medal_delete.yaml')
+@audit_log(operation="删除用户勋章")
 def user_medal_delete():
-    # 验证用户权限
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
-    if mode != 'admin':
-        return jsonify({
-            "code": 400,
-            'message': "用户权限不够"
-        }), 400
-    
     # 获取请求参数
     user_id = request.json.get("User_Id")
     group_id = request.json.get("Group_Id")
@@ -606,5 +541,4 @@ def user_medal_delete():
             "code": 500,
             "message": f"删除勋章记录失败: {str(e)}"
         }), 500
-    
     

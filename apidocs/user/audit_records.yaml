@@ -1,0 +1,134 @@
+安全审计日志
+---
+tags:
+  - 安全审计接口
+summary: 获取用户审计日志记录（管理员）
+description: 管理员获取用户的审计日志记录，需要管理员权限
+parameters:
+  - name: Authorization
+    in: header
+    required: true
+    description: JWT Token
+    schema:
+      type: string
+  - name: page
+    in: query
+    required: false
+    description: 页码，默认为1
+    schema:
+      type: integer
+      default: 1
+  - name: per_page
+    in: query
+    required: false
+    description: 每页数量，默认为10，最大100
+    schema:
+      type: integer
+      default: 10
+      maximum: 100
+  - name: user_id
+    in: query
+    required: false
+    description: 用户ID，筛选指定用户的日志
+    schema:
+      type: integer
+  - name: operation
+    in: query
+    required: false
+    description: 操作类型，模糊匹配
+    schema:
+      type: string
+responses:
+  '200':
+    description: 成功返回审计日志列表
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 200
+            message:
+              type: string
+              example: "查询成功"
+            data:
+              type: object
+              properties:
+                logs:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                        example: 1
+                      user_id:
+                        type: integer
+                        example: 1
+                      username:
+                        type: string
+                        example: "张三"
+                      ip_address:
+                        type: string
+                        example: "127.0.0.1"
+                      user_agent:
+                        type: string
+                        example: "Mozilla/5.0..."
+                      operation:
+                        type: string
+                        example: "用户登录"
+                      operation_url:
+                        type: string
+                        example: "/auth/login"
+                      operation_data:
+                        type: string
+                        example: "{'username': 'test'}"
+                      result:
+                        type: string
+                        example: "成功"
+                      timestamp:
+                        type: string
+                        format: date-time
+                        example: "2023-01-01T12:00:00"
+                pagination:
+                  type: object
+                  properties:
+                    page:
+                      type: integer
+                      example: 1
+                    per_page:
+                      type: integer
+                      example: 10
+                    total:
+                      type: integer
+                      example: 100
+                    pages:
+                      type: integer
+                      example: 10
+  '401':
+    description: 未授权
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 401
+            message:
+              type: string
+              example: "用户未认证"
+  '403':
+    description: 权限不足
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            code:
+              type: integer
+              example: 403
+            message:
+              type: string
+              example: "用户权限不足"

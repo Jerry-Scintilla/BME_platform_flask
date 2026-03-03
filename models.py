@@ -262,7 +262,7 @@ class InformationModel(db.Model):
     # 请假信息特有字段
     start_time = db.Column(db.DateTime)
     end_time = db.Column(db.DateTime)  # 也用于任务信息的截止时间
-    student_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    student_id = db.Column(db.String(100))
     status = db.Column(db.Integer, default=0)  # 0: 未批准, 1: 已批准
     
     # 任务信息特有字段
@@ -347,3 +347,41 @@ class ArticleComment(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
 
 
+# 审计日志模型
+class AuditLog(db.Model):
+    __tablename__ = 'audit_log'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    username = db.Column(db.String(100), nullable=False)
+    ip_address = db.Column(db.String(45), nullable=False)  # 支持IPv4和IPv6
+    user_agent = db.Column(db.Text)  # 浏览器信息
+    operation = db.Column(db.String(200), nullable=False)  # 操作内容
+    operation_url = db.Column(db.String(200))  # 操作的URL
+    operation_data = db.Column(db.Text)  # 操作的数据（JSON格式）
+    result = db.Column(db.String(50))  # 操作结果（成功/失败）
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # 关联用户
+    user = db.relationship('UserModel', backref=db.backref('audit_logs', lazy='dynamic'))
+
+
+# 权限模块表
+class PermissionModel(db.Model):
+    __tablename__ = 'permission'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)  # 权限名称
+    description = db.Column(db.String(200))  # 权限描述
+
+
+# 用户权限关联表
+class UserPermissionModel(db.Model):
+    __tablename__ = 'user_permission'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    permission_id = db.Column(db.Integer, db.ForeignKey('permission.id'), nullable=False)
+    
+    # 添加联合唯一约束，防止重复分配相同权限
+    __table_args__ = (db.UniqueConstraint('user_id', 'permission_id'),)
+    
+    user = db.relationship('UserModel', backref=db.backref('user_permissions', lazy=True))
+    permission = db.relationship('PermissionModel', backref=db.backref('user_permissions', lazy=True))
