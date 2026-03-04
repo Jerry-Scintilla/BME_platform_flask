@@ -2,9 +2,11 @@
 import os
 from datetime import timedelta
 
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # 如果没有 dotenv，则跳过
 
 HOSTNAME = '127.0.0.1'
 PORT = '3300'
@@ -21,7 +23,7 @@ SQLALCHEMY_DATABASE_URI = DB_URI
 REDIS_URL = "redis://:123456@localhost:6379/0"
 
 # JWT密匙
-JWT_SECRET_KEY = os.getenv("JWT_SECRET")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET") or "your-secret-key-change-in-production"
 JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)
 
 # 邮箱授权码

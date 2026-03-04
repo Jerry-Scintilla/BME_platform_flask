@@ -175,7 +175,6 @@ class LessonForm(wtforms.Form):
     Lesson_Content = wtforms.TextAreaField('Lesson_Content')
     Lesson_Duration = wtforms.IntegerField('Lesson_Duration', validators=[NumberRange(min=0, max=9999, message='时长格式不对')])
     Lesson_Order = wtforms.IntegerField('Lesson_Order', validators=[NumberRange(min=0, max=9999, message='排序格式不对')])
-    Is_Preview = wtforms.BooleanField('Is_Preview')
     Resource_Url = wtforms.StringField('Resource_Url')
 
 

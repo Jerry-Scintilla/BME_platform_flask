@@ -59,7 +59,7 @@ class CourseModel(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     title = db.Column(db.String(100), nullable=False)
     introduction = db.Column(db.Text, nullable=False)
-    chapters = db.Column(db.Integer, nullable=False)
+    chapters = db.Column(db.Integer, nullable=True)
     cover = db.Column(db.String(100))
     url = db.Column(db.String(100))
     tags = db.Column(db.String(100))
@@ -143,8 +143,11 @@ class Chapter(db.Model):
     name = db.Column(db.Text, nullable=False)
     url = db.Column(db.String(100))
     order = db.Column(db.Integer, nullable=False, default=0)  # 排序字段
-    priority = db.Column(db.Integer, nullable=False, default=0)  # 0=章(Chapter), 1=节(Section)
+    level = db.Column(db.Integer, nullable=False, default=1)  # 层级深度：1=一级章节, 2=二级章节...
+    parent_id = db.Column(db.Integer, db.ForeignKey('chapter.id'), nullable=True)  # 父章节ID，最高级为null
 
+    # 自关联：子章节
+    children = db.relationship('Chapter', backref=db.backref('parent', remote_side=[id]), cascade='all, delete-orphan')
     # 关联课时
     lessons = db.relationship('LessonModel', backref='chapter', lazy=True, cascade='all, delete-orphan')
 
@@ -171,7 +174,6 @@ class LessonModel(db.Model):
     content = db.Column(db.Text)  # 图文内容或外链URL
     duration = db.Column(db.Integer, default=0)  # 时长（分钟）
     order = db.Column(db.Integer, nullable=False, default=0)  # 排序
-    is_preview = db.Column(db.Boolean, default=False)  # 是否可免费预览
     resource_url = db.Column(db.String(200))  # 附件/视频资源URL
 
     create_time = db.Column(db.DateTime, default=datetime.now)
@@ -187,7 +189,6 @@ class LessonModel(db.Model):
             'content': self.content,
             'duration': self.duration,
             'order': self.order,
-            'is_preview': self.is_preview,
             'resource_url': self.resource_url,
             'create_time': self.create_time.strftime('%Y-%m-%d %H:%M:%S') if self.create_time else None
         }

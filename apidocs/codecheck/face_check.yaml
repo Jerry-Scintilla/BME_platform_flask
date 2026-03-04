@@ -1,0 +1,33 @@
+人脸签到
+---
+tags:
+  - 签到模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: face_check
+      required:
+        - image
+      properties:
+        image:
+          type: string
+          description: base64编码的图片数据
+
+responses:
+  200:
+    description: 签到成功
+  400:
+    description: 参数错误或签到失败
+  401:
+    description: 未认证
