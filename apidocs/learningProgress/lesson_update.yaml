@@ -1,0 +1,47 @@
+更新单个课时学习进度
+---
+tags:
+  - 学习进度模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: lesson_progress_update
+      required:
+        - Course_Id
+        - Lesson_Id
+        - Status
+      properties:
+        Course_Id:
+          type: integer
+          description: 课程ID
+        Lesson_Id:
+          type: integer
+          description: 课时ID
+        Status:
+          type: string
+          description: 学习状态 (not_started/learning/completed)
+        Duration:
+          type: integer
+          description: 学习时长（分钟）
+        Detail:
+          type: object
+          description: 详情JSON对象，不同类型课时有不同字段
+
+responses:
+  200:
+    description: 更新成功
+  400:
+    description: 参数错误或状态无效
+  404:
+    description: 课程或课时不存在

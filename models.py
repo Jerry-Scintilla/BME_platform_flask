@@ -74,18 +74,52 @@ class CourseModel(db.Model):
 
 
 class LearningProgressModel(db.Model):
+    """学习进度模型 - 每课时一条记录"""
     __tablename__ = 'learning_progress'
+
+    # 状态常量
+    STATUS_NOT_STARTED = 'not_started'
+    STATUS_LEARNING = 'learning'
+    STATUS_COMPLETED = 'completed'
+
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
-    lesson_id = db.Column(db.Integer, db.ForeignKey('lesson.id'))  # 当前学习到的课时ID
+    lesson_id = db.Column(db.Integer, db.ForeignKey('lesson.id'), nullable=False)
 
-    # 保留旧的 progress 字段用于兼容，优先使用 lesson_id
+    # 学习状态: not_started / learning / completed
+    status = db.Column(db.String(20), default=STATUS_NOT_STARTED)
+
+    # 学习时长（分钟）
+    duration = db.Column(db.Integer, default=0)
+
+    # 详情 - JSON格式，不同类型课时有不同字段
+    detail = db.Column(db.JSON)
+
+    # 时间戳
+    start_time = db.Column(db.DateTime)
+    completed_time = db.Column(db.DateTime)
+
+    # 保留旧的 progress 字段用于兼容
     progress = db.Column(db.Integer, nullable=False, default=0)
 
     user = db.relationship('UserModel', backref=db.backref('learning_progress', lazy=True))
     course = db.relationship('CourseModel', backref=db.backref('learning_progress', lazy=True))
     lesson = db.relationship('LessonModel', backref=db.backref('learning_progress', lazy=True))
+
+    def to_dict(self):
+        """转换为字典"""
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'course_id': self.course_id,
+            'lesson_id': self.lesson_id,
+            'status': self.status,
+            'duration': self.duration,
+            'detail': self.detail,
+            'start_time': self.start_time.strftime('%Y-%m-%d %H:%M:%S') if self.start_time else None,
+            'completed_time': self.completed_time.strftime('%Y-%m-%d %H:%M:%S') if self.completed_time else None
+        }
 
     def get_chapter_info(self):
         """
@@ -136,6 +170,43 @@ class LearningProgressModel(db.Model):
             return chapter_num, section_num, parent_chapter.name, current_chapter.name
 
 
+class UserCourseModel(db.Model):
+    """用户选课表 - 将选课与小组解耦"""
+    __tablename__ = 'user_course'
+
+    # 状态常量
+    STATUS_ACTIVE = 'active'      # 学习中
+    STATUS_COMPLETED = 'completed'  # 已完成
+    STATUS_DROPPED = 'dropped'    # 已退课
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+
+    # 选课时间
+    enroll_time = db.Column(db.DateTime, default=datetime.now)
+
+    # 状态: active / completed / dropped
+    status = db.Column(db.String(20), default=STATUS_ACTIVE)
+
+    # 关联关系
+    user = db.relationship('UserModel', backref=db.backref('user_courses', lazy=True))
+    course = db.relationship('CourseModel', backref=db.backref('user_courses', lazy=True))
+
+    # 联合唯一约束：防止用户重复选同一门课
+    __table_args__ = (db.UniqueConstraint('user_id', 'course_id'),)
+
+    def to_dict(self):
+        """转换为字典"""
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'course_id': self.course_id,
+            'enroll_time': self.enroll_time.strftime('%Y-%m-%d %H:%M:%S') if self.enroll_time else None,
+            'status': self.status
+        }
+
+
 class Chapter(db.Model):
     __tablename__ = 'chapter'
     id = db.Column(db.Integer, primary_key=True)
@@ -174,6 +245,7 @@ class LessonModel(db.Model):
     content = db.Column(db.Text)  # 图文内容或外链URL
     duration = db.Column(db.Integer, default=0)  # 时长（分钟）
     order = db.Column(db.Integer, nullable=False, default=0)  # 排序
+    is_preview = db.Column(db.Boolean, default=False)  # 是否可免费预览
     resource_url = db.Column(db.String(200))  # 附件/视频资源URL
 
     create_time = db.Column(db.DateTime, default=datetime.now)

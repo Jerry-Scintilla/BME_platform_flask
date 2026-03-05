@@ -1,0 +1,19 @@
+获取用户选课列表
+---
+tags:
+  - 用户选课模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取成功
+  404:
+    description: 用户不存在
