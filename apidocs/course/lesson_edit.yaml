@@ -1,0 +1,58 @@
+编辑课时
+---
+tags:
+  - 课程模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: lesson_edit
+      required:
+        - lesson_id
+      properties:
+        lesson_id:
+          type: integer
+          description: 课时ID
+        Lesson_Title:
+          type: string
+          description: 课时标题
+        Lesson_Type:
+          type: string
+          description: 课时类型 (video=视频, text=图文, link=外链, quiz=测验, homework=作业)
+        Lesson_Content:
+          type: string
+          description: 课时内容（图文字内容或外链URL）
+        Lesson_Duration:
+          type: integer
+          description: 时长（分钟）
+        Lesson_Order:
+          type: integer
+          description: 排序顺序
+        Is_Preview:
+          type: boolean
+          description: 是否可免费预览
+        Resource_Url:
+          type: string
+          description: 资源URL（视频/附件）
+
+responses:
+  200:
+    description: 更新成功
+  400:
+    description: 参数错误
+  402:
+    description: 表单验证失败
+  403:
+    description: 无权限
+  404:
+    description: 课时不存在

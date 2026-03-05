@@ -199,14 +199,16 @@ def admin_login():
         email = form.User_Email.data
         password = form.User_Password.data
         admin = UserModel.query.filter_by(email=email).first()
-        # print(email, password)
-        # print(admin)
-        # if admin.is_(None):
-        #     code = 400
-        #     msg = "用户不存在，请检查邮箱输入是否正确"
-        #     token = "Null"
-        #     User_Name = "Null"
-        # # print(mode)
+
+        # 先检查用户是否存在
+        if not admin:
+            return jsonify({
+                "code": 400,
+                "message": "用户不存在，请检查邮箱输入是否正确",
+                "token": "Null",
+                "User_Name": "Null",
+            }), 400
+
         try:
             user_permission = UserPermissionModel.query.filter_by(
                 user_id=admin.id,
@@ -235,10 +237,11 @@ def admin_login():
                 }),200
 
 
-        except:
+        except Exception as e:
+            print(f"Login error: {e}")
             return jsonify({
                 "code": 400,
-                "message": "用户不存在，请检查邮箱输入是否正确",
+                "message": "登录失败，请稍后重试",
                 "token": "Null",
                 "User_Name": "Null",
             }), 400
