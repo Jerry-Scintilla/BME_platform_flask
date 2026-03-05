@@ -286,6 +286,7 @@ def check_multiple_permissions(permission_names, require_all=False):
 from .auth import bp as auth_bp
 from .user import bp as user_bp
 from .course import bp as course_bp
+from .course_group import bp as course_group_bp
 from .article import bp as article_bp
 from .medal import bp as medal_bp
 from .codecheck import bp as codecheck_bp
@@ -298,6 +299,7 @@ __all__ = [
     'auth_bp',
     'user_bp',
     'course_bp',
+    'course_group_bp',
     'article_bp',
     'medal_bp',
     'codecheck_bp',

@@ -307,6 +307,45 @@ class GroupModel(db.Model):
     course = db.relationship('CourseModel', backref=db.backref('groups', lazy=True))
 
 
+# ============== 新课程小组模型 (CourseGroup) ==============
+
+class CourseGroup(db.Model):
+    """课程学习小组"""
+    __tablename__ = 'course_group'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)  # 小组名称
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)  # 课程ID
+    teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # 导师ID
+
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 关联
+    course = db.relationship('CourseModel', backref=db.backref('course_groups', lazy=True))
+    teacher = db.relationship('UserModel', foreign_keys=[teacher_id])
+
+
+class CourseGroupMember(db.Model):
+    """课程小组成员"""
+    __tablename__ = 'course_group_member'
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('course_group.id'), nullable=False)
+    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+    joined_at = db.Column(db.DateTime, default=datetime.now)
+
+    # 联合唯一索引：每人每课程只能加入一个小组
+    __table_args__ = (
+        db.UniqueConstraint('student_id', 'group_id', name='uq_student_course_group'),
+    )
+
+    # 关联
+    student = db.relationship('UserModel', foreign_keys=[student_id])
+    group = db.relationship('CourseGroup', backref='members')
+
+
 class CheckRecord(db.Model):
     __tablename__ = 'check_record'
     id = db.Column(db.Integer, primary_key=True)
