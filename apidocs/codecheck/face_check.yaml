@@ -1,0 +1,39 @@
+使用人脸识别签到/签退（第三方服务接入）
+---
+tags:
+  - 考勤模块
+consumes:
+  - application/json
+
+parameters:
+  - name: body
+    in: body
+    required: true
+    schema:
+      id: face_check
+      required:
+        - email
+        - status
+        - token
+      properties:
+        email:
+          type: string
+          description: 签到邮箱
+        status:
+          type: string
+          description: 签到状态（check_in 或 check_out）
+          enum: [check_in, check_out]
+        token:
+          type: string
+          description: 第三方人脸服务凭据
+
+
+responses:
+  200:
+    description: 人脸签到/签退成功
+  401:
+    description: 邮箱不匹配或第三方凭据无效
+  403:
+    description: 已有未签退记录且未超过 6 小时
+  409:
+    description: 没有签到记录
