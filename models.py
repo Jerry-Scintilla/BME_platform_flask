@@ -318,6 +318,8 @@ class CourseGroup(db.Model):
     name = db.Column(db.String(100), nullable=False)  # 小组名称
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)  # 课程ID
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # 导师ID
+    student_limit = db.Column(db.Integer, default=30)  # 人数限制
+    status = db.Column(db.String(20), default='active')  # 状态: active(进行中), completed(已完成), paused(已暂停)
 
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
