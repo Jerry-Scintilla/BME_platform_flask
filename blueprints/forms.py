@@ -173,7 +173,7 @@ class LessonForm(wtforms.Form):
     Lesson_Title = wtforms.StringField('Lesson_Title', validators=[DataRequired(message='课时标题不能为空'), length(min=1, max=200, message='课时标题长度不正确')])
     Lesson_Type = wtforms.StringField('Lesson_Type', validators=[DataRequired(message='课时类型不能为空')])
     Lesson_Content = wtforms.TextAreaField('Lesson_Content')
-    Lesson_Duration = wtforms.IntegerField('Lesson_Duration', validators=[NumberRange(min=0, max=9999, message='时长格式不对')])
+    Lesson_Duration = wtforms.IntegerField('Lesson_Duration')
     Lesson_Order = wtforms.IntegerField('Lesson_Order')
     Resource_Url = wtforms.StringField('Resource_Url')
 

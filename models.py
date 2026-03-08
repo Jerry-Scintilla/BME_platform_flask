@@ -2,6 +2,7 @@ from datetime import datetime
 
 from pygments.lexer import default
 from sqlalchemy import and_
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import foreign, remote
 
 from exts import db
@@ -242,7 +243,7 @@ class LessonModel(db.Model):
     # 课时类型: video=视频, text=图文, link=外链, quiz=测验, homework=作业
     type = db.Column(db.String(20), nullable=False, default=TYPE_TEXT)
 
-    content = db.Column(db.Text)  # 图文内容或外链URL
+    content = db.Column(LONGTEXT)  # 图文内容或外链URL
     duration = db.Column(db.Integer, default=0)  # 时长（分钟）
     order = db.Column(db.Integer, nullable=False, default=0)  # 排序
     is_preview = db.Column(db.Boolean, default=False)  # 是否可免费预览

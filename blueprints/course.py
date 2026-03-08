@@ -691,8 +691,8 @@ def lesson_add():
         title=title,
         type=lesson_type,
         content=form.Lesson_Content.data or '',
-        duration=form.Lesson_Duration.data or 0,
-        order=form.Lesson_Order.data or 0,
+        duration=form.Lesson_Duration.data if form.Lesson_Duration.data is not None else 0,
+        order=form.Lesson_Order.data if form.Lesson_Order.data is not None else 0,
         resource_url=form.Resource_Url.data
     )
 
