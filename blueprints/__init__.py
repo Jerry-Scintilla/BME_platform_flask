@@ -294,6 +294,7 @@ from .homeCover import bp as homeCover_bp
 from .learningProgress import bp as learningprogress_bp
 from .information import bp as information_bp
 from .permissionACL import bp as permission_bp
+from .task import bp as task_bp
 
 __all__ = [
     'auth_bp',
@@ -306,5 +307,6 @@ __all__ = [
     'homeCover_bp',
     'learningprogress_bp',
     'information_bp',
-    'permission_bp'
+    'permission_bp',
+    'task_bp'
 ]

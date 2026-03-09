@@ -436,6 +436,131 @@ class CourseGroupJoinRequest(db.Model):
     reviewer = db.relationship('UserModel', primaryjoin="CourseGroupJoinRequest.reviewed_by==UserModel.id", foreign_keys=[reviewed_by])
 
 
+# ==================== 任务模块 ====================
+
+class Task(db.Model):
+    """任务主表"""
+    __tablename__ = 'task'
+
+    # 状态常量
+    STATUS_DRAFT = 'draft'
+    STATUS_PUBLISHED = 'published'
+    STATUS_CLOSED = 'closed'
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, nullable=False)
+    course_id = db.Column(db.Integer, nullable=False)
+    term = db.Column(db.String(20), nullable=False)
+    teacher_id = db.Column(db.Integer, nullable=False)
+
+    title = db.Column(db.String(200), nullable=False)  # 任务标题
+    requirement_text = db.Column(db.Text, nullable=True)  # 任务要求
+
+    deadline_at = db.Column(db.DateTime, nullable=True)  # 截止时间 (UTC)
+    allow_late = db.Column(db.Boolean, default=False)  # 是否允许逾期提交
+    max_attempts = db.Column(db.Integer, default=0)  # 0=不限制次数，>0=限制次数
+
+    # 成绩策略
+    is_scored = db.Column(db.Boolean, default=False)  # 是否打分
+    score_min = db.Column(db.Integer, default=0)  # 最低分
+    score_max = db.Column(db.Integer, default=100)  # 最高分
+
+    # 状态
+    status = db.Column(db.String(20), default=STATUS_DRAFT)  # draft/published/closed
+
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 索引
+    __table_args__ = (
+        db.Index('idx_task_group_status_deadline', 'group_id', 'status', 'deadline_at'),
+    )
+
+    # 关联
+    group = db.relationship('CourseGroup', primaryjoin="Task.group_id==CourseGroup.id", foreign_keys=[group_id])
+    teacher = db.relationship('UserModel', primaryjoin="Task.teacher_id==UserModel.id", foreign_keys=[teacher_id])
+    assignees = db.relationship('TaskAssignee', back_populates='task', cascade='all, delete-orphan')
+    submissions = db.relationship('TaskSubmission', back_populates='task', cascade='all, delete-orphan')
+
+
+class TaskAssignee(db.Model):
+    """任务派发对象"""
+    __tablename__ = 'task_assignee'
+
+    # 状态常量
+    STATUS_NOT_STARTED = 'not_started'
+    STATUS_SUBMITTED = 'submitted'
+    STATUS_LATE = 'late'
+    STATUS_GRADED = 'graded'
+    STATUS_MISSED = 'missed'
+
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+    student_id = db.Column(db.Integer, nullable=False)
+
+    assigned_at = db.Column(db.DateTime, default=datetime.now)  # 分配时间
+    status = db.Column(db.String(20), default=STATUS_NOT_STARTED)  # not_started/submitted/late/graded/missed
+    extension_deadline_at = db.Column(db.DateTime, nullable=True)  # 延期截止时间
+
+    # 唯一约束
+    __table_args__ = (
+        db.UniqueConstraint('task_id', 'student_id', name='uq_task_student'),
+    )
+
+    # 关联
+    task = db.relationship('Task', back_populates='assignees')
+    student = db.relationship('UserModel', primaryjoin="TaskAssignee.student_id==UserModel.id", foreign_keys=[student_id])
+
+
+class TaskSubmission(db.Model):
+    """任务提交记录"""
+    __tablename__ = 'task_submission'
+
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+    student_id = db.Column(db.Integer, nullable=False)
+    attempt_no = db.Column(db.Integer, default=1)  # 第几次提交
+
+    content_text = db.Column(db.Text, nullable=True)  # 提交内容
+    submitted_at = db.Column(db.DateTime, default=datetime.now)  # 提交时间
+
+    is_late = db.Column(db.Boolean, default=False)  # 是否逾期
+    score = db.Column(db.Integer, nullable=True)  # 得分
+    feedback = db.Column(db.Text, nullable=True)  # 老师反馈
+    graded_by = db.Column(db.Integer, nullable=True)  # 评分老师ID
+    graded_at = db.Column(db.DateTime, nullable=True)  # 评分时间
+
+    # 唯一约束：同一学生同一任务同一尝试次数唯一
+    __table_args__ = (
+        db.UniqueConstraint('task_id', 'student_id', 'attempt_no', name='uq_task_student_attempt'),
+    )
+
+    # 关联
+    task = db.relationship('Task', back_populates='submissions')
+    student = db.relationship('UserModel', primaryjoin="TaskSubmission.student_id==UserModel.id", foreign_keys=[student_id])
+    grader = db.relationship('UserModel', primaryjoin="TaskSubmission.graded_by==UserModel.id", foreign_keys=[graded_by])
+    attachments = db.relationship('TaskSubmissionAttachment', back_populates='submission', cascade='all, delete-orphan')
+
+
+class TaskSubmissionAttachment(db.Model):
+    """任务提交附件"""
+    __tablename__ = 'task_submission_attachment'
+
+    id = db.Column(db.Integer, primary_key=True)
+    submission_id = db.Column(db.Integer, db.ForeignKey('task_submission.id'), nullable=False)
+    file_name = db.Column(db.String(255), nullable=False)  # 文件名
+    storage_key = db.Column(db.String(500), nullable=False)  # 存储路径
+    mime_type = db.Column(db.String(100), nullable=True)  # MIME类型
+    size_bytes = db.Column(db.Integer, nullable=True)  # 文件大小
+    sha256 = db.Column(db.String(64), nullable=True)  # 文件哈希
+    kind = db.Column(db.String(20), default='file')  # image/file
+
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    # 关联
+    submission = db.relationship('TaskSubmission', back_populates='attachments')
+
+
 class CheckRecord(db.Model):
     __tablename__ = 'check_record'
     id = db.Column(db.Integer, primary_key=True)

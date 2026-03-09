@@ -42,6 +42,7 @@ app.register_blueprint(learningprogress_bp)
 app.register_blueprint(homeCover_bp)
 app.register_blueprint(information_bp)
 app.register_blueprint(permission_bp)
+app.register_blueprint(task_bp)
 
 
 @app.route('/')
