@@ -1,11 +1,12 @@
 from flask import Blueprint, request, jsonify
 from flask_cors import cross_origin
 from sqlalchemy import and_
+from sqlalchemy.orm import joinedload
 from datetime import datetime
 
 from exts import db
 
-from models import UserModel, CourseModel, CourseGroup, CourseGroupMember, CourseGroupJoinRequest, LearningProgressModel, UserCourseModel
+from models import UserModel, CourseModel, CourseGroup, CourseGroupMember, CourseGroupJoinRequest, LearningProgressModel, UserCourseModel, LessonModel
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from flasgger import swag_from
 from . import check_permission
@@ -338,17 +339,46 @@ def list_members(group_id):
     if not group:
         return jsonify({"code": 404, "message": "小组不存在"}), 404
 
+    # 获取课程的总课时数
+    total_lessons = LessonModel.query.filter_by(course_id=group.course_id).count()
+
+    # 查询成员列表
+    members = CourseGroupMember.query.filter(
+        CourseGroupMember.group_id == group_id,
+        CourseGroupMember.course_id == group.course_id
+    ).all()
+
     members_data = []
-    for member in group.members:
+    for member in members:
+        # 直接通过student_id查询用户信息
+        student = UserModel.query.get(member.student_id)
+        student_name = student.username if student else ""
+        # 构造完整的头像URL
+        student_avatar = None
+        if student and student.avatar_url:
+            base_url = request.host_url.rstrip('/')
+            student_avatar = f"{base_url}/data/avatars/{student.avatar_url}"
+
+        # 计算该成员在此课程下的学习完成率
+        completion_rate = 0.0
+        if total_lessons > 0:
+            completed_lessons = LearningProgressModel.query.filter_by(
+                user_id=member.student_id,
+                course_id=group.course_id,
+                status=LearningProgressModel.STATUS_COMPLETED
+            ).count()
+            completion_rate = round((completed_lessons / total_lessons) * 100, 1)
+
         members_data.append({
             "id": member.student_id,
             "student_id": member.student_id,
-            "name": member.student.username if member.student else "",
+            "name": student_name,
+            "avatar": student_avatar,
             "role": member.role or 'member',
             "status": member.status or 'active',
             "join_date": member.joined_at.strftime('%Y-%m-%d') if member.joined_at else None,
             "last_active": member.last_active.strftime('%Y-%m-%d %H:%M:%S') if member.last_active else None,
-            "completion_rate": member.completion_rate or 0.0
+            "completion_rate": completion_rate
         })
 
     return jsonify({
