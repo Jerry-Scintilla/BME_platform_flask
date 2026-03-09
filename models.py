@@ -341,10 +341,23 @@ class CourseGroupMember(db.Model):
     """课程小组成员"""
     __tablename__ = 'course_group_member'
 
+    # 角色常量
+    ROLE_LEADER = 'leader'
+    ROLE_MEMBER = 'member'
+
+    # 状态常量
+    STATUS_ACTIVE = 'active'
+    STATUS_INACTIVE = 'inactive'
+
     id = db.Column(db.Integer, primary_key=True)
     group_id = db.Column(db.Integer, nullable=False)  # 使用复合外键
     course_id = db.Column(db.Integer, nullable=False)  # 显式记录 course_id
     student_id = db.Column(db.Integer, nullable=False)  # 使用复合外键
+
+    role = db.Column(db.String(20), default=ROLE_MEMBER)  # 角色: leader/member
+    status = db.Column(db.String(20), default=STATUS_ACTIVE)  # 状态: active/inactive
+    last_active = db.Column(db.DateTime, nullable=True)  # 最近活跃时间
+    completion_rate = db.Column(db.Float, default=0.0)  # 任务完成率 0-100
 
     joined_at = db.Column(db.DateTime, default=datetime.now)
 
@@ -375,6 +388,52 @@ class CourseGroupMember(db.Model):
         foreign_keys=[group_id, course_id],
         backref='members'
     )
+
+
+class CourseGroupJoinRequest(db.Model):
+    """课程小组加入申请表"""
+    __tablename__ = 'course_group_join_request'
+
+    # 状态常量
+    STATUS_PENDING = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_REJECTED = 'rejected'
+    STATUS_CANCELED = 'canceled'
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, nullable=False)
+    course_id = db.Column(db.Integer, nullable=False)
+    student_id = db.Column(db.Integer, nullable=False)
+
+    # 申请理由
+    apply_reason = db.Column(db.Text, nullable=True)
+
+    # 审核备注
+    review_note = db.Column(db.Text, nullable=True)
+
+    # 审核老师
+    reviewed_by = db.Column(db.Integer, nullable=True)
+
+    # 状态: pending / approved / rejected / canceled
+    status = db.Column(db.String(20), default=STATUS_PENDING)
+
+    # 时间戳
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+
+    # 索引和外键
+    __table_args__ = (
+        db.Index('idx_group_status_created', 'group_id', 'status', 'created_at'),
+        db.Index('idx_student_course_status', 'student_id', 'course_id', 'status'),
+        db.ForeignKeyConstraint(['group_id', 'course_id'], ['course_group.id', 'course_group.course_id']),
+        db.ForeignKeyConstraint(['student_id', 'course_id'], ['user_course.user_id', 'user_course.course_id']),
+    )
+
+    # 关联
+    student = db.relationship('UserModel', primaryjoin="CourseGroupJoinRequest.student_id==UserModel.id", foreign_keys=[student_id])
+    group = db.relationship('CourseGroup', primaryjoin="CourseGroupJoinRequest.group_id==CourseGroup.id", foreign_keys=[group_id])
+    reviewer = db.relationship('UserModel', primaryjoin="CourseGroupJoinRequest.reviewed_by==UserModel.id", foreign_keys=[reviewed_by])
 
 
 class CheckRecord(db.Model):

@@ -1,10 +1,11 @@
 from flask import Blueprint, request, jsonify
 from flask_cors import cross_origin
 from sqlalchemy import and_
+from datetime import datetime
 
 from exts import db
 
-from models import UserModel, CourseModel, CourseGroup, CourseGroupMember, LearningProgressModel, UserCourseModel
+from models import UserModel, CourseModel, CourseGroup, CourseGroupMember, CourseGroupJoinRequest, LearningProgressModel, UserCourseModel
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from flasgger import swag_from
 from . import check_permission
@@ -154,11 +155,23 @@ def list_groups():
 
     result = []
     for group in groups:
+        # 获取课程名称
+        course_name = ''
+        if hasattr(group, 'course') and group.course:
+            course_name = group.course.Course_title if hasattr(group.course, 'Course_title') else getattr(group.course, 'title', '')
+
+        # 获取老师名称
+        teacher_name = ''
+        if hasattr(group, 'teacher') and group.teacher:
+            teacher_name = group.teacher.username
+
         result.append({
             "id": group.id,
             "name": group.name,
             "course_id": group.course_id,
             "teacher_id": group.teacher_id,
+            "teacher_name": teacher_name,
+            "course_name": course_name,
             "term": group.term,
             "member_count": len(group.members),
             "student_limit": group.student_limit,
@@ -196,13 +209,20 @@ def get_group_detail(group_id):
             "joined_at": member.joined_at.strftime('%Y-%m-%d %H:%M:%S') if member.joined_at else None
         })
 
+    # 获取课程信息
+    course_name = ''
+    if hasattr(group, 'course') and group.course:
+        course_name = group.course.Course_title if hasattr(group.course, 'Course_title') else getattr(group.course, 'title', '')
+
     return jsonify({
         "code": 200,
         "data": {
             "id": group.id,
             "name": group.name,
             "course_id": group.course_id,
+            "course_name": course_name,
             "term": group.term,
+            "status": group.status,
             "teacher": {
                 "id": group.teacher_id,
                 "name": group.teacher.username if group.teacher else ""
@@ -301,6 +321,41 @@ def delete_group(group_id):
 
 
 # ==================== 成员管理 ====================
+
+# 获取小组成员列表 GET /course-groups/{group_id}/members
+@bp.route("/<int:group_id>/members", methods=["GET"])
+@jwt_required()
+def list_members(group_id):
+    """
+    获取小组成员列表
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    group = CourseGroup.query.get(group_id)
+    if not group:
+        return jsonify({"code": 404, "message": "小组不存在"}), 404
+
+    members_data = []
+    for member in group.members:
+        members_data.append({
+            "id": member.student_id,
+            "student_id": member.student_id,
+            "name": member.student.username if member.student else "",
+            "role": member.role or 'member',
+            "status": member.status or 'active',
+            "join_date": member.joined_at.strftime('%Y-%m-%d') if member.joined_at else None,
+            "last_active": member.last_active.strftime('%Y-%m-%d %H:%M:%S') if member.last_active else None,
+            "completion_rate": member.completion_rate or 0.0
+        })
+
+    return jsonify({
+        "code": 200,
+        "data": members_data
+    })
+
 
 # 老师添加成员 POST /course-groups/{group_id}/members
 @bp.route("/<int:group_id>/members", methods=["POST"])
@@ -417,19 +472,120 @@ def remove_member(group_id, student_id):
     })
 
 
-# ==================== 用户自助加入/退出 ====================
-
-# 用户加入小组 POST /course-groups/{group_id}/join
-@bp.route("/<int:group_id>/join", methods=["POST"])
+# 老师修改成员角色 PATCH /course-groups/{group_id}/members/{student_id}/role
+@bp.route("/<int:group_id>/members/<int:student_id>/role", methods=["PATCH"])
 @jwt_required()
-def join_group(group_id):
+def update_member_role(group_id, student_id):
     """
-    当前登录学生加入指定小组
+    老师修改成员角色
+    请求体: { "role": "leader" | "member" }
     """
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
     if not user:
         return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    group = CourseGroup.query.get(group_id)
+    if not group:
+        return jsonify({"code": 404, "message": "小组不存在"}), 404
+
+    # 权限检查
+    if group.teacher_id != user.id:
+        return jsonify({"code": 403, "message": "无权限操作"}), 403
+
+    data = request.get_json(silent=True) or {}
+    role = data.get('role')
+
+    if role not in ['leader', 'member']:
+        return jsonify({"code": 400, "message": "角色无效"}), 400
+
+    # 查找成员
+    member = CourseGroupMember.query.filter_by(
+        group_id=group_id,
+        student_id=student_id
+    ).first()
+
+    if not member:
+        return jsonify({"code": 404, "message": "成员不存在"}), 404
+
+    # 如果设置为 leader，需要先将其他成员降为 member
+    if role == 'leader':
+        CourseGroupMember.query.filter(
+            CourseGroupMember.group_id == group_id,
+            CourseGroupMember.id != member.id
+        ).update({'role': 'member'})
+
+    member.role = role
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "角色已更新"
+    })
+
+
+# 老师修改成员状态 PATCH /course-groups/{group_id}/members/{student_id}/status
+@bp.route("/<int:group_id>/members/<int:student_id>/status", methods=["PATCH"])
+@jwt_required()
+def update_member_status(group_id, student_id):
+    """
+    老师修改成员状态
+    请求体: { "status": "active" | "inactive" }
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    group = CourseGroup.query.get(group_id)
+    if not group:
+        return jsonify({"code": 404, "message": "小组不存在"}), 404
+
+    # 权限检查
+    if group.teacher_id != user.id:
+        return jsonify({"code": 403, "message": "无权限操作"}), 403
+
+    data = request.get_json(silent=True) or {}
+    status = data.get('status')
+
+    if status not in ['active', 'inactive']:
+        return jsonify({"code": 400, "message": "状态无效"}), 400
+
+    # 查找成员
+    member = CourseGroupMember.query.filter_by(
+        group_id=group_id,
+        student_id=student_id
+    ).first()
+
+    if not member:
+        return jsonify({"code": 404, "message": "成员不存在"}), 404
+
+    member.status = status
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "状态已更新"
+    })
+
+
+# ==================== 用户自助加入/退出 ====================
+
+# 用户申请加入小组 POST /course-groups/{group_id}/join
+@bp.route("/<int:group_id>/join", methods=["POST"])
+@jwt_required()
+def join_group(group_id):
+    """
+    当前登录学生申请加入指定小组
+    请求体: { "apply_reason": "申请理由" }
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    data = request.get_json(silent=True) or {}
+    apply_reason = data.get('apply_reason', '')
 
     # 1. 校验小组存在且状态为 active
     group = CourseGroup.query.get(group_id)
@@ -443,7 +599,7 @@ def join_group(group_id):
         status=UserCourseModel.STATUS_ACTIVE
     ).first()
     if not enrollment:
-        return jsonify({"code": 422, "message": "未选修该课程，无法加入小组"}), 422
+        return jsonify({"code": 422, "message": "未选修该课程，无法申请加入小组"}), 422
 
     # 3. 校验未加入该课程其他小组
     existing = CourseGroupMember.query.filter_by(
@@ -451,30 +607,40 @@ def join_group(group_id):
         course_id=group.course_id
     ).first()
     if existing:
-        return jsonify({"code": 409, "message": "已加入该课程的其他小组"}), 409
+        return jsonify({"code": 409, "message": "已加入该课程的小组，无需申请"}), 409
 
-    # 4. 校验小组未满员
-    if len(group.members) >= group.student_limit:
-        return jsonify({"code": 422, "message": "小组人数已满"}), 422
+    # 4. 校验无同课程 pending 申请
+    pending_request = CourseGroupJoinRequest.query.filter_by(
+        student_id=user.id,
+        course_id=group.course_id,
+        status=CourseGroupJoinRequest.STATUS_PENDING
+    ).first()
+    if pending_request:
+        return jsonify({"code": 409, "message": "已有待审核的申请"}), 409
 
-    # 添加成员
-    member = CourseGroupMember(
+    # 创建申请
+    request_obj = CourseGroupJoinRequest(
         group_id=group.id,
         course_id=group.course_id,
-        student_id=user.id
+        student_id=user.id,
+        apply_reason=apply_reason,
+        status=CourseGroupJoinRequest.STATUS_PENDING
     )
-    db.session.add(member)
+    db.session.add(request_obj)
     db.session.commit()
 
     return jsonify({
-        "code": 200,
-        "message": "joined",
+        "code": 201,
+        "message": "申请已提交",
         "data": {
+            "id": request_obj.id,
             "group_id": group.id,
             "course_id": group.course_id,
-            "student_id": user.id
+            "student_id": user.id,
+            "status": request_obj.status,
+            "apply_reason": apply_reason
         }
-    })
+    }), 201
 
 
 # 用户退出小组 POST /course-groups/{group_id}/leave
@@ -504,6 +670,275 @@ def leave_group(group_id):
     return jsonify({
         "code": 200,
         "message": "left"
+    })
+
+
+# ==================== 申请审核 ====================
+
+# 老师查看小组的申请列表 GET /course-groups/{group_id}/join-requests
+@bp.route("/<int:group_id>/join-requests", methods=["GET"])
+@jwt_required()
+def list_join_requests(group_id):
+    """
+    老师查看小组的申请列表
+    参数: status (pending/approved/rejected/canceled)
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    # 校验小组存在
+    group = CourseGroup.query.get(group_id)
+    if not group:
+        return jsonify({"code": 404, "message": "小组不存在"}), 404
+
+    # 校验权限：只有小组老师可以查看
+    if group.teacher_id != user.id:
+        return jsonify({"code": 403, "message": "无权限查看"}), 403
+
+    status = request.args.get('status')
+
+    query = CourseGroupJoinRequest.query.filter_by(group_id=group_id)
+    if status:
+        query = query.filter_by(status=status)
+
+    requests = query.order_by(CourseGroupJoinRequest.created_at.desc()).all()
+
+    result = []
+    for req in requests:
+        result.append({
+            "id": req.id,
+            "student_id": req.student_id,
+            "student_name": req.student.username if req.student else "",
+            "apply_reason": req.apply_reason,
+            "status": req.status,
+            "review_note": req.review_note,
+            "reviewed_by": req.reviewed_by,
+            "reviewed_at": req.reviewed_at.strftime('%Y-%m-%d %H:%M:%S') if req.reviewed_at else None,
+            "created_at": req.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    return jsonify({
+        "code": 200,
+        "data": result,
+        "total": len(result)
+    })
+
+
+# 老师通过申请 POST /course-groups/{group_id}/join-requests/{request_id}/approve
+@bp.route("/<int:group_id>/join-requests/<int:request_id>/approve", methods=["POST"])
+@jwt_required()
+def approve_join_request(group_id, request_id):
+    """
+    老师通过学生加入申请
+    请求体: { "review_note": "审核备注" }
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    data = request.get_json(silent=True) or {}
+    review_note = data.get('review_note', '')
+
+    # 校验小组存在
+    group = CourseGroup.query.get(group_id)
+    if not group:
+        return jsonify({"code": 404, "message": "小组不存在"}), 404
+
+    # 校验权限：只有小组老师可以审核
+    if group.teacher_id != user.id:
+        return jsonify({"code": 403, "message": "无权限审核"}), 403
+
+    # 校验申请存在
+    join_request = CourseGroupJoinRequest.query.get(request_id)
+    if not join_request or join_request.group_id != group_id:
+        return jsonify({"code": 404, "message": "申请不存在"}), 404
+
+    # 校验申请状态为 pending
+    if join_request.status != CourseGroupJoinRequest.STATUS_PENDING:
+        return jsonify({"code": 400, "message": "申请已处理"}), 400
+
+    # 审核通过时再次校验
+    # 1. 学生仍已选课
+    enrollment = UserCourseModel.query.filter_by(
+        user_id=join_request.student_id,
+        course_id=join_request.course_id,
+        status=UserCourseModel.STATUS_ACTIVE
+    ).first()
+    if not enrollment:
+        return jsonify({"code": 422, "message": "学生已退选该课程"}), 422
+
+    # 2. 学生仍未在课程其他组
+    existing = CourseGroupMember.query.filter_by(
+        student_id=join_request.student_id,
+        course_id=join_request.course_id
+    ).first()
+    if existing:
+        return jsonify({"code": 409, "message": "学生已在其他小组"}), 409
+
+    # 3. 当前 member_count < student_limit
+    if len(group.members) >= group.student_limit:
+        return jsonify({"code": 422, "message": "小组人数已满"}), 422
+
+    try:
+        # 更新申请状态
+        join_request.status = CourseGroupJoinRequest.STATUS_APPROVED
+        join_request.review_note = review_note
+        join_request.reviewed_by = user.id
+        join_request.reviewed_at = datetime.now()
+
+        # 添加成员（同一事务）
+        member = CourseGroupMember(
+            group_id=group.id,
+            course_id=group.course_id,
+            student_id=join_request.student_id
+        )
+        db.session.add(member)
+        db.session.commit()
+
+        return jsonify({
+            "code": 200,
+            "message": "已通过申请并加入小组",
+            "data": {
+                "request_id": join_request.id,
+                "member_id": member.id
+            }
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"code": 500, "message": f"操作失败: {str(e)}"}), 500
+
+
+# 老师拒绝申请 POST /course-groups/{group_id}/join-requests/{request_id}/reject
+@bp.route("/<int:group_id>/join-requests/<int:request_id>/reject", methods=["POST"])
+@jwt_required()
+def reject_join_request(group_id, request_id):
+    """
+    老师拒绝学生加入申请
+    请求体: { "review_note": "拒绝原因" }
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    data = request.get_json(silent=True) or {}
+    review_note = data.get('review_note', '')
+
+    # 校验小组存在
+    group = CourseGroup.query.get(group_id)
+    if not group:
+        return jsonify({"code": 404, "message": "小组不存在"}), 404
+
+    # 校验权限：只有小组老师可以审核
+    if group.teacher_id != user.id:
+        return jsonify({"code": 403, "message": "无权限审核"}), 403
+
+    # 校验申请存在
+    join_request = CourseGroupJoinRequest.query.get(request_id)
+    if not join_request or join_request.group_id != group_id:
+        return jsonify({"code": 404, "message": "申请不存在"}), 404
+
+    # 校验申请状态为 pending
+    if join_request.status != CourseGroupJoinRequest.STATUS_PENDING:
+        return jsonify({"code": 400, "message": "申请已处理"}), 400
+
+    # 更新申请状态
+    join_request.status = CourseGroupJoinRequest.STATUS_REJECTED
+    join_request.review_note = review_note
+    join_request.reviewed_by = user.id
+    join_request.reviewed_at = datetime.now()
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "已拒绝申请",
+        "data": {
+            "request_id": join_request.id
+        }
+    })
+
+
+# 学生撤销申请 POST /course-groups/{group_id}/join-requests/{request_id}/cancel
+@bp.route("/<int:group_id>/join-requests/<int:request_id>/cancel", methods=["POST"])
+@jwt_required()
+def cancel_join_request(group_id, request_id):
+    """
+    学生撤销自己的申请
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    # 校验申请存在
+    join_request = CourseGroupJoinRequest.query.get(request_id)
+    if not join_request or join_request.group_id != group_id:
+        return jsonify({"code": 404, "message": "申请不存在"}), 404
+
+    # 校验申请属于当前学生
+    if join_request.student_id != user.id:
+        return jsonify({"code": 403, "message": "无权限操作"}), 403
+
+    # 校验申请状态为 pending
+    if join_request.status != CourseGroupJoinRequest.STATUS_PENDING:
+        return jsonify({"code": 400, "message": "申请已处理，无法撤销"}), 400
+
+    # 更新申请状态
+    join_request.status = CourseGroupJoinRequest.STATUS_CANCELED
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "已撤销申请"
+    })
+
+
+# 学生查看自己的申请 GET /course-groups/my-join-requests
+@bp.route("/my-join-requests", methods=["GET"])
+@jwt_required()
+def my_join_requests():
+    """
+    学生查看自己的申请列表
+    参数: status, course_id
+    """
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    status = request.args.get('status')
+    course_id = request.args.get('course_id')
+
+    query = CourseGroupJoinRequest.query.filter_by(student_id=user.id)
+    if status:
+        query = query.filter_by(status=status)
+    if course_id:
+        query = query.filter_by(course_id=course_id)
+
+    requests = query.order_by(CourseGroupJoinRequest.created_at.desc()).all()
+
+    result = []
+    for req in requests:
+        result.append({
+            "id": req.id,
+            "group_id": req.group_id,
+            "group_name": req.group.name if req.group else "",
+            "course_id": req.course_id,
+            "apply_reason": req.apply_reason,
+            "status": req.status,
+            "review_note": req.review_note,
+            "reviewed_by": req.reviewed_by,
+            "reviewed_at": req.reviewed_at.strftime('%Y-%m-%d %H:%M:%S') if req.reviewed_at else None,
+            "created_at": req.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        })
+
+    return jsonify({
+        "code": 200,
+        "data": result,
+        "total": len(result)
     })
 
 
