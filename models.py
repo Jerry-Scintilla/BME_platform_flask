@@ -318,11 +318,19 @@ class CourseGroup(db.Model):
     name = db.Column(db.String(100), nullable=False)  # 小组名称
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)  # 课程ID
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # 导师ID
+    term = db.Column(db.String(20), default='2026-spring')  # 学期，如 2026-spring
     student_limit = db.Column(db.Integer, default=30)  # 人数限制
     status = db.Column(db.String(20), default='active')  # 状态: active(进行中), completed(已完成), paused(已暂停)
 
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 联合唯一约束：(course_id, teacher_id, term) 保证同一老师在同一课程同一学期只有一个组
+    # (id, course_id) 用于复合外键引用
+    __table_args__ = (
+        db.UniqueConstraint('course_id', 'teacher_id', 'term', name='uq_course_teacher_term'),
+        db.UniqueConstraint('id', 'course_id', name='uq_id_course'),
+    )
 
     # 关联
     course = db.relationship('CourseModel', backref=db.backref('course_groups', lazy=True))
@@ -334,19 +342,39 @@ class CourseGroupMember(db.Model):
     __tablename__ = 'course_group_member'
 
     id = db.Column(db.Integer, primary_key=True)
-    group_id = db.Column(db.Integer, db.ForeignKey('course_group.id'), nullable=False)
-    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    group_id = db.Column(db.Integer, nullable=False)  # 使用复合外键
+    course_id = db.Column(db.Integer, nullable=False)  # 显式记录 course_id
+    student_id = db.Column(db.Integer, nullable=False)  # 使用复合外键
 
     joined_at = db.Column(db.DateTime, default=datetime.now)
 
-    # 联合唯一索引：每人每课程只能加入一个小组
+    # 联合唯一约束：(student_id, course_id) 防止同课程多组
+    # 复合外键：(group_id, course_id) -> course_group(id, course_id)
+    # 复合外键：(student_id, course_id) -> user_course(user_id, course_id)
     __table_args__ = (
-        db.UniqueConstraint('student_id', 'group_id', name='uq_student_course_group'),
+        db.UniqueConstraint('student_id', 'course_id', name='uq_student_course'),
+        db.ForeignKeyConstraint(
+            ['group_id', 'course_id'],
+            ['course_group.id', 'course_group.course_id'],
+            name='fk_member_group_course'
+        ),
+        db.ForeignKeyConstraint(
+            ['student_id', 'course_id'],
+            ['user_course.user_id', 'user_course.course_id'],
+            name='fk_member_user_course'
+        ),
     )
 
-    # 关联
-    student = db.relationship('UserModel', foreign_keys=[student_id])
-    group = db.relationship('CourseGroup', backref='members')
+    # 关联 - 使用 primaryjoin 明确指定连接条件
+    student = db.relationship('UserModel',
+        primaryjoin="CourseGroupMember.student_id==UserModel.id",
+        foreign_keys=[student_id]
+    )
+    group = db.relationship('CourseGroup',
+        primaryjoin="and_(CourseGroupMember.group_id==CourseGroup.id, CourseGroupMember.course_id==CourseGroup.course_id)",
+        foreign_keys=[group_id, course_id],
+        backref='members'
+    )
 
 
 class CheckRecord(db.Model):
