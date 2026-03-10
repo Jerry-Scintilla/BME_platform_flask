@@ -220,10 +220,13 @@ def get_group_detail(group_id):
         "data": {
             "id": group.id,
             "name": group.name,
+            "description": group.description or '',
             "course_id": group.course_id,
             "course_name": course_name,
             "term": group.term,
             "status": group.status,
+            "student_limit": group.student_limit,
+            "created_at": group.created_at.strftime('%Y-%m-%d %H:%M:%S') if group.created_at else None,
             "teacher": {
                 "id": group.teacher_id,
                 "name": group.teacher.username if group.teacher else ""
@@ -261,13 +264,15 @@ def update_group(group_id):
     # 更新字段
     if 'name' in data:
         group.name = data['name']
+    if 'description' in data:
+        group.description = data['description']
     if 'student_limit' in data:
         # 校验 student_limit >= 当前成员数
         if data['student_limit'] < len(group.members):
             return jsonify({"code": 400, "message": f"人数限制不能少于当前成员数({len(group.members)})"}), 400
         group.student_limit = data['student_limit']
     if 'status' in data:
-        valid_status = ['active', 'completed', 'paused']
+        valid_status = ['active', 'completed']
         if data['status'] not in valid_status:
             return jsonify({"code": 400, "message": f"状态必须为: {', '.join(valid_status)}"}), 400
         group.status = data['status']
@@ -280,6 +285,7 @@ def update_group(group_id):
         "data": {
             "id": group.id,
             "name": group.name,
+            "description": group.description or '',
             "course_id": group.course_id,
             "teacher_id": group.teacher_id,
             "term": group.term,

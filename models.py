@@ -316,6 +316,7 @@ class CourseGroup(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)  # 小组名称
+    description = db.Column(db.String(1000), default='')  # 小组描述
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)  # 课程ID
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # 导师ID
     term = db.Column(db.String(20), default='2026-spring')  # 学期，如 2026-spring
