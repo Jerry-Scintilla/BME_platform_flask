@@ -713,3 +713,95 @@ class UserPermissionModel(db.Model):
     
     user = db.relationship('UserModel', backref=db.backref('user_permissions', lazy=True))
     permission = db.relationship('PermissionModel', backref=db.backref('user_permissions', lazy=True))
+
+
+# ==================== 讨论区模块 ====================
+
+class DiscussionThread(db.Model):
+    """讨论主题帖"""
+    __tablename__ = 'discussion_thread'
+
+    # 状态常量
+    STATUS_NORMAL = 'normal'
+    STATUS_HIDDEN = 'hidden'
+    STATUS_LOCKED = 'locked'
+    STATUS_DELETED = 'deleted'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    scope_type = db.Column(db.String(20), nullable=False)  # global/article/course/group/task
+    scope_id = db.Column(db.Integer, nullable=True)  # 关联对象ID，global时为空
+    title = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    status = db.Column(db.String(20), default=STATUS_NORMAL)
+    is_pinned = db.Column(db.Boolean, default=False)
+    reply_count = db.Column(db.Integer, default=0)
+    like_count = db.Column(db.Integer, default=0)
+    view_count = db.Column(db.Integer, default=0)
+    last_reply_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 索引
+    __table_args__ = (
+        db.Index('idx_thread_scope_status', 'scope_type', 'scope_id', 'status', 'last_reply_at'),
+        db.Index('idx_thread_author', 'author_id', 'created_at'),
+    )
+
+    # 关系
+    author = db.relationship('UserModel', backref=db.backref('discussion_threads', lazy='dynamic'))
+    replies = db.relationship('DiscussionReply', backref='thread', lazy='dynamic',
+                             cascade='all, delete-orphan', order_by='DiscussionReply.created_at')
+
+
+class DiscussionReply(db.Model):
+    """讨论回复"""
+    __tablename__ = 'discussion_reply'
+
+    STATUS_NORMAL = 'normal'
+    STATUS_HIDDEN = 'hidden'
+    STATUS_DELETED = 'deleted'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), nullable=False)
+    parent_reply_id = db.Column(db.Integer, db.ForeignKey('discussion_reply.id'), nullable=True)  # 楼中楼
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), default=STATUS_NORMAL)
+    like_count = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 索引
+    __table_args__ = (
+        db.Index('idx_reply_thread', 'thread_id', 'created_at'),
+        db.Index('idx_reply_parent', 'parent_reply_id', 'created_at'),
+    )
+
+    # 关系
+    author = db.relationship('UserModel', backref=db.backref('discussion_replies', lazy='dynamic'))
+    children = db.relationship('DiscussionReply', backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
+
+
+class DiscussionReaction(db.Model):
+    """讨论互动（点赞等）"""
+    __tablename__ = 'discussion_reaction'
+
+    TARGET_THREAD = 'thread'
+    TARGET_REPLY = 'reply'
+    REACTION_LIKE = 'like'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    target_type = db.Column(db.String(20), nullable=False)  # thread/reply
+    target_id = db.Column(db.Integer, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    reaction_type = db.Column(db.String(20), default=REACTION_LIKE)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    # 唯一约束：防止重复点赞
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'target_type', 'target_id', 'reaction_type', name='uq_discussion_reaction'),
+    )
+
+    # 关系
+    user = db.relationship('UserModel', backref=db.backref('discussion_reactions', lazy='dynamic'))
