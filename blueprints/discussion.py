@@ -277,6 +277,7 @@ def list_threads():
         result.append({
             "id": thread.id,
             "title": thread.title,
+            "content": thread.content,
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
