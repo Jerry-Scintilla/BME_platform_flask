@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from flask_cors import cross_origin
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import joinedload
 from datetime import datetime
 
@@ -144,6 +144,23 @@ def list_groups():
                 CourseGroupMember.course_id == CourseGroup.course_id
             )
         ).filter(CourseGroupMember.student_id == user.id).distinct()
+    elif mine == 'all':
+        # 小组广场：排除自己作为老师的小组，以及自己已加入的小组
+        query = query.filter(CourseGroup.teacher_id != user.id)
+        # 排除已加入的小组
+        query = query.join(
+            CourseGroupMember,
+            and_(
+                CourseGroupMember.group_id == CourseGroup.id,
+                CourseGroupMember.course_id == CourseGroup.course_id
+            ),
+            isouter=True
+        ).filter(
+            or_(
+                CourseGroupMember.student_id != user.id,
+                CourseGroupMember.student_id == None
+            )
+        )
 
     if course_id:
         query = query.filter_by(course_id=course_id)
@@ -152,7 +169,7 @@ def list_groups():
     if status:
         query = query.filter_by(status=status)
 
-    groups = query.order_by(CourseGroup.created_at.desc()).all()
+    groups = query.distinct().order_by(CourseGroup.created_at.desc()).all()
 
     result = []
     for group in groups:
@@ -169,6 +186,7 @@ def list_groups():
         result.append({
             "id": group.id,
             "name": group.name,
+            "description": group.description or '',
             "course_id": group.course_id,
             "teacher_id": group.teacher_id,
             "teacher_name": teacher_name,
