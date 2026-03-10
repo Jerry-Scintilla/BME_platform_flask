@@ -24,6 +24,18 @@ def options_handler(path):
     return jsonify({"code": 200}), 200
 
 
+def get_avatar_url(avatar_url):
+    """获取完整的头像URL"""
+    if not avatar_url:
+        return ""
+    # 检查是否已经是完整URL
+    if avatar_url.startswith('http://') or avatar_url.startswith('https://'):
+        return avatar_url
+    # 添加前缀
+    base_url = request.host_url.rstrip('/')
+    return f"{base_url}/data/avatars/{avatar_url}"
+
+
 # ==================== 权限辅助函数 ====================
 
 def get_current_user():
@@ -269,6 +281,7 @@ def list_threads():
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
             "author_name": thread.author.username if thread.author else "",
+            "author_avatar": get_avatar_url(thread.author.avatar_url) if thread.author else "",
             "status": thread.status,
             "is_pinned": thread.is_pinned,
             "reply_count": thread.reply_count,
@@ -319,6 +332,7 @@ def get_thread(thread_id):
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
             "author_name": thread.author.username if thread.author else "",
+            "author_avatar": get_avatar_url(thread.author.avatar_url) if thread.author else "",
             "status": thread.status,
             "is_pinned": thread.is_pinned,
             "reply_count": thread.reply_count,
@@ -575,6 +589,7 @@ def list_replies(thread_id):
                 "id": child.id,
                 "author_id": child.author_id,
                 "author_name": child.author.username if child.author else "",
+                "author_avatar": get_avatar_url(child.author.avatar_url) if child.author else "",
                 "content": child.content,
                 "like_count": child.like_count,
                 "created_at": child.created_at.strftime('%Y-%m-%d %H:%M:%S')
@@ -584,6 +599,7 @@ def list_replies(thread_id):
             "id": reply.id,
             "author_id": reply.author_id,
             "author_name": reply.author.username if reply.author else "",
+            "author_avatar": get_avatar_url(reply.author.avatar_url) if reply.author else "",
             "content": reply.content,
             "like_count": reply.like_count,
             "created_at": reply.created_at.strftime('%Y-%m-%d %H:%M:%S'),
