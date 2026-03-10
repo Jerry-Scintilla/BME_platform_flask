@@ -502,6 +502,73 @@ def records_top10():
     return jsonify(result)
 
 
+# 获取用户个人出勤统计
+@bp.route('/records/my_stats', methods=['GET'])
+@jwt_required()
+def get_my_records_stats():
+    """获取当前用户的出勤统计数据：累计天数、本月时长、本月排名"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    now = datetime.now()
+
+    # 1. 获取累计出勤天数（从有记录以来）
+    all_records = CheckRecord.query.filter(
+        CheckRecord.user_id == user.id,
+        CheckRecord.duration != None
+    ).all()
+
+    # 按日期去重计算天数
+    attendance_dates = set()
+    for record in all_records:
+        if record.date:
+            attendance_dates.add(record.date)
+    total_days = len(attendance_dates)
+
+    # 2. 获取本月时长
+    first_day = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day = (first_day + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    month_records = CheckRecord.query.filter(
+        CheckRecord.user_id == user.id,
+        CheckRecord.date >= first_day.date(),
+        CheckRecord.date <= last_day.date(),
+        CheckRecord.duration != None
+    ).all()
+
+    month_hours = sum(record.duration or 0 for record in month_records)
+
+    # 3. 获取本月排名
+    # 先计算所有用户的本月时长
+    all_month_records = CheckRecord.query.filter(
+        CheckRecord.date >= first_day.date(),
+        CheckRecord.date <= last_day.date(),
+        CheckRecord.duration != None
+    ).all()
+
+    user_month_hours = defaultdict(float)
+    for record in all_month_records:
+        user_month_hours[record.user_id] += record.duration or 0
+
+    # 排序获取排名
+    sorted_users = sorted(user_month_hours.items(), key=lambda x: x[1], reverse=True)
+    my_rank = None
+    for rank, (uid, hours) in enumerate(sorted_users, 1):
+        if uid == user.id:
+            my_rank = rank
+            break
+
+    return jsonify({
+        "code": 200,
+        "data": {
+            "total_days": total_days,
+            "month_hours": round(month_hours, 2),
+            "month_rank": my_rank
+        }
+    })
+
+
 @bp.route('/weekly_records', methods=['GET'])
 @jwt_required()
 @check_permission('user_management')
