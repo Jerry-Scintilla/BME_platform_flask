@@ -1,0 +1,33 @@
+获取单个课时学习进度
+---
+tags:
+  - 学习进度模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: query
+    type: integer
+    required: true
+    description: 课程ID
+
+  - name: Lesson_Id
+    in: query
+    type: integer
+    required: true
+    description: 课时ID
+
+responses:
+  200:
+    description: 查询成功
+  400:
+    description: 缺少参数
+  404:
+    description: 课时不存在

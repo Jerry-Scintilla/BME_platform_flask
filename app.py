@@ -14,7 +14,7 @@ from flasgger import Swagger
 
 from flask_redis import FlaskRedis
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='./data/avatars', static_url_path='/data/avatars')
 
 # 配置CORS，允许特定域名访问API
 CORS(app, supports_credentials=True)
@@ -35,12 +35,15 @@ app.register_blueprint(auth_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(article_bp)
 app.register_blueprint(course_bp)
+app.register_blueprint(course_group_bp)
 app.register_blueprint(medal_bp)
 app.register_blueprint(codecheck_bp)
 app.register_blueprint(learningprogress_bp)
 app.register_blueprint(homeCover_bp)
 app.register_blueprint(information_bp)
 app.register_blueprint(permission_bp)
+app.register_blueprint(task_bp)
+app.register_blueprint(discussion_bp)
 
 
 @app.route('/')

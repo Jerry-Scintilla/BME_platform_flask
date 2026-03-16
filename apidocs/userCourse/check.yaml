@@ -1,0 +1,27 @@
+检查用户是否已选课程
+---
+tags:
+  - 用户选课模块
+consumes:
+  - application/json
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: query
+    type: integer
+    required: true
+    description: 课程ID
+
+responses:
+  200:
+    description: 查询成功
+  400:
+    description: 课程ID为空
+  404:
+    description: 用户不存在

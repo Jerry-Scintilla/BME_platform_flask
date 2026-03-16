@@ -277,7 +277,14 @@ def chapter_add():
             new_chapter = Chapter(name=name, order=order, level=level, parent_id=parent_id, course_id=course_id)
             db.session.add(new_chapter)
 
-    db.session.commit()
+    db.session.flush()
+
+    # 更新课程的顶级章节数量（level=1 的一级章节）
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if course:
+        top_level_chapters_count = Chapter.query.filter_by(course_id=course_id, level=1).count()
+        course.chapters = top_level_chapters_count
+        db.session.commit()
 
     return jsonify({
         "code": 200,
@@ -684,15 +691,19 @@ def lesson_add():
         title=title,
         type=lesson_type,
         content=form.Lesson_Content.data or '',
-        duration=form.Lesson_Duration.data or 0,
-        order=form.Lesson_Order.data or 0,
+        duration=form.Lesson_Duration.data if form.Lesson_Duration.data is not None else 0,
+        order=form.Lesson_Order.data if form.Lesson_Order.data is not None else 0,
         resource_url=form.Resource_Url.data
     )
 
     db.session.add(lesson)
+    db.session.flush()
 
-    # 更新课程课时数
-    course.class_hour = (course.class_hour or 0) + 1
+    # 更新课程总学时（根据所有课时的 duration 之和计算，单位：分钟）
+    total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+        LessonModel.course_id == course_id
+    ).scalar() or 0
+    course.class_hour = total_duration
     db.session.commit()
 
     return jsonify({
@@ -746,6 +757,13 @@ def lesson_edit():
     if form.Resource_Url.data is not None:
         lesson.resource_url = form.Resource_Url.data
 
+    db.session.flush()
+
+    # 更新课程总学时（根据所有课时的 duration 之和计算）
+    total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+        LessonModel.course_id == course.id
+    ).scalar() or 0
+    course.class_hour = total_duration
     db.session.commit()
 
     return jsonify({
@@ -777,9 +795,13 @@ def lesson_delete():
         return jsonify({"code": 403, "message": "无课程管理权限"}), 403
 
     db.session.delete(lesson)
+    db.session.flush()
 
-    # 更新课程课时数
-    course.class_hour = max(0, (course.class_hour or 0) - 1)
+    # 更新课程总学时（根据所有课时的 duration 之和计算）
+    total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+        LessonModel.course_id == course.id
+    ).scalar() or 0
+    course.class_hour = total_duration
     db.session.commit()
 
     return jsonify({
