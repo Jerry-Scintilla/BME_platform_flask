@@ -355,7 +355,9 @@ def course_edit():
 @bp.route("/course/list")
 @swag_from('../apidocs/course/list.yaml')
 def course_list():
-    a_list = CourseModel.query.all()
+    a_list = CourseModel.query.filter(
+        (CourseModel.status == None) | (CourseModel.status == CourseModel.STATUS_NORMAL)
+    ).all()
     data = []
     for course in a_list:
         # 处理other_tags，将逗号分隔的字符串转为数组
@@ -605,14 +607,13 @@ def course_delete():
         }), 400
 
     course_id = request.json.get('Course_Id')
-    courses = CourseModel.query.filter_by(id=course_id).first()
-    if courses is None:
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if course is None:
         return jsonify({
             "code": 402,
             'message': "课程不存在"
         }), 402
-    chapter = Chapter.query.filter_by(course_id=course_id).delete()
-    db.session.delete(courses)
+    course.status = CourseModel.STATUS_DELETED
     db.session.commit()
     return jsonify({
         "code": 200,
@@ -625,9 +626,10 @@ def course_delete():
 @bp.route("/course/search")
 @swag_from('../apidocs/course/search_courses.yaml')
 def search_courses():
+    normal_filter = (CourseModel.status == None) | (CourseModel.status == CourseModel.STATUS_NORMAL)
     search_query = request.args.get('Query')
     if search_query:
-        courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%')).all()
+        courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%'), normal_filter).all()
         if not courses:
             return jsonify({
                 "code": 402,
@@ -662,7 +664,9 @@ def search_courses():
         })
     course_id = request.args.get('Course_Id')
     if course_id:
-        course = CourseModel.query.filter_by(id=course_id).first()
+        course = CourseModel.query.filter(
+            CourseModel.id == course_id, normal_filter
+        ).first()
         if course is None:
             return jsonify({
                 "code": 402,
