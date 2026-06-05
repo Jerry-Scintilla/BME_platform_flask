@@ -266,6 +266,17 @@ def get_project(project_id):
     })
 
 
+@bp.route("/admin/projects/<int:project_id>/reveal-key", methods=["GET"])
+@jwt_required()
+@check_permission(LLM_PERMISSION)
+def reveal_project_key(project_id):
+    p = LLMProjectModel.query.get(project_id)
+    if not p:
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+
+    return jsonify({"code": 200, "data": {"litellm_key": p.litellm_key}})
+
+
 @bp.route("/admin/projects/<int:project_id>/regenerate-key", methods=["POST"])
 @jwt_required()
 @check_permission(LLM_PERMISSION)
@@ -700,6 +711,20 @@ def list_user_keys():
         "created_at": k.created_at.strftime('%Y-%m-%d %H:%M:%S') if k.created_at else None,
     } for k in keys]
     return jsonify({"code": 200, "data": result})
+
+
+@bp.route("/keys/<int:key_id>/reveal", methods=["GET"])
+@jwt_required()
+def reveal_user_key(key_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户未认证"}), 401
+
+    k = LLMUserKeyModel.query.filter_by(id=key_id, user_id=user.id).first()
+    if not k:
+        return jsonify({"code": 404, "message": "Key 不存在"}), 404
+
+    return jsonify({"code": 200, "data": {"litellm_key": k.litellm_key}})
 
 
 @bp.route("/keys/<int:key_id>", methods=["DELETE"])
