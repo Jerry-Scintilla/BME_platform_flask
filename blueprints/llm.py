@@ -6,12 +6,13 @@
   2. 用户级：平台用户自建 key（挂在 LiteLLM internal user 上），有基础配额，
      可查用量、申请增额；管理员配置默认配额、审批、监控。
 """
+import json
 from datetime import datetime
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
-from exts import db
+from exts import db, redis_client
 from models import (
     UserModel,
     LLMProjectModel,
@@ -77,18 +78,81 @@ def _models_list(models_str):
     return [m.strip() for m in models_str.split(",") if m.strip()]
 
 
-def _safe_user_spend(user_id):
-    """安全获取某用户在 LiteLLM 的用量与预算，失败返回 None 字段"""
+# ---------- 用量查询的 Redis 短缓存 ----------
+# LiteLLM 的 spend 是实时累加的，看板/用量接口高频读取会给 LiteLLM 的库带来压力，
+# 这里加一层很短的缓存（默认 30s）削峰；额度变更处主动失效，保证及时性。
+USAGE_CACHE_TTL = 60          # 用户/项目用量缓存秒数
+GLOBAL_CACHE_TTL = 60         # 全局报表缓存秒数
+
+
+def _cache_get(key):
+    try:
+        raw = redis_client.get(key)
+        if raw:
+            return json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(key, value, ttl=USAGE_CACHE_TTL):
+    try:
+        redis_client.setex(key, ttl, json.dumps(value))
+    except Exception:
+        pass
+
+
+def _cache_delete(key):
+    try:
+        redis_client.delete(key)
+    except Exception:
+        pass
+
+
+def _invalidate_user_usage(user_id):
+    """额度/用量发生变化后，清除该用户的用量缓存"""
+    _cache_delete(f"llm:usage:user:{user_id}")
+
+
+def _safe_user_spend(user_id, use_cache=True):
+    """安全获取某用户在 LiteLLM 的用量与预算，失败返回 None 字段。
+    成功结果缓存 USAGE_CACHE_TTL 秒；失败不缓存，便于 LiteLLM 恢复后立即生效。"""
+    cache_key = f"llm:usage:user:{user_id}"
+    if use_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
     try:
         info = llm.user_info(user_id)
-        user_info = info.get("user_info", info) if isinstance(info, dict) else {}
-        return {
+        # user_info 键存在但值可能为 None，需单独判断
+        raw = info.get("user_info") if isinstance(info, dict) else None
+        user_info = raw if isinstance(raw, dict) else (info if isinstance(info, dict) else {})
+        result = {
             "spend": user_info.get("spend"),
             "max_budget": user_info.get("max_budget"),
             "budget_duration": user_info.get("budget_duration"),
         }
-    except LiteLLMError:
+        _cache_set(cache_key, result)
+        return result
+    except Exception:
         return {"spend": None, "max_budget": None, "budget_duration": None}
+
+
+def _safe_project_usage(team_id, use_cache=True):
+    """安全获取项目(team)的用量与预算，成功结果缓存。"""
+    cache_key = f"llm:usage:team:{team_id}"
+    if use_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+    try:
+        info = llm.team_info(team_id)
+        ti = info.get("team_info", info) if isinstance(info, dict) else {}
+        result = {"spend": ti.get("spend"), "max_budget": ti.get("max_budget")}
+        _cache_set(cache_key, result)
+        return result
+    except LiteLLMError:
+        return {"spend": None, "max_budget": None}
 
 
 # ==================== 管理员：项目 ====================
@@ -153,13 +217,9 @@ def list_projects():
         spend = None
         max_budget = None
         if p.litellm_team_id:
-            try:
-                info = llm.team_info(p.litellm_team_id)
-                team_info = info.get("team_info", info) if isinstance(info, dict) else {}
-                spend = team_info.get("spend")
-                max_budget = team_info.get("max_budget")
-            except LiteLLMError:
-                pass
+            usage = _safe_project_usage(p.litellm_team_id)
+            spend = usage["spend"]
+            max_budget = usage["max_budget"]
         result.append({
             "id": p.id,
             "name": p.name,
@@ -397,6 +457,7 @@ def set_user_quota(user_id):
     except LiteLLMError as e:
         return _llm_error_response(e)
 
+    _invalidate_user_usage(user_id)
     return jsonify({"code": 200, "message": "配额已更新"})
 
 
@@ -476,6 +537,7 @@ def review_quota_request(request_id):
             )
         except LiteLLMError as e:
             return _llm_error_response(e)
+        _invalidate_user_usage(r.user_id)
         r.status = LLMQuotaRequestModel.STATUS_APPROVED
     else:
         r.status = LLMQuotaRequestModel.STATUS_REJECTED
@@ -502,11 +564,14 @@ def admin_dashboard():
     pending_requests = LLMQuotaRequestModel.query.filter_by(
         status=LLMQuotaRequestModel.STATUS_PENDING).count()
 
-    global_spend = None
-    try:
-        global_spend = llm.global_spend_report(start_date=start_date, end_date=end_date)
-    except LiteLLMError as e:
-        global_spend = {"error": e.message}
+    cache_key = f"llm:usage:global:{start_date or ''}:{end_date or ''}"
+    global_spend = _cache_get(cache_key)
+    if global_spend is None:
+        try:
+            global_spend = llm.global_spend_report(start_date=start_date, end_date=end_date)
+            _cache_set(cache_key, global_spend, ttl=GLOBAL_CACHE_TTL)
+        except LiteLLMError as e:
+            global_spend = {"error": e.message}
 
     return jsonify({
         "code": 200,
@@ -520,6 +585,35 @@ def admin_dashboard():
 
 
 # ==================== 平台用户接口 ====================
+
+@bp.route("/service-info", methods=["GET"])
+@jwt_required()
+def get_service_info():
+    """返回 LiteLLM 服务接入信息：base_url、chat endpoint、可用模型列表"""
+    base_url = current_app.config.get("LITELLM_BASE_URL", "").rstrip("/")
+    chat_url = f"{base_url}/chat/completions"
+
+    config = _get_quota_config()
+    if config.allowed_models:
+        model_ids = _models_list(config.allowed_models) or []
+    else:
+        try:
+            data = llm.list_models()
+            model_ids = [m.get("id") for m in data.get("data", [])] if isinstance(data, dict) else []
+        except LiteLLMError:
+            model_ids = []
+
+    models = [{"id": mid, "request_url": chat_url} for mid in model_ids if mid]
+
+    return jsonify({
+        "code": 200,
+        "data": {
+            "base_url": base_url,
+            "chat_url": chat_url,
+            "models": models,
+        }
+    })
+
 
 @bp.route("/models", methods=["GET"])
 @jwt_required()
@@ -570,6 +664,9 @@ def create_user_key():
         litellm_key = key_resp.get("key")
     except LiteLLMError as e:
         return _llm_error_response(e)
+
+    if is_first_key:
+        _invalidate_user_usage(user.id)
 
     record = LLMUserKeyModel(user_id=user.id, key_alias=key_alias, litellm_key=litellm_key)
     db.session.add(record)
@@ -634,7 +731,10 @@ def get_my_usage():
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
 
-    usage = _safe_user_spend(user.id)
+    force_refresh = request.args.get("refresh", "0") == "1"
+    usage = _safe_user_spend(user.id, use_cache=not force_refresh)
+    if force_refresh:
+        print(f"[llm/usage refresh] user_id={user.id} result={usage}")
     spend = usage["spend"]
     max_budget = usage["max_budget"]
     remaining = None
