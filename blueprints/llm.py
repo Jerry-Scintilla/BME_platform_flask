@@ -544,7 +544,7 @@ def review_quota_request(request_id):
             llm.update_user_budget(
                 r.user_id,
                 max_budget=float(r.requested_budget),
-                budget_duration=config.budget_duration,
+                # 不传 budget_duration，保留用户当前周期进度，不重置计时
             )
         except LiteLLMError as e:
             return _llm_error_response(e)
