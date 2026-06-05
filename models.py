@@ -846,6 +846,8 @@ class LLMQuotaRequestModel(db.Model):
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'))
     created_at = db.Column(db.DateTime, default=datetime.now)
     reviewed_at = db.Column(db.DateTime)
+    override_expires_at = db.Column(db.DateTime, nullable=True)  # 临时增额到期时间
+    reverted_at = db.Column(db.DateTime, nullable=True)          # 回滚完成时间，null=未回滚
 
     user = db.relationship('UserModel', foreign_keys=[user_id],
                            backref=db.backref('llm_quota_requests', lazy='dynamic'))

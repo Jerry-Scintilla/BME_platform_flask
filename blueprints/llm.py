@@ -7,7 +7,7 @@
      可查用量、申请增额；管理员配置默认配额、审批、监控。
 """
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -71,6 +71,21 @@ def _get_quota_config():
     return config
 
 
+def _parse_duration_days(duration_str):
+    """'30d'->30, '7d'->7, '1mo'->30；解析失败默认 30"""
+    if not duration_str:
+        return 30
+    s = duration_str.strip().lower()
+    try:
+        if s.endswith('mo'):
+            return int(s[:-2]) * 30
+        if s.endswith('d'):
+            return int(s[:-1])
+    except ValueError:
+        pass
+    return 30
+
+
 def _models_list(models_str):
     """逗号分隔字符串 -> 列表（空返回 None，表示不限制）"""
     if not models_str:
@@ -112,6 +127,37 @@ def _cache_delete(key):
 def _invalidate_user_usage(user_id):
     """额度/用量发生变化后，清除该用户的用量缓存"""
     _cache_delete(f"llm:usage:user:{user_id}")
+
+
+def _revert_expired_overrides(user_id):
+    """检查并回滚已到期的临时增额，恢复至申请前的原始预算。
+    若 LiteLLM 不可用则跳过，不标记已回滚，等下次触发重试。"""
+    now = datetime.now()
+    expired = LLMQuotaRequestModel.query.filter(
+        LLMQuotaRequestModel.user_id == user_id,
+        LLMQuotaRequestModel.status == LLMQuotaRequestModel.STATUS_APPROVED,
+        LLMQuotaRequestModel.override_expires_at.isnot(None),
+        LLMQuotaRequestModel.override_expires_at <= now,
+        LLMQuotaRequestModel.reverted_at.is_(None),
+    ).all()
+
+    if not expired:
+        return
+
+    # 多条同时到期时取最小的基准预算，保证回到最保守的原始值
+    revert_to = min(
+        (r.current_budget for r in expired if r.current_budget is not None),
+        default=0.0,
+    )
+    try:
+        llm.update_user_budget(user_id, max_budget=revert_to)
+        _invalidate_user_usage(user_id)
+    except Exception:
+        return
+
+    for r in expired:
+        r.reverted_at = now
+    db.session.commit()
 
 
 def _safe_user_spend(user_id, use_cache=True):
@@ -503,6 +549,8 @@ def list_quota_requests():
             "review_comment": r.review_comment,
             "created_at": r.created_at.strftime('%Y-%m-%d %H:%M:%S') if r.created_at else None,
             "reviewed_at": r.reviewed_at.strftime('%Y-%m-%d %H:%M:%S') if r.reviewed_at else None,
+            "override_expires_at": r.override_expires_at.strftime('%Y-%m-%d %H:%M:%S') if r.override_expires_at else None,
+            "reverted_at": r.reverted_at.strftime('%Y-%m-%d %H:%M:%S') if r.reverted_at else None,
         })
 
     return jsonify({
@@ -540,16 +588,18 @@ def review_quota_request(request_id):
 
     if action == "approve":
         config = _get_quota_config()
+        expires_days = _parse_duration_days(config.budget_duration)
         try:
             llm.update_user_budget(
                 r.user_id,
                 max_budget=float(r.requested_budget),
-                # 不传 budget_duration，保留用户当前周期进度，不重置计时
+                budget_duration=config.budget_duration,  # 重置周期，单次有效
             )
         except LiteLLMError as e:
             return _llm_error_response(e)
         _invalidate_user_usage(r.user_id)
         r.status = LLMQuotaRequestModel.STATUS_APPROVED
+        r.override_expires_at = datetime.now() + timedelta(days=expires_days)
     else:
         r.status = LLMQuotaRequestModel.STATUS_REJECTED
 
@@ -756,6 +806,7 @@ def get_my_usage():
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
 
+    _revert_expired_overrides(user.id)
     force_refresh = request.args.get("refresh", "0") == "1"
     usage = _safe_user_spend(user.id, use_cache=not force_refresh)
     if force_refresh:
@@ -829,5 +880,7 @@ def list_my_quota_requests():
         "review_comment": r.review_comment,
         "created_at": r.created_at.strftime('%Y-%m-%d %H:%M:%S') if r.created_at else None,
         "reviewed_at": r.reviewed_at.strftime('%Y-%m-%d %H:%M:%S') if r.reviewed_at else None,
+        "override_expires_at": r.override_expires_at.strftime('%Y-%m-%d %H:%M:%S') if r.override_expires_at else None,
+        "reverted_at": r.reverted_at.strftime('%Y-%m-%d %H:%M:%S') if r.reverted_at else None,
     } for r in reqs]
     return jsonify({"code": 200, "data": result})
