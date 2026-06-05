@@ -306,8 +306,10 @@ def course_edit():
             course.other_tags = other_tags
 
         # 重新统计课时数（自动计算，不允许手动编辑）
-        lesson_count = LessonModel.query.filter_by(course_id=course_id).count()
-        course.class_hour = lesson_count
+        total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+            LessonModel.course_id == course_id
+        ).scalar() or 0
+        course.class_hour = total_duration
 
         db.session.commit()
 
@@ -340,7 +342,7 @@ def course_edit():
             "message": "课程信息修改完成",
             "chapters": chapters_data,
             "lessons": lessons_data,
-            "class_hour": lesson_count or 0
+            "class_hour": total_duration or 0
         })
 
     else:
@@ -1050,4 +1052,37 @@ def lesson_detail():
         "code": 200,
         "message": "查询成功",
         "lesson": lesson.to_dict()
+    })
+
+
+@bp.route("/course/fix_class_hours", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/fix_class_hours.yaml')
+@audit_log(operation="修复课程课时数")
+def fix_class_hours():
+    """从lesson表重新计算指定课程的class_hour"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if user.user_mode != 'admin':
+        return jsonify({"code": 400, "message": "用户权限不够"}), 400
+
+    data = request.get_json()
+    course_id = data.get("Course_Id")
+    if not course_id:
+        return jsonify({"code": 400, "message": "缺少课程ID"}), 400
+
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+
+    total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+        LessonModel.course_id == course.id
+    ).scalar() or 0
+    course.class_hour = total_duration
+
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": f"课时数已修复为 {total_duration}",
+        "class_hour": total_duration
     })
