@@ -32,3 +32,12 @@ MAIL_PORT = 465
 MAIL_USERNAME = os.getenv("MAIL_USERNAME")
 MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
 MAIL_DEFAULT_SENDER = os.getenv("MAIL_USERNAME")
+
+# LiteLLM 大模型代理配置
+# LiteLLM Proxy 的基础地址，例如 http://127.0.0.1:4000
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://127.0.0.1:4000")
+# LiteLLM Proxy 的 master key，用于调用其 Admin API
+LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY")
+# 平台用户默认配额（美元）及重置周期，作为 LiteLLM internal user 的 max_budget 兜底默认值
+LITELLM_DEFAULT_MAX_BUDGET = float(os.getenv("LITELLM_DEFAULT_MAX_BUDGET", "5"))
+LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "30d")

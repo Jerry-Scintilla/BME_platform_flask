@@ -19,7 +19,12 @@ dependencies = [
     "flask-wtf>=1.2.2",
     "gunicorn>=23.0.0",
     "pymysql>=1.1.1",
+    "requests>=2.34.2",
 ]
 
 [tool.uv.sources]
 index_url = { url = "https://mirrors.aliyun.com/pypi/simple/" }
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
