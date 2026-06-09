@@ -160,6 +160,40 @@ def _revert_expired_overrides(user_id):
     db.session.commit()
 
 
+def _sum_spend_from_keys(user_id):
+    """从各 key 的 /key/info 汇总 spend，用于 LiteLLM user record 不存在时的降级取数。"""
+    keys = LLMUserKeyModel.query.filter_by(user_id=user_id, is_active=True).all()
+    total_spend = 0.0
+    has_any = False
+    for k in keys:
+        try:
+            ki = llm.key_info(k.litellm_key)
+            key_spend = (ki.get("info") or ki).get("spend")
+            if key_spend is not None:
+                total_spend += float(key_spend)
+                has_any = True
+        except Exception:
+            pass
+    return total_spend if has_any else None
+
+
+def _reprovision_user(user_id):
+    """在 LiteLLM user record 丢失时（如 LiteLLM DB 重置）重新 provision，
+    预算从本地配置默认值恢复，不干扰已有的 key。"""
+    try:
+        config = LLMQuotaConfigModel.query.get(1)
+        u = UserModel.query.get(user_id)
+        llm.provision_user(
+            user_id,
+            user_email=u.email if u else None,
+            max_budget=config.default_max_budget if config else None,
+            budget_duration=config.budget_duration if config else None,
+        )
+        current_app.logger.info(f"[llm] re-provisioned user_id={user_id} in LiteLLM")
+    except Exception as e:
+        current_app.logger.warning(f"[llm] re-provision failed for user_id={user_id}: {e}")
+
+
 def _safe_user_spend(user_id, use_cache=True):
     """安全获取某用户在 LiteLLM 的用量与预算，失败返回 None 字段。
     成功结果缓存 USAGE_CACHE_TTL 秒；失败不缓存，便于 LiteLLM 恢复后立即生效。"""
@@ -170,17 +204,42 @@ def _safe_user_spend(user_id, use_cache=True):
             return cached
     try:
         info = llm.user_info(user_id)
-        # user_info 键存在但值可能为 None，需单独判断
-        raw = info.get("user_info") if isinstance(info, dict) else None
-        user_info = raw if isinstance(raw, dict) else (info if isinstance(info, dict) else {})
+        # user_info 键存在但值可能为 None（理论上不应出现，防御性处理）
+        user_info_obj = info.get("user_info") if isinstance(info, dict) else None
+        if not isinstance(user_info_obj, dict):
+            current_app.logger.warning(
+                f"[llm] user_info is null for user_id={user_id}, falling back to key-level spend sum."
+            )
+            spend = _sum_spend_from_keys(user_id)
+            result = {"spend": spend, "max_budget": None, "budget_duration": None}
+            _cache_set(cache_key, result)
+            return result
+
         result = {
-            "spend": user_info.get("spend"),
-            "max_budget": user_info.get("max_budget"),
-            "budget_duration": user_info.get("budget_duration"),
+            "spend": user_info_obj.get("spend"),
+            "max_budget": user_info_obj.get("max_budget"),
+            "budget_duration": user_info_obj.get("budget_duration"),
         }
         _cache_set(cache_key, result)
         return result
-    except Exception:
+    except LiteLLMError as e:
+        if e.status_code == 404:
+            # user 在 LiteLLM 侧不存在（如 LiteLLM DB 被重置）
+            # 1. 异步 re-provision，让后续请求能正常聚合 spend
+            _reprovision_user(user_id)
+            # 2. 从各 key 取当前 spend 作为本次返回值
+            spend = _sum_spend_from_keys(user_id)
+            config = LLMQuotaConfigModel.query.get(1)
+            result = {
+                "spend": spend,
+                "max_budget": config.default_max_budget if config else None,
+                "budget_duration": config.budget_duration if config else None,
+            }
+            return result
+        current_app.logger.warning(f"[llm] _safe_user_spend failed for user_id={user_id}: {e}")
+        return {"spend": None, "max_budget": None, "budget_duration": None}
+    except Exception as e:
+        current_app.logger.warning(f"[llm] _safe_user_spend failed for user_id={user_id}: {e}")
         return {"spend": None, "max_budget": None, "budget_duration": None}
 
 
@@ -650,9 +709,10 @@ def admin_dashboard():
 @bp.route("/service-info", methods=["GET"])
 @jwt_required()
 def get_service_info():
-    """返回 LiteLLM 服务接入信息：base_url、chat endpoint、可用模型列表"""
+    """返回 LiteLLM 服务接入信息：base_url、OpenAI /chat/completions、Claude API /v1/messages、可用模型列表"""
     base_url = current_app.config.get("LITELLM_BASE_URL", "").rstrip("/")
     chat_url = f"{base_url}/chat/completions"
+    messages_url = f"{base_url}/v1/messages"
 
     config = _get_quota_config()
     if config.allowed_models:
@@ -664,13 +724,14 @@ def get_service_info():
         except LiteLLMError:
             model_ids = []
 
-    models = [{"id": mid, "request_url": chat_url} for mid in model_ids if mid]
+    models = [{"id": mid} for mid in model_ids if mid]
 
     return jsonify({
         "code": 200,
         "data": {
             "base_url": base_url,
             "chat_url": chat_url,
+            "messages_url": messages_url,
             "models": models,
         }
     })
@@ -707,9 +768,10 @@ def create_user_key():
     models_list = _models_list(config.allowed_models)
 
     try:
-        # 首次创建前确保 LiteLLM 中存在该 user 并带默认预算
-        is_first_key = LLMUserKeyModel.query.filter_by(user_id=user.id).count() == 0
+        existing_key_count = LLMUserKeyModel.query.filter_by(user_id=user.id).count()
+        is_first_key = existing_key_count == 0
         if is_first_key:
+            # 首次：创建 LiteLLM user 并设置默认预算
             llm.provision_user(
                 user.id,
                 user_email=user.email,
@@ -717,6 +779,10 @@ def create_user_key():
                 budget_duration=config.budget_duration,
                 models=models_list,
             )
+        else:
+            # 非首次：仅确保 LiteLLM user 记录存在（避免 LiteLLM 重置后 user 消失导致 usage 无法聚合）
+            # 不传 max_budget，provision_user 在 user 已存在时 fallback 的 update_user_budget 会跳过预算字段
+            llm.provision_user(user.id, user_email=user.email, models=models_list)
         key_resp = llm.generate_key(
             key_alias=key_alias,
             user_id=user.id,
