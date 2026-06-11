@@ -8,8 +8,15 @@ LiteLLM Proxy Admin API 客户端封装
 
 参考部署样式见 AMEII_LLM（config.yaml / docker-compose.yml）。
 实际端点以所部署的 LiteLLM 版本为准，首次联调需校验。
+
+【已知 Bug 规避】LiteLLM ≤ v1.84.x 的 reset_budget 后台任务在重置 DB 中
+spend=0 后未同步清除 Redis 缓存，导致预算周期到期后用户仍被超限值拦截。
+规避方式：在 budget_reset_at 到期后主动调用 reset_user_spend()，通过
+POST /user/update spend=0 触发 LiteLLM 内部缓存失效路径。
+上游 Issue：https://github.com/BerriAI/litellm/issues/27735
 """
 import requests
+from datetime import datetime, timezone
 from flask import current_app
 
 
@@ -130,6 +137,47 @@ def update_user_budget(user_id, max_budget=None, budget_duration=None):
     if budget_duration:
         payload["budget_duration"] = budget_duration
     return _request("POST", "/user/update", json=payload)
+
+
+def reset_user_spend(user_id):
+    """
+    将用户的 spend 强制归零，同时触发 LiteLLM 内部 Redis 缓存失效。
+
+    规避 LiteLLM ≤ v1.84.x 中 reset_budget 后台任务仅更新 DB、未清除
+    Redis spend 缓存的 Bug（Issue #27735）。应在 budget_reset_at 到期后调用，
+    以使预算周期刷新立即对请求生效，而无需等待 Redis TTL 自然过期。
+    """
+    return _request("POST", "/user/update", json={"user_id": str(user_id), "spend": 0})
+
+
+def reset_user_spend_if_needed(user_id):
+    """
+    查询用户信息，若 budget_reset_at 已过期且 spend > 0，则自动调用 reset_user_spend。
+    返回 (已重置: bool, 用户信息: dict)。
+    """
+    info = user_info(user_id)
+    user_data = info.get("user_info") or info
+    if isinstance(user_data, list):
+        user_data = user_data[0] if user_data else {}
+
+    if not isinstance(user_data, dict):
+        return False, info
+
+    spend = user_data.get("spend", 0) or 0
+    reset_at_str = user_data.get("budget_reset_at")
+
+    if not reset_at_str or spend <= 0:
+        return False, user_data
+
+    try:
+        reset_at = datetime.fromisoformat(reset_at_str.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= reset_at:
+            reset_user_spend(user_id)
+            return True, user_data
+    except (ValueError, AttributeError):
+        pass
+
+    return False, user_data
 
 
 def user_info(user_id):
