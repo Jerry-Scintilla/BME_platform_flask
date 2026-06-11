@@ -62,7 +62,8 @@ def register():
             return jsonify(data), 401
 
         else:
-            user = UserModel(email=email, password=password, username=username, study_stage="未分流")
+            user = UserModel(email=email, username=username, study_stage="未分流")
+            user.set_password(password)
             db.session.add(user)
             db.session.commit()
             token = create_access_token(identity=email)
@@ -115,7 +116,11 @@ def login():
             Skill_Tags = user.skill_tags
 
 
-            if user.password == password:
+            if user.check_password(password):
+                # 历史遗留的明文(MD5)密码，登录成功后自动升级为加盐哈希
+                if not user.password_is_hashed:
+                    user.set_password(password)
+                    db.session.commit()
                 code = 200
                 msg = "登录成功"
                 token = create_access_token(identity=email)
@@ -220,7 +225,7 @@ def admin_login():
                     'message': "用户权限不够"
                 }), 401
 
-            if admin.password != password:
+            if not admin.check_password(password):
                 return jsonify({
                     "code": 402,
                     'msg':"密码错误",
@@ -229,6 +234,10 @@ def admin_login():
                 }),402
 
             else:
+                # 历史遗留的明文(MD5)密码，登录成功后自动升级为加盐哈希
+                if not admin.password_is_hashed:
+                    admin.set_password(password)
+                    db.session.commit()
                 return jsonify({
                 'code' : 200,
                 'msg' : "登录成功",
@@ -321,7 +330,7 @@ def find_password():
         }), 401
 
     if redis_captcha == captcha:
-        user.password = password
+        user.set_password(password)
         # 从Redis中删除验证码
         redis_client.delete(f"captcha:{email}")
         db.session.commit()

@@ -5,6 +5,8 @@ from sqlalchemy import and_
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import foreign, remote
 
+from werkzeug.security import generate_password_hash, check_password_hash
+
 from exts import db
 
 
@@ -12,7 +14,9 @@ class UserModel(db.Model):
     __tablename__ = 'user'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     username = db.Column(db.String(100), nullable=False)
-    password = db.Column(db.String(100), nullable=False)
+    # 存储的是经过加盐哈希后的密码（前端先做 MD5，后端再用 pbkdf2 加盐哈希）。
+    # 历史数据可能仍是前端 MD5 明文，由 check_password 兼容并在登录时自动升级。
+    password = db.Column(db.String(255), nullable=False)
     email = db.Column(db.String(100), nullable=False, unique=True)
     join_time = db.Column(db.DateTime, default=datetime.now)
     # 签出测试
@@ -33,6 +37,31 @@ class UserModel(db.Model):
 
     # down_code = db.Column(db.String(100))
     # down_id = db.Column(db.Integer)
+
+    # 用于识别 password 字段是否已是加盐哈希值（而非历史遗留的 MD5 明文）
+    _PWHASH_PREFIXES = ('pbkdf2:', 'scrypt:', 'argon2')
+
+    @property
+    def password_is_hashed(self):
+        """判断当前存储的密码是否已经过加盐哈希处理。"""
+        return isinstance(self.password, str) and self.password.startswith(self._PWHASH_PREFIXES)
+
+    def set_password(self, raw_password):
+        """对前端传来的密码（已是 MD5）再做加盐哈希后存储。"""
+        self.password = generate_password_hash(raw_password, method='pbkdf2:sha256')
+
+    def check_password(self, raw_password):
+        """校验密码，兼容历史遗留的明文(MD5)存储。
+
+        返回 True/False。若需在校验通过后把历史明文升级为哈希，
+        由调用方判断 password_is_hashed 后调用 set_password 并提交。
+        """
+        if not isinstance(self.password, str) or not self.password:
+            return False
+        if self.password_is_hashed:
+            return check_password_hash(self.password, raw_password)
+        # 历史遗留：数据库中直接存的是前端 MD5 明文
+        return self.password == raw_password
 
 
 # 已弃用，改用redis存储

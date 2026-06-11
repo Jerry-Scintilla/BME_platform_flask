@@ -158,21 +158,21 @@ def check_in_out():
 
 # 人脸签到/签退（第三方服务接入）
 @bp.route('/face_check', methods=['POST'])
+@jwt_required()
 @swag_from('../apidocs/codecheck/face_check.yaml')
 def face_check():
-    # 获取请求参数
-    request_email = request.json.get('email')
+    # 从 JWT 获取当前登录用户身份，不信任请求体中的 email
+    current_user_email = get_jwt_identity()
+
     check_status = request.json.get('status')  # 'check_in' 或 'check_out'
     third_party_token = request.json.get('token')  # 第三方凭据
 
-    from dotenv import load_dotenv
     import os
-    load_dotenv()
 
     if os.getenv("FACE_SECRET") != third_party_token:
         return jsonify({"error": "第三方凭据无效"}), 401
 
-    user = UserModel.query.filter_by(email=request_email).first()
+    user = UserModel.query.filter_by(email=current_user_email).first()
     if not user:
         return jsonify({"error": "用户不存在"}), 404
     
