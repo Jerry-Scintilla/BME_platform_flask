@@ -6,8 +6,10 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
-from exts import db
+from exts import db, mail
 from models import UserModel, NotificationModel
+from flask_mail import Message
+from threading import Thread
 
 bp = Blueprint("notification", __name__, url_prefix="/notification")
 
@@ -79,6 +81,44 @@ def batch_create_notifications(user_ids, title, content, category='system',
         )
         notifications.append(n)
     return notifications
+
+
+def _send_email_async(app, user_emails, title, content):
+    """在子线程中发送邮件，不阻塞请求响应"""
+    with app.app_context():
+        try:
+            subject = f'[BME] {title}'
+            # 逐个发送，避免一次塞太多收件人暴露隐私
+            for email in user_emails:
+                try:
+                    msg = Message(
+                        subject=subject,
+                        recipients=[email],
+                        body=f'{title}\n\n{content}\n\n— BME 卓越工程师在线教育平台',
+                    )
+                    mail.send(msg)
+                except Exception as e:
+                    print(f'[通知邮件] 发送失败 {email}: {e}')
+            print(f'[通知邮件] 已发送 {len(user_emails)} 封')
+        except Exception as e:
+            print(f'[通知邮件] 发送异常: {e}')
+
+
+def send_notification_emails(user_ids, title, content):
+    """异步发送通知邮件给指定用户"""
+    from flask import current_app
+    app = current_app._get_current_object()
+
+    users = UserModel.query.filter(UserModel.id.in_(user_ids)).all()
+    emails = [u.email for u in users if u.email and '@' in u.email]
+    if not emails:
+        return
+
+    Thread(
+        target=_send_email_async,
+        args=(app, emails, title, content),
+        daemon=True,
+    ).start()
 
 
 # ────────────────────────────────────────
@@ -342,6 +382,9 @@ def notification_batch_create():
         is_important=data.get('is_important', False),
     )
     db.session.commit()
+
+    # 异步发送邮件通知
+    send_notification_emails(user_ids, title, data.get('content', ''))
 
     return jsonify({
         "code": 200,
