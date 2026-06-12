@@ -44,6 +44,7 @@ app.register_blueprint(information_bp)
 app.register_blueprint(permission_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(discussion_bp)
+app.register_blueprint(llm_bp)
 
 
 @app.route('/')

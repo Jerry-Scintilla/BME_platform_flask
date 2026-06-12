@@ -296,6 +296,7 @@ from .information import bp as information_bp
 from .permissionACL import bp as permission_bp
 from .task import bp as task_bp
 from .discussion import bp as discussion_bp
+from .llm import bp as llm_bp
 
 __all__ = [
     'auth_bp',
@@ -310,5 +311,6 @@ __all__ = [
     'information_bp',
     'permission_bp',
     'task_bp',
-    'discussion_bp'
+    'discussion_bp',
+    'llm_bp'
 ]

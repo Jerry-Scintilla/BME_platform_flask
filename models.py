@@ -812,6 +812,77 @@ class DiscussionReply(db.Model):
     children = db.relationship('DiscussionReply', backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
 
 
+# ==================== 大模型（LiteLLM）模块 ====================
+
+class LLMProjectModel(db.Model):
+    """大模型项目：对应 LiteLLM 的 Team，不限额，仅监控用量"""
+    __tablename__ = 'llm_project'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)  # 项目名
+    description = db.Column(db.Text)
+    litellm_team_id = db.Column(db.String(100))  # LiteLLM team_id
+    litellm_key = db.Column(db.String(200))  # 项目 virtual key（sk-...）
+    models = db.Column(db.String(500))  # 允许的模型，逗号分隔，空表示全部
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    is_active = db.Column(db.Boolean, default=True)
+
+    creator = db.relationship('UserModel', backref=db.backref('llm_projects', lazy='dynamic'))
+
+
+class LLMUserKeyModel(db.Model):
+    """平台用户自建的大模型 API Key（本地映射，预算挂在 LiteLLM user 上）"""
+    __tablename__ = 'llm_user_key'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    key_alias = db.Column(db.String(100))  # key 别名
+    litellm_key = db.Column(db.String(200), nullable=False)  # virtual key（sk-...）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    is_active = db.Column(db.Boolean, default=True)
+
+    user = db.relationship('UserModel', backref=db.backref('llm_user_keys', lazy='dynamic'))
+
+
+class LLMQuotaConfigModel(db.Model):
+    """平台用户默认配额配置（单例，id=1）"""
+    __tablename__ = 'llm_quota_config'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    default_max_budget = db.Column(db.Float, nullable=False, default=5.0)  # 默认额度（美元）
+    budget_duration = db.Column(db.String(20), default='30d')  # 重置周期
+    allowed_models = db.Column(db.String(500))  # 允许模型，逗号分隔，空表示全部
+    updated_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class LLMQuotaRequestModel(db.Model):
+    """平台用户增额申请"""
+    __tablename__ = 'llm_quota_request'
+
+    STATUS_PENDING = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_REJECTED = 'rejected'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    current_budget = db.Column(db.Float)  # 申请时的当前额度
+    requested_budget = db.Column(db.Float, nullable=False)  # 期望的新额度
+    reason = db.Column(db.Text)  # 申请理由
+    status = db.Column(db.String(20), default=STATUS_PENDING)
+    review_comment = db.Column(db.Text)  # 审批意见
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    reviewed_at = db.Column(db.DateTime)
+    override_expires_at = db.Column(db.DateTime, nullable=True)  # 临时增额到期时间
+    reverted_at = db.Column(db.DateTime, nullable=True)          # 回滚完成时间，null=未回滚
+
+    user = db.relationship('UserModel', foreign_keys=[user_id],
+                           backref=db.backref('llm_quota_requests', lazy='dynamic'))
+    reviewer = db.relationship('UserModel', foreign_keys=[reviewed_by])
+
+
 class DiscussionReaction(db.Model):
     """讨论互动（点赞等）"""
     __tablename__ = 'discussion_reaction'
