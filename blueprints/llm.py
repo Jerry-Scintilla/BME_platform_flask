@@ -928,6 +928,108 @@ def create_quota_request():
     return jsonify({"code": 200, "message": "申请已提交，等待审批"})
 
 
+ACTIVITY_CACHE_TTL = 120  # 活动趋势数据缓存 2 分钟
+
+
+def _default_date_range(days=29):
+    """返回 (start_date, end_date) 字符串，默认最近 days+1 天。"""
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+
+# ==================== 管理员：活动趋势 ====================
+
+@bp.route("/admin/users/<int:user_id>/activity", methods=["GET"])
+@jwt_required()
+@check_permission(LLM_PERMISSION)
+def get_user_activity(user_id):
+    """查询某用户按日活动趋势：spend / token / 请求量 / 模型分布。"""
+    u = UserModel.query.get(user_id)
+    if not u:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+    default_start, default_end = _default_date_range()
+    start_date = request.args.get('start_date', default_start)
+    end_date = request.args.get('end_date', default_end)
+    cache_key = f"llm:activity:user:{user_id}:{start_date}:{end_date}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify({"code": 200, "data": cached})
+    try:
+        data = llm.user_daily_activity(user_id, start_date=start_date, end_date=end_date)
+        _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
+        return jsonify({"code": 200, "data": data})
+    except LiteLLMError as e:
+        return _llm_error_response(e)
+
+
+@bp.route("/admin/projects/<int:project_id>/activity", methods=["GET"])
+@jwt_required()
+@check_permission(LLM_PERMISSION)
+def get_project_activity(project_id):
+    """查询某项目（team）按日活动趋势。"""
+    p = LLMProjectModel.query.get(project_id)
+    if not p:
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+    default_start, default_end = _default_date_range()
+    start_date = request.args.get('start_date', default_start)
+    end_date = request.args.get('end_date', default_end)
+    cache_key = f"llm:activity:team:{p.litellm_team_id}:{start_date}:{end_date}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify({"code": 200, "data": cached})
+    try:
+        data = llm.team_daily_activity(p.litellm_team_id, start_date=start_date, end_date=end_date)
+        _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
+        return jsonify({"code": 200, "data": data})
+    except LiteLLMError as e:
+        return _llm_error_response(e)
+
+
+@bp.route("/admin/model-stats", methods=["GET"])
+@jwt_required()
+@check_permission(LLM_PERMISSION)
+def get_model_stats():
+    """全局按模型分组的用量统计，用于管理员看板。"""
+    default_start, default_end = _default_date_range()
+    start_date = request.args.get('start_date', default_start)
+    end_date = request.args.get('end_date', default_end)
+    cache_key = f"llm:model_stats:{start_date}:{end_date}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify({"code": 200, "data": cached})
+    try:
+        data = llm.model_spend_report(start_date=start_date, end_date=end_date)
+        _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
+        return jsonify({"code": 200, "data": data})
+    except LiteLLMError as e:
+        return _llm_error_response(e)
+
+
+# ==================== 平台用户：我的活动趋势 ====================
+
+@bp.route("/my-activity", methods=["GET"])
+@jwt_required()
+def get_my_activity():
+    """当前用户查询自己的按日活动数据。"""
+    user = _current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户未认证"}), 401
+    default_start, default_end = _default_date_range()
+    start_date = request.args.get('start_date', default_start)
+    end_date = request.args.get('end_date', default_end)
+    cache_key = f"llm:activity:user:{user.id}:{start_date}:{end_date}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify({"code": 200, "data": cached})
+    try:
+        data = llm.user_daily_activity(user.id, start_date=start_date, end_date=end_date)
+        _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
+        return jsonify({"code": 200, "data": data})
+    except LiteLLMError as e:
+        return _llm_error_response(e)
+
+
 @bp.route("/quota-requests", methods=["GET"])
 @jwt_required()
 def list_my_quota_requests():

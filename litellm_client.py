@@ -249,3 +249,35 @@ def global_spend_report(start_date=None, end_date=None):
 def list_models():
     """列出 LiteLLM 当前可用模型。"""
     return _request("GET", "/models")
+
+
+# ==================== 活动趋势查询 ====================
+
+def user_daily_activity(user_id, start_date=None, end_date=None):
+    """查询某用户按日的活动数据（spend / token / 请求数趋势）。"""
+    params = {"user_id": str(user_id)}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    return _request("GET", "/user/daily/activity", params=params)
+
+
+def team_daily_activity(team_id, start_date=None, end_date=None):
+    """查询某 team（项目）按日的活动数据。"""
+    params = {"team_ids": team_id}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    return _request("GET", "/team/daily/activity", params=params)
+
+
+def model_spend_report(start_date=None, end_date=None):
+    """全局按模型分组的用量报告。"""
+    params = {"group_by": "model"}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    return _request("GET", "/global/spend/report", params=params)
