@@ -281,3 +281,23 @@ def model_spend_report(start_date=None, end_date=None):
     if end_date:
         params["end_date"] = end_date
     return _request("GET", "/global/spend/report", params=params)
+
+
+def get_model_alias_map():
+    """
+    返回 {provider_model: alias_name} 映射字典。
+    例如：{"anthropic/deepseek-v4-flash": "deepseek-v4-flash-anthropic"}
+    用于将 breakdown.models 中 provider-prefixed key 替换为用户可见的 alias 名称。
+    失败时返回空字典，由调用方降级处理。
+    """
+    try:
+        data = _request("GET", "/model/info")
+        mapping = {}
+        for item in (data.get("data") or []):
+            alias = item.get("model_name", "")
+            provider = (item.get("litellm_params") or {}).get("model", "")
+            if alias and provider:
+                mapping[provider] = alias
+        return mapping
+    except LiteLLMError:
+        return {}

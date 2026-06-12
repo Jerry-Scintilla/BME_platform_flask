@@ -929,6 +929,50 @@ def create_quota_request():
 
 
 ACTIVITY_CACHE_TTL = 120  # 活动趋势数据缓存 2 分钟
+MODEL_ALIAS_CACHE_TTL = 300  # 模型别名映射缓存 5 分钟
+
+
+def _get_model_alias_map():
+    """获取 provider→alias 映射，带 Redis 缓存。失败时返回空字典。"""
+    cache_key = "llm:model_alias_map"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    mapping = llm.get_model_alias_map()
+    _cache_set(cache_key, mapping, ttl=MODEL_ALIAS_CACHE_TTL)
+    return mapping
+
+
+def _apply_model_aliases(results):
+    """
+    将 breakdown.models 中 provider-prefixed key（含 '/'）替换为 alias 名称。
+    alias routing 条目（不含 '/'，spend/token 均为 0）直接丢弃，避免重复展示。
+    若 alias 映射不存在，则保留 '/' 后的部分作为 display name。
+    """
+    alias_map = _get_model_alias_map()
+    for day in (results or []):
+        raw = (day.get("breakdown") or {}).get("models")
+        if not raw:
+            continue
+        merged = {}
+        for key, val in raw.items():
+            if "/" not in key:
+                # alias routing 条目：只有请求路由记录，spend/token 数据在 provider 条目中
+                continue
+            display = alias_map.get(key) or key.split("/", 1)[-1]
+            if display not in merged:
+                merged[display] = val
+            else:
+                # 同一 alias 被多个 provider 支撑时，合并 metrics
+                base_m = merged[display].get("metrics") if isinstance(merged[display], dict) and "metrics" in merged[display] else merged[display]
+                extra_m = val.get("metrics") if isinstance(val, dict) and "metrics" in val else val
+                if isinstance(base_m, dict) and isinstance(extra_m, dict):
+                    for field in ("spend", "total_tokens", "prompt_tokens", "completion_tokens",
+                                  "api_requests", "successful_requests", "failed_requests",
+                                  "cache_read_input_tokens", "cache_creation_input_tokens"):
+                        base_m[field] = (base_m.get(field) or 0) + (extra_m.get(field) or 0)
+        day["breakdown"]["models"] = merged
+    return results
 
 
 def _default_date_range(days=29):
@@ -957,6 +1001,7 @@ def get_user_activity(user_id):
         return jsonify({"code": 200, "data": cached})
     try:
         data = llm.user_daily_activity(user_id, start_date=start_date, end_date=end_date)
+        _apply_model_aliases(data.get("results") or data.get("data") or [])
         _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
         return jsonify({"code": 200, "data": data})
     except LiteLLMError as e:
@@ -980,6 +1025,7 @@ def get_project_activity(project_id):
         return jsonify({"code": 200, "data": cached})
     try:
         data = llm.team_daily_activity(p.litellm_team_id, start_date=start_date, end_date=end_date)
+        _apply_model_aliases(data.get("results") or data.get("data") or [])
         _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
         return jsonify({"code": 200, "data": data})
     except LiteLLMError as e:
@@ -1024,6 +1070,7 @@ def get_my_activity():
         return jsonify({"code": 200, "data": cached})
     try:
         data = llm.user_daily_activity(user.id, start_date=start_date, end_date=end_date)
+        _apply_model_aliases(data.get("results") or data.get("data") or [])
         _cache_set(cache_key, data, ttl=ACTIVITY_CACHE_TTL)
         return jsonify({"code": 200, "data": data})
     except LiteLLMError as e:
