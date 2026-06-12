@@ -20,14 +20,19 @@ from flasgger import swag_from
 from blueprints.forms import LeaveForm, TaskForm, NoticeForm
 
 from . import audit_log
+from .notification import create_notification
 
 bp = Blueprint("information", __name__, url_prefix="")
 
-# 辅助函数：创建提醒信息
+# source_type 数字 → 字符串映射（兼容旧调用方式）
+_SOURCE_TYPE_NAMES = {1: 'leave', 2: 'task', 3: 'notice', 4: 'error', 5: 'homework'}
+
+
+# 辅助函数：创建提醒信息（已迁移到 notification 表）
 def create_reminder(title, content, related_info_id, student_id, group_id, source_type=0):
     """
-    创建提醒信息
-    
+    创建提醒信息 — 现在写入独立的 notification 表
+
     参数:
     - title: 提醒标题
     - content: 提醒内容
@@ -35,25 +40,23 @@ def create_reminder(title, content, related_info_id, student_id, group_id, sourc
     - student_id: 接收提醒的用户ID
     - group_id: 所属小组ID
     - source_type: 原始信息类型 (1:请假 2:任务 3:通知 4:报错 5:作业)
-    
+
     返回:
-    - 创建的提醒信息对象
+    - 创建的通知对象
     """
-    reminder = InformationModel(
-        group_id=group_id,
-        type=0,  # 0代表提醒信息
+    source_name = _SOURCE_TYPE_NAMES.get(source_type, 'other')
+
+    n = create_notification(
+        user_id=student_id,
         title=title,
         content=content,
-        range=str(related_info_id),  # 存储关联的信息ID
-        student_id=student_id,
-        priority=source_type,  # 使用priority字段存储原始信息类型
-        status=0  # 0代表未读状态
+        category='group',
+        source_type=source_name,
+        source_id=related_info_id,
+        group_id=group_id,
     )
-    
-    db.session.add(reminder)
     db.session.commit()
-    
-    return reminder
+    return n
 
 # 辅助函数：处理日期时间格式，如果只有日期部分，则设置时间为23:59:59
 def process_datetime(dt):
@@ -87,35 +90,33 @@ def process_datetime(dt):
     
     return dt
 
-# 辅助函数：删除与指定信息关联的所有提醒
+# 辅助函数：删除与指定信息关联的所有提醒（已迁移到 notification 表）
 def delete_related_reminders(info_id):
     """
-    删除与指定信息ID关联的所有提醒
-    
+    删除与指定信息ID关联的所有通知
+
     参数:
     - info_id: 原始信息的ID
-    
+
     返回:
-    - 删除的提醒数量
+    - 删除的通知数量
     """
-    # 查找所有关联该信息的提醒
-    reminders = InformationModel.query.filter_by(
-        type=0,  # 提醒信息
-        range=str(info_id)  # 关联的信息ID
+    from models import NotificationModel
+
+    # 删除 notification 表中关联的通知
+    count = NotificationModel.query.filter_by(source_id=info_id).delete()
+
+    # 同时清理旧的 information 表中 type=0 的残留（兼容）
+    old_reminders = InformationModel.query.filter_by(
+        type=0, range=str(info_id)
     ).all()
-    
-    # 记录删除数量
-    deleted_count = len(reminders)
-    
-    # 批量删除
-    for reminder in reminders:
-        db.session.delete(reminder)
-    
-    # 提交到数据库
-    if deleted_count > 0:
+    for r in old_reminders:
+        db.session.delete(r)
+
+    if count > 0 or len(old_reminders) > 0:
         db.session.commit()
-    
-    return deleted_count
+
+    return count
 
 @bp.route("/information/leave/add", methods=["POST"])
 @jwt_required()

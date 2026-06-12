@@ -17,6 +17,8 @@ from models import (
     UserModel, CourseModel, Chapter, LessonModel,
     UserCourseModel, MedalModel, MedalUserModel,
     PermissionModel, HomeCover,
+    NotificationModel,
+    UserPermissionModel,
 )
 
 
@@ -126,6 +128,15 @@ def seed():
             perm_count += 1
         if perm_count:
             print(f"  ✅ 创建 {perm_count} 条权限")
+
+        # 给管理员和教师分配所有权限
+        all_perms = PermissionModel.query.all()
+        for user in [admin_user, teacher]:
+            if UserPermissionModel.query.filter_by(user_id=user.id).first():
+                continue
+            for p in all_perms:
+                db.session.add(UserPermissionModel(user_id=user.id, permission_id=p.id))
+            print(f"  ✅ 给 {user.username} 分配了 {len(all_perms)} 条权限")
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 3. 课程
@@ -281,6 +292,52 @@ def seed():
             db.session.add(HomeCover(url="/data/covers/default.jpg", cover_id=1))
             db.session.add(HomeCover(url="/data/covers/default.jpg", cover_id=2))
             print(f"  ✅ 创建首页封面")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 8. 通知测试数据
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if NotificationModel.query.first() is None:
+            notifications_data = [
+                {
+                    "user_id": student1.id,
+                    "title": "系统维护通知",
+                    "content": "系统将于本周六凌晨 2:00–4:00 进行维护升级，期间可能无法正常访问，请提前保存工作。",
+                    "category": "system",
+                    "source_type": "admin",
+                    "is_read": False,
+                    "is_important": True,
+                },
+                {
+                    "user_id": student1.id,
+                    "title": "新功能上线：学习进度统计",
+                    "content": "学习进度统计功能已上线，您可以在个人中心查看详细的学习数据分析报告。",
+                    "category": "system",
+                    "source_type": "admin",
+                    "is_read": True,
+                    "is_important": False,
+                },
+                {
+                    "user_id": student2.id,
+                    "title": "系统维护通知",
+                    "content": "系统将于本周六凌晨 2:00–4:00 进行维护升级，期间可能无法正常访问，请提前保存工作。",
+                    "category": "system",
+                    "source_type": "admin",
+                    "is_read": False,
+                    "is_important": True,
+                },
+                {
+                    "user_id": teacher.id,
+                    "title": "系统维护通知",
+                    "content": "系统将于本周六凌晨 2:00–4:00 进行维护升级，期间可能无法正常访问，请提前保存工作。",
+                    "category": "system",
+                    "source_type": "admin",
+                    "is_read": False,
+                    "is_important": True,
+                },
+            ]
+            for nd in notifications_data:
+                db.session.add(NotificationModel(**nd))
+            print(f"  ✅ 创建 {len(notifications_data)} 条系统通知测试数据")
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 提交

@@ -699,6 +699,43 @@ class InformationModel(db.Model):
         return None
 
 
+class NotificationModel(db.Model):
+    """通知表 — 独立于 information 表，语义清晰的通知记录"""
+    __tablename__ = 'notification'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)          # 接收人
+    title = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text)
+    category = db.Column(db.String(20), nullable=False, index=True)
+        # 'system'  — 系统公告、维护通知
+        # 'group'   — 小组内业务通知（请假/任务/作业/通知等）
+        # 'course'  — 课程相关通知（预留）
+    source_type = db.Column(db.String(20), nullable=True)
+        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin'
+    source_id = db.Column(db.Integer, nullable=True)
+        # 关联的原始记录 ID（如请假ID、任务ID）
+    group_id = db.Column(db.Integer, nullable=True, index=True)
+    is_read = db.Column(db.Boolean, default=False, index=True)
+    is_important = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.now, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'title': self.title,
+            'content': self.content,
+            'category': self.category,
+            'source_type': self.source_type,
+            'source_id': self.source_id,
+            'group_id': self.group_id,
+            'is_read': self.is_read,
+            'is_important': self.is_important,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class ArticleComment(db.Model):
     __tablename__ = 'article_comment'
     id = db.Column(db.Integer, primary_key=True)
