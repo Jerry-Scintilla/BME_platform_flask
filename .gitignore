@@ -1,6 +1,7 @@
 /migrations/
 /data/
 /test/
+docs/
 
 # PyCharm项目文件
 .idea/

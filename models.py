@@ -86,6 +86,9 @@ class ArticleModel(db.Model):
 
 class CourseModel(db.Model):
     __tablename__ = 'course'
+    STATUS_NORMAL = 'normal'
+    STATUS_DELETED = 'deleted'
+
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     title = db.Column(db.String(100), nullable=False)
     introduction = db.Column(db.Text, nullable=False)
@@ -97,6 +100,7 @@ class CourseModel(db.Model):
     class_hour = db.Column(db.Integer, nullable=True)
     difficulty = db.Column(db.Integer, nullable=True)
     other_tags = db.Column(db.String(100))
+    status = db.Column(db.String(20), default=STATUS_NORMAL)
 
     # 课程创建者，用于权限管理
     creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)

@@ -24,6 +24,189 @@ from . import check_permission, audit_log
 bp = Blueprint("course", __name__, url_prefix="")
 
 
+def _topological_sort_chapters(chapters_list):
+    """Sort chapters so parents always come before children."""
+    key_map = {ch["key"]: ch for ch in chapters_list}
+    visited = set()
+    result = []
+
+    def visit(key):
+        if key in visited:
+            return
+        visited.add(key)
+        ch = key_map[key]
+        parent_key = ch.get("parent_key")
+        if parent_key and parent_key in key_map:
+            visit(parent_key)
+        result.append(ch)
+
+    for ch in chapters_list:
+        visit(ch["key"])
+
+    return result
+
+
+def _validate_import_data(data):
+    """Validate the entire import payload. Returns list of error strings."""
+    errors = []
+
+    course_data = data.get("course")
+    if not course_data or not isinstance(course_data, dict):
+        return ["缺少 course 字段"]
+
+    if not course_data.get("title"):
+        errors.append("课程标题不能为空")
+    elif len(course_data["title"]) > 100:
+        errors.append("课程标题不能超过100个字符")
+
+    if not course_data.get("introduction"):
+        errors.append("课程简介不能为空")
+
+    diff = course_data.get("difficulty")
+    if diff is not None and (not isinstance(diff, int) or diff < 1 or diff > 5):
+        errors.append("课程难度需要在1-5之间")
+
+    chapters_data = data.get("chapters")
+    if not chapters_data or not isinstance(chapters_data, list):
+        errors.append("缺少 chapters 字段或格式不正确")
+        return errors
+
+    valid_lesson_types = ['video', 'text', 'link', 'quiz', 'homework']
+
+    # Collect all keys first, check uniqueness
+    all_keys = set()
+    for i, ch in enumerate(chapters_data):
+        ch_label = f"章节[{i}]"
+        if not ch.get("key"):
+            errors.append(f"{ch_label}: 缺少 key 字段")
+        elif ch["key"] in all_keys:
+            errors.append(f"{ch_label}: key '{ch['key']}' 重复")
+        else:
+            all_keys.add(ch["key"])
+
+        if not ch.get("name"):
+            errors.append(f"{ch_label}: 章节名称不能为空")
+
+        parent_key = ch.get("parent_key")
+        if parent_key and parent_key not in all_keys:
+            errors.append(f"{ch_label}: parent_key '{parent_key}' 不存在")
+
+        lessons = ch.get("lessons", [])
+        if not isinstance(lessons, list):
+            errors.append(f"{ch_label}: lessons 格式不正确")
+            continue
+
+        for j, les in enumerate(lessons):
+            les_label = f"{ch_label}.课时[{j}]"
+            if not les.get("title"):
+                errors.append(f"{les_label}: 课时标题不能为空")
+            elif len(les["title"]) > 200:
+                errors.append(f"{les_label}: 课时标题不能超过200个字符")
+
+            lt = les.get("type")
+            if not lt:
+                errors.append(f"{les_label}: 课时类型不能为空")
+            elif lt not in valid_lesson_types:
+                errors.append(f"{les_label}: 课时类型必须为 {', '.join(valid_lesson_types)}")
+
+    return errors
+
+
+# 批量导入课程
+@bp.route("/course/import", methods=["POST"])
+@jwt_required()
+@check_permission('course_management')
+@audit_log(operation="批量导入课程")
+def course_import():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"code": 400, "message": "请求体不是有效的 JSON"}), 400
+
+    # Validate all data before any DB writes
+    errors = _validate_import_data(data)
+    if errors:
+        return jsonify({"code": 400, "message": errors}), 400
+
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+
+    course_data = data["course"]
+    chapters_data = data["chapters"]
+
+    try:
+        # 1. Create course
+        course = CourseModel(
+            title=course_data["title"],
+            introduction=course_data["introduction"],
+            difficulty=course_data.get("difficulty", 1),
+            tags=course_data.get("tags", ""),
+            other_tags=course_data.get("other_tags", ""),
+            class_hour=0,
+            chapters=0,
+            creator_id=user.id if user else None
+        )
+        db.session.add(course)
+        db.session.flush()
+
+        # 2. Create chapters (parents first via topological sort)
+        sorted_chapters = _topological_sort_chapters(chapters_data)
+        key_to_id = {}
+
+        for ch in sorted_chapters:
+            parent_id = key_to_id.get(ch.get("parent_key")) if ch.get("parent_key") else None
+            chapter = Chapter(
+                course_id=course.id,
+                name=ch["name"],
+                order=ch.get("order", 0),
+                level=ch.get("level", 1),
+                parent_id=parent_id
+            )
+            db.session.add(chapter)
+            db.session.flush()
+            key_to_id[ch["key"]] = chapter.id
+
+        # 3. Create all lessons
+        total_duration = 0
+        lessons_count = 0
+        for ch in chapters_data:
+            chapter_id = key_to_id[ch["key"]]
+            for les in ch.get("lessons", []):
+                lesson = LessonModel(
+                    course_id=course.id,
+                    chapter_id=chapter_id,
+                    title=les["title"],
+                    type=les.get("type", "text"),
+                    content=les.get("content", ""),
+                    duration=les.get("duration", 0),
+                    order=les.get("order", 0),
+                    resource_url=les.get("resource_url", "")
+                )
+                db.session.add(lesson)
+                total_duration += les.get("duration", 0)
+                lessons_count += 1
+
+        # 4. Update aggregates
+        top_level_count = sum(1 for ch in chapters_data if ch.get("level", 1) == 1)
+        course.chapters = top_level_count
+        course.class_hour = total_duration
+
+        db.session.commit()
+
+        return jsonify({
+            "code": 200,
+            "message": "课程导入成功",
+            "Course_Id": course.id,
+            "Course_Title": course.title,
+            "chapters_count": len(chapters_data),
+            "lessons_count": lessons_count,
+            "class_hour": total_duration
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"code": 500, "message": f"导入失败: {str(e)}"}), 500
+
+
 # 发布课程
 @bp.route("/course/public", methods=["POST"])
 @jwt_required()
@@ -123,8 +306,10 @@ def course_edit():
             course.other_tags = other_tags
 
         # 重新统计课时数（自动计算，不允许手动编辑）
-        lesson_count = LessonModel.query.filter_by(course_id=course_id).count()
-        course.class_hour = lesson_count
+        total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+            LessonModel.course_id == course_id
+        ).scalar() or 0
+        course.class_hour = total_duration
 
         db.session.commit()
 
@@ -157,7 +342,7 @@ def course_edit():
             "message": "课程信息修改完成",
             "chapters": chapters_data,
             "lessons": lessons_data,
-            "class_hour": lesson_count or 0
+            "class_hour": total_duration or 0
         })
 
     else:
@@ -172,7 +357,9 @@ def course_edit():
 @bp.route("/course/list")
 @swag_from('../apidocs/course/list.yaml')
 def course_list():
-    a_list = CourseModel.query.all()
+    a_list = CourseModel.query.filter(
+        (CourseModel.status == None) | (CourseModel.status == CourseModel.STATUS_NORMAL)
+    ).all()
     data = []
     for course in a_list:
         # 处理other_tags，将逗号分隔的字符串转为数组
@@ -422,14 +609,13 @@ def course_delete():
         }), 400
 
     course_id = request.json.get('Course_Id')
-    courses = CourseModel.query.filter_by(id=course_id).first()
-    if courses is None:
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if course is None:
         return jsonify({
             "code": 402,
             'message': "课程不存在"
         }), 402
-    chapter = Chapter.query.filter_by(course_id=course_id).delete()
-    db.session.delete(courses)
+    course.status = CourseModel.STATUS_DELETED
     db.session.commit()
     return jsonify({
         "code": 200,
@@ -442,9 +628,10 @@ def course_delete():
 @bp.route("/course/search")
 @swag_from('../apidocs/course/search_courses.yaml')
 def search_courses():
+    normal_filter = (CourseModel.status == None) | (CourseModel.status == CourseModel.STATUS_NORMAL)
     search_query = request.args.get('Query')
     if search_query:
-        courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%')).all()
+        courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%'), normal_filter).all()
         if not courses:
             return jsonify({
                 "code": 402,
@@ -479,7 +666,9 @@ def search_courses():
         })
     course_id = request.args.get('Course_Id')
     if course_id:
-        course = CourseModel.query.filter_by(id=course_id).first()
+        course = CourseModel.query.filter(
+            CourseModel.id == course_id, normal_filter
+        ).first()
         if course is None:
             return jsonify({
                 "code": 402,
@@ -863,4 +1052,37 @@ def lesson_detail():
         "code": 200,
         "message": "查询成功",
         "lesson": lesson.to_dict()
+    })
+
+
+@bp.route("/course/fix_class_hours", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/fix_class_hours.yaml')
+@audit_log(operation="修复课程课时数")
+def fix_class_hours():
+    """从lesson表重新计算指定课程的class_hour"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if user.user_mode != 'admin':
+        return jsonify({"code": 400, "message": "用户权限不够"}), 400
+
+    data = request.get_json()
+    course_id = data.get("Course_Id")
+    if not course_id:
+        return jsonify({"code": 400, "message": "缺少课程ID"}), 400
+
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+
+    total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
+        LessonModel.course_id == course.id
+    ).scalar() or 0
+    course.class_hour = total_duration
+
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": f"课时数已修复为 {total_duration}",
+        "class_hour": total_duration
     })

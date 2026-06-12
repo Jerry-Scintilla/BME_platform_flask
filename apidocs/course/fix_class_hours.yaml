@@ -1,0 +1,31 @@
+修复指定课程课时数
+---
+tags:
+  - 课程模块
+security:
+  - Bearer: []
+parameters:
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      properties:
+        Course_Id:
+          type: string
+          description: 课程ID
+responses:
+  200:
+    description: 课时数修复成功
+    schema:
+      type: object
+      properties:
+        code:
+          type: integer
+          description: 状态码
+        message:
+          type: string
+          description: 修复结果说明
+        class_hour:
+          type: integer
+          description: 修复后的课时数（分钟）
