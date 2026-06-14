@@ -604,6 +604,20 @@ class CheckRecord(db.Model):
     duration = db.Column(db.Float)
     date = db.Column(db.Date, index=True)
 
+class RoomModel(db.Model):
+    __tablename__ = 'study_room'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)  # 如 '106'
+    description = db.Column(db.String(200))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+class SeatModel(db.Model):
+    __tablename__ = 'seat'
+    id = db.Column(db.Integer, primary_key=True)
+    room_id = db.Column(db.Integer, db.ForeignKey('study_room.id'), nullable=False)
+    label = db.Column(db.String(20), nullable=False)  # 如 'A1'（字母=八角形，数字=三角形）
+    bound_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), unique=True)  # 固定绑定，可空；unique=一人一座
+
 class HomeCover(db.Model):
     __tablename__ = 'home_cover'
     id = db.Column(db.Integer, primary_key=True)

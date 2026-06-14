@@ -298,6 +298,7 @@ from .task import bp as task_bp
 from .discussion import bp as discussion_bp
 from .llm import bp as llm_bp
 from .notification import bp as notification_bp
+from .seat import bp as seat_bp
 
 __all__ = [
     'auth_bp',
@@ -314,5 +315,6 @@ __all__ = [
     'task_bp',
     'discussion_bp',
     'llm_bp',
-    'notification_bp'
+    'notification_bp',
+    'seat_bp'
 ]
