@@ -83,19 +83,27 @@ def batch_create_notifications(user_ids, title, content, category='system',
     return notifications
 
 
-def _send_email_async(app, user_emails, title, content):
-    """在子线程中发送邮件，不阻塞请求响应"""
+def _send_email_async(app, user_emails, title, content, html=None, attachments=None):
+    """在子线程中发送邮件，不阻塞请求响应。
+
+    html         — 可选 HTML 正文；提供时 content 作为纯文本 fallback
+    attachments  — 可选 list[dict]，每项 {filename, content_type, data(bytes)}
+    """
     with app.app_context():
         try:
             subject = f'[BME] {title}'
             # 逐个发送，避免一次塞太多收件人暴露隐私
             for email in user_emails:
                 try:
-                    msg = Message(
-                        subject=subject,
-                        recipients=[email],
-                        body=f'{title}\n\n{content}\n\n— BME 卓越工程师在线教育平台',
-                    )
+                    msg = Message(subject=subject, recipients=[email])
+                    if html:
+                        msg.html = html
+                        msg.body = content or title  # 纯文本 fallback
+                    else:
+                        msg.body = f'{title}\n\n{content}\n\n— BME 卓越工程师在线教育平台'
+                    if attachments:
+                        for att in attachments:
+                            msg.attach(att['filename'], att['content_type'], att['data'])
                     mail.send(msg)
                 except Exception as e:
                     print(f'[通知邮件] 发送失败 {email}: {e}')
@@ -117,6 +125,29 @@ def send_notification_emails(user_ids, title, content):
     Thread(
         target=_send_email_async,
         args=(app, emails, title, content),
+        daemon=True,
+    ).start()
+
+
+def send_report_emails(user_ids, title, content, html=None, attachments=None):
+    """按 user_id 查 email 后异步发送（支持 HTML 正文与附件）。
+
+    供出勤报告等富文本邮件使用；与 send_notification_emails 的区别仅在于
+    支持 html / attachments 参数。
+    """
+    from flask import current_app
+    app = current_app._get_current_object()
+
+    users = UserModel.query.filter(UserModel.id.in_(user_ids)).all()
+    emails = [u.email for u in users if u.email and '@' in u.email]
+    if not emails:
+        print('[报告邮件] 无有效收件人，跳过发送')
+        return
+
+    Thread(
+        target=_send_email_async,
+        args=(app, emails, title, content),
+        kwargs={'html': html, 'attachments': attachments},
         daemon=True,
     ).start()
 

@@ -299,6 +299,7 @@ from .discussion import bp as discussion_bp
 from .llm import bp as llm_bp
 from .notification import bp as notification_bp
 from .seat import bp as seat_bp
+from .attendance_report import bp as attendance_report_bp
 
 __all__ = [
     'auth_bp',
@@ -316,5 +317,6 @@ __all__ = [
     'discussion_bp',
     'llm_bp',
     'notification_bp',
-    'seat_bp'
+    'seat_bp',
+    'attendance_report_bp'
 ]

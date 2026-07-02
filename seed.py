@@ -119,6 +119,7 @@ def seed():
             {"name": "task.manage", "description": "任务管理"},
             {"name": "discussion.manage", "description": "讨论区管理"},
             {"name": "checkin.manage", "description": "签到管理"},
+            {"name": "attendance_report.recipient", "description": "接收每日出勤汇总邮件"},
         ]
         perm_count = 0
         for p in permissions_data:

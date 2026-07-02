@@ -13,9 +13,9 @@ start() {
     return 1
   fi
   mkdir -p "$DIR/log"
-  source "$VENV"
+  source "$VENV" 2>/dev/null || true
   echo "🚀 启动 Flask 后端..."
-  nohup python "$DIR/app.py" >> "$LOG_FILE" 2>&1 &
+  nohup "$DIR/.venv/bin/python" "$DIR/app.py" >> "$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 1
   if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
