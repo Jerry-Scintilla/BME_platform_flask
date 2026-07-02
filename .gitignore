@@ -16,5 +16,14 @@ __pycache__/
 
 .env
 
+# 本地运行产物（pid / 日志 / scheduler 锁，运行时生成，不提交）
+.flask.pid
+*.pid
+log/
+*.log
+
+# 虚拟环境（本地）
+.venv/
+
 # VSCode
 .vscode/
