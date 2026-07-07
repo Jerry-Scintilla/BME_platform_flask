@@ -22,6 +22,9 @@ __pycache__/
 log/
 *.log
 
+# 本地种子脚本（开发自用，不入库）
+init_seats_*.py
+
 # 虚拟环境（本地）
 .venv/
 

@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-HOSTNAME = '127.0.0.1'
-PORT = '3306'
+HOSTNAME = os.getenv("DB_HOST", "127.0.0.1")
+PORT = os.getenv("DB_PORT", "3306")
 DATABASE = 'sysu_bme'
 USERNAME = os.getenv("DB_USERNAME")
 PASSWORD = os.getenv("DB_PASSWORD")

@@ -11,7 +11,10 @@
 """
 import atexit
 import csv
-import fcntl
+try:
+    import fcntl  # Unix 专属；Windows 下为 None（开发环境单进程退化为无跨进程锁）
+except ImportError:
+    fcntl = None
 import io
 import os
 from datetime import date, datetime, timedelta
@@ -200,8 +203,8 @@ def ensure_recipient_permission(app):
     seed.py 也会创建该权限，但已运行的环境未必重跑 seed，这里兜底。
     多 worker 并发创建因 name unique 约束，失败方回滚忽略即可。
     """
-    try:
-        with app.app_context():
+    with app.app_context():
+        try:
             if not PermissionModel.query.filter_by(name=RECIPIENT_PERMISSION).first():
                 db.session.add(PermissionModel(
                     name=RECIPIENT_PERMISSION,
@@ -209,9 +212,9 @@ def ensure_recipient_permission(app):
                 ))
                 db.session.commit()
                 app.logger.info(f"[attendance_report] 已创建权限 {RECIPIENT_PERMISSION}")
-    except Exception as e:
-        db.session.rollback()
-        app.logger.debug(f"[attendance_report] ensure 收件人权限跳过: {e}")
+        except Exception as e:
+            db.session.rollback()
+            app.logger.warning(f"[attendance_report] ensure 收件人权限跳过: {e}")
 
 
 # ────────────────────────────────────────
@@ -272,10 +275,17 @@ _LOCK_PATH = os.path.join(
 
 
 def _try_acquire_scheduler_lock():
-    """非阻塞排他锁。抢到返回 fd（持有者可启动 scheduler），否则返回 None。"""
+    """非阻塞排他锁。抢到返回 fd（持有者可启动 scheduler），否则返回 None。
+
+    Windows 无 fcntl，开发环境单进程下直接持有 fd（不做跨进程锁）。
+    """
     global _lock_fd
     os.makedirs(os.path.dirname(_LOCK_PATH), exist_ok=True)
     fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    if fcntl is None:
+        _lock_fd = fd
+        atexit.register(_release_scheduler_lock)
+        return fd
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -290,7 +300,8 @@ def _release_scheduler_lock():
     global _lock_fd
     if _lock_fd is not None:
         try:
-            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(_lock_fd, fcntl.LOCK_UN)
             os.close(_lock_fd)
         finally:
             _lock_fd = None
