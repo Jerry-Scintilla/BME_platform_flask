@@ -467,6 +467,56 @@ def attendance_dashboard(sid):
     })
 
 
+@bp.route("/attendance/mine")
+@jwt_required()
+def attendance_mine():
+    """学员看自己在某营的考勤（仅 @jwt_required，where 钉自己，无法查他人）。
+    ?camp_session_id=<sid> 必填。复用 _eval_day，算法与 dashboard 同。"""
+    user = _current_user()
+    sid = request.args.get("camp_session_id", type=int)
+    if not sid:
+        return jsonify({"code": 400, "message": "缺少 camp_session_id"}), 400
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    frm, to = camp.start_date, camp.end_date
+    plans = CampAttendancePlan.query.filter(
+        CampAttendancePlan.camp_session_id == sid,
+        CampAttendancePlan.user_id == user.id,
+        CampAttendancePlan.date.between(frm, to)).all()
+    checks = CheckRecord.query.filter(
+        CheckRecord.user_id == user.id,
+        CheckRecord.date.between(frm, to)).all()
+    leave_set = _approved_leave_dates(sid, frm, to)
+    checks_map = defaultdict(list)
+    for r in checks:
+        checks_map[(r.user_id, r.date)].append(r)
+    daily = {}
+    psum = Counter()
+    dates_set = set()
+    for p in plans:
+        res = _eval_day(checks_map.get((p.user_id, p.date), []), p,
+                        (p.user_id, p.date) in leave_set)
+        daily[p.date.isoformat()] = res
+        dates_set.add(p.date)
+        psum[res["status"]] += 1
+    planned = len(plans)
+    personal = {
+        "present": psum.get("present", 0), "late": psum.get("late", 0),
+        "short_hours": psum.get("short_hours", 0), "late_and_short": psum.get("late_and_short", 0),
+        "absent": psum.get("absent", 0), "on_leave": psum.get("on_leave", 0),
+        "planned_days": planned,
+        "attendance_rate": round(psum.get("present", 0) / planned, 3) if planned else None,
+    }
+    return jsonify({
+        "code": 200,
+        "range": {"from": frm.isoformat(), "to": to.isoformat()},
+        "dates": sorted(d.isoformat() for d in dates_set),
+        "daily": daily,
+        "personal": personal,
+    })
+
+
 # ─────────────────────────────────────────────
 # 请假（学员提交 / 导生·老师审批）
 # ─────────────────────────────────────────────
@@ -543,6 +593,27 @@ def leave_list(sid):
             "id": lv.id, "user_id": lv.user_id, "username": u.username if u else "",
             "start_date": lv.start_date.isoformat(), "end_date": lv.end_date.isoformat(),
             "reason": lv.reason, "status": lv.status, "created_at": lv.created_at.isoformat() if lv.created_at else None,
+        })
+    return jsonify({"code": 200, "leaves": data})
+
+
+@bp.route("/leave/mine")
+@jwt_required()
+def leave_mine():
+    """学员看自己的请假历史（仅 @jwt_required，where 钉自己）。
+    ?camp_session_id=<sid> 可选，传则按营过滤。"""
+    user = _current_user()
+    sid = request.args.get("camp_session_id", type=int)
+    q = CampLeave.query.filter_by(user_id=user.id)
+    if sid:
+        q = q.filter_by(camp_session_id=sid)
+    data = []
+    for lv in q.order_by(CampLeave.created_at.desc()).all():
+        data.append({
+            "id": lv.id, "camp_session_id": lv.camp_session_id,
+            "start_date": lv.start_date.isoformat(), "end_date": lv.end_date.isoformat(),
+            "reason": lv.reason, "status": lv.status,
+            "created_at": lv.created_at.isoformat() if lv.created_at else None,
         })
     return jsonify({"code": 200, "leaves": data})
 
