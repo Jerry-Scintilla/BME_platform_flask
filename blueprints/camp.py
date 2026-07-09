@@ -6,6 +6,7 @@
   - 学员操作（选课/请假）→ 仅营期成员
 营期看板（混合考勤算法）见 Phase D 的 /camp/attendance/dashboard/<sid>。
 """
+from collections import defaultdict, Counter
 from datetime import date, time, timedelta, datetime
 
 from flask import Blueprint, request, jsonify
@@ -14,7 +15,7 @@ from flask_jwt_extended import jwt_required
 from exts import db
 from models import (
     CampSession, CampMember, CampCourse, CampAttendancePlan,
-    CampSeat, CampLeave, CourseModel, UserCourseModel,
+    CampSeat, CampLeave, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
 )
 
@@ -67,6 +68,60 @@ def _in_my_team(camp_id, mentor, student_id):
     return CampMember.query.filter_by(
         camp_session_id=camp_id, role='student',
         user_id=student_id, team_mentor_id=mentor.id).first() is not None
+
+
+def _eval_day(records, plan, on_leave):
+    """对某学员某承诺日的 CheckRecord 列表算混合考勤状态（纯函数，可单测）。
+
+    records : 该 (user,date) 的 CheckRecord 列表（可能为空）
+    plan    : CampAttendancePlan（冗余 expected_check_in / min_daily_hours）
+    on_leave: 该日是否命中已批准请假
+    返回: {status, is_late, is_sufficient, first_check_in, total_hours, in_progress}
+    status ∈ present / late / short_hours / late_and_short / absent / on_leave
+    """
+    if on_leave:
+        return {"status": "on_leave", "is_late": None, "is_sufficient": None,
+                "first_check_in": None, "total_hours": None, "in_progress": None}
+    if not records:
+        return {"status": "absent", "is_late": None, "is_sufficient": None,
+                "first_check_in": None, "total_hours": 0, "in_progress": False}
+    total = sum(r.duration or 0 for r in records)            # None 段按 0（未签退/脏段）
+    ins = [r.check_in for r in records if r.check_in is not None]
+    first = min(ins).time() if ins else None
+    in_progress = any(r.check_out is None for r in records)  # 当日有未签退段
+    # 迟到维度（无容忍）；expected_check_in 为 None → 不判迟到
+    is_late = bool(first is not None and plan.expected_check_in is not None
+                   and first > plan.expected_check_in)
+    # 达标维度；min_daily_hours 为 None → 不判达标（视作达标）
+    is_sufficient = (total >= plan.min_daily_hours) if plan.min_daily_hours else True
+    if is_late and not is_sufficient:
+        status = "late_and_short"
+    elif is_late:
+        status = "late"
+    elif not is_sufficient:
+        status = "short_hours"
+    else:
+        status = "present"
+    return {"status": status, "is_late": is_late, "is_sufficient": is_sufficient,
+            "first_check_in": min(ins).isoformat() if ins else None,
+            "total_hours": round(total, 2), "in_progress": in_progress}
+
+
+def _approved_leave_dates(camp_id, frm, to):
+    """该营已批准、与 [frm,to] 相交的请假段 → set[(user_id, date)]。"""
+    leaves = CampLeave.query.filter(
+        CampLeave.camp_session_id == camp_id,
+        CampLeave.status == "approved",
+        CampLeave.start_date <= to,
+        CampLeave.end_date >= frm).all()
+    leave_set = set()
+    for lv in leaves:
+        d = lv.start_date
+        while d <= lv.end_date and d <= to:
+            if d >= frm:
+                leave_set.add((lv.user_id, d))
+            d += timedelta(days=1)
+    return leave_set
 
 
 def _session_dict(c):
@@ -304,6 +359,112 @@ def plan_regenerate(sid):
     db.session.commit()
     cnt = CampAttendancePlan.query.filter_by(camp_session_id=sid).count()
     return jsonify({"code": 200, "message": "已重生成", "plan_count": cnt})
+
+
+# ─────────────────────────────────────────────
+# 考勤看板（混合双维度：迟到维度 + 当日时长达标维度）
+# ─────────────────────────────────────────────
+
+@bp.route("/attendance/dashboard/<int:sid>")
+@jwt_required()
+@camp_role('mentor', 'teacher', 'super_admin')
+def attendance_dashboard(sid):
+    """学生×承诺日 状态矩阵 + 汇总。
+    导生=本团队；老师/超管=全营；学员被 @camp_role 拦截(403)。
+    ?from=&to= 缺省=营期起止；聚合 CheckRecord 按 (user_id,date)，不依赖 camp_session_id。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    user = _current_user()
+
+    # 1. 范围（缺省=营期范围）
+    try:
+        frm = date.fromisoformat(request.args.get("from")) if request.args.get("from") else camp.start_date
+        to = date.fromisoformat(request.args.get("to")) if request.args.get("to") else camp.end_date
+    except ValueError:
+        return jsonify({"code": 400, "message": "日期格式错误，需 YYYY-MM-DD"}), 400
+    if frm > to:
+        return jsonify({"code": 400, "message": "from 不能晚于 to"}), 400
+
+    visible = _visible_student_ids(sid, user)
+    empty_summary = {"present": 0, "late": 0, "short_hours": 0,
+                     "late_and_short": 0, "absent": 0, "on_leave": 0,
+                     "total": 0, "attendance_rate": None}
+    if not visible:
+        return jsonify({"code": 200,
+                        "range": {"from": frm.isoformat(), "to": to.isoformat()},
+                        "dates": [], "summary": empty_summary, "rows": []})
+
+    # 2. 三次批量查询（避免 N×M），CheckRecord 按 (user_id,date) 聚合，无视 camp_session_id
+    plans = CampAttendancePlan.query.filter(
+        CampAttendancePlan.camp_session_id == sid,
+        CampAttendancePlan.user_id.in_(visible),
+        CampAttendancePlan.date.between(frm, to)).all()
+    checks = CheckRecord.query.filter(
+        CheckRecord.user_id.in_(visible),
+        CheckRecord.date.between(frm, to)).all()
+    leave_set = _approved_leave_dates(sid, frm, to)
+
+    # 3. 分组
+    checks_map = defaultdict(list)
+    for r in checks:
+        checks_map[(r.user_id, r.date)].append(r)
+    users = {u.id: u.username for u in
+             UserModel.query.filter(UserModel.id.in_(visible)).all()}
+    mentors = {m.user_id: m.team_mentor_id for m in
+               CampMember.query.filter_by(camp_session_id=sid, role='student').all()}
+
+    # 4. 矩阵 + 汇总
+    dates_set = set()
+    by_user = defaultdict(list)
+    gsummary = Counter()
+    for p in plans:
+        res = _eval_day(checks_map.get((p.user_id, p.date), []), p,
+                        (p.user_id, p.date) in leave_set)
+        by_user[p.user_id].append((p.date, res))
+        dates_set.add(p.date)
+        gsummary[res["status"]] += 1
+
+    rows = []
+    for uid, items in by_user.items():
+        psum = Counter(r["status"] for _, r in items)
+        planned = len(items)
+        rows.append({
+            "user_id": uid,
+            "username": users.get(uid, ""),
+            "team_mentor_id": mentors.get(uid),
+            "daily": {d.isoformat(): r for d, r in items},
+            "personal": {
+                "present": psum.get("present", 0),
+                "late": psum.get("late", 0),
+                "short_hours": psum.get("short_hours", 0),
+                "late_and_short": psum.get("late_and_short", 0),
+                "absent": psum.get("absent", 0),
+                "on_leave": psum.get("on_leave", 0),
+                "planned_days": planned,
+                "attendance_rate": round(psum.get("present", 0) / planned, 3) if planned else None,
+            },
+        })
+    rows.sort(key=lambda r: r["user_id"])
+
+    gtotal = sum(gsummary.values())
+    summary = {
+        "present": gsummary.get("present", 0),
+        "late": gsummary.get("late", 0),
+        "short_hours": gsummary.get("short_hours", 0),
+        "late_and_short": gsummary.get("late_and_short", 0),
+        "absent": gsummary.get("absent", 0),
+        "on_leave": gsummary.get("on_leave", 0),
+        "total": gtotal,
+        "attendance_rate": round(gsummary.get("present", 0) / gtotal, 3) if gtotal else None,
+    }
+    return jsonify({
+        "code": 200,
+        "range": {"from": frm.isoformat(), "to": to.isoformat()},
+        "dates": sorted(d.isoformat() for d in dates_set),
+        "summary": summary,
+        "rows": rows,
+    })
 
 
 # ─────────────────────────────────────────────

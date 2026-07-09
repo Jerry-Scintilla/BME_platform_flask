@@ -11,6 +11,7 @@ from models import UserModel, GroupModel, CourseModel, LearningProgressModel, Ch
 # 导入表单验证
 from .forms import AvatarForm
 from .forms import UserInfoForm
+from . import get_user_permissions  # RBAC：user_index 返回当前用户角色/权限
 
 # 导入token验证模块
 from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
@@ -128,6 +129,9 @@ def user_index():
         "Github_Id": Github_Id,
         "Skill_Tags": Skill_Tags,
         "College": user.college,
+        "role": user.role,
+        "role_rank": user.role_rank,
+        "permissions": get_user_permissions(user.id),
     }
     return jsonify(data)
 
