@@ -237,6 +237,7 @@ class UserCourseModel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True)  # 营期选课
 
     # 选课时间
     enroll_time = db.Column(db.DateTime, default=datetime.now)
@@ -335,8 +336,11 @@ class MedalUserModel(db.Model):
     medal_id = db.Column(db.Integer, db.ForeignKey('medal.id'), nullable=False)
     get_time = db.Column(db.DateTime, default=datetime.now)
     description = db.Column(db.String(100))
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True)  # 营期内发放
+    issued_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)                # 发放人(导生/老师)
 
-    user = db.relationship('UserModel', backref=db.backref('medal_user', lazy=True))
+    user = db.relationship('UserModel', foreign_keys=[user_id], backref=db.backref('medal_user', lazy=True))
+    issuer = db.relationship('UserModel', foreign_keys=[issued_by])
     medal = db.relationship('MedalModel', backref=db.backref('medal_user', lazy=True))
 
 
@@ -624,6 +628,8 @@ class CheckRecord(db.Model):
     check_out = db.Column(db.DateTime)
     duration = db.Column(db.Float)
     date = db.Column(db.Date, index=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
+    seat_id = db.Column(db.Integer, db.ForeignKey('seat.id'), nullable=True)
 
 class RoomModel(db.Model):
     __tablename__ = 'study_room'
@@ -746,6 +752,8 @@ class NotificationModel(db.Model):
         # 'system'  — 系统公告、维护通知
         # 'group'   — 小组内业务通知（请假/任务/作业/通知等）
         # 'course'  — 课程相关通知（预留）
+        # 'camp'    — 营期通知（请假审批/奖励发放/考勤提醒等）
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
     source_type = db.Column(db.String(20), nullable=True)
         # 触发来源：'leave', 'task', 'homework', 'notice', 'admin'
     source_id = db.Column(db.Integer, nullable=True)
@@ -981,3 +989,92 @@ class DiscussionReaction(db.Model):
 
     # 关系
     user = db.relationship('UserModel', backref=db.backref('discussion_reactions', lazy='dynamic'))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 营期（Camp）系统
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class CampSession(db.Model):
+    """营期：如 2026暑期营 / 2026-1学期营"""
+    __tablename__ = 'camp_session'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    camp_type = db.Column(db.String(20), default='short_term')   # short_term / semester / winter
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)
+    status = db.Column(db.String(20), default='draft')           # draft / active / archived
+    # 弹性考勤规则
+    expected_check_in = db.Column(db.Time)                       # 期望到岗时间（判迟到基准）
+    min_daily_hours = db.Column(db.Float)                        # 每日最低有效时长（判达标）
+    weekdays_only = db.Column(db.Boolean, default=True)          # 承诺出勤日 = 范围内工作日
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class CampMember(db.Model):
+    """营期成员（独立于 CourseGroup，隔离安全）。
+    role=student/mentor；team_mentor_id 仅 student 行填，指向其导生。"""
+    __tablename__ = 'camp_member'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False, default='student')          # student / mentor
+    team_mentor_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
+    joined_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'user_id', name='uq_camp_member_camp_user'),
+    )
+
+
+class CampCourse(db.Model):
+    """营期可选课程目录"""
+    __tablename__ = 'camp_course'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
+    sort_order = db.Column(db.Integer, default=0)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'course_id', name='uq_camp_course'),
+    )
+
+
+class CampAttendancePlan(db.Model):
+    """承诺出勤日期（营期范围 × 工作日展开；阈值冗余自 CampSession，便于按日判定）"""
+    __tablename__ = 'camp_attendance_plan'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    date = db.Column(db.Date, nullable=False)
+    expected_check_in = db.Column(db.Time)    # 冗余：判迟到
+    min_daily_hours = db.Column(db.Float)     # 冗余：判达标
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'user_id', 'date', name='uq_camp_plan_user_date'),
+    )
+
+
+class CampSeat(db.Model):
+    """营期座位分配（复用物理 Seat，按营期独立分配；不动全局 Seat.bound_user_id）"""
+    __tablename__ = 'camp_seat'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    seat_id = db.Column(db.Integer, db.ForeignKey('seat.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)    # null = 未分配
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'seat_id', name='uq_camp_seat'),
+    )
+
+
+class CampLeave(db.Model):
+    """营期请假（整天 + 连续日期段）"""
+    __tablename__ = 'camp_leave'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)
+    reason = db.Column(db.Text)
+    status = db.Column(db.String(20), default='pending')   # pending / approved / rejected
+    approver_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    approved_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)

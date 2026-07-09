@@ -35,7 +35,8 @@ SOURCE_TYPE_MAP = {
 
 def create_notification(user_id, title, content, category='group',
                         source_type=None, source_id=None,
-                        group_id=None, is_important=False):
+                        group_id=None, is_important=False,
+                        camp_session_id=None):
     """
     创建一条通知记录。
 
@@ -43,11 +44,12 @@ def create_notification(user_id, title, content, category='group',
       user_id       — 接收人 ID
       title         — 通知标题
       content       — 通知内容
-      category      — 'system' | 'group' | 'course'
-      source_type   — 触发来源: 'leave', 'task', 'homework', 'notice', 'admin'
+      category      — 'system' | 'group' | 'course' | 'camp'
+      source_type   — 触发来源: 'leave', 'task', 'homework', 'notice', 'admin', 'reward'
       source_id     — 原始业务记录 ID
       group_id      — 所属小组 ID（group 类型时必填）
       is_important  — 是否重要
+      camp_session_id — 所属营期 ID（camp 类型时填）
     """
     n = NotificationModel(
         user_id=user_id,
@@ -58,6 +60,7 @@ def create_notification(user_id, title, content, category='group',
         source_id=source_id,
         group_id=group_id,
         is_important=is_important,
+        camp_session_id=camp_session_id,
     )
     db.session.add(n)
     return n
@@ -65,7 +68,8 @@ def create_notification(user_id, title, content, category='group',
 
 def batch_create_notifications(user_ids, title, content, category='system',
                                 source_type=None, source_id=None,
-                                group_id=None, is_important=False):
+                                group_id=None, is_important=False,
+                                camp_session_id=None):
     """批量创建通知（给多个用户发同一条通知）"""
     notifications = []
     for uid in user_ids:
@@ -78,6 +82,7 @@ def batch_create_notifications(user_ids, title, content, category='system',
             source_id=source_id,
             group_id=group_id,
             is_important=is_important,
+            camp_session_id=camp_session_id,
         )
         notifications.append(n)
     return notifications
