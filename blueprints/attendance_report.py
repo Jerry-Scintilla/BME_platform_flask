@@ -36,7 +36,7 @@ WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"
 
 # 收件人资格通过 RBAC 权限表达：拥有此权限的用户即为出勤报告收件人。
 # 增删收件人复用 /permission/assign 与 /permission/revoke，无需新建表或接口。
-RECIPIENT_PERMISSION = "attendance_report.recipient"
+RECIPIENT_PERMISSION = "attendance_report_recipient"
 
 
 # ────────────────────────────────────────

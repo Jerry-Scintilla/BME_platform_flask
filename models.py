@@ -23,7 +23,9 @@ class UserModel(db.Model):
     # 添加勋章，学习阶段
     medal = db.Column(db.Integer, server_default='0')
     study_stage = db.Column(db.Text)
-    user_mode = db.Column(db.String(20), default='user')
+    user_mode = db.Column(db.String(20), default='user')  # 旧字段，保留双写；新逻辑用 role
+    # RBAC 四级角色：super_admin / teacher / mentor / student
+    role = db.Column(db.String(20), nullable=False, server_default='student')
     avatar_url = db.Column(db.String(100))
     # 添加详细个人信息
     student_id = db.Column(db.Integer)
@@ -62,6 +64,25 @@ class UserModel(db.Model):
             return check_password_hash(self.password, raw_password)
         # 历史遗留：数据库中直接存的是前端 MD5 明文
         return self.password == raw_password
+
+    # ── RBAC 角色四级：super_admin / teacher / mentor / student ──
+    ROLE_RANK = {'super_admin': 4, 'teacher': 3, 'mentor': 2, 'student': 1}
+
+    @property
+    def role_rank(self):
+        return self.ROLE_RANK.get(self.role or 'student', 1)
+
+    def has_role_at_least(self, role):
+        """当前角色等级 >= 指定角色等级"""
+        return self.role_rank >= self.ROLE_RANK.get(role, 0)
+
+    def is_staff(self):
+        """老师/导生/超管（可登录管理端）"""
+        return self.role_rank >= self.ROLE_RANK['mentor']
+
+    def is_admin_like(self):
+        """超管（系统级全权）"""
+        return self.role == 'super_admin'
 
 
 # 已弃用，改用redis存储

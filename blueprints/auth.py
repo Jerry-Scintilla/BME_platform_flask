@@ -15,7 +15,7 @@ import string
 import random
 
 from models import AuditLog
-from . import check_permission
+from . import check_permission, get_user_permissions
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
@@ -130,6 +130,9 @@ def login():
                     "message": msg,
                     "token": token,
                     "User_Name": User_Name,
+                    "role": user.role,
+                    "role_rank": user.role_rank,
+                    "permissions": get_user_permissions(user.id),
                     "User_Email": User_Email,
                     "User_Medal": User_Medal,
                     "User_Stage": User_Stage,
@@ -219,7 +222,7 @@ def admin_login():
                 user_id=admin.id,
             ).first()
 
-            if not user_permission and admin.user_mode != 'admin':
+            if not user_permission and not admin.is_staff():
                 return jsonify({
                     "code": 401,
                     'message': "用户权限不够"
@@ -242,7 +245,10 @@ def admin_login():
                 'code' : 200,
                 'msg' : "登录成功",
                 'token' : create_access_token(identity=email),
-                'User_Name' : admin.username
+                'User_Name' : admin.username,
+                'role' : admin.role,
+                'role_rank' : admin.role_rank,
+                'permissions' : get_user_permissions(admin.id),
                 }),200
 
 

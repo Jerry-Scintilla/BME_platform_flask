@@ -172,47 +172,74 @@ def build_result(dates, date_info, today, now, is_current_month, format_duration
     return result
 
 
+def _current_user():
+    """从 JWT 取当前用户，无则返回 None。"""
+    user_email = get_jwt_identity()
+    if not user_email:
+        return None
+    return UserModel.query.filter_by(email=user_email).first()
+
+
+def get_user_permissions(user_id):
+    """返回某用户的权限名列表（供登录返回体使用）。"""
+    rows = UserPermissionModel.query.filter_by(user_id=user_id).all()
+    if not rows:
+        return []
+    perms = PermissionModel.query.filter(
+        PermissionModel.id.in_([r.permission_id for r in rows])
+    ).all()
+    perm_map = {p.id: p.name for p in perms}
+    return [perm_map[r.permission_id] for r in rows if r.permission_id in perm_map]
+
+
 def check_permission(permission_name):
     """
     权限检查装饰器
     用法: @check_permission('course_management')
+
+    规则：super_admin 直通；其余角色查 ACL（UserPermission）。
+    旧实现里「任何 user_mode=='admin' 直通一切」已废弃。
     """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # 获取当前用户
-            user_email = get_jwt_identity()
-            user = UserModel.query.filter_by(email=user_email).first()
-            
+            user = _current_user()
             if not user:
-                return jsonify({
-                    "code": 401,
-                    "message": "用户未认证"
-                }), 401
-            
-            # 检查是否是管理员（保持向后兼容）
-            if user.user_mode == 'admin':
+                return jsonify({"code": 401, "message": "用户未认证"}), 401
+
+            # 超管直通
+            if user.is_admin_like():
                 return func(*args, **kwargs)
-            
-            # 检查用户是否有特定权限
+
             permission = PermissionModel.query.filter_by(name=permission_name).first()
             if not permission:
-                return jsonify({
-                    "code": 403,
-                    "message": f"权限 '{permission_name}' 不存在"
-                }), 403
-            
-            user_permission = UserPermissionModel.query.filter_by(
-                user_id=user.id, 
-                permission_id=permission.id
+                return jsonify({"code": 403, "message": f"权限 '{permission_name}' 不存在"}), 403
+
+            granted = UserPermissionModel.query.filter_by(
+                user_id=user.id, permission_id=permission.id
             ).first()
-            
-            if not user_permission:
-                return jsonify({
-                    "code": 403,
-                    "message": "用户权限不足"
-                }), 403
-                
+            if not granted:
+                return jsonify({"code": 403, "message": "用户权限不足"}), 403
+
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def camp_role(*roles):
+    """
+    营期专用：要求当前用户全局角色属于 roles 之一。
+    用法: @camp_role('teacher', 'super_admin')
+    （导生团队级收敛装饰器 camp_team_scoped 在 Phase C 引入，依赖 CampMember）
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            user = _current_user()
+            if not user:
+                return jsonify({"code": 401, "message": "用户未认证"}), 401
+            if user.role not in roles:
+                return jsonify({"code": 403, "message": "角色权限不足"}), 403
             return func(*args, **kwargs)
         return wrapper
     return decorator
@@ -237,8 +264,8 @@ def check_multiple_permissions(permission_names, require_all=False):
                     "message": "用户未认证"
                 }), 401
             
-            # 检查是否是管理员（保持向后兼容）
-            if user.user_mode == 'admin':
+            # 检查是否是超管（直通）
+            if user.is_admin_like():
                 return func(*args, **kwargs)
             
             permissions = PermissionModel.query.filter(
