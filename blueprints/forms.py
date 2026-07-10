@@ -68,8 +68,8 @@ class LoginForm(wtforms.Form):
             args = request.args.to_dict()
             super(LoginForm, self).__init__(data=data, **args)
 
-    User_Password = wtforms.StringField(validators=[length(min=8, max=100, message='Invalid password')])
-    User_Email = wtforms.StringField(validators=[Email(message='Invalid Email')])
+    User_Password = wtforms.StringField(validators=[length(min=8, max=100, message='密码长度需为 8-100 位')])
+    User_Email = wtforms.StringField(validators=[Email(message='邮箱格式不正确')])
 
 
 class ArticleForm(wtforms.Form):
