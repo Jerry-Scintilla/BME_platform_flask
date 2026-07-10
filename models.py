@@ -1089,6 +1089,7 @@ class CampJoinRequest(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     reason = db.Column(db.Text, nullable=True)
+    selected_days = db.Column(db.Text, nullable=True)   # 学员手选承诺出勤日（JSON 数组字符串，approve 后展开为 CampAttendancePlan）
     status = db.Column(db.String(20), default='pending', index=True)   # pending / approved / rejected
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     reviewed_at = db.Column(db.DateTime, nullable=True)

@@ -6,6 +6,7 @@
   - 学员操作（选课/请假）→ 仅营期成员
 营期看板（混合考勤算法）见 Phase D 的 /camp/attendance/dashboard/<sid>。
 """
+import json
 from collections import defaultdict, Counter
 from datetime import date, time, timedelta, datetime
 
@@ -215,9 +216,11 @@ def session_update(sid):
 # 成员
 # ─────────────────────────────────────────────
 
-def _assign_member(sid, user_id, team_mentor_id=None):
+def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True):
     """营期成员分配核心：role 由 user.role 派生 + team_mentor 校验。
-    返回 (CampMember, None) 成功（未 commit，由调用方 commit）；或 (None, (message, code)) 失败。"""
+    auto_plan=True 学员按工作日自动生成承诺日（member_assign 直接加成员兜底）；
+    approve 端点传 False，改由调用方用学生手选日期建 plan。
+    返回 (CampMember, None) 成功（未 commit）；或 (None, (message, code)) 失败。"""
     camp = CampSession.query.get(sid)
     if not camp:
         return None, ("营期不存在", 404)
@@ -238,8 +241,8 @@ def _assign_member(sid, user_id, team_mentor_id=None):
         team_mentor_id = None
     m = CampMember(camp_session_id=sid, user_id=user_id, role=role, team_mentor_id=team_mentor_id)
     db.session.add(m)
-    if role == 'student':
-        _gen_plan(camp, user_id)          # 学员加入即生成承诺出勤日
+    if auto_plan and role == 'student':
+        _gen_plan(camp, user_id)          # 直接加成员：按工作日生成（兜底）
     return m, None
 
 
@@ -415,11 +418,14 @@ def attendance_dashboard(sid):
                         "range": {"from": frm.isoformat(), "to": to.isoformat()},
                         "dates": [], "summary": empty_summary, "rows": []})
 
-    # 2. 三次批量查询（避免 N×M），CheckRecord 按 (user_id,date) 聚合，无视 camp_session_id
+    # 2. 批量查询：plans 按 (user,date) 索引；CheckRecord 按 (user,date) 聚合
     plans = CampAttendancePlan.query.filter(
         CampAttendancePlan.camp_session_id == sid,
         CampAttendancePlan.user_id.in_(visible),
         CampAttendancePlan.date.between(frm, to)).all()
+    plan_map = defaultdict(dict)   # {user_id: {date: plan}}
+    for p in plans:
+        plan_map[p.user_id][p.date] = p
     checks = CheckRecord.query.filter(
         CheckRecord.user_id.in_(visible),
         CheckRecord.date.between(frm, to)).all()
@@ -434,21 +440,28 @@ def attendance_dashboard(sid):
     mentors = {m.user_id: m.team_mentor_id for m in
                CampMember.query.filter_by(camp_session_id=sid, role='student').all()}
 
-    # 4. 矩阵 + 汇总
-    dates_set = set()
+    # 4. 矩阵（全范围日期 × 可见学员）+ 汇总：承诺日跑 _eval_day，非承诺日 unpledged
+    all_days = _weekdays(frm, to)
+    dates_set = set(all_days)
     by_user = defaultdict(list)
     gsummary = Counter()
-    for p in plans:
-        res = _eval_day(checks_map.get((p.user_id, p.date), []), p,
-                        (p.user_id, p.date) in leave_set)
-        by_user[p.user_id].append((p.date, res))
-        dates_set.add(p.date)
-        gsummary[res["status"]] += 1
+    for uid in visible:
+        pm = plan_map.get(uid, {})
+        for d in all_days:
+            p = pm.get(d)
+            if p:
+                res = _eval_day(checks_map.get((uid, d), []), p, (uid, d) in leave_set)
+            else:
+                res = {"status": "unpledged", "is_late": None, "is_sufficient": None,
+                       "first_check_in": None, "total_hours": 0, "in_progress": False}
+            by_user[uid].append((d, res))
+            gsummary[res["status"]] += 1
 
     rows = []
     for uid, items in by_user.items():
         psum = Counter(r["status"] for _, r in items)
-        planned = len(items)
+        pledged = len(plan_map.get(uid, {}))
+        satisfied = psum.get("present", 0)
         rows.append({
             "user_id": uid,
             "username": users.get(uid, ""),
@@ -461,8 +474,10 @@ def attendance_dashboard(sid):
                 "late_and_short": psum.get("late_and_short", 0),
                 "absent": psum.get("absent", 0),
                 "on_leave": psum.get("on_leave", 0),
-                "planned_days": planned,
-                "attendance_rate": round(psum.get("present", 0) / planned, 3) if planned else None,
+                "unpledged": psum.get("unpledged", 0),
+                "pledged_days": pledged, "satisfied": satisfied,
+                "planned_days": pledged,
+                "attendance_rate": round(satisfied / pledged, 3) if pledged else None,
             },
         })
     rows.sort(key=lambda r: r["user_id"])
@@ -504,6 +519,7 @@ def attendance_mine():
         CampAttendancePlan.camp_session_id == sid,
         CampAttendancePlan.user_id == user.id,
         CampAttendancePlan.date.between(frm, to)).all()
+    plan_by_date = {p.date: p for p in plans}
     checks = CheckRecord.query.filter(
         CheckRecord.user_id == user.id,
         CheckRecord.date.between(frm, to)).all()
@@ -514,19 +530,26 @@ def attendance_mine():
     daily = {}
     psum = Counter()
     dates_set = set()
-    for p in plans:
-        res = _eval_day(checks_map.get((p.user_id, p.date), []), p,
-                        (p.user_id, p.date) in leave_set)
-        daily[p.date.isoformat()] = res
-        dates_set.add(p.date)
+    for d in _weekdays(frm, to):               # 营期全范围所有天数（不再按工作日过滤）
+        p = plan_by_date.get(d)
+        if p:
+            res = _eval_day(checks_map.get((user.id, d), []), p, (user.id, d) in leave_set)
+        else:
+            res = {"status": "unpledged", "is_late": None, "is_sufficient": None,
+                   "first_check_in": None, "total_hours": 0, "in_progress": False}
+        daily[d.isoformat()] = res
+        dates_set.add(d)
         psum[res["status"]] += 1
-    planned = len(plans)
+    pledged = len(plans)
+    satisfied = psum.get("present", 0)
     personal = {
         "present": psum.get("present", 0), "late": psum.get("late", 0),
         "short_hours": psum.get("short_hours", 0), "late_and_short": psum.get("late_and_short", 0),
         "absent": psum.get("absent", 0), "on_leave": psum.get("on_leave", 0),
-        "planned_days": planned,
-        "attendance_rate": round(psum.get("present", 0) / planned, 3) if planned else None,
+        "unpledged": psum.get("unpledged", 0),
+        "pledged_days": pledged, "satisfied": satisfied,
+        "planned_days": pledged,            # 兼容旧前端字段
+        "attendance_rate": round(satisfied / pledged, 3) if pledged else None,
     }
     return jsonify({
         "code": 200,
@@ -778,7 +801,20 @@ def join_request_submit(sid):
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
         return jsonify({"code": 409, "message": "已有待审批的申请，请等待审核"}), 409
     d = request.json or {}
-    db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id, reason=d.get("reason")))
+    # 学员手选承诺出勤日（JSON 数组），校验格式 + 在营期范围内
+    selected_days = d.get("selected_days") or []
+    valid = []
+    try:
+        for s in selected_days:
+            dv = date.fromisoformat(str(s))
+            if camp.start_date <= dv <= camp.end_date:
+                valid.append(dv.isoformat())
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "承诺出勤日格式错误"}), 400
+    if not valid:
+        return jsonify({"code": 400, "message": "请至少选择一个承诺出勤日"}), 400
+    db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
+                                   reason=d.get("reason"), selected_days=json.dumps(valid)))
     db.session.commit()
     return jsonify({"code": 200, "message": "申请已提交，等待审批"})
 
@@ -832,11 +868,34 @@ def join_request_approve(rid):
     if req.status != 'pending':
         return jsonify({"code": 400, "message": "该申请已处理"}), 400
     d = request.json or {}
-    # 学员审批时老师选定归属导生（body team_mentor_id）；_assign_member 内部校验导生在本营
-    m, err = _assign_member(req.camp_session_id, req.user_id, d.get("team_mentor_id"))
+    # 学员审批时老师选定归属导生（body team_mentor_id）；auto_plan=False 改由手选日期建 plan
+    m, err = _assign_member(req.camp_session_id, req.user_id, d.get("team_mentor_id"), auto_plan=False)
     if err:
         msg, code = err
         return jsonify({"code": code, "message": msg}), code
+    # 用学员申请时手选的承诺日建 CampAttendancePlan（替代 _gen_plan 自动工作日）
+    if m.role == 'student':
+        camp = CampSession.query.get(req.camp_session_id)
+        days = []
+        try:
+            days = json.loads(req.selected_days) if req.selected_days else []
+        except (ValueError, TypeError):
+            days = []
+        if days:
+            exist = {p.date for p in CampAttendancePlan.query.filter_by(
+                camp_session_id=req.camp_session_id, user_id=req.user_id).all()}
+            for ds in days:
+                try:
+                    dv = date.fromisoformat(ds)
+                except ValueError:
+                    continue
+                if dv in exist:
+                    continue
+                db.session.add(CampAttendancePlan(
+                    camp_session_id=req.camp_session_id, user_id=req.user_id, date=dv,
+                    expected_check_in=camp.expected_check_in, min_daily_hours=camp.min_daily_hours))
+        else:
+            _gen_plan(camp, req.user_id)   # 兜底：申请没带手选日则按工作日
     req.status = 'approved'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
