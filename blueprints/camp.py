@@ -175,7 +175,10 @@ def session_list():
         ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()]
         q = q.filter(CampSession.id.in_(ids)) if ids else q.filter(False)
     camps = q.order_by(CampSession.start_date.desc()).all()
-    return jsonify({"code": 200, "sessions": [_session_dict(c) for c in camps]})
+    # 附当前用户是否成员：用户端「我的营期」据此过滤掉非成员营（管理端列表忽略此字段）
+    member_ids = {m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()}
+    return jsonify({"code": 200,
+                    "sessions": [{**_session_dict(c), "is_member": c.id in member_ids} for c in camps]})
 
 
 @bp.route("/sessions/<int:sid>")
