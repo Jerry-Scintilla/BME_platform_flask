@@ -806,8 +806,8 @@ def join_request_submit(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
-    if user.role not in ('student', 'mentor'):
-        return jsonify({"code": 400, "message": "仅学员/导生可申请加入营期"}), 400
+    if user.role != 'student':
+        return jsonify({"code": 400, "message": "仅学员可申请加入营期；导生/老师由管理员直接分配"}), 400
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
         return jsonify({"code": 402, "message": "你已是该营期成员"}), 402
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
