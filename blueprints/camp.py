@@ -440,7 +440,7 @@ def attendance_dashboard(sid):
     mentors = {m.user_id: m.team_mentor_id for m in
                CampMember.query.filter_by(camp_session_id=sid, role='student').all()}
 
-    # 4. 矩阵（全范围日期 × 可见学员）+ 汇总：未来日 future，过去承诺日 _eval_day，非承诺 unpledged
+    # 4. 矩阵（全范围日期 × 可见学员）+ 汇总：未承诺 unpledged，未来承诺日 pledged，过去承诺日 _eval_day
     today = date.today()
     all_days = _weekdays(frm, to)
     dates_set = set(all_days)
@@ -450,14 +450,14 @@ def attendance_dashboard(sid):
         pm = plan_map.get(uid, {})
         for d in all_days:
             p = pm.get(d)
-            if d > today:
-                res = {"status": "future", "is_late": None, "is_sufficient": None,
-                       "first_check_in": None, "total_hours": 0, "in_progress": False}
-            elif p:
-                res = _eval_day(checks_map.get((uid, d), []), p, (uid, d) in leave_set)
-            else:
+            if not p:
                 res = {"status": "unpledged", "is_late": None, "is_sufficient": None,
                        "first_check_in": None, "total_hours": 0, "in_progress": False}
+            elif d > today:
+                res = {"status": "pledged", "is_late": None, "is_sufficient": None,
+                       "first_check_in": None, "total_hours": 0, "in_progress": False}
+            else:
+                res = _eval_day(checks_map.get((uid, d), []), p, (uid, d) in leave_set)
             by_user[uid].append((d, res))
             gsummary[res["status"]] += 1
 
@@ -481,7 +481,7 @@ def attendance_dashboard(sid):
                 "absent": psum.get("absent", 0),
                 "on_leave": psum.get("on_leave", 0),
                 "unpledged": psum.get("unpledged", 0),
-                "future": psum.get("future", 0),
+                "pledged_pending": psum.get("pledged", 0),
                 "pledged_days": pledged, "satisfied": satisfied,
                 "planned_days": pledged,
                 "attendance_rate": round(satisfied / elapsed_pledged, 3) if elapsed_pledged else None,
@@ -538,16 +538,16 @@ def attendance_mine():
     daily = {}
     psum = Counter()
     dates_set = set()
-    for d in _weekdays(frm, to):               # 营期全范围所有天数（不再按工作日过滤）
+    for d in _weekdays(frm, to):               # 营期全范围所有天数
         p = plan_by_date.get(d)
-        if d > today:                          # 未来日：还没到，不算缺勤
-            res = {"status": "future", "is_late": None, "is_sufficient": None,
-                   "first_check_in": None, "total_hours": 0, "in_progress": False}
-        elif p:
-            res = _eval_day(checks_map.get((user.id, d), []), p, (user.id, d) in leave_set)
-        else:
+        if not p:                              # 未承诺（不管未来/过去）
             res = {"status": "unpledged", "is_late": None, "is_sufficient": None,
                    "first_check_in": None, "total_hours": 0, "in_progress": False}
+        elif d > today:                        # 未来承诺日：已承诺，待考勤（不算缺勤）
+            res = {"status": "pledged", "is_late": None, "is_sufficient": None,
+                   "first_check_in": None, "total_hours": 0, "in_progress": False}
+        else:
+            res = _eval_day(checks_map.get((user.id, d), []), p, (user.id, d) in leave_set)
         daily[d.isoformat()] = res
         dates_set.add(d)
         psum[res["status"]] += 1
@@ -558,7 +558,7 @@ def attendance_mine():
         "present": psum.get("present", 0), "late": psum.get("late", 0),
         "short_hours": psum.get("short_hours", 0), "late_and_short": psum.get("late_and_short", 0),
         "absent": psum.get("absent", 0), "on_leave": psum.get("on_leave", 0),
-        "unpledged": psum.get("unpledged", 0), "future": psum.get("future", 0),
+        "unpledged": psum.get("unpledged", 0), "pledged_pending": psum.get("pledged", 0),
         "pledged_days": pledged, "satisfied": satisfied,
         "planned_days": pledged,            # 兼容旧前端字段
         "attendance_rate": round(satisfied / elapsed_pledged, 3) if elapsed_pledged else None,
