@@ -755,7 +755,7 @@ class NotificationModel(db.Model):
         # 'camp'    — 营期通知（请假审批/奖励发放/考勤提醒等）
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
     source_type = db.Column(db.String(20), nullable=True)
-        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin'
+        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin', 'reward', 'join_request'
     source_id = db.Column(db.Integer, nullable=True)
         # 关联的原始记录 ID（如请假ID、任务ID）
     group_id = db.Column(db.Integer, nullable=True, index=True)
@@ -770,6 +770,7 @@ class NotificationModel(db.Model):
             'title': self.title,
             'content': self.content,
             'category': self.category,
+            'camp_session_id': self.camp_session_id,
             'source_type': self.source_type,
             'source_id': self.source_id,
             'group_id': self.group_id,

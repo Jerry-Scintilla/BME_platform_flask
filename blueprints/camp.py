@@ -911,6 +911,20 @@ def join_request_approve(rid):
     req.status = 'approved'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
+    # 通知学生：入营申请已通过（同事务，commit 之前）
+    camp = CampSession.query.get(req.camp_session_id)
+    camp_name = camp.name if camp else '营期'
+    mentor_name = None
+    if getattr(m, 'team_mentor_id', None):      # 老师审批时可能未指定归属导生
+        mu = UserModel.query.get(m.team_mentor_id)
+        if mu:
+            mentor_name = mu.username
+    content = f"你的入营申请已通过，欢迎加入「{camp_name}」。"
+    if mentor_name:
+        content += f"你的导生是 {mentor_name}，可在营期内联系。"
+    create_notification(req.user_id, "入营申请已通过", content,
+                        category='camp', source_type='join_request',
+                        source_id=req.id, camp_session_id=req.camp_session_id)
     db.session.commit()
     return jsonify({"code": 200, "message": "已批准并加入营期", "member_id": m.id})
 
@@ -928,6 +942,19 @@ def join_request_reject(rid):
     req.status = 'rejected'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
+    # 通知学生：入营申请未通过（同事务，commit 之前；拒绝原因从 body 读，不入库）
+    d = request.json or {}
+    reason = (d.get("reason") or "").strip()
+    camp = CampSession.query.get(req.camp_session_id)
+    camp_name = camp.name if camp else '该营期'
+    content = f"很遗憾，你对「{camp_name}」的入营申请未通过。"
+    if reason:
+        content += f"原因：{reason}。"
+    content += "如有疑问请联系老师。"
+    create_notification(req.user_id, "入营申请未通过", content,
+                        category='camp', source_type='join_request',
+                        source_id=req.id, camp_session_id=req.camp_session_id,
+                        is_important=True)
     db.session.commit()
     return jsonify({"code": 200, "message": "已拒绝"})
 
