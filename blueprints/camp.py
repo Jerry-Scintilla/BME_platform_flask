@@ -223,16 +223,26 @@ def member_assign(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     d = request.json or {}
-    user_id, role = d.get("user_id"), d.get("role", "student")
+    user_id = d.get("user_id")
     team_mentor_id = d.get("team_mentor_id")
     if not user_id:
         return jsonify({"code": 400, "message": "缺少 user_id"}), 400
-    if not UserModel.query.get(user_id):
+    user = UserModel.query.get(user_id)
+    if not user:
         return jsonify({"code": 404, "message": "用户不存在"}), 404
+    # 营期角色由全局 role 派生（物理杜绝"全局学生当营期导生"等错配）
+    if user.role not in ('student', 'mentor'):
+        return jsonify({"code": 400, "message": "教师/超管通过营期管理入口操作，不作为营期成员加入"}), 400
+    role = user.role
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first():
         return jsonify({"code": 402, "message": "该用户已在营期中"}), 402
-    m = CampMember(camp_session_id=sid, user_id=user_id, role=role,
-                   team_mentor_id=team_mentor_id if role == 'student' else None)
+    # 归属导生仅学员可设，且必须是本营导生
+    if role == 'student' and team_mentor_id:
+        if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
+            return jsonify({"code": 400, "message": "指定的导生不在本营"}), 400
+    else:
+        team_mentor_id = None
+    m = CampMember(camp_session_id=sid, user_id=user_id, role=role, team_mentor_id=team_mentor_id)
     db.session.add(m)
     if role == 'student':
         _gen_plan(camp, user_id)          # 学员加入即生成承诺出勤日

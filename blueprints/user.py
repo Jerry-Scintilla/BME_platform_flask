@@ -150,6 +150,7 @@ def user_list():
                   "User_Medal": user.medal,
                   "User_Stage": user.study_stage,
                   "User_Mode": user.user_mode,
+                  "role": user.role,
                   "join_time": user.join_time
                   }
         data.append(b_list)
