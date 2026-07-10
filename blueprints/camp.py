@@ -15,7 +15,7 @@ from flask_jwt_extended import jwt_required
 from exts import db
 from models import (
     CampSession, CampMember, CampCourse, CampAttendancePlan,
-    CampSeat, CampLeave, CheckRecord, CourseModel, UserCourseModel,
+    CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
 )
 
@@ -131,6 +131,7 @@ def _session_dict(c):
         "status": c.status,
         "expected_check_in": c.expected_check_in.isoformat() if c.expected_check_in else None,
         "min_daily_hours": c.min_daily_hours, "weekdays_only": c.weekdays_only,
+        "is_featured": bool(c.is_featured),
         "member_count": CampMember.query.filter_by(camp_session_id=c.id).count(),
     }
 
@@ -214,38 +215,47 @@ def session_update(sid):
 # 成员
 # ─────────────────────────────────────────────
 
-@bp.route("/sessions/<int:sid>/members", methods=["POST"])
-@jwt_required()
-@camp_role('teacher', 'super_admin')
-@audit_log(operation="分配营期成员")
-def member_assign(sid):
+def _assign_member(sid, user_id, team_mentor_id=None):
+    """营期成员分配核心：role 由 user.role 派生 + team_mentor 校验。
+    返回 (CampMember, None) 成功（未 commit，由调用方 commit）；或 (None, (message, code)) 失败。"""
     camp = CampSession.query.get(sid)
     if not camp:
-        return jsonify({"code": 404, "message": "营期不存在"}), 404
-    d = request.json or {}
-    user_id = d.get("user_id")
-    team_mentor_id = d.get("team_mentor_id")
-    if not user_id:
-        return jsonify({"code": 400, "message": "缺少 user_id"}), 400
+        return None, ("营期不存在", 404)
     user = UserModel.query.get(user_id)
     if not user:
-        return jsonify({"code": 404, "message": "用户不存在"}), 404
+        return None, ("用户不存在", 404)
     # 营期角色由全局 role 派生（物理杜绝"全局学生当营期导生"等错配）
     if user.role not in ('student', 'mentor'):
-        return jsonify({"code": 400, "message": "教师/超管通过营期管理入口操作，不作为营期成员加入"}), 400
+        return None, ("教师/超管通过营期管理入口操作，不作为营期成员加入", 400)
     role = user.role
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first():
-        return jsonify({"code": 402, "message": "该用户已在营期中"}), 402
+        return None, ("该用户已在营期中", 402)
     # 归属导生仅学员可设，且必须是本营导生
     if role == 'student' and team_mentor_id:
         if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
-            return jsonify({"code": 400, "message": "指定的导生不在本营"}), 400
+            return None, ("指定的导生不在本营", 400)
     else:
         team_mentor_id = None
     m = CampMember(camp_session_id=sid, user_id=user_id, role=role, team_mentor_id=team_mentor_id)
     db.session.add(m)
     if role == 'student':
         _gen_plan(camp, user_id)          # 学员加入即生成承诺出勤日
+    return m, None
+
+
+@bp.route("/sessions/<int:sid>/members", methods=["POST"])
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+@audit_log(operation="分配营期成员")
+def member_assign(sid):
+    d = request.json or {}
+    user_id = d.get("user_id")
+    if not user_id:
+        return jsonify({"code": 400, "message": "缺少 user_id"}), 400
+    m, err = _assign_member(sid, user_id, d.get("team_mentor_id"))
+    if err:
+        msg, code = err
+        return jsonify({"code": code, "message": msg}), code
     db.session.commit()
     return jsonify({"code": 200, "message": "已加入", "member_id": m.id})
 
@@ -703,3 +713,170 @@ def seat_list(sid):
             "username": u.username if u else None,
         })
     return jsonify({"code": 200, "seats": data})
+
+
+# ─────────────────────────────────────────────
+# 营期主页指定 + 加入申请 + 团队改派
+# ─────────────────────────────────────────────
+
+def _camp_mentors(sid):
+    """本营导生列表（供审批/改派选归属导生）"""
+    out = []
+    for m in CampMember.query.filter_by(camp_session_id=sid, role='mentor').all():
+        u = UserModel.query.get(m.user_id)
+        if u:
+            out.append({"user_id": u.id, "username": u.username})
+    return out
+
+
+@bp.route("/featured")
+@jwt_required()
+def camp_featured():
+    """用户端营期主页：返回后台指定的当前营期 + 当前用户是否成员 + 我的最新申请状态。"""
+    user = _current_user()
+    camp = CampSession.query.filter_by(is_featured=True).first()
+    if not camp:
+        return jsonify({"code": 200, "session": None, "is_member": False, "my_request": None})
+    is_member = CampMember.query.filter_by(camp_session_id=camp.id, user_id=user.id).first() is not None
+    my_req = (CampJoinRequest.query.filter_by(camp_session_id=camp.id, user_id=user.id)
+              .order_by(CampJoinRequest.created_at.desc()).first())
+    return jsonify({
+        "code": 200,
+        "session": _session_dict(camp),
+        "is_member": is_member,
+        "my_request": {"id": my_req.id, "status": my_req.status} if my_req else None,
+    })
+
+
+@bp.route("/sessions/<int:sid>/feature", methods=["PUT"])
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+@audit_log(operation="设为当前营期")
+def camp_feature(sid):
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    CampSession.query.filter(CampSession.is_featured.is_(True)).update({"is_featured": False})
+    camp.is_featured = True
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已设为当前营期"})
+
+
+@bp.route("/sessions/<int:sid>/join-request", methods=["POST"])
+@jwt_required()
+@audit_log(operation="提交营期加入申请")
+def join_request_submit(sid):
+    """学员/导生自助提交加入申请（teacher/超管不申请，他们直接管营）。"""
+    user = _current_user()
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if user.role not in ('student', 'mentor'):
+        return jsonify({"code": 400, "message": "仅学员/导生可申请加入营期"}), 400
+    if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
+        return jsonify({"code": 402, "message": "你已是该营期成员"}), 402
+    if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
+        return jsonify({"code": 409, "message": "已有待审批的申请，请等待审核"}), 409
+    d = request.json or {}
+    db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id, reason=d.get("reason")))
+    db.session.commit()
+    return jsonify({"code": 200, "message": "申请已提交，等待审批"})
+
+
+@bp.route("/join-requests/mine")
+@jwt_required()
+def join_request_mine():
+    user = _current_user()
+    rows = CampJoinRequest.query.filter_by(user_id=user.id).order_by(CampJoinRequest.created_at.desc()).all()
+    data = []
+    for r in rows:
+        c = CampSession.query.get(r.camp_session_id)
+        data.append({
+            "id": r.id, "camp_session_id": r.camp_session_id, "camp_name": c.name if c else None,
+            "reason": r.reason, "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return jsonify({"code": 200, "requests": data})
+
+
+@bp.route("/sessions/<int:sid>/join-requests")
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+def join_request_list(sid):
+    """老师/超管看某营的加入申请（默认 pending，?status=all 看全部）。返回含本营导生列表供审批选。"""
+    status = request.args.get("status", "pending")
+    q = CampJoinRequest.query.filter_by(camp_session_id=sid)
+    if status != "all":
+        q = q.filter_by(status=status)
+    rows = q.order_by(CampJoinRequest.created_at.desc()).all()
+    data = []
+    for r in rows:
+        u = UserModel.query.get(r.user_id)
+        data.append({
+            "id": r.id, "user_id": r.user_id, "username": u.username if u else None,
+            "email": u.email if u else None, "role": u.role if u else None,
+            "reason": r.reason, "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return jsonify({"code": 200, "requests": data, "mentors": _camp_mentors(sid)})
+
+
+@bp.route("/join-requests/<int:rid>/approve", methods=["POST"])
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+@audit_log(operation="批准营期申请")
+def join_request_approve(rid):
+    req = CampJoinRequest.query.get(rid)
+    if not req:
+        return jsonify({"code": 404, "message": "申请不存在"}), 404
+    if req.status != 'pending':
+        return jsonify({"code": 400, "message": "该申请已处理"}), 400
+    d = request.json or {}
+    # 学员审批时老师选定归属导生（body team_mentor_id）；_assign_member 内部校验导生在本营
+    m, err = _assign_member(req.camp_session_id, req.user_id, d.get("team_mentor_id"))
+    if err:
+        msg, code = err
+        return jsonify({"code": code, "message": msg}), code
+    req.status = 'approved'
+    req.reviewed_by = _current_user().id
+    req.reviewed_at = datetime.now()
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已批准并加入营期", "member_id": m.id})
+
+
+@bp.route("/join-requests/<int:rid>/reject", methods=["POST"])
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+@audit_log(operation="拒绝营期申请")
+def join_request_reject(rid):
+    req = CampJoinRequest.query.get(rid)
+    if not req:
+        return jsonify({"code": 404, "message": "申请不存在"}), 404
+    if req.status != 'pending':
+        return jsonify({"code": 400, "message": "该申请已处理"}), 400
+    req.status = 'rejected'
+    req.reviewed_by = _current_user().id
+    req.reviewed_at = datetime.now()
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已拒绝"})
+
+
+@bp.route("/sessions/<int:sid>/members/<int:uid>", methods=["PUT"])
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+@audit_log(operation="改派营期成员导生")
+def member_update(sid, uid):
+    """改成员归属导生（仅学员行可改；日常团队改派入口）。"""
+    m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
+    if not m:
+        return jsonify({"code": 404, "message": "成员不存在"}), 404
+    if m.role != 'student':
+        return jsonify({"code": 400, "message": "仅学员可指定归属导生"}), 400
+    d = request.json or {}
+    team_mentor_id = d.get("team_mentor_id")
+    if team_mentor_id:
+        if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
+            return jsonify({"code": 400, "message": "指定的导生不在本营"}), 400
+    m.team_mentor_id = team_mentor_id
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已更新"})

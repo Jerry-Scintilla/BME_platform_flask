@@ -1008,6 +1008,7 @@ class CampSession(db.Model):
     expected_check_in = db.Column(db.Time)                       # 期望到岗时间（判迟到基准）
     min_daily_hours = db.Column(db.Float)                        # 每日最低有效时长（判达标）
     weekdays_only = db.Column(db.Boolean, default=True)          # 承诺出勤日 = 范围内工作日
+    is_featured = db.Column(db.Boolean, default=False)          # 用户端主页指定的当前营期（全局唯一，由管理端设置）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -1077,4 +1078,18 @@ class CampLeave(db.Model):
     status = db.Column(db.String(20), default='pending')   # pending / approved / rejected
     approver_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     approved_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampJoinRequest(db.Model):
+    """营期加入申请（学员自助申请 → teacher/super_admin 审批 → 通过即 member_assign 入营）。
+    不加 UQ(camp,user)：rejected 后允许重新提交（新行）；端点校验"无 pending 申请 + 非成员"。"""
+    __tablename__ = 'camp_join_request'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    reason = db.Column(db.Text, nullable=True)
+    status = db.Column(db.String(20), default='pending', index=True)   # pending / approved / rejected
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
