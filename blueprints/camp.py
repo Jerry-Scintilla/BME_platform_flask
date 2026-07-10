@@ -646,6 +646,16 @@ def reward_issue():
     return jsonify({"code": 200, "message": "已发放"})
 
 
+@bp.route("/medals")
+@jwt_required()
+@camp_role('mentor', 'teacher', 'super_admin')
+def camp_medals():
+    """营期可用勋章列表（导生发奖励时选勋章用；@camp_role 门控，不依赖 medal_management 权限）。"""
+    medals = MedalModel.query.all()
+    data = [{"id": m.id, "name": m.medal_name} for m in medals]
+    return jsonify({"code": 200, "medals": data})
+
+
 # ─────────────────────────────────────────────
 # 座位（复用物理 Seat，按营期分配）
 # ─────────────────────────────────────────────
