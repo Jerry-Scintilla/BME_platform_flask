@@ -117,6 +117,10 @@ def can_post_thread(scope_type, scope_id, user):
     if scope_type == 'task':
         return True
 
+    # article: 文章评论区，登录用户均可参与
+    if scope_type == 'article':
+        return True
+
     if scope_type == 'course':
         from models import UserCourseModel
         enrollment = UserCourseModel.query.filter_by(
@@ -142,6 +146,47 @@ def can_moderate_thread(thread, user):
 
 
 # ==================== 主题帖 CRUD ====================
+
+# 获取或创建某篇文章的评论汇总 thread（scope=article），用于文章评论区
+@bp.route("/article/<int:article_id>/thread", methods=["GET"])
+@jwt_required()
+def get_or_create_article_thread(article_id):
+    """文章评论区：获取/创建该文章的汇总 thread，评论挂在其 replies 下"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户不存在"}), 401
+
+    from models import ArticleModel
+    article = ArticleModel.query.get(article_id)
+    if not article:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+
+    thread = DiscussionThread.query.filter_by(
+        scope_type='article',
+        scope_id=article_id,
+        status=DiscussionThread.STATUS_NORMAL
+    ).order_by(DiscussionThread.created_at.asc()).first()
+
+    if not thread:
+        thread = DiscussionThread(
+            title=f"文章评论 · {article.title}",
+            content="该文章的评论区（系统自动创建）",
+            scope_type='article',
+            scope_id=article_id,
+            author_id=user.id
+        )
+        db.session.add(thread)
+        db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "data": {
+            "thread_id": thread.id,
+            "article_id": article_id,
+            "reply_count": thread.reply_count
+        }
+    }), 200
+
 
 # 创建主题帖 POST /discussions/threads
 @bp.route("/threads", methods=["POST"])
@@ -728,17 +773,15 @@ def toggle_reaction():
     ).first()
 
     if existing:
-        # 取消点赞
+        # 取消 reaction
         db.session.delete(existing)
-        # 更新计数
-        if target_type == 'thread':
-            target.like_count = max(0, target.like_count - 1)
-        else:
+        # 仅点赞计入 like_count（收藏等不计）
+        if reaction_type == 'like':
             target.like_count = max(0, target.like_count - 1)
         db.session.commit()
         liked = False
     else:
-        # 点赞
+        # 新增 reaction
         reaction = DiscussionReaction(
             user_id=user.id,
             target_type=target_type,
@@ -746,10 +789,7 @@ def toggle_reaction():
             reaction_type=reaction_type
         )
         db.session.add(reaction)
-        # 更新计数
-        if target_type == 'thread':
-            target.like_count += 1
-        else:
+        if reaction_type == 'like':
             target.like_count += 1
         db.session.commit()
         liked = True
@@ -778,17 +818,18 @@ def get_my_reaction(thread_id):
     if not thread:
         return jsonify({"code": 404, "message": "帖子不存在"}), 404
 
-    reaction = DiscussionReaction.query.filter_by(
-        user_id=user.id,
-        target_type='thread',
-        target_id=thread_id,
-        reaction_type='like'
+    like = DiscussionReaction.query.filter_by(
+        user_id=user.id, target_type='thread', target_id=thread_id, reaction_type='like'
+    ).first()
+    bookmark = DiscussionReaction.query.filter_by(
+        user_id=user.id, target_type='thread', target_id=thread_id, reaction_type='bookmark'
     ).first()
 
     return jsonify({
         "code": 200,
         "data": {
             "thread_id": thread_id,
-            "liked": reaction is not None
+            "liked": like is not None,
+            "bookmarked": bookmark is not None
         }
     })
