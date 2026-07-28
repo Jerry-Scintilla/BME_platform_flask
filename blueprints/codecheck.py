@@ -63,6 +63,23 @@ def generate_check_code():
     })
 
 
+def invalidate_check_aggregate_cache():
+    """任意用户签到/签退后失效全员聚合缓存。
+
+    三个全员聚合接口（admin_records/records_top10/weekly_records）都是全员扫描，
+    任一用户数据变更都会影响其结果，故无 user 维度、统一删当前周期 key。
+    key 格式必须与三个接口内部拼出的 key 完全一致。
+    """
+    now = datetime.now()
+    iso_year, iso_week, _ = now.isocalendar()
+    keys = [
+        f"annual_check_records_cache:{now.year}",
+        f"check_records_top10:{now.strftime('%Y-%m')}",
+        f"weekly_check_records_cache:{iso_year}-W{iso_week:02d}",
+    ]
+    redis_client.delete(*keys)
+
+
 # 签到/签退
 @bp.route('/check', methods=['POST'])
 @jwt_required()
@@ -152,6 +169,7 @@ def check_in_out():
         redis_client.hset(full_key, 'used', '1')
 
     db.session.commit()
+    invalidate_check_aggregate_cache()
 
     return jsonify({"message": "签到/签退成功"})
 
@@ -235,7 +253,8 @@ def face_check():
         redis_client.delete(f"latest_check:{user.id}")
     
     db.session.commit()
-    
+    invalidate_check_aggregate_cache()
+
     return jsonify({"message": "人脸签到/签退成功"})
 
 
@@ -314,16 +333,8 @@ def get_records():
 def get_yearly_records():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    redis_key = f"records_yearly:{user.email}:yearly_daily"
-
-    # 尝试从Redis获取缓存数据
-    cached_data = redis_client.get(redis_key)
-    if cached_data:
-        # print("缓存命中")
-        return jsonify(json.loads(cached_data))
-
-    # 缓存未命中，从数据库查询
-    user = UserModel.query.filter_by(email=user_email).first()
+    # 个人年度日历：单用户当年记录仅几百~两千行、date 有索引、毫秒级，无需缓存。
+    # 去掉缓存后每次请求直查 DB，新打卡立即可见；同时消除 key 不带年份的跨年串味隐患。
     now = datetime.now()
     # 获取当年第一天和最后一天
     first_day = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -361,8 +372,6 @@ def get_yearly_records():
             "total_hours": round(total, 2)
         })
 
-    # 将结果存入Redis，设置1小时过期时间
-    redis_client.setex(redis_key, timedelta(hours=1), json.dumps(result))
     return jsonify(result)
 
 
@@ -371,17 +380,16 @@ def get_yearly_records():
 @check_permission('user_management')
 @swag_from('../apidocs/codecheck/admin_records.yaml')
 def admin_records():
-    # Redis缓存键
-    cache_key = "annual_check_records_cache"
+    # 获取当前日期
+    now = datetime.now()
+    current_year = now.year
+    # Redis缓存键（带年份维度，避免跨年串味）
+    cache_key = f"annual_check_records_cache:{current_year}"
     # 尝试从Redis获取缓存
     cached_data = redis_client.get(cache_key)
     if cached_data:
         # 如果缓存存在，直接返回缓存数据
-        # print("缓存命中")
         return jsonify(json.loads(cached_data))
-    # 获取当前日期
-    now = datetime.now()
-    current_year = now.year
     # 计算一年前的时间范围（当前日期往前推12个月）
     one_year_ago = now - timedelta(days=365)
     # 查询所有用户一年内的考勤记录
@@ -444,7 +452,7 @@ def records_top10():
     # Redis缓存键
     now = datetime.now()
     current_month = now.strftime("%Y-%m")
-    cache_key = "check_records_top10"
+    cache_key = f"check_records_top10:{current_month}"  # 带月份维度，避免月初串味
     # 尝试从Redis获取缓存
     cached_data = redis_client.get(cache_key)
     if cached_data:
@@ -576,14 +584,15 @@ def get_my_records_stats():
 @check_permission('user_management')
 @swag_from('../apidocs/codecheck/weekly_records.yaml')
 def weekly_records():
-    # Redis缓存键
-    cache_key = "weekly_check_records_cache"
+    # 获取当前日期和时间
+    now = datetime.now()
+    # Redis缓存键（带 ISO 周维度，避免跨周串味）
+    iso_year, iso_week, _ = now.isocalendar()
+    cache_key = f"weekly_check_records_cache:{iso_year}-W{iso_week:02d}"
     # 尝试从Redis获取缓存
     cached_data = redis_client.get(cache_key)
     if cached_data:
         return jsonify(json.loads(cached_data))
-    # 获取当前日期和时间
-    now = datetime.now()
     # 计算本周的开始日期（周一）和结束日期（周日）
     current_week_start = now - timedelta(days=now.weekday())
     current_week_end = current_week_start + timedelta(days=6)

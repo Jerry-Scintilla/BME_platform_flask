@@ -13,6 +13,7 @@ python scripts/migrate/migrate_03_feature_camp.py       # camp_session.is_featur
 python scripts/migrate/migrate_04_join_selected_days.py # camp_join_request.selected_days
 python scripts/migrate/migrate_05_perms.py              # 17 下划线权限 + super_admin 授权
 python init_seats.py                                    # 建 study_room/seat 表 + 106 房 40 座位
+python scripts/migrate/migrate_06_check_record_indexes.py  # check_record (user_id, date) 复合索引
 ```
 
 ## 顺序依赖
@@ -37,3 +38,4 @@ python init_seats.py                                    # 建 study_room/seat �
 | 03_feature_camp | `camp_session.is_featured` + 建 camp_join_request 表 |
 | 04_join_selected_days | `camp_join_request.selected_days TEXT` |
 | 05_perms | 17 下划线权限 + 删点号旧权限 + super_admin 全授权 |
+| 06_check_record_indexes | `CREATE INDEX ix_check_record_user_date ON check_record (user_id, date)`（幂等） |

@@ -622,6 +622,9 @@ class TaskSubmissionAttachment(db.Model):
 
 class CheckRecord(db.Model):
     __tablename__ = 'check_record'
+    __table_args__ = (
+        db.Index('ix_check_record_user_date', 'user_id', 'date'),
+    )
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     check_in = db.Column(db.DateTime)
