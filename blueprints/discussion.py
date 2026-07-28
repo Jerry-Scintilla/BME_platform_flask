@@ -833,3 +833,44 @@ def get_my_reaction(thread_id):
             "bookmarked": bookmark is not None
         }
     })
+
+
+# 当前用户收藏的文章列表 GET /discussions/article/favorites/me
+@bp.route("/article/favorites/me", methods=["GET"])
+@jwt_required()
+def my_article_favorites():
+    """当前用户收藏（bookmark）的文章列表"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户不存在"}), 401
+
+    from models import ArticleModel
+    # 用户 bookmark 的 article-scope threads
+    rows = db.session.query(DiscussionThread, DiscussionReaction).join(
+        DiscussionReaction,
+        and_(
+            DiscussionReaction.target_type == 'thread',
+            DiscussionReaction.target_id == DiscussionThread.id,
+            DiscussionReaction.reaction_type == 'bookmark',
+        )
+    ).filter(
+        DiscussionReaction.user_id == user.id,
+        DiscussionThread.scope_type == 'article',
+    ).order_by(DiscussionReaction.created_at.desc()).all()
+
+    result = []
+    for thread, reaction in rows:
+        article = ArticleModel.query.get(thread.scope_id)
+        if not article:
+            continue
+        result.append({
+            "article_id": article.id,
+            "title": article.title,
+            "introduction": article.introduction,
+            "author": article.author.username if article.author else '',
+            "author_avatar": get_avatar_url(article.author.avatar_url) if article.author else '',
+            "publish_time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S') if article.publish_time else '',
+            "favorited_at": reaction.created_at.strftime('%Y-%m-%d %H:%M:%S') if reaction.created_at else '',
+        })
+
+    return jsonify({"code": 200, "data": result, "total": len(result)}), 200

@@ -234,12 +234,17 @@ def article():
     # return send_file(article_path)
     with open(article_path, 'r', encoding='utf-8') as file:
         html_content = file.read()
+    author_avatar = ''
+    if article.author and article.author.avatar_url:
+        au = article.author.avatar_url
+        author_avatar = au if au.startswith('http') else request.host_url.rstrip('/') + '/data/avatars/' + au
     return jsonify({
         "code": 200,
         "message": "获取文章详情成功",
         "Article_Id": article_id,
         "Article_Title": article.title,
         "Article_Author": article.author.username,
+        "Article_Author_Avatar": author_avatar,
         "Publish_Time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
         "Article_Introduction": article.introduction,
         "html_content": html_content
