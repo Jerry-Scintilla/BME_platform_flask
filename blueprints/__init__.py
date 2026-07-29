@@ -323,6 +323,7 @@ from .information import bp as information_bp
 from .permissionACL import bp as permission_bp
 from .task import bp as task_bp
 from .discussion import bp as discussion_bp
+from .community import bp as community_bp
 from .llm import bp as llm_bp
 from .notification import bp as notification_bp
 from .seat import bp as seat_bp
@@ -344,6 +345,7 @@ __all__ = [
     'permission_bp',
     'task_bp',
     'discussion_bp',
+    'community_bp',
     'llm_bp',
     'notification_bp',
     'seat_bp',
