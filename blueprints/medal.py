@@ -245,6 +245,12 @@ def user_medal_list():
 def user_medal_show():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
+    # 可选 user_id：查看他人主页时取对方的勋章（不传则默认自己）
+    target_id = request.args.get("user_id")
+    if target_id:
+        other = UserModel.query.get(int(target_id))
+        if other:
+            user = other
     student_id = user.id
     medals = MedalUserModel.query.filter_by(user_id=student_id).all()
     medal_list = MedalModel.query.all()

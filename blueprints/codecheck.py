@@ -333,6 +333,12 @@ def get_records():
 def get_yearly_records():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
+    # 可选 user_id：查看他人主页时取对方的年度出勤（不传则默认自己）
+    target_id = request.args.get("user_id")
+    if target_id:
+        other = UserModel.query.get(int(target_id))
+        if other:
+            user = other
     # 个人年度日历：单用户当年记录仅几百~两千行、date 有索引、毫秒级，无需缓存。
     # 去掉缓存后每次请求直查 DB，新打卡立即可见；同时消除 key 不带年份的跨年串味隐患。
     now = datetime.now()
