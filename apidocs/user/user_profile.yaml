@@ -1,0 +1,22 @@
+查询任意用户的公开资料
+---
+tags:
+  - 用户模块
+
+parameters:
+  - name: user_id
+    in: path
+    type: integer
+    required: true
+    description: 用户 id
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+responses:
+  200:
+    description: 获取用户资料成功（不含邮箱/学号，附带学习统计）
+  404:
+    description: 用户不存在

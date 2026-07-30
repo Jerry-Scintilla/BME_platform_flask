@@ -1,4 +1,6 @@
 import os
+from collections import defaultdict
+from datetime import datetime, timedelta
 from flask import Blueprint, request, redirect, jsonify
 import base64
 
@@ -132,6 +134,86 @@ def user_index():
         "role": user.role,
         "role_rank": user.role_rank,
         "permissions": get_user_permissions(user.id),
+    }
+    return jsonify(data)
+
+
+# 查询任意用户的公开资料（按 id）—— 排行榜/社区点击进个人主页用
+# 与 user_index 对齐字段，但剔除邮箱/学号等隐私项；附带学习统计
+@bp.route("/profile/<int:user_id>")
+@jwt_required()
+@swag_from('../apidocs/user/user_profile.yaml')
+def user_profile(user_id):
+    """按 user_id 返回某用户的公开主页资料（不含邮箱/学号）+ 学习统计"""
+    user = UserModel.query.get(int(user_id))
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    join_time = user.join_time.strftime('%Y-%m-%d') if user.join_time else None
+
+    # —— 学习统计：复用 records/my_stats 的 CheckRecord 聚合写法 ——
+    now = datetime.now()
+
+    # 累计出勤天数（按 date 去重）+ 累计学习时长
+    all_records = CheckRecord.query.filter(
+        CheckRecord.user_id == user.id,
+        CheckRecord.duration != None
+    ).all()
+    attendance_dates = {r.date for r in all_records if r.date}
+    total_days = len(attendance_dates)
+    total_hours = round(sum((r.duration or 0) for r in all_records), 2)
+
+    # 本月时长
+    first_day = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day = (first_day + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    month_records = CheckRecord.query.filter(
+        CheckRecord.user_id == user.id,
+        CheckRecord.date >= first_day.date(),
+        CheckRecord.date <= last_day.date(),
+        CheckRecord.duration != None
+    ).all()
+    month_hours = round(sum((r.duration or 0) for r in month_records), 2)
+
+    # 本月排名（全用户本月时长排序定位；无记录则为 None）
+    all_month_records = CheckRecord.query.filter(
+        CheckRecord.date >= first_day.date(),
+        CheckRecord.date <= last_day.date(),
+        CheckRecord.duration != None
+    ).all()
+    user_month_hours = defaultdict(float)
+    for r in all_month_records:
+        user_month_hours[r.user_id] += r.duration or 0
+    sorted_users = sorted(user_month_hours.items(), key=lambda x: x[1], reverse=True)
+    month_rank = None
+    for rank, (uid, _hours) in enumerate(sorted_users, 1):
+        if uid == user.id:
+            month_rank = rank
+            break
+
+    data = {
+        "code": 200,
+        "message": "获取用户资料成功",
+        "User_Name": user.username,
+        "User_Medal": user.medal,
+        "User_Stage": user.study_stage,
+        "User_Mode": user.user_mode,
+        "join_time": join_time,
+        "User_Id": str(user.id).zfill(7),
+        "Introduction": user.introduction,
+        "User_Sex": user.sex,
+        "Institute": user.institute,
+        "Major": user.major,
+        "Github_Id": user.github_id,
+        "Skill_Tags": user.skill_tags,
+        "College": user.college,
+        "role": user.role,
+        "role_rank": user.role_rank,
+        "data": {
+            "total_days": total_days,
+            "total_hours": total_hours,
+            "month_hours": month_hours,
+            "month_rank": month_rank,
+        },
     }
     return jsonify(data)
 
