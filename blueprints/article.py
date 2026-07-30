@@ -6,7 +6,7 @@ import calendar, time, os
 from exts import db
 
 # 导入数据库表
-from models import ArticleModel, UserModel, ArticleComment
+from models import ArticleModel, UserModel, ArticleComment, DiscussionThread
 
 # 导入表单验证
 from .forms import ArticleForm
@@ -210,6 +210,49 @@ def article_list():
         data.append(b_list)
 
     return jsonify(data)
+
+
+# 某用户发布的文章列表（个人主页用；字段对齐社区 feed 文章项，前端直接复用 ArticleCard）
+@bp.route("/article/by_author/<int:user_id>")
+def article_by_author(user_id):
+    articles = ArticleModel.query.filter_by(author_id=user_id)\
+        .order_by(ArticleModel.publish_time.desc()).all()
+
+    # 批量取每篇文章的评论数（scope=article 的 thread reply_count 之和，与 community feed 同口径）
+    reply_map = {}
+    if articles:
+        article_ids = [a.id for a in articles]
+        for t in DiscussionThread.query.filter(
+            DiscussionThread.scope_type == 'article',
+            DiscussionThread.scope_id.in_(article_ids),
+            DiscussionThread.status == DiscussionThread.STATUS_NORMAL
+        ).all():
+            reply_map[t.scope_id] = reply_map.get(t.scope_id, 0) + (t.reply_count or 0)
+
+    host = request.host_url.rstrip('/')
+    data = []
+    for a in articles:
+        au = a.author.avatar_url if a.author else None
+        avatar = ''
+        if au:
+            avatar = au if au.startswith('http') else f"{host}/data/avatars/{au}"
+        data.append({
+            "type": "article",
+            "id": a.id,
+            "article_id": a.id,
+            "title": a.title,
+            "summary": (a.introduction or '')[:200],
+            "author_id": a.author_id,
+            "author_name": a.author.username if a.author else "",
+            "author_avatar": avatar,
+            "created_at": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else "",
+            "like_count": 0,
+            "reply_count": reply_map.get(a.id, 0),
+            "view_count": 0,
+            "liked": False,
+            "is_pinned": False,
+        })
+    return jsonify({"code": 200, "data": data}), 200
 
 
 # 文章内容发送（html）
