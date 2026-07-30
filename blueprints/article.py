@@ -244,6 +244,7 @@ def article():
         "Article_Id": article_id,
         "Article_Title": article.title,
         "Article_Author": article.author.username,
+        "Article_Author_Id": article.author_id,
         "Article_Author_Avatar": author_avatar,
         "Publish_Time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
         "Article_Introduction": article.introduction,
