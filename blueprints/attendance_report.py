@@ -189,7 +189,7 @@ def build_csv(data):
 # ────────────────────────────────────────
 
 def _get_recipient_user_ids():
-    """返回拥有 attendance_report.recipient 权限的 user_id 列表。"""
+    """返回拥有 attendance_report_recipient 权限的 user_id 列表。"""
     perm = PermissionModel.query.filter_by(name=RECIPIENT_PERMISSION).first()
     if not perm:
         return []
@@ -348,10 +348,10 @@ def init_scheduler(app):
 @bp.route("/recipients", methods=["GET"])
 @jwt_required()
 def list_recipients():
-    """查看当前出勤报告收件人（拥有 attendance_report.recipient 权限的用户）。仅管理员。
+    """查看当前出勤报告收件人（拥有 attendance_report_recipient 权限的用户）。仅管理员。
 
     增删收件人请用 /permission/assign 与 /permission/revoke
-    （传 permission_name='attendance_report.recipient' 或对应 permission_id）。
+    （传 permission_name='attendance_report_recipient' 或对应 permission_id）。
     """
     user = UserModel.query.filter_by(email=get_jwt_identity()).first()
     if not user:

@@ -43,6 +43,6 @@ LITELLM_DEFAULT_MAX_BUDGET = float(os.getenv("LITELLM_DEFAULT_MAX_BUDGET", "5"))
 LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "30d")
 
 # 每日出勤报告（00:00 自动汇总昨日出勤并发邮件）
-# 收件人通过 RBAC 权限 attendance_report.recipient 管理（见 /permission/assign）
+# 收件人通过 RBAC 权限 attendance_report_recipient 管理（见 /permission/assign）
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
 ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shanghai")
