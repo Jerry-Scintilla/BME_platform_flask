@@ -364,9 +364,18 @@ def get_thread(thread_id):
     if not can_view_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限查看"}), 403
 
-    # 增加浏览计数
-    thread.view_count += 1
-    db.session.commit()
+    # 增加浏览计数（按用户去重：同一用户对同一帖子只计一次，避免刷新社区广场反复 +1）
+    # 复用 DiscussionReaction(target_type=thread, reaction_type=view) 作为浏览印记，
+    # 其 (user_id, target_type, target_id, reaction_type) 唯一约束天然保证幂等。
+    viewed = DiscussionReaction.query.filter_by(
+        user_id=user.id, target_type='thread', target_id=thread_id, reaction_type='view'
+    ).first()
+    if not viewed:
+        thread.view_count += 1
+        db.session.add(DiscussionReaction(
+            user_id=user.id, target_type='thread', target_id=thread_id, reaction_type='view'
+        ))
+        db.session.commit()
 
     return jsonify({
         "code": 200,
@@ -626,20 +635,39 @@ def list_replies(thread_id):
 
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
 
-    result = []
+    # 预取每个顶级回复的正常子回复（避免下面逐条重复查询，也便于批量取点赞状态）
+    top_replies = []
     for reply in pagination.items:
-        # 获取子回复（楼中楼）
-        children = []
-        for child in reply.children.filter_by(status=DiscussionReply.STATUS_NORMAL).all():
-            children.append({
-                "id": child.id,
-                "author_id": child.author_id,
-                "author_name": child.author.username if child.author else "",
-                "author_avatar": get_avatar_url(child.author.avatar_url) if child.author else "",
-                "content": child.content,
-                "like_count": child.like_count,
-                "created_at": child.created_at.strftime('%Y-%m-%d %H:%M:%S')
-            })
+        children = reply.children.filter_by(status=DiscussionReply.STATUS_NORMAL).all()
+        top_replies.append((reply, children))
+
+    # 批量查当前用户对本页回复（含楼中楼）的点赞状态，组装时回填 liked 字段
+    all_reply_ids = [r.id for r, _ in top_replies]
+    for _, children in top_replies:
+        all_reply_ids.extend(c.id for c in children)
+
+    liked_ids = set()
+    if all_reply_ids:
+        liked_rows = DiscussionReaction.query.filter(
+            DiscussionReaction.user_id == user.id,
+            DiscussionReaction.target_type == 'reply',
+            DiscussionReaction.target_id.in_(all_reply_ids),
+            DiscussionReaction.reaction_type == 'like'
+        ).all()
+        liked_ids = {row.target_id for row in liked_rows}
+
+    result = []
+    for reply, children in top_replies:
+        children_data = [{
+            "id": c.id,
+            "author_id": c.author_id,
+            "author_name": c.author.username if c.author else "",
+            "author_avatar": get_avatar_url(c.author.avatar_url) if c.author else "",
+            "content": c.content,
+            "like_count": c.like_count,
+            "liked": c.id in liked_ids,
+            "created_at": c.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        } for c in children]
 
         result.append({
             "id": reply.id,
@@ -648,8 +676,9 @@ def list_replies(thread_id):
             "author_avatar": get_avatar_url(reply.author.avatar_url) if reply.author else "",
             "content": reply.content,
             "like_count": reply.like_count,
+            "liked": reply.id in liked_ids,
             "created_at": reply.created_at.strftime('%Y-%m-%d %H:%M:%S'),
-            "children": children
+            "children": children_data
         })
 
     return jsonify({
