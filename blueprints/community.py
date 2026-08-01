@@ -112,6 +112,24 @@ def community_feed():
             cur = article_last_reply_map.get(sid)
             article_last_reply_map[sid] = t.last_reply_at if cur is None else max(cur, t.last_reply_at)
 
+    # 3) V2 文章互动数（reply/like/view）+ thread_id 映射；只读，绝不在此为 v2 文章新建 thread
+    v2_reply_map = {}
+    v2_like_map = {}
+    v2_view_map = {}
+    v2_thread_id_map = {}
+    v2_last_reply_map = {}
+    for t in DiscussionThread.query.filter_by(
+        scope_type='article_v2', status=DiscussionThread.STATUS_NORMAL
+    ).all():
+        sid = t.scope_id
+        v2_reply_map[sid] = v2_reply_map.get(sid, 0) + (t.reply_count or 0)
+        v2_like_map[sid] = v2_like_map.get(sid, 0) + (t.like_count or 0)
+        v2_view_map[sid] = v2_view_map.get(sid, 0) + (t.view_count or 0)
+        v2_thread_id_map[sid] = t.id
+        if t.last_reply_at is not None:
+            cur = v2_last_reply_map.get(sid)
+            v2_last_reply_map[sid] = t.last_reply_at if cur is None else max(cur, t.last_reply_at)
+
     items = []
 
     # ── 1. global 讨论帖（与 list_threads 权限口径一致） ──
@@ -179,10 +197,18 @@ def community_feed():
         })
 
     # ── 3. V2 文章（Markdown，article_v2 表；与旧文章同格式并入信息流） ──
-    # V2 第一版无评论/点赞统计：reply/like/view 均为 0，仅按发布时间参与排序
+    # 互动数取自上方预取的 v2_*_map（scope_type='article_v2' 的 thread）；无 thread 的文章显示 0
     for a in ArticleV2Model.query.all():
         if content_type == 'discussion':
             continue
+        rc = v2_reply_map.get(a.id, 0)
+        lc = v2_like_map.get(a.id, 0)
+        tid = v2_thread_id_map.get(a.id)
+        vc = v2_view_map.get(a.id, 0)
+        rank_dt = a.publish_time
+        last_rep = v2_last_reply_map.get(a.id)
+        if last_rep is not None:
+            rank_dt = last_rep if rank_dt is None else max(rank_dt, last_rep)
         items.append({
             "type": "article",
             "id": a.id,
@@ -192,16 +218,16 @@ def community_feed():
             "author_name": a.author.username if a.author else "",
             "author_avatar": get_avatar_url(a.author.avatar_url) if a.author else "",
             "created_at": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else "",
-            "like_count": 0,
-            "reply_count": 0,                       # V2 第一版无评论
-            "view_count": 0,
-            "liked": False,
+            "like_count": lc,
+            "reply_count": rc,
+            "view_count": vc,
+            "liked": (tid in liked_thread_ids) if tid else False,
             "is_pinned": False,
             "article_id": a.id,
             "article_version": 2,                   # 前端据此跳 /article-v2
-            "_interaction": 0,
-            "_rank_dt": a.publish_time or now,
-            "_article_reply_count": 0,
+            "_interaction": lc + 2 * rc,            # 与 v1 文章口径对齐：赞 + 2*评
+            "_rank_dt": rank_dt or now,
+            "_article_reply_count": rc,
         })
 
     # 排序：置顶(is_pinned)绝对优先 → 热度分(hot)或活跃时间(latest) → 确定性平局打破

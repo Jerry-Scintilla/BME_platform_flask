@@ -10,8 +10,13 @@ from flask import Blueprint, request, jsonify
 import wtforms
 from wtforms.validators import length
 
+from sqlalchemy import and_, or_
+
 from exts import db
-from models import ArticleV2Model, UserModel, PermissionModel, UserPermissionModel
+from models import (
+    ArticleV2Model, UserModel, PermissionModel, UserPermissionModel,
+    DiscussionThread, DiscussionReply, DiscussionReaction,
+)
 
 # 导入token验证模块
 from flask_jwt_extended import get_jwt_identity, jwt_required
@@ -113,6 +118,14 @@ def article_v2_get(article_id):
     if article.author and article.author.avatar_url:
         au = article.author.avatar_url
         author_avatar = au if au.startswith('http') else request.host_url.rstrip('/') + '/data/avatars/' + au
+    # 互动计数：取该 v2 文章的汇总 thread（只读，不创建）；匿名阅读页也能直接拿到
+    thread = DiscussionThread.query.filter_by(
+        scope_type='article_v2', scope_id=article_id,
+        status=DiscussionThread.STATUS_NORMAL
+    ).order_by(DiscussionThread.created_at.asc()).first()
+    reply_count = thread.reply_count if thread else 0
+    like_count = thread.like_count if thread else 0
+    view_count = thread.view_count if thread else 0
     return jsonify({
         "code": 200,
         "message": "获取文章详情成功",
@@ -125,6 +138,9 @@ def article_v2_get(article_id):
             "author_id": article.author_id,
             "author_name": article.author.username if article.author else "",
             "author_avatar": author_avatar,
+            "reply_count": reply_count,
+            "like_count": like_count,
+            "view_count": view_count,
         }
     })
 
@@ -156,7 +172,7 @@ def article_v2_edit(article_id):
     return jsonify({"code": 200, "message": "文章编辑成功"})
 
 
-# 删除文章（V2 第一版无评论关系，仅删记录）
+# 删除文章（连同其 discussion 互动数据：thread / replies / reactions，软关联需手工清）
 @bp.route("/<int:article_id>/delete", methods=["POST"])
 @jwt_required()
 @audit_log(operation="删除文章")
@@ -168,6 +184,26 @@ def article_v2_delete(article_id):
     check = _ensure_article_access(_current_user(), article)
     if check:
         return check
+
+    # 清理该 v2 文章的 discussion 互动（scope_type/target_type 均为软关联，无 DB FK 级联）
+    v2_threads = DiscussionThread.query.filter_by(
+        scope_type='article_v2', scope_id=article_id
+    ).all()
+    thread_ids = [t.id for t in v2_threads]
+    reply_ids = [r.id for t in v2_threads
+                 for r in DiscussionReply.query.filter_by(thread_id=t.id).all()]
+    conds = []
+    if thread_ids:
+        conds.append(and_(DiscussionReaction.target_type == 'thread',
+                          DiscussionReaction.target_id.in_(thread_ids)))
+    if reply_ids:
+        conds.append(and_(DiscussionReaction.target_type == 'reply',
+                          DiscussionReaction.target_id.in_(reply_ids)))
+    if conds:
+        DiscussionReaction.query.filter(or_(*conds)).delete(synchronize_session=False)
+    for t in v2_threads:
+        db.session.delete(t)   # replies 由 DiscussionThread.replies cascade=all,delete-orphan 连带删
+
     db.session.delete(article)
     db.session.commit()
     return jsonify({"code": 200, "message": "文章删除成功"})

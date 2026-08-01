@@ -93,6 +93,14 @@ def can_view_thread(thread, user):
         # TODO: 根据文章可见性判断
         return True
 
+    # article_v2: V2 文章（Markdown）评论区，与 v1 同口径
+    if thread.scope_type == 'article_v2':
+        from models import ArticleV2Model
+        article = ArticleV2Model.query.get(thread.scope_id)
+        if not article:
+            return False
+        return True
+
     return False
 
 
@@ -117,8 +125,8 @@ def can_post_thread(scope_type, scope_id, user):
     if scope_type == 'task':
         return True
 
-    # article: 文章评论区，登录用户均可参与
-    if scope_type == 'article':
+    # article / article_v2: 文章评论区，登录用户均可参与
+    if scope_type in ('article', 'article_v2'):
         return True
 
     if scope_type == 'course':
@@ -188,6 +196,48 @@ def get_or_create_article_thread(article_id):
     }), 200
 
 
+# 获取或创建某篇 V2 文章的评论汇总 thread（scope=article_v2）
+@bp.route("/article_v2/<int:article_id>/thread", methods=["GET"])
+@jwt_required()
+def get_or_create_article_v2_thread(article_id):
+    """V2 文章评论区：获取/创建该文章的汇总 thread，评论挂在其 replies 下"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户不存在"}), 401
+
+    from models import ArticleV2Model
+    article = ArticleV2Model.query.get(article_id)
+    if not article:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+
+    thread = DiscussionThread.query.filter_by(
+        scope_type='article_v2',
+        scope_id=article_id,
+        status=DiscussionThread.STATUS_NORMAL
+    ).order_by(DiscussionThread.created_at.asc()).first()
+
+    if not thread:
+        thread = DiscussionThread(
+            title=f"文章评论 · {article.title}",
+            content="该文章的评论区（系统自动创建）",
+            scope_type='article_v2',
+            scope_id=article_id,
+            author_id=user.id
+        )
+        db.session.add(thread)
+        db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "data": {
+            "thread_id": thread.id,
+            "article_id": article_id,
+            "reply_count": thread.reply_count,
+            "like_count": thread.like_count
+        }
+    }), 200
+
+
 # 创建主题帖 POST /discussions/threads
 @bp.route("/threads", methods=["POST"])
 @jwt_required()
@@ -210,7 +260,7 @@ def create_thread():
         return jsonify({"code": 400, "message": "标题和内容不能为空"}), 400
 
     # 校验 scope_type
-    valid_scopes = ['global', 'article', 'course', 'group', 'task']
+    valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task']
     if scope_type not in valid_scopes:
         return jsonify({"code": 400, "message": f"scope_type 必须为: {', '.join(valid_scopes)}"}), 400
 
@@ -873,8 +923,8 @@ def my_article_favorites():
     if not user:
         return jsonify({"code": 401, "message": "用户不存在"}), 401
 
-    from models import ArticleModel
-    # 用户 bookmark 的 article-scope threads
+    from models import ArticleModel, ArticleV2Model
+    # 用户 bookmark 的 article / article_v2 scope threads
     rows = db.session.query(DiscussionThread, DiscussionReaction).join(
         DiscussionReaction,
         and_(
@@ -884,16 +934,22 @@ def my_article_favorites():
         )
     ).filter(
         DiscussionReaction.user_id == user.id,
-        DiscussionThread.scope_type == 'article',
+        DiscussionThread.scope_type.in_(['article', 'article_v2']),
     ).order_by(DiscussionReaction.created_at.desc()).all()
 
     result = []
     for thread, reaction in rows:
-        article = ArticleModel.query.get(thread.scope_id)
+        if thread.scope_type == 'article_v2':
+            article = ArticleV2Model.query.get(thread.scope_id)
+            version = 2
+        else:
+            article = ArticleModel.query.get(thread.scope_id)
+            version = 1
         if not article:
             continue
         result.append({
             "article_id": article.id,
+            "article_version": version,
             "title": article.title,
             "introduction": article.introduction,
             "author": article.author.username if article.author else '',
