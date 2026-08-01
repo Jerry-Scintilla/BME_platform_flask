@@ -3,7 +3,7 @@ from flask_cors import cross_origin
 from datetime import datetime
 
 from exts import db
-from models import UserModel, DiscussionThread, DiscussionReaction, ArticleModel
+from models import UserModel, DiscussionThread, DiscussionReaction, ArticleModel, ArticleV2Model
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
 bp = Blueprint("community", __name__, url_prefix="/community")
@@ -176,6 +176,32 @@ def community_feed():
             "_interaction": 2 * rc,
             "_rank_dt": rank_dt or now,
             "_article_reply_count": rc,            # 确定性平局打破
+        })
+
+    # ── 3. V2 文章（Markdown，article_v2 表；与旧文章同格式并入信息流） ──
+    # V2 第一版无评论/点赞统计：reply/like/view 均为 0，仅按发布时间参与排序
+    for a in ArticleV2Model.query.all():
+        if content_type == 'discussion':
+            continue
+        items.append({
+            "type": "article",
+            "id": a.id,
+            "title": a.title,
+            "summary": (a.introduction or '')[:200],
+            "author_id": a.author_id,
+            "author_name": a.author.username if a.author else "",
+            "author_avatar": get_avatar_url(a.author.avatar_url) if a.author else "",
+            "created_at": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else "",
+            "like_count": 0,
+            "reply_count": 0,                       # V2 第一版无评论
+            "view_count": 0,
+            "liked": False,
+            "is_pinned": False,
+            "article_id": a.id,
+            "article_version": 2,                   # 前端据此跳 /article-v2
+            "_interaction": 0,
+            "_rank_dt": a.publish_time or now,
+            "_article_reply_count": 0,
         })
 
     # 排序：置顶(is_pinned)绝对优先 → 热度分(hot)或活跃时间(latest) → 确定性平局打破
