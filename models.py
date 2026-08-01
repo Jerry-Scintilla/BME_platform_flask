@@ -105,6 +105,23 @@ class ArticleModel(db.Model):
     author = db.relationship(UserModel, backref="articles")
 
 
+class ArticleV2Model(db.Model):
+    """文章 V2：正文存 Markdown（content_md 字段，不写文件）。
+
+    与旧 ArticleModel 完全隔离（独立表 article_v2）。backref 用 articles_v2，
+    避免与 ArticleModel 的 backref="articles" 在 UserModel 上冲突。
+    """
+    __tablename__ = 'article_v2'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    title = db.Column(db.String(100), nullable=False)
+    introduction = db.Column(db.Text, nullable=False)
+    content_md = db.Column(db.Text, nullable=False)  # Markdown 正文，不写文件
+    publish_time = db.Column(db.DateTime, default=datetime.now)
+    # 外键
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    author = db.relationship(UserModel, backref="articles_v2")
+
+
 class CourseModel(db.Model):
     __tablename__ = 'course'
     STATUS_NORMAL = 'normal'

@@ -1,0 +1,36 @@
+发布文章（V2，存 Markdown）
+---
+tags:
+  - 文章模块V2
+consumes:
+  - application/json
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: Bearer token
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      required: [title, introduction, content_md]
+      properties:
+        title:
+          type: string
+          description: 文章标题
+        introduction:
+          type: string
+          description: 文章简介
+        content_md:
+          type: string
+          description: 文章正文（Markdown）
+
+responses:
+  200:
+    description: 文章发布成功，返回新文章 id
+  400:
+    description: 字段校验失败
+  401:
+    description: 用户不存在

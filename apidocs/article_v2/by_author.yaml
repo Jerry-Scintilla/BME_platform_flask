@@ -1,0 +1,14 @@
+某用户的文章列表（V2）
+---
+tags:
+  - 文章模块V2
+parameters:
+  - name: user_id
+    in: path
+    type: integer
+    required: true
+    description: 用户 id
+
+responses:
+  200:
+    description: 返回 {code, data:[...]}

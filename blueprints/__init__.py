@@ -315,6 +315,7 @@ from .user import bp as user_bp
 from .course import bp as course_bp
 from .course_group import bp as course_group_bp
 from .article import bp as article_bp
+from .article_v2 import bp as article_v2_bp
 from .medal import bp as medal_bp
 from .codecheck import bp as codecheck_bp
 from .homeCover import bp as homeCover_bp
@@ -337,6 +338,7 @@ __all__ = [
     'course_bp',
     'course_group_bp',
     'article_bp',
+    'article_v2_bp',
     'medal_bp',
     'codecheck_bp',
     'homeCover_bp',

@@ -1,0 +1,38 @@
+编辑文章（V2，改 title/introduction/content_md）
+---
+tags:
+  - 文章模块V2
+consumes:
+  - application/json
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: Bearer token
+  - name: article_id
+    in: path
+    type: integer
+    required: true
+    description: 文章 id
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      properties:
+        title:
+          type: string
+        introduction:
+          type: string
+        content_md:
+          type: string
+          description: 文章正文（Markdown）
+
+responses:
+  200:
+    description: 文章编辑成功
+  403:
+    description: 用户权限不足
+  404:
+    description: 文章不存在

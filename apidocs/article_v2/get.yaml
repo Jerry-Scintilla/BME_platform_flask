@@ -1,0 +1,16 @@
+获取文章详情（V2，返回 Markdown 正文）
+---
+tags:
+  - 文章模块V2
+parameters:
+  - name: article_id
+    in: path
+    type: integer
+    required: true
+    description: 文章 id
+
+responses:
+  200:
+    description: 获取文章详情成功
+  404:
+    description: 文章不存在
