@@ -311,9 +311,9 @@ def article():
     article = ArticleModel.query.filter_by(id=article_id).first()
     if article is None:
         return jsonify({
-            "code": 401,
+            "code": 404,
             "message": '文章不存在'
-        }), 401
+        }), 404
     path = article.url
     article_path = './data/article/' + path
     # print(article_path)
