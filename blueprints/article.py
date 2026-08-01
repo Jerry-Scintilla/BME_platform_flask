@@ -6,7 +6,7 @@ import calendar, time, os
 from exts import db
 
 # 导入数据库表
-from models import ArticleModel, UserModel, ArticleComment, DiscussionThread
+from models import ArticleModel, UserModel, ArticleComment, DiscussionThread, PermissionModel, UserPermissionModel
 
 # 导入表单验证
 from .forms import ArticleForm
@@ -18,14 +18,36 @@ from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_requi
 from flasgger import swag_from
 
 # 导入权限检查模块
-from . import check_permission, audit_log
+from . import check_permission, audit_log, _current_user
 
 bp = Blueprint("article", __name__, url_prefix="")
+
+def _is_article_manager(user):
+    """super_admin 直通；其余查 ACL 是否授予 article_management（逻辑同 check_permission）"""
+    if not user:
+        return False
+    if user.is_admin_like():
+        return True
+    permission = PermissionModel.query.filter_by(name='article_management').first()
+    if not permission:
+        return False
+    return UserPermissionModel.query.filter_by(
+        user_id=user.id, permission_id=permission.id
+    ).first() is not None
+
+
+def _ensure_article_access(user, article):
+    """文章管理权限或作者本人放行，否则返回 403 响应"""
+    if article is None:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+    if _is_article_manager(user) or article.author_id == user.id:
+        return None
+    return jsonify({"code": 403, "message": "用户权限不足"}), 403
+
 
 # 创建文章简介
 @bp.route("/article/public", methods=["POST"])
 @jwt_required()
-@check_permission('article_management')
 @audit_log(operation="创建文章")
 @swag_from('../apidocs/article/article_public.yaml')
 def article_public():
@@ -52,6 +74,11 @@ def article_public():
                 return jsonify({
                     "code": 403,
                     'message': '没有发送Html内容'
+                }), 400
+            if len(html_content) > 500000:
+                return jsonify({
+                    "code": 400,
+                    'message': '文章内容过长（上限 50 万字符）'
                 }), 400
             url = article.url
             name = title
@@ -120,7 +147,6 @@ def article_detail():
 # 创建文章详情（以json格式接收html）
 @bp.route("/article/detail_json", methods=["POST"])
 @jwt_required()
-@check_permission('article_management')
 @swag_from('../apidocs/article/article_detail_json.yaml')
 def article_detail_json():
     try:
@@ -135,13 +161,26 @@ def article_detail_json():
                 "code": 400,
                 'message': '没有发送Html内容'
             }), 400
+        if len(html_content) > 500000:
+            return jsonify({
+                "code": 400,
+                'message': '文章内容过长（上限 50 万字符）'
+            }), 400
         article = ArticleModel.query.filter_by(id=article_id).first()
+        if article is None:
+            return jsonify({
+                "code": 400,
+                "message": '文章不存在'
+            }), 400
+        check = _ensure_article_access(_current_user(), article)
+        if check:
+            return check
         url = article.url
         name = article_title
         if url:
             os.remove('./data/article/' + url)
 
-        article_name = article_id + '_' + name
+        article_name = str(article_id) + '_' + name
         file_path = os.path.join('./data/article', f"{article_name}.html")
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -164,7 +203,6 @@ def article_detail_json():
 
 @bp.route("/article/delete", methods=["POST"])
 @jwt_required()
-@check_permission('article_management')
 @audit_log(operation="删除文章")
 @swag_from('../apidocs/article/article_delete.yaml')
 def article_delete():
@@ -178,8 +216,13 @@ def article_delete():
             'message': "找不到该文章"
         }), 400
 
+    check = _ensure_article_access(_current_user(), article)
+    if check:
+        return check
+
     url = article.url
-    os.remove('./data/article/' + url)
+    if url:
+        os.remove('./data/article/' + url)
 
     # 删除文章统计量
     comments = ArticleComment.query.filter_by(article_id=article_id).all()
@@ -297,7 +340,6 @@ def article():
 
 @bp.route("/article/edit", methods=["POST"])
 @jwt_required()
-@check_permission('article_management')
 @audit_log(operation="编辑文章")
 @swag_from('../apidocs/article/article_edit.yaml')
 def article_edit():
@@ -311,6 +353,9 @@ def article_edit():
             "code": 400,
             "message": '文章不存在'
         }), 400
+    check = _ensure_article_access(_current_user(), article)
+    if check:
+        return check
     article.title = article_title
     article.introduction = article_introduction
     db.session.commit()
