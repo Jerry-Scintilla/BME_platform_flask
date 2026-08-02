@@ -110,13 +110,23 @@ class ArticleV2Model(db.Model):
 
     与旧 ArticleModel 完全隔离（独立表 article_v2）。backref 用 articles_v2，
     避免与 ArticleModel 的 backref="articles" 在 UserModel 上冲突。
+
+    status：draft（草稿，仅作者本人/管理员可见）/ published（已发布，公开）。
+    草稿的内容字段允许空；created_at/updated_at 记录创建与最后编辑；
+    publish_time 仅已发布文章有（草稿为 None）。
     """
     __tablename__ = 'article_v2'
+    STATUS_DRAFT = 'draft'
+    STATUS_PUBLISHED = 'published'
+
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    title = db.Column(db.String(100), nullable=False)
-    introduction = db.Column(db.Text, nullable=False)
-    content_md = db.Column(db.Text, nullable=False)  # Markdown 正文，不写文件
-    publish_time = db.Column(db.DateTime, default=datetime.now)
+    title = db.Column(db.String(100), nullable=True)        # 草稿允许空
+    introduction = db.Column(db.Text, nullable=True)        # 草稿允许空
+    content_md = db.Column(db.Text, nullable=True)          # Markdown 正文，不写文件；草稿允许空
+    status = db.Column(db.String(20), default=STATUS_PUBLISHED)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    publish_time = db.Column(db.DateTime, nullable=True)    # 仅已发布有；草稿为 None
     # 外键
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     author = db.relationship(UserModel, backref="articles_v2")

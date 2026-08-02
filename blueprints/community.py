@@ -198,7 +198,7 @@ def community_feed():
 
     # ── 3. V2 文章（Markdown，article_v2 表；与旧文章同格式并入信息流） ──
     # 互动数取自上方预取的 v2_*_map（scope_type='article_v2' 的 thread）；无 thread 的文章显示 0
-    for a in ArticleV2Model.query.all():
+    for a in ArticleV2Model.query.filter_by(status=ArticleV2Model.STATUS_PUBLISHED).all():
         if content_type == 'discussion':
             continue
         rc = v2_reply_map.get(a.id, 0)
