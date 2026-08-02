@@ -1,3 +1,8 @@
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
 # flask-sqlalchemy
 from flask_sqlalchemy import SQLAlchemy
 # flask_mail
@@ -13,7 +18,7 @@ mail = Mail()
 
 limiter = Limiter(
     key_func=get_remote_address,  # 使用客户端 IP 作为限流键
-    storage_uri="redis://localhost:6379/0",  # 使用 Redis 作为存储后端
+    storage_uri=os.getenv("REDIS_URL", "redis://localhost:6379/0"),  # 从环境变量读取 Redis 地址（含密码）
     storage_options={"socket_connect_timeout": 30},  # Redis 连接选项
     strategy="fixed-window",  # 限流策略
 )
