@@ -173,6 +173,8 @@ def user_profile(user_id):
         CheckRecord.duration != None
     ).all()
     month_hours = round(sum((r.duration or 0) for r in month_records), 2)
+    # 本月出勤天数（按 date 去重，与累计 total_days 区分）
+    month_days = len({r.date for r in month_records if r.date})
 
     # 本月排名（全用户本月时长排序定位；无记录则为 None）
     all_month_records = CheckRecord.query.filter(
@@ -211,6 +213,7 @@ def user_profile(user_id):
         "data": {
             "total_days": total_days,
             "total_hours": total_hours,
+            "month_days": month_days,
             "month_hours": month_hours,
             "month_rank": month_rank,
         },

@@ -557,6 +557,9 @@ def get_my_records_stats():
 
     month_hours = sum(record.duration or 0 for record in month_records)
 
+    # 本月出勤天数（按 date 去重，与 total_days 的累计口径区分）
+    month_days = len({record.date for record in month_records if record.date})
+
     # 3. 获取本月排名
     # 先计算所有用户的本月时长
     all_month_records = CheckRecord.query.filter(
@@ -581,6 +584,7 @@ def get_my_records_stats():
         "code": 200,
         "data": {
             "total_days": total_days,
+            "month_days": month_days,
             "month_hours": round(month_hours, 2),
             "month_rank": my_rank
         }
