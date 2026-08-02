@@ -40,8 +40,8 @@ def get_avatar_url(avatar_url):
         return ""
     if avatar_url.startswith('http://') or avatar_url.startswith('https://'):
         return avatar_url
-    base_url = request.host_url.rstrip('/')
-    return f"{base_url}/data/avatars/{avatar_url}"
+    # 相对路径：浏览器按当前页 origin 解析，避免绝对 URL 的 host/端口在反代/端口转发下失配
+    return f"/data/avatars/{avatar_url}"
 
 
 # ==================== 热度排序 ====================

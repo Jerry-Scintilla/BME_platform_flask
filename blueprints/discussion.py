@@ -31,9 +31,8 @@ def get_avatar_url(avatar_url):
     # 检查是否已经是完整URL
     if avatar_url.startswith('http://') or avatar_url.startswith('https://'):
         return avatar_url
-    # 添加前缀
-    base_url = request.host_url.rstrip('/')
-    return f"{base_url}/data/avatars/{avatar_url}"
+    # 相对路径：浏览器按当前页 origin 解析，避免反代/端口转发下 host/端口失配
+    return f"/data/avatars/{avatar_url}"
 
 
 # ==================== 权限辅助函数 ====================

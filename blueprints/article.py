@@ -272,13 +272,12 @@ def article_by_author(user_id):
         ).all():
             reply_map[t.scope_id] = reply_map.get(t.scope_id, 0) + (t.reply_count or 0)
 
-    host = request.host_url.rstrip('/')
     data = []
     for a in articles:
         au = a.author.avatar_url if a.author else None
         avatar = ''
         if au:
-            avatar = au if au.startswith('http') else f"{host}/data/avatars/{au}"
+            avatar = au if au.startswith('http') else f"/data/avatars/{au}"
         data.append({
             "type": "article",
             "id": a.id,
@@ -323,7 +322,7 @@ def article():
     author_avatar = ''
     if article.author and article.author.avatar_url:
         au = article.author.avatar_url
-        author_avatar = au if au.startswith('http') else request.host_url.rstrip('/') + '/data/avatars/' + au
+        author_avatar = au if au.startswith('http') else '/data/avatars/' + au
     return jsonify({
         "code": 200,
         "message": "获取文章详情成功",
