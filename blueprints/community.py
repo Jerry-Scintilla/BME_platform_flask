@@ -3,6 +3,7 @@ from flask_cors import cross_origin
 from datetime import datetime
 
 from exts import db
+from sqlalchemy.orm import joinedload
 from models import UserModel, DiscussionThread, DiscussionReaction, ArticleModel, ArticleV2Model
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
@@ -133,7 +134,7 @@ def community_feed():
     items = []
 
     # ── 1. global 讨论帖（与 list_threads 权限口径一致） ──
-    thread_query = DiscussionThread.query.filter(DiscussionThread.scope_type == 'global')
+    thread_query = DiscussionThread.query.filter(DiscussionThread.scope_type == 'global').options(joinedload(DiscussionThread.author))
     if not is_admin:
         thread_query = thread_query.filter(DiscussionThread.status != DiscussionThread.STATUS_DELETED)
     for t in thread_query.all():
@@ -165,7 +166,7 @@ def community_feed():
         })
 
     # ── 2. 文章（沿用 article_list 无可见性过滤，全部可见） ──
-    for a in ArticleModel.query.all():
+    for a in ArticleModel.query.options(joinedload(ArticleModel.author)).all():
         # 类型筛选：当前只要讨论时跳过文章
         if content_type == 'discussion':
             continue
@@ -198,7 +199,7 @@ def community_feed():
 
     # ── 3. V2 文章（Markdown，article_v2 表；与旧文章同格式并入信息流） ──
     # 互动数取自上方预取的 v2_*_map（scope_type='article_v2' 的 thread）；无 thread 的文章显示 0
-    for a in ArticleV2Model.query.filter_by(status=ArticleV2Model.STATUS_PUBLISHED).all():
+    for a in ArticleV2Model.query.options(joinedload(ArticleV2Model.author)).filter_by(status=ArticleV2Model.STATUS_PUBLISHED).all():
         if content_type == 'discussion':
             continue
         rc = v2_reply_map.get(a.id, 0)
