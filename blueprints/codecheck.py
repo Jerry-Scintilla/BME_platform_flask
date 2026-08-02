@@ -484,7 +484,7 @@ def records_top10():
 
     # 获取所有用户信息用于返回用户名
     users = UserModel.query.all()
-    user_info = {user.id: {"name": user.username, "id": user.id} for user in users}
+    user_info = {user.id: {"name": user.username, "id": user.id, "avatar_url": user.avatar_url} for user in users}
 
     # 按时长排序并取前10
     top_users = sorted(
@@ -504,10 +504,12 @@ def records_top10():
             minutes = 0
         formatted_duration = f"{hours}小时{minutes}分钟"
 
+        au = user_info.get(user_id, {}).get("avatar_url")
         result.append({
             "rank": rank,  # 添加排名字段
             "user_name": user_info.get(user_id, {}).get("name", ""),
             "user_id": user_info.get(user_id, {}).get("id", ""),
+            "avatar": f"/data/avatars/{au}" if au else "",  # 相对路径头像，无则前端首字兜底
             "total_duration": formatted_duration,
             "total_hours": round(total_hours, 2)
         })
