@@ -211,6 +211,15 @@ def session_update(sid):
             camp.expected_check_in = time.fromisoformat(d["expected_check_in"])
     except (ValueError, TypeError) as e:
         return jsonify({"code": 400, "message": f"参数格式错误: {e}"}), 400
+    # 同步冗余副本：改出勤时间/工时阈值后，已展开的 CampAttendancePlan 也跟着刷新，
+    # 否则 _eval_day 仍按旧副本判定迟到/工时（见 _eval_day），管理员改的设置不生效。
+    if d.get("expected_check_in") or "min_daily_hours" in d:
+        plans = CampAttendancePlan.query.filter_by(camp_session_id=sid).all()
+        for p in plans:
+            if d.get("expected_check_in"):
+                p.expected_check_in = camp.expected_check_in
+            if "min_daily_hours" in d:
+                p.min_daily_hours = camp.min_daily_hours
     db.session.commit()
     return jsonify({"code": 200, "message": "已更新", "session": _session_dict(camp)})
 
