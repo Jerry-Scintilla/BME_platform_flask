@@ -233,6 +233,23 @@ def article_v2_publish(article_id):
     return jsonify({"code": 200, "message": "文章发布成功", "id": article.id}), 200
 
 
+# 下架：已发布转草稿（admin 状态管理；publish_time 保留不重设，再次发布不覆盖）
+@bp.route("/<int:article_id>/unpublish", methods=["POST"])
+@jwt_required()
+@audit_log(operation="下架文章")
+def article_v2_unpublish(article_id):
+    article = ArticleV2Model.query.filter_by(id=article_id).first()
+    if article is None:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+    check = _ensure_article_access(_current_user(), article)
+    if check:
+        return check
+    if article.status != ArticleV2Model.STATUS_DRAFT:
+        article.status = ArticleV2Model.STATUS_DRAFT
+        db.session.commit()
+    return jsonify({"code": 200, "message": "文章已下架", "id": article.id}), 200
+
+
 # 获取文章详情（md 直接出字段，无需读文件）
 @bp.route("/<int:article_id>", methods=["GET"])
 @jwt_required(optional=True)
@@ -375,5 +392,28 @@ def article_v2_my():
     if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PUBLISHED):
         q = q.filter_by(status=status)
     articles = q.order_by(ArticleV2Model.updated_at.desc()).all()
+    data = [_article_to_dict(a) for a in articles]
+    return jsonify({"code": 200, "data": data}), 200
+
+
+# admin 列全部 v2 文章（全部作者 + 含草稿；?status=all|draft|published &q= &author_id=）
+@bp.route("/admin/list", methods=["GET"])
+@jwt_required()
+def article_v2_admin_list():
+    if not _is_article_manager(_current_user()):
+        return jsonify({"code": 403, "message": "需要文章管理权限"}), 403
+    status = request.args.get('status', 'all')
+    author_id = request.args.get('author_id', type=int)
+    kw = request.args.get('q', '', type=str).strip()
+    query = ArticleV2Model.query
+    if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PUBLISHED):
+        query = query.filter_by(status=status)
+    if author_id:
+        query = query.filter_by(author_id=author_id)
+    if kw:
+        like = f'%{kw}%'
+        query = query.filter(or_(ArticleV2Model.title.like(like),
+                                 ArticleV2Model.introduction.like(like)))
+    articles = query.order_by(ArticleV2Model.updated_at.desc()).all()
     data = [_article_to_dict(a) for a in articles]
     return jsonify({"code": 200, "data": data}), 200
