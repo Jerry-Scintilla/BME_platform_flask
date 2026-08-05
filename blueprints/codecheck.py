@@ -1,4 +1,5 @@
-import random, json
+import os, random, json, logging
+from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 from datetime import datetime, timedelta
 from . import format_duration, generate_date_range, build_result
@@ -19,6 +20,73 @@ from flasgger import swag_from
 from . import check_permission, audit_log
 
 bp = Blueprint("codecheck", __name__, url_prefix="")
+
+
+# ---------------------------------------------------------------------------
+# 重复签到防护 + 专属日志
+# ---------------------------------------------------------------------------
+# 背景：人脸/扫码签到存在 TOCTOU 竞态——同一用户在极短时间内（同秒）的两个并发
+# 请求都读到"无未签退记录"，各自 INSERT，产生重复签到，导致当日时长被重复计算。
+# 三层应对：
+#   1) Redis 短时防抖锁：吸收同秒并发/重试，窗口内第二个签到请求直接拒绝；
+#   2) 入库后探针：若仍出现"一人多条未签退"或"同一 check_in 多条"，记入专属日志
+#      （仅观测，不自动删，避免并发删冲突）——防抖被绕过（如 Redis 不可用）时的兜底；
+#   3) 专属日志文件 log/checkin_duplicate.log，便于事后排查与告警。
+CHECKIN_DEBOUNCE_SECONDS = int(os.getenv("CHECKIN_DEBOUNCE_SECONDS", "5"))
+
+_dup_logger = logging.getLogger("codecheck.duplicate")
+_dup_logger.setLevel(logging.INFO)
+_dup_logger.propagate = False
+if not _dup_logger.handlers:
+    _dup_handler = RotatingFileHandler(
+        "log/checkin_duplicate.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    _dup_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _dup_logger.addHandler(_dup_handler)
+
+
+def _checkin_debounce_key(user_id):
+    return f"check_in_debounce:{user_id}"
+
+
+def acquire_checkin_debounce(user_id, source):
+    """同一用户签到加短时防抖锁。返回 True=获锁可继续，False=窗口内重复应拒绝。"""
+    try:
+        ok = redis_client.set(_checkin_debounce_key(user_id), source,
+                              nx=True, ex=CHECKIN_DEBOUNCE_SECONDS)
+    except Exception as e:  # Redis 不可用：不阻断签到（靠探针兜底），但记录降级
+        _dup_logger.warning(f"DEBOUNCE_UNAVAILABLE user_id={user_id} source={source} err={e}")
+        return True
+    return bool(ok)
+
+
+def release_checkin_debounce(user_id):
+    """业务校验拒绝时释放防抖锁，避免误挡正当重试；成功签到不释放，靠过期。"""
+    try:
+        redis_client.delete(_checkin_debounce_key(user_id))
+    except Exception:
+        pass
+
+
+def log_checkin_duplicate(user_id, check_in_ts, source, extra=""):
+    """入库后探针：检测重复签到并记入专属日志（仅观测）。返回是否检出重复。"""
+    try:
+        open_count = CheckRecord.query.filter(
+            CheckRecord.user_id == user_id,
+            CheckRecord.check_out.is_(None)
+        ).count()
+        same_ts_count = CheckRecord.query.filter(
+            CheckRecord.user_id == user_id,
+            CheckRecord.check_in == check_in_ts
+        ).count()
+        if open_count > 1 or same_ts_count > 1:
+            _dup_logger.warning(
+                f"DUPLICATE_DETECTED user_id={user_id} source={source} "
+                f"open_count={open_count} same_checkin_count={same_ts_count} "
+                f"check_in={check_in_ts} {extra}".rstrip())
+            return True
+    except Exception as e:
+        _dup_logger.warning(f"TRIPWIRE_ERROR user_id={user_id} source={source} err={e}")
+    return False
 
 
 # 生成签码（管理员）
@@ -117,7 +185,15 @@ def check_in_out():
     now = datetime.now()
 
     # 处理签到/签退逻辑
+    _was_check_in = False
     if code_type == 'check_in':
+        # 防抖：吸收同秒并发/重试导致的重复签到
+        if not acquire_checkin_debounce(user.id, "check"):
+            _dup_logger.info(
+                f"DEBOUNCE_BLOCKED user_id={user.id} source=check "
+                f"ip={request.remote_addr} ua={request.headers.get('User-Agent', '')}")
+            return jsonify({"error": "签到处理中，请勿重复提交"}), 429
+        _was_check_in = True
         # 查找最近未签退的记录
         records = CheckRecord.query.filter(
             CheckRecord.user_id == user.id,
@@ -129,6 +205,7 @@ def check_in_out():
             latest_record = records[0]
             time_diff = (now - latest_record.check_in).total_seconds() / 3600
             if time_diff <= 6:
+                release_checkin_debounce(user.id)  # 业务拒绝，释放防抖锁
                 return jsonify({"error": "已有未签退记录且未超过6小时"}), 403
 
             # 超过6小时则删除所有未签退记录
@@ -170,6 +247,10 @@ def check_in_out():
 
     db.session.commit()
     invalidate_check_aggregate_cache()
+    # 入库后探针：防抖被绕过（如 Redis 不可用）时捕捉重复签到
+    if _was_check_in:
+        log_checkin_duplicate(user.id, now, "check",
+                              extra=f"ip={request.remote_addr} ua={request.headers.get('User-Agent', '')}")
 
     return jsonify({"message": "签到/签退成功"})
 
@@ -203,7 +284,15 @@ def face_check():
     now = datetime.now()
     
     # 处理签到/签退逻辑
+    _was_check_in = False
     if check_status == 'check_in':
+        # 防抖：吸收同秒并发/重试导致的重复签到
+        if not acquire_checkin_debounce(user.id, "face_check"):
+            _dup_logger.info(
+                f"DEBOUNCE_BLOCKED user_id={user.id} source=face_check email={target_email} "
+                f"ip={request.remote_addr} ua={request.headers.get('User-Agent', '')}")
+            return jsonify({"error": "签到处理中，请勿重复提交"}), 429
+        _was_check_in = True
         # 查找最近未签退的记录
         records = CheckRecord.query.filter(
             CheckRecord.user_id == user.id,
@@ -215,6 +304,7 @@ def face_check():
             latest_record = records[0]
             time_diff = (now - latest_record.check_in).total_seconds() / 3600
             if time_diff <= 6:
+                release_checkin_debounce(user.id)  # 业务拒绝，释放防抖锁
                 return jsonify({"error": "已有未签退记录且未超过 6 小时"}), 403
             
             # 超过 6 小时则删除所有未签退记录
@@ -254,6 +344,10 @@ def face_check():
     
     db.session.commit()
     invalidate_check_aggregate_cache()
+    # 入库后探针：防抖被绕过（如 Redis 不可用）时捕捉重复签到
+    if _was_check_in:
+        log_checkin_duplicate(user.id, now, "face_check",
+                              extra=f"email={target_email} ip={request.remote_addr} ua={request.headers.get('User-Agent', '')}")
 
     return jsonify({"message": "人脸签到/签退成功"})
 
