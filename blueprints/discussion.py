@@ -3,7 +3,7 @@ from flask_cors import cross_origin
 from sqlalchemy import and_, or_
 from datetime import datetime
 
-from exts import db
+from exts import db, redis_client
 from models import UserModel, DiscussionThread, DiscussionReply, DiscussionReaction, CourseGroup, CourseGroupMember
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
@@ -140,16 +140,14 @@ def can_post_thread(scope_type, scope_id, user):
 
 
 def can_moderate_thread(thread, user):
-    """检查用户是否可以管理主题帖（置顶/锁帖等）"""
+    """检查用户是否可以管理主题帖（置顶/锁帖等）。
+
+    仅管理员可置顶/锁帖——作者不再能管理自己的帖子（旧逻辑让作者可 pin/lock 自己的帖，
+    属自助置顶越权）。作者的删帖/编辑权限走各自端点的独立内联检查，不受此函数影响。
+    """
     if not user:
         return False
-
-    # 管理员可管理
-    if user.user_mode == 'admin':
-        return True
-
-    # 作者可管理自己的帖子
-    return thread.author_id == user.id
+    return user.user_mode == 'admin'
 
 
 # ==================== 主题帖 CRUD ====================
@@ -258,6 +256,12 @@ def create_thread():
     if not title or not content:
         return jsonify({"code": 400, "message": "标题和内容不能为空"}), 400
 
+    # 长度校验（strip 后计字符），挡 1 字灌水
+    if len((title or '').strip()) < 4:
+        return jsonify({"code": 400, "message": "标题至少 4 个字"}), 400
+    if len((content or '').strip()) < 10:
+        return jsonify({"code": 400, "message": "正文至少 10 个字"}), 400
+
     # 校验 scope_type
     valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task']
     if scope_type not in valid_scopes:
@@ -270,6 +274,25 @@ def create_thread():
     # 权限检查
     if not can_post_thread(scope_type, scope_id, user):
         return jsonify({"code": 403, "message": "无权限在此范围发帖"}), 403
+
+    # 频率限制：5 分钟 ≤ 3 帖、小时 ≤ 10 帖（redis 手动计数；limiter 按 IP 限流拿不到 jwt 用户）
+    # 放在所有校验通过后、写库前，避免无效请求消耗配额
+    uid = str(user.id)
+    key_5m = f"post_rate:{uid}:5m"
+    key_1h = f"post_rate:{uid}:1h"
+    try:
+        n5 = redis_client.incr(key_5m)
+        if n5 == 1:
+            redis_client.expire(key_5m, 300)
+        n1h = redis_client.incr(key_1h)
+        if n1h == 1:
+            redis_client.expire(key_1h, 3600)
+    except Exception:
+        n5 = n1h = 0  # redis 不可用时降级为不限流
+    if n5 > 3:
+        return jsonify({"code": 429, "message": "发帖太频繁，请 5 分钟后再试"}), 429
+    if n1h > 10:
+        return jsonify({"code": 429, "message": "发帖太频繁，请稍后再试"}), 429
 
     thread = DiscussionThread(
         title=title,
@@ -449,6 +472,52 @@ def get_thread(thread_id):
     })
 
 
+# 批量记录浏览 POST /discussions/threads/view_batch
+# 社区广场拉取一页后一次性上报当前页讨论帖 id，按用户幂等去重 +1 view_count。
+# 替代旧的"每卡拉详情接口顺带 +1"（N+1），改为每页 1 个轻量上报。
+@bp.route("/threads/view_batch", methods=["POST"])
+@jwt_required()
+def view_batch_threads():
+    """批量记录浏览（按用户幂等去重）。"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户不存在"}), 401
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get('thread_ids') or []
+    try:
+        tids = list({int(t) for t in raw})[:100]   # 去重 + 上限保护
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "message": "thread_ids 格式错误"}), 400
+    if not tids:
+        return jsonify({"code": 200, "viewed": []}), 200
+
+    # 复用 get_thread 的幂等印记：(user, thread, view) reaction 存在即已计过
+    already = {
+        r.target_id for r in DiscussionReaction.query.filter(
+            DiscussionReaction.user_id == user.id,
+            DiscussionReaction.target_type == 'thread',
+            DiscussionReaction.reaction_type == 'view',
+            DiscussionReaction.target_id.in_(tids),
+        ).all()
+    }
+    to_view = [t for t in tids if t not in already]
+    viewed = []
+    if to_view:
+        threads = {t.id: t for t in DiscussionThread.query.filter(DiscussionThread.id.in_(to_view)).all()}
+        for tid in to_view:
+            t = threads.get(tid)
+            if not t:
+                continue
+            t.view_count = (t.view_count or 0) + 1
+            db.session.add(DiscussionReaction(
+                user_id=user.id, target_type='thread', target_id=tid, reaction_type='view'
+            ))
+            viewed.append(tid)
+        db.session.commit()
+    return jsonify({"code": 200, "viewed": viewed}), 200
+
+
 # 编辑主题帖 PUT /discussions/threads/{thread_id}
 @bp.route("/threads/<int:thread_id>", methods=["PUT"])
 @jwt_required()
@@ -607,6 +676,9 @@ def create_reply(thread_id):
 
     if not content:
         return jsonify({"code": 400, "message": "回复内容不能为空"}), 400
+
+    if len((content or '').strip()) < 2:
+        return jsonify({"code": 400, "message": "回复内容至少 2 个字"}), 400
 
     # 权限检查：发帖权限
     if not can_post_thread(thread.scope_type, thread.scope_id, user):
