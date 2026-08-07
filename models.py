@@ -1125,3 +1125,18 @@ class CampJoinRequest(db.Model):
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     reviewed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class AiTopicLedger(db.Model):
+    """AI 每日话题选题账本：全局跨日去重(同一 source_url 不重复选) + 每日幂等(同一天最多 1 篇)。
+    选题维度是全局 url/date、非用户级，故不复用 DiscussionReaction 的多态印记结构。"""
+    __tablename__ = 'ai_topic_ledger'
+    id = db.Column(db.Integer, primary_key=True)
+    source_url = db.Column(db.String(500), nullable=False)
+    url_hash = db.Column(db.String(64), nullable=False, unique=True)   # sha256(source_url)，跨日去重
+    title = db.Column(db.String(200), nullable=True)
+    picked_date = db.Column(db.Date, nullable=False, index=True)        # 选题日期；job 开头查今日是否已选
+    article_v2_id = db.Column(db.Integer, db.ForeignKey('article_v2.id'), nullable=True)
+    status = db.Column(db.String(20), default='published')              # published / draft / failed / skipped
+    reason = db.Column(db.String(500), nullable=True)                   # LLM 选题理由，便于回查
+    created_at = db.Column(db.DateTime, default=datetime.now)

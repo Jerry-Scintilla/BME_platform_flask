@@ -6,6 +6,7 @@ from flask_migrate import Migrate
 # 导入蓝图模块
 from blueprints import *
 from blueprints.attendance_report import init_scheduler, ensure_recipient_permission
+from blueprints.ai_topic import init_ai_topic_scheduler, ensure_ai_topic_account, ensure_ai_topic_schema
 
 from flask_cors import CORS
 
@@ -53,10 +54,14 @@ app.register_blueprint(seat_bp)
 app.register_blueprint(attendance_report_bp)
 app.register_blueprint(camp_bp)
 app.register_blueprint(admin_bp)
+app.register_blueprint(ai_topic_bp)
 
 # 每日出勤报告：幂等创建收件人权限 + 启动定时任务（多 worker 下仅一个生效）
 ensure_recipient_permission(app)
 init_scheduler(app)
+ensure_ai_topic_account(app)
+ensure_ai_topic_schema(app)
+init_ai_topic_scheduler(app)
 
 
 @app.route('/')

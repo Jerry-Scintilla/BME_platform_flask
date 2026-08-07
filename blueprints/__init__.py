@@ -331,6 +331,7 @@ from .seat import bp as seat_bp
 from .attendance_report import bp as attendance_report_bp
 from .camp import bp as camp_bp
 from .admin import bp as admin_bp
+from .ai_topic import bp as ai_topic_bp
 
 __all__ = [
     'auth_bp',
@@ -353,5 +354,6 @@ __all__ = [
     'seat_bp',
     'attendance_report_bp',
     'camp_bp',
-    'admin_bp'
+    'admin_bp',
+    'ai_topic_bp'
 ]

@@ -46,3 +46,23 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 # 收件人通过 RBAC 权限 attendance_report_recipient 管理（见 /permission/assign）
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
 ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shanghai")
+
+# AI 每日话题（每天 1 篇精挑话题 + 讨论问题，系统账号"BME 资讯君"发布到社区广场 feed）
+AI_DAILY_TOPIC_ENABLED = os.getenv("AI_DAILY_TOPIC_ENABLED", "false").lower() == "true"
+AI_TOPIC_AUTHOR_EMAIL = os.getenv("AI_TOPIC_AUTHOR_EMAIL", "ai-topic@bme.sysu.edu.cn")
+AI_TOPIC_MODEL = os.getenv("AI_TOPIC_MODEL", "deepseek-chat")
+# 调用 LLM 的 key：默认回退 master key；生产用 litellm_client.generate_key() 发的 virtual key
+AI_TOPIC_LITELLM_KEY = os.getenv("AI_TOPIC_LITELLM_KEY") or LITELLM_MASTER_KEY
+AI_TOPIC_CRON_HOUR = int(os.getenv("AI_TOPIC_CRON_HOUR", "8"))
+AI_TOPIC_CRON_MINUTE = int(os.getenv("AI_TOPIC_CRON_MINUTE", "30"))
+# 发布模式：draft(测试期,不进 feed,admin 审) / published(直接进 feed)
+AI_TOPIC_PUBLISH_MODE = os.getenv("AI_TOPIC_PUBLISH_MODE", "draft")
+# 信源 RSS（AI 应用 + 教育科技，逗号分隔）；以下为起步候选，上线前务必核实可用性并按需增删
+AI_TOPIC_FEED_URLS = [
+    u.strip() for u in os.getenv(
+        "AI_TOPIC_FEED_URLS",
+        "https://www.solidot.org/index.rss,"
+        "http://www.ruanyifeng.com/blog/atom.xml,"
+        "https://36kr.com/feed"
+    ).split(",") if u.strip()
+]
