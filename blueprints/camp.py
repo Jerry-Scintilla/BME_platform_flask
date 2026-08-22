@@ -55,6 +55,33 @@ def _gen_plan(camp, user_id):
             ))
 
 
+def _sync_plans(camp):
+    """营期日期/weekdays/成员变更后同步全部学员的 plan：删范围外（及工作日营的周末日）+ 补范围内缺的。幂等。
+    返回同步后 plan 总数。（旧 plan_regenerate 只补不删，缩短营期后范围外脏 plan 残留继续判缺勤）"""
+    out_q = CampAttendancePlan.query.filter(
+        CampAttendancePlan.camp_session_id == camp.id,
+        ~CampAttendancePlan.date.between(camp.start_date, camp.end_date)
+    )
+    if camp.weekdays_only:
+        in_range = CampAttendancePlan.query.filter(
+            CampAttendancePlan.camp_session_id == camp.id,
+            CampAttendancePlan.date.between(camp.start_date, camp.end_date)
+        ).all()
+        weekend_ids = [p.id for p in in_range if p.date.weekday() >= 5]
+        if weekend_ids:
+            CampAttendancePlan.query.filter(CampAttendancePlan.id.in_(weekend_ids)).delete(
+                synchronize_session=False)
+    out_q.delete(synchronize_session=False)
+    for m in CampMember.query.filter_by(camp_session_id=camp.id, role='student').all():
+        _gen_plan(camp, m.user_id)
+    return CampAttendancePlan.query.filter_by(camp_session_id=camp.id).count()
+
+
+def _camp_writable(camp):
+    """archived 营只读：禁止一切营期内写操作（列表/看板等读取不受限）。"""
+    return camp.status != 'archived'
+
+
 def _visible_student_ids(camp_id, user):
     """导生=本团队学员；老师/超管=全营学员。"""
     if user.is_admin_like() or user.role == 'teacher':
@@ -71,14 +98,16 @@ def _in_my_team(camp_id, mentor, student_id):
         user_id=student_id, team_mentor_id=mentor.id).first() is not None
 
 
-def _eval_day(records, plan, on_leave):
+def _eval_day(records, plan, on_leave, is_today=False):
     """对某学员某承诺日的 CheckRecord 列表算混合考勤状态（纯函数，可单测）。
 
     records : 该 (user,date) 的 CheckRecord 列表（可能为空）
     plan    : CampAttendancePlan（冗余 expected_check_in / min_daily_hours）
     on_leave: 该日是否命中已批准请假
+    is_today: 该日是否为今天。当天有未签退段 → status=in_progress 不下判定
+              （未签退段 duration 为 0，照算法会误判 short_hours，人还坐在那里）
     返回: {status, is_late, is_sufficient, first_check_in, total_hours, in_progress}
-    status ∈ present / late / short_hours / late_and_short / absent / on_leave
+    status ∈ present / late / short_hours / late_and_short / absent / on_leave / in_progress
     """
     if on_leave:
         return {"status": "on_leave", "is_late": None, "is_sufficient": None,
@@ -90,6 +119,10 @@ def _eval_day(records, plan, on_leave):
     ins = [r.check_in for r in records if r.check_in is not None]
     first = min(ins).time() if ins else None
     in_progress = any(r.check_out is None for r in records)  # 当日有未签退段
+    if is_today and in_progress:
+        return {"status": "in_progress", "is_late": None, "is_sufficient": None,
+                "first_check_in": min(ins).isoformat() if ins else None,
+                "total_hours": round(total, 2), "in_progress": True}
     # 迟到维度（无容忍）；expected_check_in 为 None → 不判迟到
     is_late = bool(first is not None and plan.expected_check_in is not None
                    and first > plan.expected_check_in)
@@ -172,8 +205,9 @@ def session_list():
     user = _current_user()
     q = CampSession.query
     if not (user.is_admin_like() or user.role == 'teacher'):
+        # 学员/导生：仅自己参与的营，且 draft（未开放）不可见；archived 历史营保留
         ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()]
-        q = q.filter(CampSession.id.in_(ids)) if ids else q.filter(False)
+        q = q.filter(CampSession.id.in_(ids), CampSession.status != 'draft') if ids else q.filter(False)
     camps = q.order_by(CampSession.start_date.desc()).all()
     # 附当前用户是否成员：用户端「我的营期」据此过滤掉非成员营（管理端列表忽略此字段）
     member_ids = {m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()}
@@ -199,6 +233,7 @@ def session_update(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     d = request.json or {}
+    old_start, old_end, old_weekdays = camp.start_date, camp.end_date, camp.weekdays_only
     for f in ["name", "camp_type", "status", "weekdays_only", "min_daily_hours"]:
         if f in d:
             setattr(camp, f, d[f])
@@ -210,7 +245,11 @@ def session_update(sid):
         if d.get("expected_check_in"):
             camp.expected_check_in = time.fromisoformat(d["expected_check_in"])
     except (ValueError, TypeError) as e:
+        db.session.rollback()
         return jsonify({"code": 400, "message": f"参数格式错误: {e}"}), 400
+    if camp.start_date > camp.end_date:
+        db.session.rollback()
+        return jsonify({"code": 400, "message": "开始日期不能晚于结束日期"}), 400
     # 同步冗余副本：改出勤时间/工时阈值后，已展开的 CampAttendancePlan 也跟着刷新，
     # 否则 _eval_day 仍按旧副本判定迟到/工时（见 _eval_day），管理员改的设置不生效。
     if d.get("expected_check_in") or "min_daily_hours" in d:
@@ -220,8 +259,13 @@ def session_update(sid):
                 p.expected_check_in = camp.expected_check_in
             if "min_daily_hours" in d:
                 p.min_daily_hours = camp.min_daily_hours
+    # 日期范围/工作日口径变更后同步 plan（删范围外 + 补范围内缺的）
+    plan_note = ""
+    if (camp.start_date, camp.end_date, camp.weekdays_only) != (old_start, old_end, old_weekdays):
+        cnt = _sync_plans(camp)
+        plan_note = f"；承诺出勤日已同步（现 {cnt} 条，范围外已清理）"
     db.session.commit()
-    return jsonify({"code": 200, "message": "已更新", "session": _session_dict(camp)})
+    return jsonify({"code": 200, "message": "已更新" + plan_note, "session": _session_dict(camp)})
 
 
 # ─────────────────────────────────────────────
@@ -236,6 +280,8 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True):
     camp = CampSession.query.get(sid)
     if not camp:
         return None, ("营期不存在", 404)
+    if not _camp_writable(camp):
+        return None, ("营期已归档，只读", 400)
     user = UserModel.query.get(user_id)
     if not user:
         return None, ("用户不存在", 404)
@@ -299,11 +345,20 @@ def member_list(sid):
 @camp_role('teacher', 'super_admin')
 @audit_log(operation="移除营期成员")
 def member_remove(sid, uid):
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
     if not m:
         return jsonify({"code": 404, "message": "成员不存在"}), 404
     db.session.delete(m)
     CampAttendancePlan.query.filter_by(camp_session_id=sid, user_id=uid).delete()
+    # 连带清理：座位解绑（座位保留，人员清空）+ 未处理的加入申请（避免再批入已移除的人）
+    for st in CampSeat.query.filter_by(camp_session_id=sid, user_id=uid).all():
+        st.user_id = None
+    CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=uid, status='pending').delete()
     db.session.commit()
     return jsonify({"code": 200, "message": "已移除"})
 
@@ -316,6 +371,11 @@ def member_remove(sid, uid):
 @jwt_required()
 @camp_role('teacher', 'super_admin')
 def course_add(sid):
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     d = request.json or {}
     course_id = d.get("course_id")
     if not course_id or not CourseModel.query.get(course_id):
@@ -326,6 +386,24 @@ def course_add(sid):
                               sort_order=d.get("sort_order", 0)))
     db.session.commit()
     return jsonify({"code": 200, "message": "已加入"})
+
+
+@bp.route("/sessions/<int:sid>/courses/<int:cid>", methods=["DELETE"])
+@jwt_required()
+@camp_role('teacher', 'super_admin')
+@audit_log(operation="营期移除课程")
+def course_remove(sid, cid):
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    cc = CampCourse.query.filter_by(camp_session_id=sid, course_id=cid).first()
+    if not cc:
+        return jsonify({"code": 404, "message": "该课程不在营期中"}), 404
+    db.session.delete(cc)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已移除"})
 
 
 @bp.route("/sessions/<int:sid>/courses")
@@ -350,6 +428,9 @@ def selection_pick():
         return jsonify({"code": 400, "message": "缺少 camp_session_id/course_id"}), 400
     if not CampMember.query.filter_by(camp_session_id=sid, user_id=user.id, role='student').first():
         return jsonify({"code": 403, "message": "非该营期学员"}), 403
+    camp = CampSession.query.get(sid)
+    if not camp or camp.status != 'active':
+        return jsonify({"code": 400, "message": "营期未开放选课"}), 400
     if not CampCourse.query.filter_by(camp_session_id=sid, course_id=course_id).first():
         return jsonify({"code": 404, "message": "营期未开放该课程"}), 404
     uc = UserCourseModel.query.filter_by(user_id=user.id, course_id=course_id).first()
@@ -389,10 +470,10 @@ def plan_regenerate(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
-    for m in CampMember.query.filter_by(camp_session_id=sid, role='student').all():
-        _gen_plan(camp, m.user_id)
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    cnt = _sync_plans(camp)
     db.session.commit()
-    cnt = CampAttendancePlan.query.filter_by(camp_session_id=sid).count()
     return jsonify({"code": 200, "message": "已重生成", "plan_count": cnt})
 
 
@@ -469,7 +550,8 @@ def attendance_dashboard(sid):
                 res = {"status": "pledged", "is_late": None, "is_sufficient": None,
                        "first_check_in": None, "total_hours": 0, "in_progress": False}
             else:
-                res = _eval_day(checks_map.get((uid, d), []), p, (uid, d) in leave_set)
+                res = _eval_day(checks_map.get((uid, d), []), p, (uid, d) in leave_set,
+                                is_today=(d == today))
             by_user[uid].append((d, res))
             gsummary[res["status"]] += 1
 
@@ -478,8 +560,11 @@ def attendance_dashboard(sid):
         psum = Counter(r["status"] for _, r in items)
         pm = plan_map.get(uid, {})
         pledged = len(pm)
-        elapsed_pledged = sum(1 for d in pm if d <= today)
-        satisfied = psum.get("present", 0)
+        # 已过承诺日只算 d < today：今天还没过完（进行中/还没到齐），不进达标率分母
+        elapsed_pledged = sum(1 for d in pm if d < today)
+        # 出勤=时长达标（present+late）。弹性考勤语义：迟到但时长足够算出勤（需求4），
+        # 迟到仅作附加标记；late_and_short 时长不足仍不算
+        satisfied = psum.get("present", 0) + psum.get("late", 0)
         rows.append({
             "user_id": uid,
             "username": users.get(uid, ""),
@@ -492,16 +577,22 @@ def attendance_dashboard(sid):
                 "late_and_short": psum.get("late_and_short", 0),
                 "absent": psum.get("absent", 0),
                 "on_leave": psum.get("on_leave", 0),
+                "in_progress": psum.get("in_progress", 0),
                 "unpledged": psum.get("unpledged", 0),
                 "pledged_pending": psum.get("pledged", 0),
                 "pledged_days": pledged, "satisfied": satisfied,
                 "planned_days": pledged,
+                "elapsed_pledged": elapsed_pledged,
                 "attendance_rate": round(satisfied / elapsed_pledged, 3) if elapsed_pledged else None,
             },
         })
     rows.sort(key=lambda r: r["user_id"])
 
     gtotal = sum(gsummary.values())
+    # 营级出勤率与个人同口径：分子=时长达标出勤(present+late)，分母=Σ各学员已过承诺日。
+    # 旧版分母是全部格子数（含未承诺空格与未来承诺日），进行中营期会被未来日稀释到异常偏低
+    g_elapsed = sum(r["personal"]["elapsed_pledged"] for r in rows)
+    g_attended = gsummary.get("present", 0) + gsummary.get("late", 0)
     summary = {
         "present": gsummary.get("present", 0),
         "late": gsummary.get("late", 0),
@@ -510,7 +601,8 @@ def attendance_dashboard(sid):
         "absent": gsummary.get("absent", 0),
         "on_leave": gsummary.get("on_leave", 0),
         "total": gtotal,
-        "attendance_rate": round(gsummary.get("present", 0) / gtotal, 3) if gtotal else None,
+        "elapsed_total": g_elapsed,
+        "attendance_rate": round(g_attended / g_elapsed, 3) if g_elapsed else None,
     }
     return jsonify({
         "code": 200,
@@ -559,20 +651,24 @@ def attendance_mine():
             res = {"status": "pledged", "is_late": None, "is_sufficient": None,
                    "first_check_in": None, "total_hours": 0, "in_progress": False}
         else:
-            res = _eval_day(checks_map.get((user.id, d), []), p, (user.id, d) in leave_set)
+            res = _eval_day(checks_map.get((user.id, d), []), p, (user.id, d) in leave_set,
+                            is_today=(d == today))
         daily[d.isoformat()] = res
         dates_set.add(d)
         psum[res["status"]] += 1
     pledged = len(plans)
-    elapsed_pledged = sum(1 for p in plans if p.date <= today)   # 已过的承诺日（达标率分母）
-    satisfied = psum.get("present", 0)
+    elapsed_pledged = sum(1 for p in plans if p.date < today)   # 已过完的承诺日（达标率分母，今天不计）
+    # 出勤口径与 dashboard 一致：present+late（时长达标即出勤，迟到仅附加标记）
+    satisfied = psum.get("present", 0) + psum.get("late", 0)
     personal = {
         "present": psum.get("present", 0), "late": psum.get("late", 0),
         "short_hours": psum.get("short_hours", 0), "late_and_short": psum.get("late_and_short", 0),
         "absent": psum.get("absent", 0), "on_leave": psum.get("on_leave", 0),
+        "in_progress": psum.get("in_progress", 0),
         "unpledged": psum.get("unpledged", 0), "pledged_pending": psum.get("pledged", 0),
         "pledged_days": pledged, "satisfied": satisfied,
         "planned_days": pledged,            # 兼容旧前端字段
+        "elapsed_pledged": elapsed_pledged,
         "attendance_rate": round(satisfied / elapsed_pledged, 3) if elapsed_pledged else None,
     }
     return jsonify({
@@ -598,19 +694,30 @@ def leave_submit():
         return jsonify({"code": 400, "message": "缺少参数"}), 400
     if not CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
         return jsonify({"code": 403, "message": "非该营期成员"}), 403
+    camp = CampSession.query.get(sid)
+    if not camp or not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，不可请假"}), 400
     try:
-        lv = CampLeave(camp_session_id=sid, user_id=user.id,
-                       start_date=date.fromisoformat(sd), end_date=date.fromisoformat(ed),
-                       reason=d.get("reason", ""))
+        sd_d, ed_d = date.fromisoformat(sd), date.fromisoformat(ed)
     except (ValueError, TypeError):
         return jsonify({"code": 400, "message": "日期格式错误"}), 400
+    today = date.today()
+    if sd_d > ed_d:
+        return jsonify({"code": 400, "message": "开始日期不能晚于结束日期"}), 400
+    if sd_d < today:
+        return jsonify({"code": 400, "message": "不能对已过去的日期请假（今天之前）"}), 400
+    if ed_d > camp.end_date or sd_d < camp.start_date:
+        return jsonify({"code": 400, "message": f"请假日期须在营期范围内（{camp.start_date} ~ {camp.end_date}）"}), 400
+    lv = CampLeave(camp_session_id=sid, user_id=user.id,
+                   start_date=sd_d, end_date=ed_d,
+                   reason=d.get("reason", ""))
     db.session.add(lv)
     db.session.flush()
-    # 通知本营导生（无导生则通知老师）
+    # 通知审批人：优先本营导生；营里没有导生则通知老师/超管（否则请假提交后无人知晓）
     approvers = [m.user_id for m in CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()]
     if not approvers:
-        approvers = [m.user_id for m in CampMember.query.filter_by(camp_session_id=sid, role='student').all()]  # 占位，实际应通知老师
-        approvers = []  # 老师走管理端，不在此推送
+        approvers = [u.id for u in UserModel.query.filter(
+            UserModel.role.in_(['teacher', 'super_admin'])).all()]
     for aid in approvers:
         create_notification(aid, "新的营期请假申请", f"{user.username} 申请请假 {sd}~{ed}",
                             category='camp', source_type='leave', source_id=lv.id, camp_session_id=sid)
@@ -626,6 +733,8 @@ def leave_approve(lid):
     lv = CampLeave.query.get(lid)
     if not lv:
         return jsonify({"code": 404, "message": "请假记录不存在"}), 404
+    if lv.status != 'pending':
+        return jsonify({"code": 400, "message": "该请假已处理，不能重复审批（如需改判请先撤回）"}), 400
     # 导生仅限本团队；老师/超管不限
     if not (user.is_admin_like() or user.role == 'teacher'):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
@@ -641,6 +750,36 @@ def leave_approve(lid):
                         camp_session_id=lv.camp_session_id)
     db.session.commit()
     return jsonify({"code": 200, "message": "已审批", "status": lv.status})
+
+
+@bp.route("/leave/<int:lid>/revoke", methods=["POST"])
+@jwt_required()
+@camp_role('mentor', 'teacher', 'super_admin')
+@audit_log(operation="撤回请假审批")
+def leave_revoke(lid):
+    """撤回已批准的请假（如误批）：status 回 pending、清空审批人字段，重新进入待审批，
+    之后可再次批准或拒绝。考勤按 status='approved' 实时聚合（_approved_leave_dates），
+    撤回即生效，看板/我的考勤中该段自动回算，无需迁移历史。"""
+    user = _current_user()
+    lv = CampLeave.query.get(lid)
+    if not lv:
+        return jsonify({"code": 404, "message": "请假记录不存在"}), 404
+    if lv.status != 'approved':
+        return jsonify({"code": 400, "message": "仅已批准的请假可撤回"}), 400
+    # 与审批同权限：导生仅限本团队；老师/超管不限
+    if not (user.is_admin_like() or user.role == 'teacher'):
+        if not _in_my_team(lv.camp_session_id, user, lv.user_id):
+            return jsonify({"code": 403, "message": "无权撤回（非本团队）"}), 403
+    lv.status = 'pending'
+    lv.approver_id = None
+    lv.approved_at = None
+    db.session.flush()
+    create_notification(lv.user_id, "请假审批已撤回",
+                        f"你 {lv.start_date.isoformat()}~{lv.end_date.isoformat()} 的请假批准已被撤回，将重新审核",
+                        category='camp', source_type='leave', source_id=lv.id,
+                        camp_session_id=lv.camp_session_id)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已撤回，该请假重新进入待审批"})
 
 
 @bp.route("/sessions/<int:sid>/leave")
@@ -698,6 +837,9 @@ def reward_issue():
     sid, uid, medal_id = d.get("camp_session_id"), d.get("user_id"), d.get("medal_id")
     if not sid or not uid or not medal_id:
         return jsonify({"code": 400, "message": "缺少参数"}), 400
+    camp = CampSession.query.get(sid)
+    if not camp or not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     if not (user.is_admin_like() or user.role == 'teacher'):
         if not _in_my_team(sid, user, uid):
             return jsonify({"code": 403, "message": "无权给该学员发奖励"}), 403
@@ -735,8 +877,19 @@ def seat_assign():
     sid, seat_id, uid = d.get("camp_session_id"), d.get("seat_id"), d.get("user_id")
     if not sid or not seat_id:
         return jsonify({"code": 400, "message": "缺少参数"}), 400
+    camp = CampSession.query.get(sid)
+    if not camp or not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     if not SeatModel.query.get(seat_id):
         return jsonify({"code": 404, "message": "座位不存在"}), 404
+    if uid:
+        if not CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first():
+            return jsonify({"code": 404, "message": "该用户不是本营期成员"}), 404
+        # 一人一座：先解绑本营其他座位，避免同一人占多个座
+        for other in CampSeat.query.filter(CampSeat.camp_session_id == sid,
+                                           CampSeat.user_id == uid,
+                                           CampSeat.seat_id != seat_id).all():
+            other.user_id = None
     cs = CampSeat.query.filter_by(camp_session_id=sid, seat_id=seat_id).first()
     if not cs:
         cs = CampSeat(camp_session_id=sid, seat_id=seat_id)
@@ -781,7 +934,8 @@ def _camp_mentors(sid):
 def camp_featured():
     """用户端营期主页：返回后台指定的当前营期 + 当前用户是否成员 + 我的最新申请状态。"""
     user = _current_user()
-    camp = CampSession.query.filter_by(is_featured=True).first()
+    # 只展示进行中的营；归档/草稿营不该再作为主页入口
+    camp = CampSession.query.filter_by(is_featured=True, status='active').first()
     if not camp:
         return jsonify({"code": 200, "session": None, "is_member": False, "my_request": None})
     is_member = CampMember.query.filter_by(camp_session_id=camp.id, user_id=user.id).first() is not None
@@ -803,6 +957,8 @@ def camp_feature(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if camp.status != 'active':
+        return jsonify({"code": 400, "message": "仅进行中的营期可设为当前营期"}), 400
     CampSession.query.filter(CampSession.is_featured.is_(True)).update({"is_featured": False})
     camp.is_featured = True
     db.session.commit()
@@ -820,25 +976,33 @@ def join_request_submit(sid):
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if user.role != 'student':
         return jsonify({"code": 400, "message": "仅学员可申请加入营期；导生/老师由管理员直接分配"}), 400
+    if camp.status != 'active':
+        return jsonify({"code": 400, "message": "该营期当前未开放（仅进行中的营期可申请加入）"}), 400
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
         return jsonify({"code": 402, "message": "你已是该营期成员"}), 402
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
         return jsonify({"code": 409, "message": "已有待审批的申请，请等待审核"}), 409
     d = request.json or {}
-    # 学员手选承诺出勤日（JSON 数组），校验格式 + 在营期范围内
+    # 学员手选承诺出勤日（JSON 数组），校验格式 + 范围内 + 未来日 + 工作日营不含周末
     selected_days = d.get("selected_days") or []
+    today = date.today()
     valid = []
     try:
         for s in selected_days:
             dv = date.fromisoformat(str(s))
-            if camp.start_date <= dv <= camp.end_date:
-                valid.append(dv.isoformat())
+            if not (camp.start_date <= dv <= camp.end_date) or dv < today:
+                continue
+            if camp.weekdays_only and dv.weekday() >= 5:
+                continue
+            valid.append(dv.isoformat())
     except (ValueError, TypeError):
         return jsonify({"code": 400, "message": "承诺出勤日格式错误"}), 400
     if not valid:
-        return jsonify({"code": 400, "message": "请至少选择一个承诺出勤日"}), 400
+        return jsonify({"code": 400, "message": "请至少选择一个有效的承诺出勤日（未来、营期范围内" +
+                        ("、工作日" if camp.weekdays_only else "") + "）"}), 400
+    # 个别无效日静默剔除（前端日期格已限可选范围，此处兜底）；去重排序后落库
     db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
-                                   reason=d.get("reason"), selected_days=json.dumps(valid)))
+                                   reason=d.get("reason"), selected_days=json.dumps(sorted(set(valid)))))
     db.session.commit()
     return jsonify({"code": 200, "message": "申请已提交，等待审批"})
 
@@ -977,6 +1141,11 @@ def join_request_reject(rid):
 @audit_log(operation="改派营期成员导生")
 def member_update(sid, uid):
     """改成员归属导生（仅学员行可改；日常团队改派入口）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
     if not m:
         return jsonify({"code": 404, "message": "成员不存在"}), 404
