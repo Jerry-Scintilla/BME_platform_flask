@@ -53,6 +53,7 @@ app.register_blueprint(notification_bp)
 app.register_blueprint(seat_bp)
 app.register_blueprint(attendance_report_bp)
 app.register_blueprint(camp_bp)
+app.register_blueprint(camp_ms_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(ai_topic_bp)
 

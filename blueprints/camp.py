@@ -13,15 +13,17 @@ from datetime import date, time, timedelta, datetime
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 
-from exts import db
+from exts import db, redis_client
 from models import (
     CampSession, CampMember, CampCourse, CampAttendancePlan,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
+    CampMentorProfile, CampMentorPreference, CampMentorMatch,
 )
 
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
+from .camp_ms import _apply_ms_fields, _validate_ms, _ms_dict, _ms_phase
 
 bp = Blueprint("camp", __name__, url_prefix="/camp")
 
@@ -167,6 +169,8 @@ def _session_dict(c):
         "min_daily_hours": c.min_daily_hours, "weekdays_only": c.weekdays_only,
         "is_featured": bool(c.is_featured),
         "member_count": CampMember.query.filter_by(camp_session_id=c.id).count(),
+        # 选导生字段（未启用时 enabled=false，其余为 null）
+        **_ms_dict(c),
     }
 
 
@@ -191,8 +195,12 @@ def session_create():
             min_daily_hours=d.get("min_daily_hours"),
             weekdays_only=d.get("weekdays_only", True),
         )
+        _apply_ms_fields(camp, d)          # 选导生配置（可选功能，未传即不启用）
     except (ValueError, TypeError) as e:
         return jsonify({"code": 400, "message": f"参数格式错误: {e}"}), 400
+    err = _validate_ms(camp)
+    if err:
+        return jsonify({"code": 400, "message": err}), 400
     db.session.add(camp)
     db.session.commit()
     return jsonify({"code": 200, "message": "创建成功", "session_id": camp.id,
@@ -250,6 +258,20 @@ def session_update(sid):
     if camp.start_date > camp.end_date:
         db.session.rollback()
         return jsonify({"code": 400, "message": "开始日期不能晚于结束日期"}), 400
+    # 选导生配置（部分更新：只处理出现的键）；改过则重置过渡通知游标（见 _maybe_notify_transition）
+    ms_touched = any(k in d for k in (
+        "mentor_selection_enabled", "ms_preference_start", "ms_preference_deadline",
+        "ms_round1_deadline", "ms_round2_deadline", "ms_tags"))
+    if ms_touched:
+        try:
+            _apply_ms_fields(camp, d)
+        except (ValueError, TypeError) as e:
+            db.session.rollback()
+            return jsonify({"code": 400, "message": f"参数格式错误: {e}"}), 400
+        err = _validate_ms(camp)
+        if err:
+            db.session.rollback()
+            return jsonify({"code": 400, "message": err}), 400
     # 同步冗余副本：改出勤时间/工时阈值后，已展开的 CampAttendancePlan 也跟着刷新，
     # 否则 _eval_day 仍按旧副本判定迟到/工时（见 _eval_day），管理员改的设置不生效。
     if d.get("expected_check_in") or "min_daily_hours" in d:
@@ -265,6 +287,12 @@ def session_update(sid):
         cnt = _sync_plans(camp)
         plan_note = f"；承诺出勤日已同步（现 {cnt} 条，范围外已清理）"
     db.session.commit()
+    if ms_touched:
+        try:
+            # 配置变更（含「提前截止」= 把 deadline 改成 now）后重置游标，允许阶段过渡通知按新时间线重发
+            redis_client.delete(f"ms:phase_last:{camp.id}")
+        except Exception:
+            pass   # Redis 不可用不阻断营期编辑（通知触发层自身有降级）
     return jsonify({"code": 200, "message": "已更新" + plan_note, "session": _session_dict(camp)})
 
 
@@ -359,6 +387,20 @@ def member_remove(sid, uid):
     for st in CampSeat.query.filter_by(camp_session_id=sid, user_id=uid).all():
         st.user_id = None
     CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=uid, status='pending').delete()
+    # 选导生连带清理：名片 / 该用户相关志愿 / 配对账本；
+    # 移除的是导生时，其名下学员 team_mentor_id 置空（回未匹配池，二轮活跃则可再被选）
+    CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=uid).delete()
+    CampMentorPreference.query.filter(
+        CampMentorPreference.camp_session_id == sid,
+        (CampMentorPreference.student_user_id == uid)
+        | (CampMentorPreference.mentor_user_id == uid)).delete(synchronize_session=False)
+    CampMentorMatch.query.filter(
+        CampMentorMatch.camp_session_id == sid,
+        (CampMentorMatch.mentor_user_id == uid) | (CampMentorMatch.student_user_id == uid)
+    ).delete(synchronize_session=False)
+    CampMember.query.filter(
+        CampMember.camp_session_id == sid, CampMember.team_mentor_id == uid
+    ).update({CampMember.team_mentor_id: None}, synchronize_session=False)
     db.session.commit()
     return jsonify({"code": 200, "message": "已移除"})
 
@@ -932,9 +974,10 @@ def _camp_mentors(sid):
 @bp.route("/featured")
 @jwt_required()
 def camp_featured():
-    """用户端营期主页：返回后台指定的当前营期 + 当前用户是否成员 + 我的最新申请状态。"""
+    """招募指针：返回当前招募中的营期 + 当前用户是否成员 + 我的最新申请状态。
+    消费方为 /camp-home 招募页与 /camp 空状态分流；成员工作台不消费（走 session_list）。"""
     user = _current_user()
-    # 只展示进行中的营；归档/草稿营不该再作为主页入口
+    # 只展示进行中的营；归档/草稿营不该再作为招募入口
     camp = CampSession.query.filter_by(is_featured=True, status='active').first()
     if not camp:
         return jsonify({"code": 200, "session": None, "is_member": False, "my_request": None})
@@ -952,17 +995,17 @@ def camp_featured():
 @bp.route("/sessions/<int:sid>/feature", methods=["PUT"])
 @jwt_required()
 @camp_role('teacher', 'super_admin')
-@audit_log(operation="设为当前营期")
+@audit_log(operation="设为招募营期")
 def camp_feature(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if camp.status != 'active':
-        return jsonify({"code": 400, "message": "仅进行中的营期可设为当前营期"}), 400
+        return jsonify({"code": 400, "message": "仅进行中的营期可设为招募营期"}), 400
     CampSession.query.filter(CampSession.is_featured.is_(True)).update({"is_featured": False})
     camp.is_featured = True
     db.session.commit()
-    return jsonify({"code": 200, "message": "已设为当前营期"})
+    return jsonify({"code": 200, "message": "已设为招募营期"})
 
 
 @bp.route("/sessions/<int:sid>/join-request", methods=["POST"])
@@ -1057,7 +1100,11 @@ def join_request_approve(rid):
         return jsonify({"code": 400, "message": "该申请已处理"}), 400
     d = request.json or {}
     # 学员审批时老师选定归属导生（body team_mentor_id）；auto_plan=False 改由手选日期建 plan
-    m, err = _assign_member(req.camp_session_id, req.user_id, d.get("team_mentor_id"), auto_plan=False)
+    # 启用选导生的营期：忽略 body 导生——学员先进营无导生，归属由开营前的选导生活动决定
+    # （老师确需给插班生预分配时，走成员管理 member_assign / member_update 显式指定）
+    _camp = CampSession.query.get(req.camp_session_id)
+    join_mentor = None if (_camp and _camp.mentor_selection_enabled) else d.get("team_mentor_id")
+    m, err = _assign_member(req.camp_session_id, req.user_id, join_mentor, auto_plan=False)
     if err:
         msg, code = err
         return jsonify({"code": code, "message": msg}), code
@@ -1098,6 +1145,8 @@ def join_request_approve(rid):
     content = f"你的入营申请已通过，欢迎加入「{camp_name}」。"
     if mentor_name:
         content += f"你的导生是 {mentor_name}，可在营期内联系。"
+    elif camp and camp.mentor_selection_enabled:
+        content += "你的导生将通过开营前的选导生活动确定，请留意通知。"
     create_notification(req.user_id, "入营申请已通过", content,
                         category='camp', source_type='join_request',
                         source_id=req.id, camp_session_id=req.camp_session_id)
@@ -1157,5 +1206,18 @@ def member_update(sid, uid):
         if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
             return jsonify({"code": 400, "message": "指定的导生不在本营"}), 400
     m.team_mentor_id = team_mentor_id
+    # 启用选导生的营期：改派同步回写配对账本（结果页/看板与 live 链接保持一致）；清空归属则删账本行
+    if camp.mentor_selection_enabled:
+        row = CampMentorMatch.query.filter_by(camp_session_id=sid, student_user_id=uid).first()
+        if team_mentor_id:
+            if row:
+                row.mentor_user_id = team_mentor_id
+                row.round = None
+                row.source = 'admin'
+            else:
+                db.session.add(CampMentorMatch(camp_session_id=sid, mentor_user_id=team_mentor_id,
+                                               student_user_id=uid, round=None, source='admin'))
+        elif row:
+            db.session.delete(row)
     db.session.commit()
     return jsonify({"code": 200, "message": "已更新"})

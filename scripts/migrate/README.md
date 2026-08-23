@@ -14,6 +14,7 @@ python scripts/migrate/migrate_04_join_selected_days.py # camp_join_request.sele
 python scripts/migrate/migrate_05_perms.py              # 17 下划线权限 + super_admin 授权
 python init_seats.py                                    # 建 study_room/seat 表 + 106 房 40 座位
 python scripts/migrate/migrate_06_check_record_indexes.py  # check_record (user_id, date) 复合索引
+python scripts/migrate/migrate_09_mentor_selection.py     # camp_session 加选导生 6 列 + 3 张选导生表
 ```
 
 ## 顺序依赖
@@ -39,3 +40,4 @@ python scripts/migrate/migrate_06_check_record_indexes.py  # check_record (user_
 | 04_join_selected_days | `camp_join_request.selected_days TEXT` |
 | 05_perms | 17 下划线权限 + 删点号旧权限 + super_admin 全授权 |
 | 06_check_record_indexes | `CREATE INDEX ix_check_record_user_date ON check_record (user_id, date)`（幂等） |
+| 09_mentor_selection | camp_session 加 6 列（enabled + 4 时间点 + ms_tags）；create_all 建 camp_mentor_profile / preference / match 3 表；建 ./data/mentor_photos/ |

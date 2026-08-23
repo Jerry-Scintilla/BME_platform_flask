@@ -1039,7 +1039,14 @@ class CampSession(db.Model):
     expected_check_in = db.Column(db.Time)                       # 期望到岗时间（判迟到基准）
     min_daily_hours = db.Column(db.Float)                        # 每日最低有效时长（判达标）
     weekdays_only = db.Column(db.Boolean, default=True)          # 承诺出勤日 = 范围内工作日
-    is_featured = db.Column(db.Boolean, default=False)          # 用户端主页指定的当前营期（全局唯一，由管理端设置）
+    is_featured = db.Column(db.Boolean, default=False)          # 招募指针（全局唯一，管理端设置）：/camp-home 招募页与 /camp 空状态指向它；成员工作台不消费
+    # 选导生（可选的开营前置阶段，规则见 docs/营期选导生-规划.md）
+    mentor_selection_enabled = db.Column(db.Boolean, default=False)   # 是否启用
+    ms_preference_start = db.Column(db.DateTime)                # 阶段开始（导生即可建名片）
+    ms_preference_deadline = db.Column(db.DateTime)             # 学员志愿截止 = 一轮挑选开始
+    ms_round1_deadline = db.Column(db.DateTime)                 # 一轮挑选截止
+    ms_round2_deadline = db.Column(db.DateTime)                 # 二轮互选截止（NULL = 不设二轮）
+    ms_tags = db.Column(db.Text)                                # 分类标签 JSON 数组字符串（导生名片从中勾选）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -1125,6 +1132,59 @@ class CampJoinRequest(db.Model):
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     reviewed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampMentorProfile(db.Model):
+    """选导生·导生名片（每营每人一张；无名片导生对学生不可见、不可被选）。
+    资料仅在 upcoming/collecting 阶段可改（防挑选期改容量/换照片），见 _ms_phase。"""
+    __tablename__ = 'camp_mentor_profile'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    photo = db.Column(db.String(100))            # 相对文件名 {camp}_{user}.{ext}，存 ./data/mentor_photos/
+    bio = db.Column(db.Text)
+    tags = db.Column(db.Text)                    # JSON 数组字符串，⊆ 营期 ms_tags（服务端校验）
+    capacity = db.Column(db.Integer, default=8)  # 名额上限
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'user_id', name='uq_ms_profile_camp_user'),
+    )
+
+
+class CampMentorPreference(db.Model):
+    """选导生·学员志愿（每轮 1~3 条有序；提交 = 该轮整组替换，截止前可改）。
+    round=1 一轮（collecting 期提交）/ round=2 二轮（仅一轮未匹配学员，限有余额导生）。"""
+    __tablename__ = 'camp_mentor_preference'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    round = db.Column(db.Integer, nullable=False, default=1)   # 1 | 2
+    rank = db.Column(db.Integer, nullable=False)               # 1-3
+    note = db.Column(db.String(200))                           # 学员可选留言（导生挑选时可见）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'student_user_id', 'round', 'rank', name='uq_ms_pref_rank'),
+        db.UniqueConstraint('camp_session_id', 'student_user_id', 'round', 'mentor_user_id', name='uq_ms_pref_mentor'),
+    )
+
+
+class CampMentorMatch(db.Model):
+    """选导生·配对账本（provenance：哪轮/谁配的）。
+    live 真相是 camp_member.team_mentor_id——写入账本时同步设置；下游（考勤看板/请假
+    审批/团队范围）只读 live 链接，本表仅用于结果展示与追溯。"""
+    __tablename__ = 'camp_mentor_match'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    round = db.Column(db.Integer, nullable=True)               # 1 | 2 | NULL(admin 指派)
+    source = db.Column(db.String(20), nullable=False, default='mentor_pick')   # mentor_pick | admin
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'student_user_id', name='uq_ms_match_student'),
+    )
 
 
 class AiTopicLedger(db.Model):
