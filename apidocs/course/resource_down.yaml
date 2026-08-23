@@ -1,0 +1,29 @@
+生成课程资源一次性下载码（?Course_Id=XXX&Resource_Ids=1,2,3，ids为空表示全部）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: query
+    description: 传递课程id
+    type: string
+    required: true
+
+  - name: Resource_Ids
+    in: query
+    description: 资源id逗号分隔，为空则下载全部资源
+    type: string
+    required: false
+
+responses:
+  200:
+    description: 下载码生成成功（Down_Code，120秒有效）
+  402:
+    description: 参数错误或课程暂无资源

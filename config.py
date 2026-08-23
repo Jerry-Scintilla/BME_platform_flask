@@ -47,6 +47,14 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
 ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shanghai")
 
+# 对象存储（MinIO / 任意 S3 兼容服务）：课程资源等文件的本体存储，
+# 后端只做上传/下载代理，不在本地磁盘持久化文件
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "bme-course-resources")
+MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
+
 # AI 每日话题（每天 1 篇精挑话题 + 讨论问题，系统账号"BME 资讯君"发布到社区广场 feed）
 AI_DAILY_TOPIC_ENABLED = os.getenv("AI_DAILY_TOPIC_ENABLED", "false").lower() == "true"
 AI_TOPIC_AUTHOR_EMAIL = os.getenv("AI_TOPIC_AUTHOR_EMAIL", "ai-topic@bme.sysu.edu.cn")

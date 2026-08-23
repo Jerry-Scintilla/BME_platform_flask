@@ -1,6 +1,7 @@
 from flask import Flask, redirect
 import config
 from exts import db, mail, limiter, redis_client
+from storage import storage
 from flask_migrate import Migrate
 
 # 导入蓝图模块
@@ -31,6 +32,8 @@ migrate = Migrate(app, db)
 jwt = JWTManager(app)
 swagger = Swagger(app)
 redis_client.init_app(app)
+# 对象存储（懒连接，服务未起不影响启动）
+storage.init_app(app)
 
 # 蓝图注册
 app.register_blueprint(auth_bp)

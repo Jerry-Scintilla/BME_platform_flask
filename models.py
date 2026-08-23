@@ -154,6 +154,34 @@ class CourseModel(db.Model):
     creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
 
 
+class CourseResourceModel(db.Model):
+    """课程相关资源。文件本体在对象存储（见 storage.py），
+    本表只存元数据；object_key 形如 courses/{course_id}/{uuid}"""
+    __tablename__ = 'course_resource'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)        # 展示名（含扩展名）
+    object_key = db.Column(db.String(300), nullable=False)  # 对象存储 key
+    size = db.Column(db.Integer, nullable=False, default=0) # 字节数
+    content_type = db.Column(db.String(100))
+    sort_order = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    course = db.relationship('CourseModel', backref=db.backref('resources', lazy='dynamic'))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'course_id': self.course_id,
+            'name': self.name,
+            'size': self.size,
+            'content_type': self.content_type,
+            'sort_order': self.sort_order,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None
+        }
+
+
 
 class LearningProgressModel(db.Model):
     """学习进度模型 - 每课时一条记录"""

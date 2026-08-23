@@ -1,0 +1,19 @@
+凭一次性下载码下载课程资源（?Down_Code=XXX，单文件直下，多文件打包zip）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Down_Code
+    in: query
+    description: 一次性下载码
+    type: string
+    required: true
+
+responses:
+  200:
+    description: 文件流（attachment）
+  402:
+    description: 下载码不存在、已过期或IP不匹配
+  404:
+    description: 参数错误或资源不存在

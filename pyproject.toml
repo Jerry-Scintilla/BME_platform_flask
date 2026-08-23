@@ -19,6 +19,7 @@ dependencies = [
     "flask-redis>=0.4.0",
     "flask-wtf>=1.2.2",
     "gunicorn>=23.0.0",
+    "minio>=7.2.0",
     "pymysql>=1.1.1",
     "requests>=2.34.2",
     "feedparser>=6.0.14",

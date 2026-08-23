@@ -1,0 +1,31 @@
+admin上传课程资源（multipart/form-data，字段名Files支持多文件）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: admin token
+
+  - name: Course_Id
+    in: formData
+    description: 课程id
+    type: string
+    required: true
+
+  - name: Files
+    in: formData
+    description: 资源文件（可多个）
+    type: file
+    required: true
+
+responses:
+  200:
+    description: 上传成功，返回资源元数据列表
+  400:
+    description: 用户权限不够
+  402:
+    description: 参数错误/课程不存在/没有文件

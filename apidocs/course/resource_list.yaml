@@ -1,0 +1,23 @@
+查询课程相关资源列表（需要参数?Course_Id=XXX）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+
+  - name: Course_Id
+    in: query
+    description: 传递课程id
+    type: string
+    required: true
+
+responses:
+  200:
+    description: 返回资源列表（id/name/size/content_type/sort_order/created_at）
+  402:
+    description: 参数错误

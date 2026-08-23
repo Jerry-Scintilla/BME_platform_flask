@@ -1,4 +1,8 @@
 import os
+import uuid
+import hashlib
+import tempfile
+import zipfile
 
 from flask import Blueprint, request, jsonify, send_file
 
@@ -6,7 +10,10 @@ from flask import Blueprint, request, jsonify, send_file
 from exts import db, redis_client
 
 # 导入数据库表
-from models import UserModel, CourseModel, Chapter, LessonModel
+from models import UserModel, CourseModel, Chapter, LessonModel, CourseResourceModel
+
+# 导入对象存储
+from storage import storage
 
 # 导入表单验证
 from .forms import CourseForm
@@ -831,6 +838,315 @@ def book_download():
             "code": 404,
             'message': "参数错误"
         })
+
+
+# ==================== 课程相关资源 API ====================
+# 资源文件本体存对象存储（storage.py），后端只做代理，不在本地磁盘持久化。
+# 下载沿用一次性下载码机制（Redis 短时过期 + IP 绑定），浏览器凭码直接 GET，
+# 单文件直下，多文件流式打包 zip（SpooledTemporaryFile，内存优先，不落业务磁盘）。
+
+RESOURCE_CODE_TTL = 120            # 下载码有效期（秒）
+RESOURCE_CODE_PREFIX = "resource_code:"
+
+
+def _client_ip():
+    if request.headers.getlist("X-Forwarded-For"):
+        return request.headers.getlist("X-Forwarded-For")[0]
+    return request.remote_addr
+
+
+def _load_resources_by_ids(course_id, ids):
+    """按传入顺序取资源，且只取属于该课程的。"""
+    resources = CourseResourceModel.query.filter(
+        CourseResourceModel.id.in_(ids),
+        CourseResourceModel.course_id == course_id
+    ).all()
+    by_id = {r.id: r for r in resources}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+@bp.route("/course/resources")
+@jwt_required()
+@swag_from('../apidocs/course/resource_list.yaml')
+def resource_list():
+    """课程相关资源列表"""
+    course_id = request.args.get('Course_Id')
+    if not course_id:
+        return jsonify({
+            "code": 402,
+            'message': "参数错误"
+        }), 402
+    resources = (CourseResourceModel.query
+                 .filter_by(course_id=course_id)
+                 .order_by(CourseResourceModel.sort_order, CourseResourceModel.id)
+                 .all())
+    return jsonify({
+        "code": 200,
+        'message': "success",
+        'data': [r.to_dict() for r in resources]
+    })
+
+
+@bp.route("/course/resource_down")
+@jwt_required()
+@swag_from('../apidocs/course/resource_down.yaml')
+def resource_down():
+    """生成资源一次性下载码。Resource_Ids 逗号分隔；为空表示下载该课程全部资源。"""
+    course_id = request.args.get('Course_Id')
+    if not course_id:
+        return jsonify({
+            "code": 402,
+            'message': "参数错误"
+        }), 402
+
+    ids_param = (request.args.get('Resource_Ids') or '').strip()
+    if ids_param:
+        ids = [int(i) for i in ids_param.split(',') if i.strip().isdigit()]
+        resources = _load_resources_by_ids(course_id, ids)
+    else:
+        resources = (CourseResourceModel.query
+                     .filter_by(course_id=course_id)
+                     .order_by(CourseResourceModel.sort_order, CourseResourceModel.id)
+                     .all())
+
+    if not resources:
+        return jsonify({
+            "code": 402,
+            'message': "课程暂无资源"
+        }), 402
+
+    code = hashlib.sha256(
+        f"{uuid.uuid4()}{_client_ip()}{course_id}".encode()
+    ).hexdigest()[:16]
+    payload = f"{_client_ip()}:{course_id}:" + ",".join(str(r.id) for r in resources)
+    redis_client.setex(f"{RESOURCE_CODE_PREFIX}{code}", RESOURCE_CODE_TTL, payload)
+
+    return jsonify({
+        "code": 200,
+        'message': "下载链接生成成功",
+        'Down_Code': code
+    })
+
+
+@bp.route("/course/resource_download")
+@swag_from('../apidocs/course/resource_download.yaml')
+def resource_download():
+    """凭一次性下载码下载资源：单文件直下，多文件即时打包 zip。"""
+    code = request.args.get('Down_Code')
+    if not code:
+        return jsonify({
+            "code": 404,
+            'message': "参数错误"
+        }), 404
+
+    stored = redis_client.get(f"{RESOURCE_CODE_PREFIX}{code}")
+    if stored is None:
+        return jsonify({
+            "code": 402,
+            'message': "下载码不存在或已过期"
+        }), 402
+    # payload 形如 "{ip}:{course_id}:{id,id,...}"；ip 可能是 IPv6 带冒号，从右侧切
+    ip_and_course, _, id_str = stored.decode('utf-8').rpartition(':')
+    stored_ip, _, course_id = ip_and_course.rpartition(':')
+    if stored_ip != _client_ip():
+        return jsonify({
+            "code": 402,
+            'message': "下载码错误"
+        }), 402
+
+    # 一次性：校验通过即作废（真正 one-time，不依赖 TTL）
+    redis_client.delete(f"{RESOURCE_CODE_PREFIX}{code}")
+
+    ids = [int(i) for i in id_str.split(',') if i.strip().isdigit()]
+    resources = _load_resources_by_ids(course_id, ids)
+    if not resources:
+        return jsonify({
+            "code": 404,
+            'message': "资源不存在"
+        }), 404
+
+    if len(resources) == 1:
+        r = resources[0]
+        obj = storage.get_object(r.object_key)
+        return send_file(
+            obj,
+            as_attachment=True,
+            download_name=r.name,
+            mimetype=r.content_type or 'application/octet-stream',
+            max_age=0
+        )
+
+    # 多文件：流式拉取对象存储内容打包 zip（内存优先，超限才借系统临时目录且用完即删）
+    import shutil
+    buf = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
+    used_names = {}
+    try:
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for r in resources:
+                # zip 内重名自动加序号
+                base = r.name or f"resource_{r.id}"
+                if base in used_names:
+                    used_names[base] += 1
+                    stem, ext = os.path.splitext(base)
+                    base = f"{stem}({used_names[base]}){ext}"
+                else:
+                    used_names[base] = 1
+                obj = storage.get_object(r.object_key)
+                try:
+                    with zf.open(base, 'w') as target:
+                        shutil.copyfileobj(obj, target, length=1024 * 1024)
+                finally:
+                    obj.close()
+                    obj.release_conn()
+        buf.seek(0)
+        return send_file(
+            buf,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"course_{course_id}_resources.zip",
+            max_age=0
+        )
+    finally:
+        # send_file 已接管 buf 的读；这里只兜底异常路径的清理
+        pass
+
+
+def _require_admin():
+    """admin 校验，通过返回 None，否则返回错误响应。与 book_upgrade 同口径。"""
+    user = UserModel.query.filter_by(email=get_jwt_identity()).first()
+    if user is None or user.user_mode != 'admin':
+        return jsonify({
+            "code": 400,
+            'message': "用户权限不够"
+        }), 400
+    return None
+
+
+@bp.route("/course/resource_add", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/resource_add.yaml')
+@audit_log(operation="上传课程资源")
+def resource_add():
+    """admin 上传课程资源（multipart，支持多文件，字段名 Files）"""
+    err = _require_admin()
+    if err:
+        return err
+
+    course_id = request.form.get('Course_Id')
+    if not course_id:
+        return jsonify({
+            "code": 402,
+            'message': "没有发送课程 ID"
+        }), 402
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if course is None:
+        return jsonify({
+            "code": 402,
+            'message': "课程不存在"
+        }), 402
+
+    files = request.files.getlist('Files')
+    if not files:
+        return jsonify({
+            "code": 402,
+            'message': "没有发送文件"
+        }), 402
+
+    base_order = db.session.query(db.func.max(CourseResourceModel.sort_order)) \
+        .filter_by(course_id=course.id).scalar() or 0
+
+    saved = []
+    for f in files:
+        if not f.filename:
+            continue
+        ext = os.path.splitext(f.filename)[1].lower()[:20]
+        key = f"courses/{course.id}/{uuid.uuid4().hex}{ext}"
+        storage.put_object(key, f.stream, content_type=f.mimetype or 'application/octet-stream')
+        size = storage.stat_object(key).size
+        base_order += 1
+        res = CourseResourceModel(
+            course_id=course.id,
+            name=f.filename,
+            object_key=key,
+            size=size,
+            content_type=f.mimetype,
+            sort_order=base_order
+        )
+        db.session.add(res)
+        saved.append(res)
+
+    if not saved:
+        return jsonify({
+            "code": 402,
+            'message': "没有有效文件"
+        }), 402
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        'message': "上传成功",
+        'data': [r.to_dict() for r in saved]
+    })
+
+
+@bp.route("/course/resource_del", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/resource_del.yaml')
+@audit_log(operation="删除课程资源")
+def resource_del():
+    """admin 删除课程资源（对象存储 + 元数据一起删）"""
+    err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    resource_id = data.get('Resource_Id')
+    if not resource_id:
+        return jsonify({
+            "code": 402,
+            'message': "参数错误"
+        }), 402
+    res = CourseResourceModel.query.filter_by(id=resource_id).first()
+    if res is None:
+        return jsonify({
+            "code": 404,
+            'message': "资源不存在"
+        }), 404
+
+    storage.remove_object(res.object_key)  # 对象已不存在时幂等
+    db.session.delete(res)
+    db.session.commit()
+
+    return jsonify({"code": 200, 'message': "删除成功"})
+
+
+@bp.route("/course/resource_sort", methods=["POST"])
+@jwt_required()
+@swag_from('../apidocs/course/resource_sort.yaml')
+@audit_log(operation="排序课程资源")
+def resource_sort():
+    """admin 调整资源顺序，Resource_Ids 按目标顺序传数组"""
+    err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    course_id = data.get('Course_Id')
+    ids = data.get('Resource_Ids')
+    if not course_id or not isinstance(ids, list):
+        return jsonify({
+            "code": 402,
+            'message': "参数错误"
+        }), 402
+
+    resources = CourseResourceModel.query.filter_by(course_id=course_id).all()
+    by_id = {r.id: r for r in resources}
+    for idx, rid in enumerate(ids):
+        if rid in by_id:
+            by_id[rid].sort_order = idx
+    db.session.commit()
+
+    return jsonify({"code": 200, 'message': "排序成功"})
 
 
 # ==================== 课时管理 API ====================
