@@ -347,6 +347,12 @@ def phase_view(sid):
                 if cur else 0),
         })
 
+    # 从众信号：一轮已交志愿的去重学员数 / 营内学员总数（前端 collecting/round1 展示用）
+    submitted = (db.session.query(CampMentorPreference.student_user_id)
+                 .filter_by(camp_session_id=sid, round=1).distinct().count())
+    student_total = CampMember.query.filter_by(
+        camp_session_id=sid, role='student').count()
+
     return jsonify({"code": 200, "phase": phase,
                     "enabled": bool(camp.mentor_selection_enabled),
                     "config_error": bool(camp.mentor_selection_enabled and not (
@@ -361,6 +367,7 @@ def phase_view(sid):
                     "round2_enabled": bool(camp.ms_round2_deadline
                                            and camp.ms_round2_deadline > camp.ms_round1_deadline),
                     "ms_tags": _ms_tags_list(camp),
+                    "stats": {"submitted": submitted, "students": student_total},
                     "me": me})
 
 
