@@ -59,6 +59,7 @@ app.register_blueprint(camp_bp)
 app.register_blueprint(camp_ms_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(ai_topic_bp)
+app.register_blueprint(gratitude_bp)
 
 # 每日出勤报告：幂等创建收件人权限 + 启动定时任务（多 worker 下仅一个生效）
 ensure_recipient_permission(app)

@@ -333,6 +333,7 @@ from .camp import bp as camp_bp
 from .camp_ms import bp as camp_ms_bp
 from .admin import bp as admin_bp
 from .ai_topic import bp as ai_topic_bp
+from .gratitude import bp as gratitude_bp
 
 __all__ = [
     'auth_bp',
@@ -357,5 +358,6 @@ __all__ = [
     'camp_bp',
     'camp_ms_bp',
     'admin_bp',
-    'ai_topic_bp'
+    'ai_topic_bp',
+    'gratitude_bp'
 ]

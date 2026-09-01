@@ -811,9 +811,10 @@ class NotificationModel(db.Model):
         # 'group'   — 小组内业务通知（请假/任务/作业/通知等）
         # 'course'  — 课程相关通知（预留）
         # 'camp'    — 营期通知（请假审批/奖励发放/考勤提醒等）
+        # 'gratitude' — 感谢信送达提醒（source_id 指向 gratitude 表）
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
     source_type = db.Column(db.String(20), nullable=True)
-        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin', 'reward', 'join_request'
+        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin', 'reward', 'join_request', 'gratitude'
     source_id = db.Column(db.Integer, nullable=True)
         # 关联的原始记录 ID（如请假ID、任务ID）
     group_id = db.Column(db.Integer, nullable=True, index=True)
@@ -834,6 +835,43 @@ class NotificationModel(db.Model):
             'group_id': self.group_id,
             'is_read': self.is_read,
             'is_important': self.is_important,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class GratitudeModel(db.Model):
+    """感谢信 — 学员写给导生的感谢留言
+
+    依托用户对（sender/recipient），camp_session_id 仅作展示上下文，
+    不校验匹配状态机；同营期内每对用户限一封（唯一约束），
+    无营期上下文的信由接口层频控兜底。
+    """
+    __tablename__ = 'gratitude'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    recipient_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
+    content = db.Column(db.Text, nullable=False)
+    visibility = db.Column(db.String(20), default='private')
+        # 'private' — 仅收件导生可见；预留 'public'（导生主页感谢墙，见前端方案）
+    is_read = db.Column(db.Boolean, default=False, index=True)   # 收件侧已读
+    created_at = db.Column(db.DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('sender_id', 'recipient_id', 'camp_session_id',
+                            name='uq_gratitude_sender_recipient_session'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sender_id': self.sender_id,
+            'recipient_id': self.recipient_id,
+            'camp_session_id': self.camp_session_id,
+            'content': self.content,
+            'visibility': self.visibility,
+            'is_read': self.is_read,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
