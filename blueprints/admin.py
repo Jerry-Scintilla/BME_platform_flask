@@ -76,6 +76,25 @@ def admin_set_user_role(user_id):
     })
 
 
+@bp.route("/users/<int:user_id>/level", methods=["PUT"])
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation="调整用户等级")
+def admin_set_user_level(user_id):
+    """调整用户等级（LV1-4）。等级地基：现阶段手动，评价引擎属阶段 3。"""
+    level = (request.get_json(silent=True) or {}).get('level')
+    if level not in (1, 2, 3, 4):
+        return jsonify({"code": 400, "message": "level 仅支持 1-4"}), 400
+    target = UserModel.query.get(user_id)
+    if not target:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+    old = target.level
+    target.level = level
+    db.session.commit()
+    return jsonify({"code": 200, "message": f"等级已从 LV{old} 调整为 LV{level}",
+                    "data": {"user_id": target.id, "username": target.username, "old_level": old, "level": level}})
+
+
 @bp.route("/overview", methods=["GET"])
 @jwt_required()
 @check_permission('system_management')

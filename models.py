@@ -29,6 +29,9 @@ class UserModel(db.Model):
     role = db.Column(db.String(20), nullable=False, server_default='user')
     # super_admin 内部标签（teacher/developer），仅审计日志与界面展示，无权限语义
     admin_tag = db.Column(db.String(20))
+    # 用户等级地基（LV1-4）：当前仅作为导生候选人等筛选策略的数据源，管理员手动调整；
+    # 贡献/学业评价引擎与自动升级属阶段 3。
+    level = db.Column(db.Integer, nullable=False, server_default='1')
     avatar_url = db.Column(db.String(100))
     # 添加详细个人信息
     student_id = db.Column(db.Integer)
@@ -1253,6 +1256,7 @@ class CampMentorEligibility(db.Model):
     batch_id = db.Column(db.Integer, db.ForeignKey('camp_mentor_eligibility_batch.id'))
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), index=True)
+    source = db.Column(db.String(20), default='manual')   # 进池方式：manual 手工导入 / level 按等级生成
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (db.UniqueConstraint('camp_session_id', 'user_id', name='uq_cme_session_user'),)
 

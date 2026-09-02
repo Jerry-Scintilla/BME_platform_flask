@@ -130,6 +130,7 @@ def user_index():
         "Skill_Tags": Skill_Tags,
         "College": user.college,
         "role": user.role,
+        "level": user.level,
         "role_rank": user.role_rank,
         "permissions": get_user_permissions(user.id),
     }
@@ -232,6 +233,7 @@ def user_list():
                   "User_Medal": user.medal,
                   "User_Stage": user.study_stage,
                   "role": user.role,
+                  "level": user.level,
                   "join_time": user.join_time
                   }
         data.append(b_list)

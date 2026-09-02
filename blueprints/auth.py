@@ -131,6 +131,7 @@ def login():
                     "User_Name": User_Name,
                     "role": user.role,
                     "role_rank": user.role_rank,
+                    "level": user.level,
                     "permissions": get_user_permissions(user.id),
                     "User_Email": User_Email,
                     "User_Medal": User_Medal,

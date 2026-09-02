@@ -282,8 +282,57 @@ def eligibility_list(sid):
     for r in rows:
         u = UserModel.query.get(r.user_id)
         out.append({"user_id": r.user_id, "email": u.email if u else None,
-                    "username": u.username if u else None, "registered": r.user_id in member_ids})
+                    "username": u.username if u else None, "registered": r.user_id in member_ids,
+                    "source": r.source or "manual"})
     return jsonify({"code": 200, "eligibility": out})
+
+
+@bp.route("/sessions/<int:sid>/mentor-candidates/generate-by-level", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="按等级生成导生候选人")
+def candidates_generate_by_level(sid):
+    """策略 B：把 level >= min_level 的用户物化进本营候选人池（幂等合并，可重复刷新）。
+    与手工导入（策略 A）共存：已有者跳过；管理员（super_admin）不入池。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if camp.status not in ("draft", "upcoming"):
+        return jsonify({"code": 400, "message": "候选人维护仅限草稿/待开放阶段"}), 400
+    min_level = (request.json or {}).get("min_level", 2)
+    if min_level not in (1, 2, 3, 4):
+        return jsonify({"code": 400, "message": "min_level 仅支持 1-4"}), 400
+    have = {e.user_id for e in CampMentorEligibility.query.filter_by(camp_session_id=sid).all()}
+    users = [u for u in UserModel.query.filter(UserModel.level >= min_level).all() if not u.is_admin()]
+    batch = CampMentorEligibilityBatch(camp_session_id=sid, imported_by=_current_user().id)
+    db.session.add(batch)
+    db.session.flush()
+    added = 0
+    for u in users:
+        if u.id in have:
+            continue
+        db.session.add(CampMentorEligibility(batch_id=batch.id, camp_session_id=sid, user_id=u.id, source="level"))
+        added += 1
+    db.session.commit()
+    return jsonify({"code": 200,
+                    "message": f"按等级生成完成：LV>={min_level} 新增 {added} 人，池内已有跳过 {len(users)-added} 人",
+                    "data": {"added": added, "min_level": min_level}})
+
+
+@bp.route("/sessions/<int:sid>/mentor-candidates/<int:uid>", methods=["DELETE"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="移除导生候选人")
+def candidate_remove(sid, uid):
+    """手工覆盖：从候选人池移除单人（不影响已生成的营期成员关系）。"""
+    row = CampMentorEligibility.query.filter_by(camp_session_id=sid, user_id=uid).first()
+    if not row:
+        return jsonify({"code": 404, "message": "该用户不在候选人池中"}), 404
+    db.session.delete(row)
+    db.session.commit()
+    registered = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
+    note = "；其已报名的导生身份不受影响，如需移出营期请在成员管理操作" if registered else ""
+    return jsonify({"code": 200, "message": "已从候选人池移除" + note})
 
 
 @bp.route("/sessions/<int:sid>/mentor-registration", methods=["POST"])
