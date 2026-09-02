@@ -350,9 +350,14 @@ def mentor_registration(sid):
         return jsonify({"code": 200, "message": "你已是本营成员，无需重复报名"}), 200
     if camp.status != "upcoming":
         return jsonify({"code": 400, "message": "导生报名仅在待开放阶段开放"}), 400
-    db.session.add(CampMember(camp_session_id=sid, user_id=user.id, role="mentor"))
+    # 2026-09-02 调整：池内资格=可报名，报名后需管理员审核（复用营期加入申请流）
+    if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
+        return jsonify({"code": 200, "message": "已提交报名申请，等待管理员审核"}), 200
+    db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
+                                   reason="导生报名（候选人池内）", selected_days="[]",
+                                   apply_role="mentor"))
     db.session.commit()
-    return jsonify({"code": 200, "message": "报名成功，现在可以布置你的导生名片了"})
+    return jsonify({"code": 200, "message": "报名已提交，管理员审核通过后即可布置导生名片"})
 
 
 # ─────────────────────────────────────────────
@@ -1321,7 +1326,7 @@ def join_request_list(sid):
         data.append({
             "id": r.id, "user_id": r.user_id, "username": u.username if u else None,
             "email": u.email if u else None, "role": u.role if u else None,
-            "reason": r.reason, "status": r.status,
+            "reason": r.reason, "status": r.status, "apply_role": r.apply_role or "student",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
     return jsonify({"code": 200, "requests": data, "mentors": _camp_mentors(sid)})
@@ -1343,7 +1348,8 @@ def join_request_approve(rid):
     # （老师确需给插班生预分配时，走成员管理 member_assign / member_update 显式指定）
     _camp = CampSession.query.get(req.camp_session_id)
     join_mentor = None if (_camp and _camp.mentor_selection_enabled) else d.get("team_mentor_id")
-    m, err = _assign_member(req.camp_session_id, req.user_id, join_mentor, auto_plan=False, role="student")
+    m, err = _assign_member(req.camp_session_id, req.user_id, join_mentor, auto_plan=False,
+                            role=(req.apply_role or "student"))
     if err:
         msg, code = err
         return jsonify({"code": code, "message": msg}), code

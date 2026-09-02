@@ -1222,6 +1222,7 @@ class CampLeave(db.Model):
 
 
 class CampJoinRequest(db.Model):
+    apply_role = db.Column(db.String(20), default='student')   # 申请身份：student 学员 / mentor 导生（导生报名需管理员审核）
     """营期加入申请（学员自助申请 → teacher/super_admin 审批 → 通过即 member_assign 入营）。
     不加 UQ(camp,user)：rejected 后允许重新提交（新行）；端点校验"无 pending 申请 + 非成员"。"""
     __tablename__ = 'camp_join_request'
