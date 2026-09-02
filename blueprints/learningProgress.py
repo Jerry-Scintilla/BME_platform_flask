@@ -697,71 +697,9 @@ def get_lesson_progress():
 
 # ==================== 用户选课 API ====================
 
-@bp.route("/userCourse/enroll", methods=["POST"])
-@jwt_required()
-@swag_from('../apidocs/userCourse/enroll.yaml')
-def enroll_course():
-    """
-    用户选课
-    请求参数:
-    {
-        "Course_Id": 1
-    }
-    """
-    from datetime import datetime
-
-    user_email = get_jwt_identity()
-    user = UserModel.query.filter_by(email=user_email).first()
-    if not user:
-        return jsonify({"code": 404, "message": "用户不存在"}), 404
-
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"code": 400, "message": "请求参数错误"}), 400
-
-    course_id = data.get('Course_Id')
-    if not course_id:
-        return jsonify({"code": 400, "message": "课程ID不能为空"}), 400
-
-    # 验证课程存在
-    course = CourseModel.query.get(course_id)
-    if not course:
-        return jsonify({"code": 404, "message": "课程不存在"}), 404
-
-    # 检查是否已选课
-    existing = UserCourseModel.query.filter_by(
-        user_id=user.id,
-        course_id=course_id
-    ).first()
-
-    if existing:
-        if existing.status == UserCourseModel.STATUS_DROPPED:
-            # 恢复选课
-            existing.status = UserCourseModel.STATUS_ACTIVE
-            existing.enroll_time = datetime.now()
-            db.session.commit()
-            return jsonify({
-                "code": 200,
-                "message": "选课恢复成功",
-                "data": existing.to_dict()
-            })
-        else:
-            return jsonify({"code": 400, "message": "您已选择该课程"}), 400
-
-    # 创建选课记录
-    user_course = UserCourseModel(
-        user_id=user.id,
-        course_id=course_id,
-        status=UserCourseModel.STATUS_ACTIVE
-    )
-    db.session.add(user_course)
-    db.session.commit()
-
-    return jsonify({
-        "code": 200,
-        "message": "选课成功",
-        "data": user_course.to_dict()
-    })
+# 「自主加入学习」已移除（阶段 1，A14）：课程独立但学习进度只走营期，
+# 唯一入课途径 = 营期选课 /camp/selection（带 camp_session_id 戳）。
+# 历史无营戳的 user_course 行保留只读，进度照常展示。
 
 
 @bp.route("/userCourse/drop", methods=["POST"])

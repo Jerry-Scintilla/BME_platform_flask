@@ -15,7 +15,7 @@ from flask_jwt_extended import jwt_required
 
 from exts import db, redis_client
 from models import (
-    CampSession, CampMember, CampCourse, CampAttendancePlan,
+    CampSession, CampCycle, CampMember, CampCourse, CampAttendancePlan,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
@@ -163,6 +163,10 @@ def _approved_leave_dates(camp_id, frm, to):
 def _session_dict(c):
     return {
         "id": c.id, "name": c.name, "camp_type": c.camp_type,
+        "category": c.category,
+        "cycle_id": c.cycle_id,
+        "cycle_code": c.cycle.code if c.cycle else None,
+        "cycle_name": c.cycle.name if c.cycle else None,
         "start_date": c.start_date.isoformat(), "end_date": c.end_date.isoformat(),
         "status": c.status,
         "expected_check_in": c.expected_check_in.isoformat() if c.expected_check_in else None,
@@ -172,6 +176,39 @@ def _session_dict(c):
         # 选导生字段（未启用时 enabled=false，其余为 null）
         **_ms_dict(c),
     }
+
+
+# ─────────────────────────────────────────────
+# 教学周期（CampCycle）
+# ─────────────────────────────────────────────
+
+@bp.route("/cycles")
+@jwt_required()
+def cycle_list():
+    """教学周期列表（全员可读；建营下拉用）。无起止日期，纯归类标签。"""
+    cycles = CampCycle.query.order_by(CampCycle.sort_order, CampCycle.id.desc()).all()
+    return jsonify({"code": 200, "cycles": [{
+        "id": c.id, "code": c.code, "name": c.name,
+        "session_count": CampSession.query.filter_by(cycle_id=c.id).count(),
+    } for c in cycles]})
+
+
+@bp.route("/cycles", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="创建教学周期")
+def cycle_create():
+    """创建教学周期（super_admin）。body: {code, name, sort_order?}"""
+    d = request.json or {}
+    code, name = (d.get("code") or "").strip(), (d.get("name") or "").strip()
+    if not code or not name:
+        return jsonify({"code": 400, "message": "缺少 code/name"}), 400
+    if CampCycle.query.filter_by(code=code).first():
+        return jsonify({"code": 409, "message": "该周期 code 已存在"}), 409
+    c = CampCycle(code=code, name=name, sort_order=d.get("sort_order", 0))
+    db.session.add(c)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "创建成功", "cycle_id": c.id})
 
 
 # ─────────────────────────────────────────────
@@ -187,9 +224,17 @@ def session_create():
     name, start, end = d.get("name"), d.get("start_date"), d.get("end_date")
     if not name or not start or not end:
         return jsonify({"code": 400, "message": "缺少 name/start_date/end_date"}), 400
+    # 阶段 1：类型封闭枚举 + 必挂教学周期
+    from models import CAMP_CATEGORY_DEFAULTS
+    category = d.get("category", "learning")
+    if category not in CAMP_CATEGORY_DEFAULTS:
+        return jsonify({"code": 400, "message": f"category 仅支持 {'/'.join(CAMP_CATEGORY_DEFAULTS)}"}), 400
+    cycle = CampCycle.query.get(d.get("cycle_id")) if d.get("cycle_id") else None
+    if not cycle:
+        return jsonify({"code": 400, "message": "缺少有效的 cycle_id（教学周期），请先经 POST /camp/cycles 创建"}), 400
     try:
         camp = CampSession(
-            name=name, camp_type=d.get("camp_type", "short_term"),
+            name=name, category=category, cycle_id=cycle.id,
             start_date=date.fromisoformat(start), end_date=date.fromisoformat(end),
             expected_check_in=time.fromisoformat(d["expected_check_in"]) if d.get("expected_check_in") else None,
             min_daily_hours=d.get("min_daily_hours"),

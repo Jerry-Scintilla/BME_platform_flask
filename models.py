@@ -1100,12 +1100,37 @@ class DiscussionReaction(db.Model):
 # 营期（Camp）系统
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# 营期类型封闭枚举与行为默认值（老师不可自建类型；research/competition 预留，阶段 3 实现）
+CAMP_CATEGORY_DEFAULTS = {
+    'learning': {'label': '培训营（学习型）'},
+    'project': {'label': '项目营'},
+}
+
+
+class CampCycle(db.Model):
+    """营期周期（教学周期）：一年四段（寒假/春季/暑期/秋季），只做归类与统计。
+
+    无起止日期（每年时间略有出入，不影响办营）、无状态、无草稿（R-003 / Q-002）。
+    生命周期归具体营期（CampSession），周期不驱动其下营期的状态流转。
+    """
+    __tablename__ = 'camp_cycle'
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(20), nullable=False, unique=True)   # 如 2026-summer
+    name = db.Column(db.String(50), nullable=False)                # 如 2026 暑期
+    sort_order = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    sessions = db.relationship('CampSession', backref='cycle', lazy='dynamic')
+
 class CampSession(db.Model):
     """营期：如 2026暑期营 / 2026-1学期营"""
     __tablename__ = 'camp_session'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    camp_type = db.Column(db.String(20), default='short_term')   # short_term / semester / winter
+    camp_type = db.Column(db.String(20), default='short_term')   # 退役：阶段 1 起停读写，保留列便于回滚，下个大版本删除
+    # ── 阶段 1 共用骨架（2026-09）──
+    category = db.Column(db.String(20), nullable=False, server_default='learning')  # learning / project（research/competition 预留）
+    cycle_id = db.Column(db.Integer, db.ForeignKey('camp_cycle.id'))                 # 归属教学周期（CampCycle）
     start_date = db.Column(db.Date, nullable=False)
     end_date = db.Column(db.Date, nullable=False)
     status = db.Column(db.String(20), default='draft')           # draft / active / archived
