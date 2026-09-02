@@ -1233,6 +1233,30 @@ class CampJoinRequest(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
+class CampMentorEligibilityBatch(db.Model):
+    """导生资格名单批次（阶段 2，Q-007）：管理员导入名单→确认；
+    名单内用户在 upcoming（待开放）期定向可见该营的导生报名入口，自行报名无二次审核。
+    与正式营期成员（CampMember）分开：资格 ≠ 任职。"""
+    __tablename__ = 'camp_mentor_eligibility_batch'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), index=True)
+    imported_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    status = db.Column(db.String(20), default='confirmed')   # 预留 preview/confirmed，当前一步确认
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampMentorEligibility(db.Model):
+    """导生资格明细：一名用户在一个营期最多一条（UQ）。
+    唯一标识暂用 email 匹配（老师确认后可扩展学号等，见方案阶段 0）。"""
+    __tablename__ = 'camp_mentor_eligibility'
+    id = db.Column(db.Integer, primary_key=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey('camp_mentor_eligibility_batch.id'))
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (db.UniqueConstraint('camp_session_id', 'user_id', name='uq_cme_session_user'),)
+
+
 class CampMentorProfile(db.Model):
     """选导生·导生名片（每营每人一张；无名片导生对学生不可见、不可被选）。
     资料仅在 upcoming/collecting 阶段可改（防协调期改容量/换照片），见 _ms_phase。"""

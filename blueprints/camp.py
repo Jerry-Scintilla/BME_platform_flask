@@ -16,6 +16,7 @@ from flask_jwt_extended import jwt_required
 from exts import db, redis_client
 from models import (
     CampSession, CampCycle, CampMember, CampCourse, CampAttendancePlan,
+    CampMentorEligibilityBatch, CampMentorEligibility,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
@@ -212,6 +213,100 @@ def cycle_create():
 
 
 # ─────────────────────────────────────────────
+# 导生资格名单（Q-007：导入→确认→名单内定向可见→自行报名）
+# ─────────────────────────────────────────────
+
+def _eligibility_report(sid, emails):
+    """dry-run：emails → (匹配用户, 未匹配, 已有资格) 三组。"""
+    matched, unmatched = [], []
+    for e in dict.fromkeys(x.strip().lower() for x in emails if x and x.strip()):
+        u = UserModel.query.filter(db.func.lower(UserModel.email) == e).first()
+        if u:
+            matched.append(u)
+        else:
+            unmatched.append(e)
+    have = {x.user_id for x in CampMentorEligibility.query.filter_by(camp_session_id=sid).all()}
+    return matched, unmatched, have
+
+
+@bp.route("/sessions/<int:sid>/mentor-eligibility/import-preview", methods=["POST"])
+@jwt_required()
+@camp_role()
+def eligibility_preview(sid):
+    """dry-run 预览：body {emails:[...]}，不落库。"""
+    emails = (request.json or {}).get("emails") or []
+    matched, unmatched, have = _eligibility_report(sid, emails)
+    return jsonify({"code": 200, "data": {
+        "matched": [{"user_id": u.id, "email": u.email, "username": u.username,
+                     "already_eligible": u.id in have} for u in matched],
+        "unmatched_emails": unmatched,
+    }})
+
+
+@bp.route("/sessions/<int:sid>/mentor-eligibility/import-confirm", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="导入导生资格名单")
+def eligibility_confirm(sid):
+    """确认导入：幂等（UQ 跳过已存在）。允许 draft/upcoming 期操作。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if camp.status not in ("draft", "upcoming"):
+        return jsonify({"code": 400, "message": "名单导入仅限草稿/待开放阶段"}), 400
+    emails = (request.json or {}).get("emails") or []
+    matched, unmatched, have = _eligibility_report(sid, emails)
+    batch = CampMentorEligibilityBatch(camp_session_id=sid, imported_by=_current_user().id)
+    db.session.add(batch)
+    db.session.flush()
+    added = 0
+    for u in matched:
+        if u.id in have:
+            continue
+        db.session.add(CampMentorEligibility(batch_id=batch.id, camp_session_id=sid, user_id=u.id))
+        have.add(u.id)
+        added += 1
+    db.session.commit()
+    return jsonify({"code": 200, "message": f"已确认：新增 {added} 人，已有资格跳过 {len(matched)-added} 人，未匹配 {len(unmatched)} 人",
+                    "data": {"added": added, "unmatched_emails": unmatched}})
+
+
+@bp.route("/sessions/<int:sid>/mentor-eligibility")
+@jwt_required()
+@camp_role()
+def eligibility_list(sid):
+    """管理端查看名单与报名情况。"""
+    rows = CampMentorEligibility.query.filter_by(camp_session_id=sid).all()
+    member_ids = {m.user_id for m in CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()}
+    out = []
+    for r in rows:
+        u = UserModel.query.get(r.user_id)
+        out.append({"user_id": r.user_id, "email": u.email if u else None,
+                    "username": u.username if u else None, "registered": r.user_id in member_ids})
+    return jsonify({"code": 200, "eligibility": out})
+
+
+@bp.route("/sessions/<int:sid>/mentor-registration", methods=["POST"])
+@jwt_required()
+@audit_log(operation="导生报名入营")
+def mentor_registration(sid):
+    """名单内用户自行报名成为本营导生（无二次审核；幂等）。仅 upcoming 期。"""
+    user = _current_user()
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not CampMentorEligibility.query.filter_by(camp_session_id=sid, user_id=user.id).first():
+        return jsonify({"code": 403, "message": "你不在本营导生资格名单内"}), 403
+    if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
+        return jsonify({"code": 200, "message": "你已是本营成员，无需重复报名"}), 200
+    if camp.status != "upcoming":
+        return jsonify({"code": 400, "message": "导生报名仅在待开放阶段开放"}), 400
+    db.session.add(CampMember(camp_session_id=sid, user_id=user.id, role="mentor"))
+    db.session.commit()
+    return jsonify({"code": 200, "message": "报名成功，现在可以布置你的导生名片了"})
+
+
+# ─────────────────────────────────────────────
 # 状态机（H-004 冻结版）：draft→upcoming→selecting→running→archived
 # ─────────────────────────────────────────────
 
@@ -298,7 +393,8 @@ def session_list():
     q = CampSession.query
     if not (user.is_admin()):
         # 学员/导生：仅自己参与的营，且 draft（未开放）不可见；archived 历史营保留
-        ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()]
+        ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()] + \
+               [e.camp_session_id for e in CampMentorEligibility.query.filter_by(user_id=user.id).all()]
         q = q.filter(CampSession.id.in_(ids), CampSession.status != 'draft') if ids else q.filter(False)
     camps = q.order_by(CampSession.start_date.desc()).all()
     # 附当前用户是否成员：用户端「我的营期」据此过滤掉非成员营（管理端列表忽略此字段）
