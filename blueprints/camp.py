@@ -420,6 +420,8 @@ def session_update(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "已结营营期只读，信息修正请走档案修正流程"}), 400
     d = request.json or {}
     old_start, old_end, old_weekdays = camp.start_date, camp.end_date, camp.weekdays_only
     for f in ["name", "weekdays_only", "min_daily_hours"]:  # status 走 /transitions；camp_type 已退役
