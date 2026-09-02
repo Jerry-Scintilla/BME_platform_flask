@@ -1,34 +1,29 @@
-/migrations/
-/data/
-/test/
-docs/
 
-# PyCharm项目文件
+__pycache__/
+.DS_Store
+.env
+.flask.pid
 .idea/
 .idea/*
-
-# Python编译文件
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
 .Python
-
-.env
-
-# 本地运行产物（pid / 日志 / scheduler 锁，运行时生成，不提交）
-.flask.pid
-*.pid
-log/
-*.log
-
-# 本地种子/开发测试脚本（开发自用，不入库）
-init_seats_*.py
-dev_*.py
-mock_*.py
-
-# 虚拟环境（本地）
 .venv/
-
-# VSCode
 .vscode/
+*.log
+*.pid
+*.py[cod]
+*.so
+*$py.class
+/data/
+/migrations/
+/test/
+# PyCharm项目文件
+# Python编译文件
+# VSCode
+# 本地运行产物（pid / 日志 / scheduler 锁，运行时生成，不提交）
+# 本地种子/开发测试脚本（开发自用，不入库）
+# 虚拟环境（本地）
+dev_*.py
+docs/
+init_seats_*.py
+log/
+mock_*.py
