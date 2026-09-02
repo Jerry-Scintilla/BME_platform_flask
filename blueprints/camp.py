@@ -10,21 +10,24 @@ import json
 from collections import defaultdict, Counter
 from datetime import date, time, timedelta, datetime
 
+from sqlalchemy import or_
+
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 
 from exts import db, redis_client
 from models import (
-    CampSession, CampCycle, CampMember, CampCourse, CampAttendancePlan,
+    CampSession, CampCycle, CampPolicy, CampMember, CampCourse, CampAttendancePlan,
     CampMentorEligibilityBatch, CampMentorEligibility,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
+    CAMP_CATEGORY_DEFAULTS,
 )
 
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
-from .camp_ms import _apply_ms_fields, _validate_ms, _ms_dict, _ms_phase
+from .camp_ms import _apply_ms_fields, _validate_ms, _ms_dict, _ms_phase, _ms_tags_list
 
 bp = Blueprint("camp", __name__, url_prefix="/camp")
 
@@ -161,6 +164,18 @@ def _approved_leave_dates(camp_id, frm, to):
     return leave_set
 
 
+def _policy_dict(p, category):
+    """CampPolicy 序列化（无策略行时回退该营类型的代码默认值，保证契约形状稳定）"""
+    if p:
+        return {
+            "application": p.application, "formation": p.formation,
+            "match_rule": p.match_rule, "project_limit": p.project_limit,
+            "course_policy": p.course_policy,
+        }
+    return {k: v for k, v in CAMP_CATEGORY_DEFAULTS.get(
+        category or 'learning', {}).items() if k != 'label'}
+
+
 def _session_dict(c):
     return {
         "id": c.id, "name": c.name, "camp_type": c.camp_type,
@@ -168,6 +183,7 @@ def _session_dict(c):
         "cycle_id": c.cycle_id,
         "cycle_code": c.cycle.code if c.cycle else None,
         "cycle_name": c.cycle.name if c.cycle else None,
+        "policy": _policy_dict(c.policy, c.category),
         "start_date": c.start_date.isoformat(), "end_date": c.end_date.isoformat(),
         "status": c.status,
         "expected_check_in": c.expected_check_in.isoformat() if c.expected_check_in else None,
@@ -413,13 +429,18 @@ def session_create():
     if not name or not start or not end:
         return jsonify({"code": 400, "message": "缺少 name/start_date/end_date"}), 400
     # 阶段 1：类型封闭枚举 + 必挂教学周期
-    from models import CAMP_CATEGORY_DEFAULTS
     category = d.get("category", "learning")
     if category not in CAMP_CATEGORY_DEFAULTS:
         return jsonify({"code": 400, "message": f"category 仅支持 {'/'.join(CAMP_CATEGORY_DEFAULTS)}"}), 400
     cycle = CampCycle.query.get(d.get("cycle_id")) if d.get("cycle_id") else None
     if not cycle:
         return jsonify({"code": 400, "message": "缺少有效的 cycle_id（教学周期），请先经 POST /camp/cycles 创建"}), 400
+    # 营期策略：按类型默认值落一行（营期行可覆盖，方案 §3.3）
+    defaults = CAMP_CATEGORY_DEFAULTS[category]
+    policy = CampPolicy(
+        application=defaults['application'], formation=defaults['formation'],
+        match_rule=defaults['match_rule'], project_limit=defaults['project_limit'],
+        course_policy=defaults['course_policy'])
     try:
         camp = CampSession(
             name=name, category=category, cycle_id=cycle.id,
@@ -427,6 +448,7 @@ def session_create():
             expected_check_in=time.fromisoformat(d["expected_check_in"]) if d.get("expected_check_in") else None,
             min_daily_hours=d.get("min_daily_hours"),
             weekdays_only=d.get("weekdays_only", True),
+            policy=policy,
         )
         _apply_ms_fields(camp, d)          # 选导生配置（可选功能，未传即不启用）
     except (ValueError, TypeError) as e:
@@ -445,16 +467,29 @@ def session_create():
 def session_list():
     user = _current_user()
     q = CampSession.query
+    # 当前用户的营内身份与导生资格（非管理员可见性判定 + 卡片身份标记共用）
+    my_rows = CampMember.query.filter_by(user_id=user.id).all()
+    elig_rows = CampMentorEligibility.query.filter_by(user_id=user.id).all()
+    member_ids = {m.camp_session_id for m in my_rows}
+    my_roles = {m.camp_session_id: m.role for m in my_rows}
+    elig_ids = {e.camp_session_id for e in elig_rows}
     if not (user.is_admin()):
-        # 学员/导生：仅自己参与的营，且 draft（未开放）不可见；archived 历史营保留
-        ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()] + \
-               [e.camp_session_id for e in CampMentorEligibility.query.filter_by(user_id=user.id).all()]
-        q = q.filter(CampSession.id.in_(ids), CampSession.status != 'draft') if ids else q.filter(False)
+        # 营期中心可见性（方案 §3.3，五态）：成员/持资格的营（含进行中与历史）
+        # + 全员可见的 upcoming（即将开始；导生入口仅资格名单内，卡片本身可见）/ selecting（可报名）。
+        # draft 永不可见；running/archived 仅成员可见。
+        conds = [CampSession.status.in_(('upcoming', 'selecting'))]
+        own_ids = member_ids | elig_ids
+        if own_ids:
+            conds.append(CampSession.id.in_(own_ids))
+        q = q.filter(or_(*conds), CampSession.status != 'draft')
     camps = q.order_by(CampSession.start_date.desc()).all()
-    # 附当前用户是否成员：用户端「我的营期」据此过滤掉非成员营（管理端列表忽略此字段）
-    member_ids = {m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()}
+    # 附当前用户是否成员 + 营内任职（CampMember.role：student/mentor）+ 导生资格标记。
+    # 身份解耦后导生/学员是营内身份而非全局角色，用户端工作台 tab 分流改读 my_role；
+    # 非成员（含仅持导生资格的 upcoming 营）my_role 为 null。
     return jsonify({"code": 200,
-                    "sessions": [{**_session_dict(c), "is_member": c.id in member_ids} for c in camps]})
+                    "sessions": [{**_session_dict(c), "is_member": c.id in member_ids,
+                                  "my_role": my_roles.get(c.id),
+                                  "has_eligibility": c.id in elig_ids} for c in camps]})
 
 
 @bp.route("/sessions/<int:sid>")
@@ -514,6 +549,16 @@ def session_update(sid):
         if err:
             db.session.rollback()
             return jsonify({"code": 400, "message": err}), 400
+    # 营期策略覆盖（部分更新；category 不可改——策略行随类型生成，改类型=换营，建新营）
+    if isinstance(d.get("policy"), dict):
+        policy = camp.policy or CampPolicy(
+            **{k: v for k, v in CAMP_CATEGORY_DEFAULTS.get(camp.category or 'learning', {}).items()
+               if k != 'label'})
+        if not camp.policy:
+            camp.policy = policy
+        for f in ("application", "formation", "match_rule", "project_limit", "course_policy"):
+            if f in d["policy"]:
+                setattr(policy, f, d["policy"][f])
     # 同步冗余副本：改出勤时间/工时阈值后，已展开的 CampAttendancePlan 也跟着刷新，
     # 否则 _eval_day 仍按旧副本判定迟到/工时（见 _eval_day），管理员改的设置不生效。
     if d.get("expected_check_in") or "min_daily_hours" in d:
@@ -1270,6 +1315,11 @@ def join_request_submit(sid):
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
         return jsonify({"code": 409, "message": "已有待审批的申请，请等待审核"}), 409
     d = request.json or {}
+    # 报名选意向大组（A13 类别标签，须在本营 ms_tags 内；营未配置标签则不接受该字段）
+    preferred_tag = (d.get("preferred_tag") or "").strip() or None
+    if preferred_tag:
+        if preferred_tag not in _ms_tags_list(camp):
+            return jsonify({"code": 400, "message": "意向组不在本营选项内，请刷新后重选"}), 400
     # 学员手选承诺出勤日（JSON 数组），校验格式 + 范围内 + 未来日 + 工作日营不含周末
     selected_days = d.get("selected_days") or []
     today = date.today()
@@ -1289,9 +1339,27 @@ def join_request_submit(sid):
                         ("、工作日" if camp.weekdays_only else "") + "）"}), 400
     # 个别无效日静默剔除（前端日期格已限可选范围，此处兜底）；去重排序后落库
     db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
-                                   reason=d.get("reason"), selected_days=json.dumps(sorted(set(valid)))))
+                                   reason=d.get("reason"), preferred_tag=preferred_tag,
+                                   selected_days=json.dumps(sorted(set(valid)))))
     db.session.commit()
     return jsonify({"code": 200, "message": "申请已提交，等待审批"})
+
+
+@bp.route("/sessions/<int:sid>/join-request/cancel", methods=["POST"])
+@jwt_required()
+def join_request_cancel(sid):
+    """撤回本人待审批的加入申请（导生报名/学员入营通用——手滑提交可反悔，2026-09-03 用户要求）。
+    只允许撤 pending：已审批（approved/rejected）的历史不可撤；撤回后可重新提交（新行）。
+    按 营+人 定位本人最新 pending 行，前端无需跟踪申请 id。"""
+    user = _current_user()
+    row = CampJoinRequest.query.filter_by(
+        camp_session_id=sid, user_id=user.id, status='pending'
+    ).order_by(CampJoinRequest.created_at.desc()).first()
+    if not row:
+        return jsonify({"code": 404, "message": "没有可撤回的待审批申请"}), 404
+    row.status = 'cancelled'
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已撤回申请"})
 
 
 @bp.route("/join-requests/mine")
@@ -1304,7 +1372,8 @@ def join_request_mine():
         c = CampSession.query.get(r.camp_session_id)
         data.append({
             "id": r.id, "camp_session_id": r.camp_session_id, "camp_name": c.name if c else None,
-            "reason": r.reason, "status": r.status, "apply_role": r.apply_role or "student",
+            "reason": r.reason, "preferred_tag": r.preferred_tag,
+            "status": r.status, "apply_role": r.apply_role or "student",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
     return jsonify({"code": 200, "requests": data})
@@ -1326,7 +1395,8 @@ def join_request_list(sid):
         data.append({
             "id": r.id, "user_id": r.user_id, "username": u.username if u else None,
             "email": u.email if u else None, "role": u.role if u else None,
-            "reason": r.reason, "status": r.status, "apply_role": r.apply_role or "student",
+            "reason": r.reason, "preferred_tag": r.preferred_tag,
+            "status": r.status, "apply_role": r.apply_role or "student",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
     return jsonify({"code": 200, "requests": data, "mentors": _camp_mentors(sid)})

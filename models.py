@@ -1103,10 +1103,25 @@ class DiscussionReaction(db.Model):
 # 营期（Camp）系统
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 营期类型封闭枚举与行为默认值（老师不可自建类型；research/competition 预留，阶段 3 实现）
+# 营期类型封闭枚举与行为默认值（老师不可自建类型；research/competition 预留，阶段 3 实现。
+# 建营时按此模板落一行 CampPolicy，营期行可覆盖——避免主表继续膨胀，方案 §3.3/附录）
 CAMP_CATEGORY_DEFAULTS = {
-    'learning': {'label': '培训营（学习型）'},
-    'project': {'label': '项目营'},
+    'learning': {
+        'label': '培训营（学习型）',
+        'application': 'join_request',      # 报名方式：学员申请入池 + 管理员审批
+        'formation': 'preference_export',   # 组队方式：单轮志愿收集 + 导出 CSV + 线下协调 + 批量回填
+        'match_rule': 'single_mentor',      # 学习营单归属（每生一导生，强唯一）
+        'project_limit': None,
+        'course_policy': 'admin_managed',   # 阶段 5 生效：管理员负责课程，导生范围内共建
+    },
+    'project': {
+        'label': '项目营',
+        'application': 'join_request',
+        'formation': 'preference_export',   # 项目志愿单轮 + 导出 + 线下协调 + 回填
+        'match_rule': 'multi_project',      # 每人最多参与 N 个项目（负责人自己的计入）
+        'project_limit': 3,
+        'course_policy': 'unit_creator',    # 阶段 5 生效：负责人在自己项目范围开课
+    },
 }
 
 
@@ -1125,6 +1140,21 @@ class CampCycle(db.Model):
 
     sessions = db.relationship('CampSession', backref='cycle', lazy='dynamic')
 
+
+class CampPolicy(db.Model):
+    """营期策略（阶段 1 落表，阶段 3/5 开始消费）：报名方式 / 组队方式 / 归属规则 / 项目上限 / 课程策略。
+    建营时按 CAMP_CATEGORY_DEFAULTS[category] 生成一行，营期行可覆盖（方案 §3.3）。"""
+    __tablename__ = 'camp_policy'
+    id = db.Column(db.Integer, primary_key=True)
+    application = db.Column(db.String(30), nullable=False, default='join_request')
+    formation = db.Column(db.String(30), nullable=False, default='preference_export')
+    match_rule = db.Column(db.String(30), nullable=False, default='single_mentor')
+    project_limit = db.Column(db.Integer)                       # None = 不限（学习营）
+    course_policy = db.Column(db.String(30), nullable=False, default='admin_managed')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class CampSession(db.Model):
     """营期：如 2026暑期营 / 2026-1学期营"""
     __tablename__ = 'camp_session'
@@ -1134,6 +1164,7 @@ class CampSession(db.Model):
     # ── 阶段 1 共用骨架（2026-09）──
     category = db.Column(db.String(20), nullable=False, server_default='learning')  # learning / project（research/competition 预留）
     cycle_id = db.Column(db.Integer, db.ForeignKey('camp_cycle.id'))                 # 归属教学周期（CampCycle）
+    policy_id = db.Column(db.Integer, db.ForeignKey('camp_policy.id'))               # 营期策略（CampPolicy，建营时按类型默认值生成）
     start_date = db.Column(db.Date, nullable=False)
     end_date = db.Column(db.Date, nullable=False)
     status = db.Column(db.String(20), default='draft')           # draft / active / archived
@@ -1151,6 +1182,8 @@ class CampSession(db.Model):
     ms_tags = db.Column(db.Text)                                # 分类标签 JSON 数组字符串（导生名片从中勾选）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    policy = db.relationship('CampPolicy')   # 营期策略（一对一，建营生成）
 
 
 class CampMember(db.Model):
@@ -1230,6 +1263,7 @@ class CampJoinRequest(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     reason = db.Column(db.Text, nullable=True)
+    preferred_tag = db.Column(db.String(50), nullable=True)   # 报名时选的意向大组（须在本营 ms_tags 内；软件组/硬件组等类别标签，A13）
     selected_days = db.Column(db.Text, nullable=True)   # 学员手选承诺出勤日（JSON 数组字符串，approve 后展开为 CampAttendancePlan）
     status = db.Column(db.String(20), default='pending', index=True)   # pending / approved / rejected
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
