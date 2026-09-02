@@ -212,6 +212,45 @@ def cycle_create():
 
 
 # ─────────────────────────────────────────────
+# 状态机（H-004 冻结版）：draft→upcoming→selecting→running→archived
+# ─────────────────────────────────────────────
+
+# 合法迁移表：动作 → (源状态, 目标状态)。upcoming→draft 允许撤回；结营不可逆。
+CAMP_TRANSITIONS = {
+    "publish":         ("draft", "upcoming"),    # 发布：导生资格导入+导生报名+名片布置
+    "retract":         ("upcoming", "draft"),    # 撤回发布（手滑保护）
+    "open_enrollment": ("upcoming", "selecting"),# 开放报名：学员入池+市集交志愿+指派锁定
+    "open":            ("selecting", "running"), # 开营：课程/考勤/请假/奖励
+    "close":           ("running", "archived"),  # 结营：只读归档（不可逆）
+}
+
+
+@bp.route("/sessions/<int:sid>/transitions", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="营期状态迁移")
+def session_transition(sid):
+    """目标动作制状态迁移（条件更新防并发；status 不再经 PUT 直改）。body: {"action": "publish|retract|open_enrollment|open|close"}"""
+    d = request.json or {}
+    action = d.get("action")
+    if action not in CAMP_TRANSITIONS:
+        return jsonify({"code": 400, "message": f"未知动作；支持 {'/'.join(CAMP_TRANSITIONS)}"}), 400
+    src_status, dst_status = CAMP_TRANSITIONS[action]
+    # 条件更新：并发/重复提交时 rowcount=0 → 读库给出真实状态
+    n = CampSession.query.filter(CampSession.id == sid, CampSession.status == src_status)\
+        .update({"status": dst_status, "updated_at": datetime.now()})
+    if not n:
+        camp = CampSession.query.get(sid)
+        if not camp:
+            return jsonify({"code": 404, "message": "营期不存在"}), 404
+        return jsonify({"code": 409, "message": f"迁移失败：当前状态为 {camp.status}，{action} 要求 {src_status}"}), 409
+    db.session.commit()
+    camp = CampSession.query.get(sid)
+    return jsonify({"code": 200, "message": f"已{'发布' if action=='publish' else '撤回发布' if action=='retract' else '开放报名' if action=='open_enrollment' else '开营' if action=='open' else '结营'}",
+                    "session": _session_dict(camp)})
+
+
+# ─────────────────────────────────────────────
 # 营期 CRUD
 # ─────────────────────────────────────────────
 
@@ -287,7 +326,7 @@ def session_update(sid):
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     d = request.json or {}
     old_start, old_end, old_weekdays = camp.start_date, camp.end_date, camp.weekdays_only
-    for f in ["name", "camp_type", "status", "weekdays_only", "min_daily_hours"]:
+    for f in ["name", "weekdays_only", "min_daily_hours"]:  # status 走 /transitions；camp_type 已退役
         if f in d:
             setattr(camp, f, d[f])
     try:
@@ -1023,7 +1062,7 @@ def camp_featured():
     消费方为 /camp-home 招募页与 /camp 空状态分流；成员工作台不消费（走 session_list）。"""
     user = _current_user()
     # 只展示进行中的营；归档/草稿营不该再作为招募入口
-    camp = CampSession.query.filter_by(is_featured=True, status='active').first()
+    camp = CampSession.query.filter(CampSession.is_featured == True, CampSession.status.in_(('upcoming','selecting'))).first()
     if not camp:
         return jsonify({"code": 200, "session": None, "is_member": False, "my_request": None})
     is_member = CampMember.query.filter_by(camp_session_id=camp.id, user_id=user.id).first() is not None
@@ -1045,8 +1084,8 @@ def camp_feature(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
-    if camp.status != 'active':
-        return jsonify({"code": 400, "message": "仅进行中的营期可设为招募营期"}), 400
+    if camp.status not in ('upcoming', 'selecting'):
+        return jsonify({"code": 400, "message": "仅待开放/选择阶段的营期可设为招募营期"}), 400
     CampSession.query.filter(CampSession.is_featured.is_(True)).update({"is_featured": False})
     camp.is_featured = True
     db.session.commit()
@@ -1064,8 +1103,8 @@ def join_request_submit(sid):
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if user.is_admin():
         return jsonify({"code": 400, "message": "管理员无需申请加入营期；导生经资格名单报名或由管理员分配"}), 400
-    if camp.status != 'active':
-        return jsonify({"code": 400, "message": "该营期当前未开放（仅进行中的营期可申请加入）"}), 400
+    if camp.status != 'selecting':
+        return jsonify({"code": 400, "message": "该营期当前未开放报名（仅选择阶段可申请加入）"}), 400
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
         return jsonify({"code": 402, "message": "你已是该营期成员"}), 402
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
