@@ -1304,7 +1304,7 @@ def join_request_mine():
         c = CampSession.query.get(r.camp_session_id)
         data.append({
             "id": r.id, "camp_session_id": r.camp_session_id, "camp_name": c.name if c else None,
-            "reason": r.reason, "status": r.status,
+            "reason": r.reason, "status": r.status, "apply_role": r.apply_role or "student",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
     return jsonify({"code": 200, "requests": data})
