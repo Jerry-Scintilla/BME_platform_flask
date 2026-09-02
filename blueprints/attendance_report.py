@@ -356,7 +356,7 @@ def list_recipients():
     user = UserModel.query.filter_by(email=get_jwt_identity()).first()
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
-    if user.user_mode != "admin":
+    if not user.is_admin():
         return jsonify({"code": 403, "message": "权限不足，仅管理员可查看"}), 403
 
     perm = PermissionModel.query.filter_by(name=RECIPIENT_PERMISSION).first()
@@ -392,7 +392,7 @@ def send_now():
     user = UserModel.query.filter_by(email=email_identity).first()
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
-    if user.user_mode != "admin":
+    if not user.is_admin():
         return jsonify({"code": 403, "message": "权限不足，仅管理员可触发"}), 403
 
     data = request.get_json(silent=True) or {}

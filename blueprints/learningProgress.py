@@ -30,7 +30,7 @@ bp = Blueprint("learningProgress", __name__, url_prefix="")
 def update():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -155,7 +155,7 @@ def update():
 def learningprogress_list():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -278,7 +278,7 @@ def group():
 
     student_ids = [student.student_id for student in students]
 
-    if user.user_mode != 'admin':
+    if not user.is_admin():
         if user.id not in student_ids:
             return jsonify({
                 "code": 403,
@@ -330,7 +330,7 @@ def group():
 def delete():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -903,7 +903,7 @@ def list_course_students():
         return jsonify({"code": 404, "message": "用户不存在"}), 404
 
     # 只有管理员可以查看
-    if user.user_mode != 'admin':
+    if not user.is_admin():
         return jsonify({"code": 403, "message": "权限不足"}), 403
 
     course_id = request.args.get('Course_Id')

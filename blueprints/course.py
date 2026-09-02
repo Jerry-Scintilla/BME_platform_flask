@@ -400,7 +400,7 @@ def course_list():
 def chapter_public():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -445,7 +445,7 @@ def chapter_add():
     """增量添加章节，不删除原有章节"""
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -494,7 +494,7 @@ def chapter_edit():
     """更新单个章节信息"""
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -539,7 +539,7 @@ def chapter_delete():
     """删除单个章节"""
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -608,7 +608,7 @@ def chapter_list():
 def course_delete():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -715,7 +715,7 @@ def search_courses():
 def book_upgrade():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -1014,7 +1014,7 @@ def resource_download():
 def _require_admin():
     """admin 校验，通过返回 None，否则返回错误响应。与 book_upgrade 同口径。"""
     user = UserModel.query.filter_by(email=get_jwt_identity()).first()
-    if user is None or user.user_mode != 'admin':
+    if user is None or not user.is_admin():
         return jsonify({
             "code": 400,
             'message': "用户权限不够"
@@ -1176,7 +1176,7 @@ def lesson_add():
         return jsonify({"code": 404, "message": "课程不存在"}), 404
 
     # 权限检查：课程创建者或管理员可添加课时
-    if course.creator_id != user.id and user.user_mode != 'admin':
+    if course.creator_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无课程管理权限"}), 403
 
     # 验证章节存在且属于该课程
@@ -1238,7 +1238,7 @@ def lesson_edit():
 
     # 权限检查：课程创建者或管理员可编辑
     course = CourseModel.query.filter_by(id=lesson.course_id).first()
-    if course.creator_id != user.id and user.user_mode != 'admin':
+    if course.creator_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无课程管理权限"}), 403
 
     form = LessonForm()
@@ -1296,7 +1296,7 @@ def lesson_delete():
 
     # 权限检查：课程创建者或管理员可删除
     course = CourseModel.query.filter_by(id=lesson.course_id).first()
-    if course.creator_id != user.id and user.user_mode != 'admin':
+    if course.creator_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无课程管理权限"}), 403
 
     db.session.delete(lesson)
@@ -1379,7 +1379,7 @@ def fix_class_hours():
     """从lesson表重新计算指定课程的class_hour"""
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    if user.user_mode != 'admin':
+    if not user.is_admin():
         return jsonify({"code": 400, "message": "用户权限不够"}), 400
 
     data = request.get_json()

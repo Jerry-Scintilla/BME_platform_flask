@@ -201,7 +201,6 @@ def get_self_permissions():
     return jsonify({
         "code": 200,
         "user": user.username,
-        "user_mode": user.user_mode,
         "permissions": permissions
     })
 

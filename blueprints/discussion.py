@@ -50,7 +50,7 @@ def can_view_thread(thread, user):
         return False
 
     # 管理员可见
-    if user.user_mode == 'admin':
+    if user.is_admin():
         return True
 
     # 已删除/隐藏的帖子，管理员和作者可见
@@ -108,7 +108,7 @@ def can_post_thread(scope_type, scope_id, user):
     if not user:
         return False
 
-    if user.user_mode == 'admin':
+    if user.is_admin():
         return True
 
     if scope_type == 'global':
@@ -147,7 +147,7 @@ def can_moderate_thread(thread, user):
     """
     if not user:
         return False
-    return user.user_mode == 'admin'
+    return user.is_admin()
 
 
 # ==================== 主题帖 CRUD ====================
@@ -346,7 +346,7 @@ def list_threads():
     query = DiscussionThread.query
 
     # 权限过滤：只返回用户有权限查看的帖子
-    if user.user_mode != 'admin':
+    if not user.is_admin():
         # global 或非 group 的帖子
         or_conditions = [
             and_(
@@ -388,7 +388,7 @@ def list_threads():
     for thread in pagination.items:
         # 检查用户是否有权限查看（用于隐藏状态帖子）
         if thread.status in [DiscussionThread.STATUS_HIDDEN, DiscussionThread.STATUS_DELETED]:
-            if thread.author_id != user.id and user.user_mode != 'admin':
+            if thread.author_id != user.id and not user.is_admin():
                 continue
 
         result.append({
@@ -532,7 +532,7 @@ def update_thread(thread_id):
         return jsonify({"code": 404, "message": "帖子不存在"}), 404
 
     # 权限检查：作者或管理员
-    if thread.author_id != user.id and user.user_mode != 'admin':
+    if thread.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限编辑"}), 403
 
     data = request.get_json(silent=True) or {}
@@ -570,7 +570,7 @@ def delete_thread(thread_id):
         return jsonify({"code": 404, "message": "帖子不存在"}), 404
 
     # 权限检查：作者或管理员
-    if thread.author_id != user.id and user.user_mode != 'admin':
+    if thread.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限删除"}), 403
 
     # 软删除
@@ -826,7 +826,7 @@ def update_reply(reply_id):
         return jsonify({"code": 404, "message": "回复不存在"}), 404
 
     # 权限检查：作者或管理员
-    if reply.author_id != user.id and user.user_mode != 'admin':
+    if reply.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限编辑"}), 403
 
     data = request.get_json(silent=True) or {}
@@ -860,7 +860,7 @@ def delete_reply(reply_id):
         return jsonify({"code": 404, "message": "回复不存在"}), 404
 
     # 权限检查：作者或管理员
-    if reply.author_id != user.id and user.user_mode != 'admin':
+    if reply.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限删除"}), 403
 
     # 软删除

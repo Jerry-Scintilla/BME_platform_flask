@@ -86,7 +86,7 @@ def _camp_writable(camp):
 
 def _visible_student_ids(camp_id, user):
     """导生=本团队学员；老师/超管=全营学员。"""
-    if user.is_admin_like() or user.role == 'teacher':
+    if user.is_admin():
         return [m.user_id for m in CampMember.query.filter_by(
             camp_session_id=camp_id, role='student').all()]
     return [m.user_id for m in CampMember.query.filter_by(
@@ -180,7 +180,7 @@ def _session_dict(c):
 
 @bp.route("/sessions", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="创建营期")
 def session_create():
     d = request.json or {}
@@ -212,7 +212,7 @@ def session_create():
 def session_list():
     user = _current_user()
     q = CampSession.query
-    if not (user.is_admin_like() or user.role == 'teacher'):
+    if not (user.is_admin()):
         # 学员/导生：仅自己参与的营，且 draft（未开放）不可见；archived 历史营保留
         ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id).all()]
         q = q.filter(CampSession.id.in_(ids), CampSession.status != 'draft') if ids else q.filter(False)
@@ -234,7 +234,7 @@ def session_detail(sid):
 
 @bp.route("/sessions/<int:sid>", methods=["PUT"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="修改营期")
 def session_update(sid):
     camp = CampSession.query.get(sid)
@@ -334,7 +334,7 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True):
 
 @bp.route("/sessions/<int:sid>/members", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="分配营期成员")
 def member_assign(sid):
     d = request.json or {}
@@ -354,7 +354,7 @@ def member_assign(sid):
 def member_list(sid):
     user = _current_user()
     visible = set(_visible_student_ids(sid, user))
-    see_all = user.is_admin_like() or user.role == 'teacher'
+    see_all = user.is_admin()
     data = []
     for m in CampMember.query.filter_by(camp_session_id=sid).all():
         if m.role == 'student' and not see_all and m.user_id not in visible:
@@ -370,7 +370,7 @@ def member_list(sid):
 
 @bp.route("/sessions/<int:sid>/members/<int:uid>", methods=["DELETE"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="移除营期成员")
 def member_remove(sid, uid):
     camp = CampSession.query.get(sid)
@@ -411,7 +411,7 @@ def member_remove(sid, uid):
 
 @bp.route("/sessions/<int:sid>/courses", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 def course_add(sid):
     camp = CampSession.query.get(sid)
     if not camp:
@@ -432,7 +432,7 @@ def course_add(sid):
 
 @bp.route("/sessions/<int:sid>/courses/<int:cid>", methods=["DELETE"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="营期移除课程")
 def course_remove(sid, cid):
     camp = CampSession.query.get(sid)
@@ -506,7 +506,7 @@ def selection_mine():
 
 @bp.route("/attendance/plan/<int:sid>", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="重生成营期出勤计划")
 def plan_regenerate(sid):
     camp = CampSession.query.get(sid)
@@ -525,7 +525,7 @@ def plan_regenerate(sid):
 
 @bp.route("/attendance/dashboard/<int:sid>")
 @jwt_required()
-@camp_role('mentor', 'teacher', 'super_admin')
+@camp_role('mentor')
 def attendance_dashboard(sid):
     """学生×承诺日 状态矩阵 + 汇总。
     导生=本团队；老师/超管=全营；学员被 @camp_role 拦截(403)。
@@ -769,7 +769,7 @@ def leave_submit():
 
 @bp.route("/leave/<int:lid>/approve", methods=["POST"])
 @jwt_required()
-@camp_role('mentor', 'teacher', 'super_admin')
+@camp_role('mentor')
 def leave_approve(lid):
     user = _current_user()
     lv = CampLeave.query.get(lid)
@@ -778,7 +778,7 @@ def leave_approve(lid):
     if lv.status != 'pending':
         return jsonify({"code": 400, "message": "该请假已处理，不能重复审批（如需改判请先撤回）"}), 400
     # 导生仅限本团队；老师/超管不限
-    if not (user.is_admin_like() or user.role == 'teacher'):
+    if not (user.is_admin()):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
             return jsonify({"code": 403, "message": "无权审批（非本团队）"}), 403
     d = request.json or {}
@@ -796,7 +796,7 @@ def leave_approve(lid):
 
 @bp.route("/leave/<int:lid>/revoke", methods=["POST"])
 @jwt_required()
-@camp_role('mentor', 'teacher', 'super_admin')
+@camp_role('mentor')
 @audit_log(operation="撤回请假审批")
 def leave_revoke(lid):
     """撤回已批准的请假（如误批）：status 回 pending、清空审批人字段，重新进入待审批，
@@ -809,7 +809,7 @@ def leave_revoke(lid):
     if lv.status != 'approved':
         return jsonify({"code": 400, "message": "仅已批准的请假可撤回"}), 400
     # 与审批同权限：导生仅限本团队；老师/超管不限
-    if not (user.is_admin_like() or user.role == 'teacher'):
+    if not (user.is_admin()):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
             return jsonify({"code": 403, "message": "无权撤回（非本团队）"}), 403
     lv.status = 'pending'
@@ -826,12 +826,12 @@ def leave_revoke(lid):
 
 @bp.route("/sessions/<int:sid>/leave")
 @jwt_required()
-@camp_role('mentor', 'teacher', 'super_admin')
+@camp_role('mentor')
 def leave_list(sid):
     user = _current_user()
     q = CampLeave.query.filter_by(camp_session_id=sid)
     visible = set(_visible_student_ids(sid, user))
-    see_all = user.is_admin_like() or user.role == 'teacher'
+    see_all = user.is_admin()
     data = []
     for lv in q.order_by(CampLeave.created_at.desc()).all():
         if not see_all and lv.user_id not in visible:
@@ -872,7 +872,7 @@ def leave_mine():
 
 @bp.route("/reward", methods=["POST"])
 @jwt_required()
-@camp_role('mentor', 'teacher', 'super_admin')
+@camp_role('mentor')
 def reward_issue():
     user = _current_user()
     d = request.json or {}
@@ -882,7 +882,7 @@ def reward_issue():
     camp = CampSession.query.get(sid)
     if not camp or not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
-    if not (user.is_admin_like() or user.role == 'teacher'):
+    if not (user.is_admin()):
         if not _in_my_team(sid, user, uid):
             return jsonify({"code": 403, "message": "无权给该学员发奖励"}), 403
     if not MedalModel.query.get(medal_id):
@@ -899,7 +899,7 @@ def reward_issue():
 
 @bp.route("/medals")
 @jwt_required()
-@camp_role('mentor', 'teacher', 'super_admin')
+@camp_role('mentor')
 def camp_medals():
     """营期可用勋章列表（导生发奖励时选勋章用；@camp_role 门控，不依赖 medal_management 权限）。"""
     medals = MedalModel.query.all()
@@ -913,7 +913,7 @@ def camp_medals():
 
 @bp.route("/seat/assign", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 def seat_assign():
     d = request.json or {}
     sid, seat_id, uid = d.get("camp_session_id"), d.get("seat_id"), d.get("user_id")
@@ -994,7 +994,7 @@ def camp_featured():
 
 @bp.route("/sessions/<int:sid>/feature", methods=["PUT"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="设为招募营期")
 def camp_feature(sid):
     camp = CampSession.query.get(sid)
@@ -1017,8 +1017,8 @@ def join_request_submit(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
-    if user.role != 'student':
-        return jsonify({"code": 400, "message": "仅学员可申请加入营期；导生/老师由管理员直接分配"}), 400
+    if user.is_admin():
+        return jsonify({"code": 400, "message": "管理员无需申请加入营期；导生经资格名单报名或由管理员分配"}), 400
     if camp.status != 'active':
         return jsonify({"code": 400, "message": "该营期当前未开放（仅进行中的营期可申请加入）"}), 400
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
@@ -1068,7 +1068,7 @@ def join_request_mine():
 
 @bp.route("/sessions/<int:sid>/join-requests")
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 def join_request_list(sid):
     """老师/超管看某营的加入申请（默认 pending，?status=all 看全部）。返回含本营导生列表供审批选。"""
     status = request.args.get("status", "pending")
@@ -1090,7 +1090,7 @@ def join_request_list(sid):
 
 @bp.route("/join-requests/<int:rid>/approve", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="批准营期申请")
 def join_request_approve(rid):
     req = CampJoinRequest.query.get(rid)
@@ -1156,7 +1156,7 @@ def join_request_approve(rid):
 
 @bp.route("/join-requests/<int:rid>/reject", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="拒绝营期申请")
 def join_request_reject(rid):
     req = CampJoinRequest.query.get(rid)
@@ -1186,7 +1186,7 @@ def join_request_reject(rid):
 
 @bp.route("/sessions/<int:sid>/members/<int:uid>", methods=["PUT"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="改派营期成员导生")
 def member_update(sid, uid):
     """改成员归属导生（仅学员行可改；日常团队改派入口）。"""

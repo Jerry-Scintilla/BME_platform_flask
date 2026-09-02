@@ -23,9 +23,12 @@ class UserModel(db.Model):
     # 添加勋章，学习阶段
     medal = db.Column(db.Integer, server_default='0')
     study_stage = db.Column(db.Text)
-    user_mode = db.Column(db.String(20), default='user')  # 旧字段，保留双写；新逻辑用 role
-    # RBAC 四级角色：super_admin / teacher / mentor / student
-    role = db.Column(db.String(20), nullable=False, server_default='student')
+    # 身份解耦（2026-09 Phase 1a）：全局角色只分两级 super_admin / user；
+    # 「导生/组长/学员」等是营期内任职（CampMember），不再看本字段。
+    # 旧 user_mode 列已随 migrate_10_identity 删除（约 48 处裸门禁同步清账）。
+    role = db.Column(db.String(20), nullable=False, server_default='user')
+    # super_admin 内部标签（teacher/developer），仅审计日志与界面展示，无权限语义
+    admin_tag = db.Column(db.String(20))
     avatar_url = db.Column(db.String(100))
     # 添加详细个人信息
     student_id = db.Column(db.Integer)
@@ -65,23 +68,28 @@ class UserModel(db.Model):
         # 历史遗留：数据库中直接存的是前端 MD5 明文
         return self.password == raw_password
 
-    # ── RBAC 角色四级：super_admin / teacher / mentor / student ──
-    ROLE_RANK = {'super_admin': 4, 'teacher': 3, 'mentor': 2, 'student': 1}
+    # ── 全局角色（两级）：super_admin / user ──
+    # 营内身份（导生/学员等）查 CampMember，不查这里。
+    ROLE_RANK = {'super_admin': 1, 'user': 0}
 
     @property
     def role_rank(self):
-        return self.ROLE_RANK.get(self.role or 'student', 1)
+        return self.ROLE_RANK.get(self.role or 'user', 0)
 
     def has_role_at_least(self, role):
-        """当前角色等级 >= 指定角色等级"""
+        """历史兼容：两级模型下等价于「是否 super_admin」"""
         return self.role_rank >= self.ROLE_RANK.get(role, 0)
 
     def is_staff(self):
-        """老师/导生/超管（可登录管理端）"""
-        return self.role_rank >= self.ROLE_RANK['mentor']
+        """管理端准入（身份解耦后仅 super_admin；导生事务在用户端完成）"""
+        return self.role == 'super_admin'
+
+    def is_admin(self):
+        """系统级全权。全局管理员判断的唯一收口，禁止裸比较 role 字符串"""
+        return self.role == 'super_admin'
 
     def is_admin_like(self):
-        """超管（系统级全权）"""
+        """deprecated：is_admin() 的旧名，保留别名避免散落改动"""
         return self.role == 'super_admin'
 
 

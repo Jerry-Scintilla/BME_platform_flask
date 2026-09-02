@@ -44,7 +44,7 @@ def ensure_ai_topic_account(app):
             return u
         u = UserModel(
             username="BME资讯君", email=email,
-            user_mode="admin", role="super_admin",
+            role="super_admin",
             introduction="BME 平台 AI 资讯助手，每日整理 AI/教育科技话题。",
         )
         u.set_password(secrets.token_urlsafe(24))   # 随机串，系统号不登录
@@ -386,7 +386,7 @@ def init_ai_topic_scheduler(app):
 def manual_run():
     """手动触发一次当日话题生成（仅 admin）。幂等：今日已出则跳过。"""
     user = UserModel.query.filter_by(email=get_jwt_identity()).first()
-    if not user or user.user_mode != "admin":
+    if not user or not user.is_admin():
         return jsonify({"code": 403, "message": "仅管理员可触发"}), 403
     try:
         _run_daily_topic(current_app)

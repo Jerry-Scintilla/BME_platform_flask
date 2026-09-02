@@ -28,7 +28,7 @@ bp = Blueprint("homeCover", __name__, url_prefix="")
 def upgrade():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -105,7 +105,7 @@ def upgrade():
 def delete():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,
@@ -168,7 +168,7 @@ def delete():
 def list():
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
-    mode = user.user_mode
+    mode = 'admin' if user.is_admin() else 'user'
     if mode != 'admin':
         return jsonify({
             "code": 400,

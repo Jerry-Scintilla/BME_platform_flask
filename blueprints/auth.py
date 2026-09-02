@@ -103,7 +103,6 @@ def login():
             User_Email = user.email
             User_Medal = user.medal
             User_Stage = user.study_stage
-            User_Mode = user.user_mode
             join_time = user.join_time
             User_Time = join_time.strftime('%Y-%m-%d')
             User_Id = str(user.id).zfill(7)
@@ -136,7 +135,6 @@ def login():
                     "User_Email": User_Email,
                     "User_Medal": User_Medal,
                     "User_Stage": User_Stage,
-                    "User_Mode": User_Mode,
                     "join_time": User_Time,
                     "User_Id": User_Id,
                     "Student_Id": Student_Id,
@@ -170,7 +168,6 @@ def login():
             #     "User_Email": user.email,
             #     "User_Medal": user.medal,
             #     "User_Stage": user.study_stage,
-            #     "User_Mode": user.mode,
             #     "join_time": user.join_time.strftime("%Y-%m-%d %H:%M:%S"),
             #     "User_Id": user.id,
             #     "Student_Id": user.student_id,

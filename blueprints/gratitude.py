@@ -3,7 +3,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from sqlalchemy.exc import IntegrityError
 
 from exts import db, redis_client
-from models import UserModel, CampSession, NotificationModel, GratitudeModel
+from models import UserModel, CampSession, CampMember, NotificationModel, GratitudeModel
 from .notification import create_notification
 
 bp = Blueprint("gratitude", __name__, url_prefix="/gratitude")
@@ -55,12 +55,18 @@ def gratitude_send():
         return jsonify({"code": 404, "message": "收件人不存在"}), 404
     if recipient.id == user.id:
         return jsonify({"code": 400, "message": "不能给自己写感谢信"}), 400
-    if recipient.role == "student":
-        return jsonify({"code": 400, "message": "只能给导生写感谢信"}), 400
 
     if camp_session_id is not None:
         if not CampSession.query.filter_by(id=camp_session_id).first():
             return jsonify({"code": 404, "message": "营期不存在"}), 404
+        # 收件人必须是该营期导生（身份解耦后不再看全局 role）
+        if not CampMember.query.filter_by(
+            camp_session_id=camp_session_id, user_id=recipient.id, role='mentor'
+        ).first():
+            return jsonify({"code": 400, "message": "只能给该营期的导生写感谢信"}), 400
+    else:
+        if not CampMember.query.filter_by(user_id=recipient.id, role='mentor').first():
+            return jsonify({"code": 400, "message": "只能给导生写感谢信"}), 400
 
     # 频率限制：每用户每小时 ≤ 5 封（redis 手动计数；同营期重复由唯一约束兜底）
     # 放在所有校验通过后、写库前，避免无效请求消耗配额

@@ -288,7 +288,7 @@ def leave_query():
     
     # 如果通过小组ID查询，检查用户是否为管理员
     if group_id:
-        if user.user_mode != 'admin':
+        if not user.is_admin():
             return jsonify({
                 "code": 403,
                 "message": "权限不足，只有管理员可以通过小组ID查询"
@@ -419,7 +419,7 @@ def leave_approve():
     
     # 检查是否为组长或管理员
     is_group_leader = (group.teacher_id == user.id)
-    is_admin = (user.user_mode == 'admin')
+    is_admin = (user.is_admin())
     
     if not (is_group_leader or is_admin):
         return jsonify({
@@ -497,7 +497,7 @@ def task_add():
             }),400
         
         # 检查用户是否为组长（只有组长可以创建任务）
-        if group.teacher_id != user.id and user.user_mode != 'admin':
+        if group.teacher_id != user.id and not user.is_admin():
             return jsonify({
                 "code": 403,
                 "message": "只有组长或管理员可以创建任务"
@@ -653,7 +653,7 @@ def task_delete():
         }),404
     
     # 验证删除权限：只有组长和管理员可删除任务
-    is_admin = (user.user_mode == 'admin')
+    is_admin = (user.is_admin())
     is_group_leader = False
     
     # 查询小组信息，检查用户是否为小组组长
@@ -863,7 +863,7 @@ def notice_add():
             }),400
         
         # 检查用户是否为组长（只有组长可以发布通知）
-        if group.teacher_id != user.id and user.user_mode != 'admin':
+        if group.teacher_id != user.id and not user.is_admin():
             return jsonify({
                 "code": 403,
                 "message": "只有组长或管理员可以发布通知"
@@ -1014,7 +1014,7 @@ def notice_delete():
         }),404
     
     # 验证删除权限：只有组长或管理员可以删除通知
-    is_admin = (user.user_mode == 'admin')
+    is_admin = (user.is_admin())
     is_group_leader = False
     
     # 查询小组信息，检查用户是否为小组组长
@@ -1097,7 +1097,7 @@ def notice_query():
         # 如果range为0，表示全组通知；否则检查用户ID是否在range中
         if notice.range != "0":
             # 检查学生是否在通知范围内
-            if user.user_mode != 'admin' and str(user.id) not in notice.range.split(","):
+            if not user.is_admin() and str(user.id) not in notice.range.split(","):
                 # 该通知不是发给当前用户的
                 continue
         
@@ -1203,7 +1203,7 @@ def information_query_all():
             }), 404
         
         # 检查用户是否为管理员或属于该小组
-        if user.user_mode != 'admin' and group.teacher_id != user.id and group.student_id != user.id:
+        if not user.is_admin() and group.teacher_id != user.id and group.student_id != user.id:
             return jsonify({
                 "code": 403,
                 "message": "权限不足，您不是该小组成员"
@@ -1212,7 +1212,7 @@ def information_query_all():
         group_ids = [group_id]
     else:
         # 查询用户所在的所有小组
-        if user.user_mode == 'admin':
+        if user.is_admin():
             # 管理员可以查看所有小组
             groups = GroupModel.query.all()
         else:
@@ -1231,7 +1231,7 @@ def information_query_all():
         group_ids = list(unique_groups.keys())
         
         # 调试信息：打印用户ID和查询到的小组IDs
-        print(f"用户ID: {user.id}, 用户模式: {user.user_mode}, 查询到的小组IDs: {group_ids}")
+        print(f"用户ID: {user.id}, 角色: {user.role}, 查询到的小组IDs: {group_ids}")
         
         if not group_ids:
             # 用户不属于任何小组
@@ -1370,7 +1370,7 @@ def information_query_all():
                 print(f"处理通知信息")
                 
                 # 检查通知范围
-                if info.range != "0" and user.user_mode != 'admin':
+                if info.range != "0" and not user.is_admin():
                     if str(user.id) not in info.range.split(","):
                         # 该通知不是发给当前用户的
                         print(f"通知不是发给当前用户的，跳过")
@@ -2150,7 +2150,7 @@ def homework_query():
     # 如果指定了学生ID，并且用户有权限查看该学生的作业
     if student_id:
         # 管理员或组长可以查看指定学生的作业
-        if user.user_mode == 'admin' or GroupModel.query.filter_by(teacher_id=user.id).first():
+        if user.is_admin() or GroupModel.query.filter_by(teacher_id=user.id).first():
             query = query.filter_by(student_id=student_id)
         # 普通用户只能查看自己的作业
         elif student_id != user.id:
@@ -2293,7 +2293,7 @@ def homework_download():
         group_id=homework.group_id, 
         teacher_id=user.id
     ).first() is not None
-    is_admin = (user.user_mode == 'admin')
+    is_admin = (user.is_admin())
     
     if not (is_owner or is_group_leader or is_admin):
         return jsonify({
@@ -2632,7 +2632,7 @@ def reminder_batch_delete():
     
     # 只有管理员可以按接收者ID标记其他用户的提醒为已读
     if user_id and user_id != user.id:
-        if user.user_mode != 'admin':
+        if not user.is_admin():
             return jsonify({
                 "code": 403,
                 "message": "权限不足，只有管理员可以标记其他用户的提醒为已读"

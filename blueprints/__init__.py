@@ -197,8 +197,8 @@ def check_permission(permission_name):
     权限检查装饰器
     用法: @check_permission('course_management')
 
-    规则：super_admin 直通；其余角色查 ACL（UserPermission）。
-    旧实现里「任何 user_mode=='admin' 直通一切」已废弃。
+    规则：super_admin 直通；其余用户查 ACL（UserPermission）。
+    （历史上「任何 user_mode=='admin' 直通一切」的旧实现与该列已于 Phase 1a 清账删除。）
     """
     def decorator(func):
         @wraps(func)
@@ -228,9 +228,12 @@ def check_permission(permission_name):
 
 def camp_role(*roles):
     """
-    营期专用：要求当前用户全局角色属于 roles 之一。
-    用法: @camp_role('teacher', 'super_admin')
-    （导生团队级收敛装饰器 camp_team_scoped 在 Phase C 引入，依赖 CampMember）
+    营期专用门禁（Phase 1a 身份解耦后语义）：
+    - super_admin 恒通过；
+    - 其余用户要求在该营期 CampMember.role ∈ roles（营内任职，不看全局 role）。
+    用法: @camp_role('mentor')  —— 本营导生或 super_admin
+          @camp_role()          —— 仅 super_admin（建营/归档等管理动作）
+    营期 id 取自路由参数 kwargs['sid']。
     """
     def decorator(func):
         @wraps(func)
@@ -238,8 +241,23 @@ def camp_role(*roles):
             user = _current_user()
             if not user:
                 return jsonify({"code": 401, "message": "用户未认证"}), 401
-            if user.role not in roles:
-                return jsonify({"code": 403, "message": "角色权限不足"}), 403
+            if user.is_admin():
+                return func(*args, **kwargs)
+            if not roles:
+                return jsonify({"code": 403, "message": "需要管理员权限"}), 403
+            sid = kwargs.get('sid')
+            if sid is None:
+                return jsonify({"code": 500, "message": "路由缺少营期参数 sid"}), 500
+            from models import CampMember
+            try:
+                sid_int = int(sid)
+            except (TypeError, ValueError):
+                return jsonify({"code": 400, "message": "营期参数非法"}), 400
+            member = CampMember.query.filter_by(
+                camp_session_id=sid_int, user_id=user.id
+            ).first()
+            if not member or member.role not in roles:
+                return jsonify({"code": 403, "message": "营期内角色权限不足"}), 403
             return func(*args, **kwargs)
         return wrapper
     return decorator

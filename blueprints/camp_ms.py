@@ -190,7 +190,7 @@ def _member_row(sid, uid, role=None):
 
 
 def _is_staff(user):
-    return user.is_admin_like() or user.role == 'teacher'
+    return user.is_admin()
 
 
 def _live_matched(camp_id, mentor_id):
@@ -788,7 +788,7 @@ def matched_list(sid):
 
 @bp.route("/<int:sid>/overview")
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 def overview(sid):
     camp, err = _camp_or_404(sid)
     if err:
@@ -856,7 +856,7 @@ def overview(sid):
 
 @bp.route("/<int:sid>/assign", methods=["POST"])
 @jwt_required()
-@camp_role('teacher', 'super_admin')
+@camp_role()
 @audit_log(operation="手动指派导生")
 def assign(sid):
     camp, err = _camp_or_404(sid)

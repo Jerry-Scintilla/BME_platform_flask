@@ -184,7 +184,7 @@ def notification_list():
     show_all = request.args.get("all", "false").lower() == "true"
 
     # 管理员可以通过 all=true 查看所有用户的通知
-    if show_all and user.user_mode == 'admin':
+    if show_all and user.is_admin():
         query = NotificationModel.query
         unread_count = NotificationModel.query.filter_by(is_read=False).count()
     else:
@@ -350,7 +350,7 @@ def notification_create():
         return jsonify({"code": 401, "message": "用户未认证"}), 401
 
     # 仅管理员可调用
-    if user.user_mode != 'admin':
+    if not user.is_admin():
         return jsonify({"code": 403, "message": "权限不足，仅管理员可创建通知"}), 403
 
     data = request.get_json() or {}
@@ -395,7 +395,7 @@ def notification_batch_create():
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
 
-    if user.user_mode != 'admin':
+    if not user.is_admin():
         return jsonify({"code": 403, "message": "权限不足，仅管理员可批量创建通知"}), 403
 
     data = request.get_json() or {}

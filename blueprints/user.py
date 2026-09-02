@@ -92,7 +92,6 @@ def user_index():
 
     User_Stage = user.study_stage
 
-    User_Mode = user.user_mode
 
     join_time = user.join_time
     User_Time = join_time.strftime('%Y-%m-%d')
@@ -120,7 +119,6 @@ def user_index():
         "User_Name": User_Name,
         "User_Medal": User_Medal,
         "User_Stage": User_Stage,
-        "User_Mode": User_Mode,
         "join_time": User_Time,
         "User_Id": User_Id,
         "Student_Id": Student_Id,
@@ -198,7 +196,6 @@ def user_profile(user_id):
         "User_Name": user.username,
         "User_Medal": user.medal,
         "User_Stage": user.study_stage,
-        "User_Mode": user.user_mode,
         "join_time": join_time,
         "User_Id": str(user.id).zfill(7),
         "Introduction": user.introduction,
@@ -234,7 +231,6 @@ def user_list():
                   "User_Name": user.username,
                   "User_Medal": user.medal,
                   "User_Stage": user.study_stage,
-                  "User_Mode": user.user_mode,
                   "role": user.role,
                   "join_time": user.join_time
                   }

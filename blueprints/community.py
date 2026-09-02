@@ -311,7 +311,7 @@ def community_feed():
     sort = request.args.get('sort', 'hot')
     # 整个请求只取一次 now，与模型 default=datetime.now() 同源（本地时间），勿用 utcnow()
     now = datetime.now()
-    is_admin = user.user_mode == 'admin'
+    is_admin = user.is_admin()
 
     # ── 公共缓存（不含用户特定 liked）：按管理员/普通视角分桶，TTL 8s ──
     view = 'admin' if is_admin else 'public'
