@@ -1139,12 +1139,12 @@ class CampSession(db.Model):
     min_daily_hours = db.Column(db.Float)                        # 每日最低有效时长（判达标）
     weekdays_only = db.Column(db.Boolean, default=True)          # 承诺出勤日 = 范围内工作日
     is_featured = db.Column(db.Boolean, default=False)          # 招募指针（全局唯一，管理端设置）：/camp-home 招募页与 /camp 空状态指向它；成员工作台不消费
-    # 选导生（可选的开营前置阶段，规则见 docs/营期选导生-规划.md）
+    # 选导生（可选的开营前置阶段，单轮制，规则见 docs/营期选导生-规划.md）
     mentor_selection_enabled = db.Column(db.Boolean, default=False)   # 是否启用
     ms_preference_start = db.Column(db.DateTime)                # 阶段开始（导生即可建名片）
-    ms_preference_deadline = db.Column(db.DateTime)             # 学员志愿截止 = 一轮挑选开始
-    ms_round1_deadline = db.Column(db.DateTime)                 # 一轮挑选截止
-    ms_round2_deadline = db.Column(db.DateTime)                 # 二轮互选截止（NULL = 不设二轮）
+    ms_preference_deadline = db.Column(db.DateTime)             # 学员志愿截止（之后老师导出 CSV 线下协调再批量指派）
+    ms_round1_deadline = db.Column(db.DateTime)                 # 已废弃（单轮化）：保留列兼容旧数据，写入/阶段计算一律忽略
+    ms_round2_deadline = db.Column(db.DateTime)                 # 已废弃（单轮化）：保留列兼容旧数据，写入/阶段计算一律忽略
     ms_tags = db.Column(db.Text)                                # 分类标签 JSON 数组字符串（导生名片从中勾选）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
@@ -1235,7 +1235,7 @@ class CampJoinRequest(db.Model):
 
 class CampMentorProfile(db.Model):
     """选导生·导生名片（每营每人一张；无名片导生对学生不可见、不可被选）。
-    资料仅在 upcoming/collecting 阶段可改（防挑选期改容量/换照片），见 _ms_phase。"""
+    资料仅在 upcoming/collecting 阶段可改（防协调期改容量/换照片），见 _ms_phase。"""
     __tablename__ = 'camp_mentor_profile'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -1252,14 +1252,14 @@ class CampMentorProfile(db.Model):
 
 
 class CampMentorPreference(db.Model):
-    """选导生·学员志愿（每轮 1~3 条有序；提交 = 该轮整组替换，截止前可改）。
-    round=1 一轮（collecting 期提交）/ round=2 二轮（仅一轮未匹配学员，限有余额导生）。"""
+    """选导生·学员志愿（单轮：1~3 条有序；提交 = 整组替换，截止前可改）。
+    round 恒为 1（旧两轮制历史数据可能存 2，读取一律按 round==1）。"""
     __tablename__ = 'camp_mentor_preference'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    round = db.Column(db.Integer, nullable=False, default=1)   # 1 | 2
+    round = db.Column(db.Integer, nullable=False, default=1)   # 单轮化后恒为 1
     rank = db.Column(db.Integer, nullable=False)               # 1-3
     note = db.Column(db.String(200))                           # 学员可选留言（导生挑选时可见）
     created_at = db.Column(db.DateTime, default=datetime.now)
@@ -1278,8 +1278,8 @@ class CampMentorMatch(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    round = db.Column(db.Integer, nullable=True)               # 1 | 2 | NULL(admin 指派)
-    source = db.Column(db.String(20), nullable=False, default='mentor_pick')   # mentor_pick | admin
+    round = db.Column(db.Integer, nullable=True)               # 1 | NULL(admin 指派)；2 仅历史数据
+    source = db.Column(db.String(20), nullable=False, default='mentor_pick')   # admin（mentor_pick 已随单轮化退役，仅历史数据）
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'student_user_id', name='uq_ms_match_student'),

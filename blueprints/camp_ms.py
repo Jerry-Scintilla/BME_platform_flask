@@ -1,27 +1,31 @@
 """营期·选导生（Mentor Selection）蓝图。
 
-开营前置的可选阶段（类似点外卖）：导生发布名片（照片/简介/分类/名额）→ 学员交 3 个
-有序志愿（可附留言）→ 导生手动「收下」（满额即止、先到先得）→ 一轮落选学员二轮互选
-（只在有余额导生里重选）→ 结束后进入开营。
+开营前置的可选阶段（单轮制）：导生发布名片（照片/简介/分类/名额）→ 学员在收集期
+提交 3 个有序志愿（可附留言，截止前可整组替换）→ 截止后老师导出 CSV → 线下协调 →
+老师批量指派回填。导生不再在系统内收人（旧两轮互选已退役）。
 
 核心约定：
   - live 师生链接 = camp_member.team_mentor_id（唯一真相，下游考勤看板/请假审批零改动）；
     camp_mentor_match 只是配对账本（round/来源），写入时同步设置链接。
-  - 阶段不落库、读时计算（_ms_phase）：upcoming → collecting → round1 → round2 → done；
-    「提前截止」= 老师把对应 deadline 改成 now（复用 session_update）。
-  - 导生名片仅 upcoming/collecting 可改（防挑选期改容量/换照片）。
+  - 阶段不落库、读时计算（_ms_phase）：upcoming → collecting → done；
+    「提前截止」= 老师把 ms_preference_deadline 改成 now（复用 session_update）。
+  - 导生名片仅 upcoming/collecting 可改（防协调期改容量/换照片）。
   - 名额口径一律按 live 链接计（teacher 经 member_assign 预分配的插班生也占名额）。
+  - 一轮/二轮截止字段（ms_round1_deadline / ms_round2_deadline）已随单轮化废弃：
+    保留模型列与序列化键仅为兼容旧数据/旧前端，配置写入与阶段计算一律忽略。
 
 本模块与 camp.py 的分工：ms 配置解析/校验/阶段计算等共享助手放这里，camp.py 的
 session_create/update/_session_dict 从这里 import（camp_ms 不反向依赖 camp，避免环）。
 """
+import csv
+import io
 import json
 import os
 from datetime import datetime, time
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from flask import Blueprint, request, jsonify, send_from_directory
+from flask import Blueprint, Response, request, jsonify, send_from_directory
 from flask_jwt_extended import jwt_required
 
 from exts import db, redis_client
@@ -42,9 +46,9 @@ MENTOR_PHOTO_DIR = os.path.join('.', 'data', 'mentor_photos')
 # 营级分类标签默认集（session 未配置 ms_tags 时应用层默认）
 MS_DEFAULT_TAGS = ["硬件组", "软件组", "深度学习", "机械设计", "其他"]
 
-# 阶段常量（见 _ms_phase）
-MS_DISABLED, MS_UPCOMING, MS_COLLECTING, MS_ROUND1, MS_ROUND2, MS_DONE = (
-    'disabled', 'upcoming', 'collecting', 'round1', 'round2', 'done')
+# 阶段常量（见 _ms_phase；单轮化后不再有导生挑选阶段）
+MS_DISABLED, MS_UPCOMING, MS_COLLECTING, MS_DONE = (
+    'disabled', 'upcoming', 'collecting', 'done')
 
 MS_SOURCE_TYPE = 'mentor_selection'   # 通知 source_type（String(20) 放得下 16 字符）
 
@@ -86,11 +90,10 @@ def _parse_ms_dt(val):
 
 def _apply_ms_fields(camp, d):
     """从请求体应用选导生配置（只处理出现的键；datetime 解析失败 raise ValueError）。
-    空字符串/None → 置 NULL（update 里用于清除二轮等）。"""
+    空字符串/None → 置 NULL。round 截止键已随单轮化废弃，传入一律忽略。"""
     if "mentor_selection_enabled" in d:
         camp.mentor_selection_enabled = bool(d.get("mentor_selection_enabled"))
-    for f in ("ms_preference_start", "ms_preference_deadline",
-              "ms_round1_deadline", "ms_round2_deadline"):
+    for f in ("ms_preference_start", "ms_preference_deadline"):
         if f in d:
             v = d.get(f)
             setattr(camp, f, _parse_ms_dt(v) if v else None)
@@ -105,55 +108,38 @@ def _apply_ms_fields(camp, d):
 
 def _validate_ms(camp):
     """选导生配置校验（create/update 存库前调用）。返回 None 或错误 message。
-    规则：enabled 时 ps < pd < r1 严格递增（pd==r1 会产生零挑选窗口）；r2 留空或 > r1；
-    各时间点不得晚于开营日当天末（选导生是开营前置阶段）。关闭 enabled 随时允许。"""
+    规则：enabled 时需志愿开始 < 志愿截止，且不得晚于开营日当天末（选导生是开营前置
+    阶段）。round 截止字段已随单轮化废弃，不参与校验。关闭 enabled 随时允许。"""
     if not camp.mentor_selection_enabled:
         return None
-    ps, pd_, r1, r2 = (camp.ms_preference_start, camp.ms_preference_deadline,
-                       camp.ms_round1_deadline, camp.ms_round2_deadline)
-    if not (ps and pd_ and r1):
-        return "启用选导生需设置志愿开始 / 志愿截止 / 一轮截止时间"
-    if not (ps < pd_ < r1):
-        return "选导生时间需满足：志愿开始 < 志愿截止 < 一轮截止"
-    if r2 and r2 <= r1:
-        return "二轮截止需晚于一轮截止（留空则不设二轮）"
+    ps, pd_ = camp.ms_preference_start, camp.ms_preference_deadline
+    if not (ps and pd_):
+        return "启用选导生需设置志愿开始 / 志愿截止时间"
+    if not ps < pd_:
+        return "选导生时间需满足：志愿开始 < 志愿截止"
     camp_end = datetime.combine(camp.start_date, time(23, 59, 59))
-    for label, v in (("志愿开始", ps), ("志愿截止", pd_),
-                     ("一轮截止", r1), ("二轮截止", r2)):
+    for label, v in (("志愿开始", ps), ("志愿截止", pd_)):
         if v and v > camp_end:
             return f"选导生{label}时间不得晚于开营日（{camp.start_date.isoformat()}）"
     return None
-
-
-def _unmatched_count(camp):
-    """未匹配学员数（live 链接 team_mentor_id 为空；不查账本，永不漂移）。"""
-    return CampMember.query.filter_by(
-        camp_session_id=camp.id, role='student', team_mentor_id=None).count()
 
 
 def _ms_phase(camp, now=None):
     """选导生阶段（读时计算，不落库）：
       disabled  未启用（含"开了但没配全"的坏配置——overview 层给 config_error 告警）
       upcoming  未到开始（导生已可建名片）
-      collecting 收志愿（学员提交/修改一轮志愿）
-      round1    一轮挑选（导生收人）
-      round2    二轮互选（仅一轮未匹配学员，只在有余额导生里重选）
-      done      结束（含二轮被跳过：r2 未设，或窗口内已无人未匹配 → 提前 done）"""
+      collecting 收志愿（学员提交/修改志愿，唯一提交窗口）
+      done      截止后（老师导出 CSV → 线下协调 → 批量指派回填，指派即逐人通知）"""
     now = now or datetime.now()
     if not camp.mentor_selection_enabled:
         return MS_DISABLED
-    ps, pd_, r1, r2 = (camp.ms_preference_start, camp.ms_preference_deadline,
-                       camp.ms_round1_deadline, camp.ms_round2_deadline)
-    if not (ps and pd_ and r1):
+    ps, pd_ = camp.ms_preference_start, camp.ms_preference_deadline
+    if not (ps and pd_):
         return MS_DISABLED
     if now < ps:
         return MS_UPCOMING
     if now < pd_:
         return MS_COLLECTING
-    if now < r1:
-        return MS_ROUND1
-    if r2 and r2 > r1 and now < r2 and _unmatched_count(camp) > 0:
-        return MS_ROUND2
     return MS_DONE
 
 
@@ -194,7 +180,7 @@ def _is_staff(user):
 
 
 def _live_matched(camp_id, mentor_id):
-    """导生已收人数（live 链接口径：含 teacher 预分配的插班生）。"""
+    """导生名下学员数（live 链接口径：含 teacher 预分配的插班生）。"""
     return CampMember.query.filter_by(
         camp_session_id=camp_id, role='student', team_mentor_id=mentor_id).count()
 
@@ -205,10 +191,6 @@ def _avatar_url(u):
 
 def _photo_url(p):
     return f"/camp/ms/photo/{p.photo}" if p and p.photo else None
-
-
-def _current_round(phase):
-    return 2 if phase == MS_ROUND2 else 1
 
 
 def _fmt_dt(v):
@@ -223,7 +205,7 @@ def _maybe_notify_transition(camp, phase):
     """读端点顺带调用。Redis 游标 ms:phase_last:{sid} 去重 + SETNX 锁；
     Redis 不可用 → 降级跳过（绝不裸发全营重复通知）。
     老师 session_update 动过 ms 配置会删游标（允许按新时间线重发）。"""
-    if phase not in (MS_COLLECTING, MS_ROUND1, MS_ROUND2, MS_DONE):
+    if phase not in (MS_COLLECTING, MS_DONE):
         return
     key_last, key_lock = f"ms:phase_last:{camp.id}", f"ms:notify_lock:{camp.id}"
     try:
@@ -248,41 +230,26 @@ def _maybe_notify_transition(camp, phase):
 
 
 def _send_phase_notifications(camp, phase):
-    """按阶段向对应人群发通知（只 add 不 commit，与 _maybe_notify_transition 的 commit 同事务）。"""
+    """按阶段向对应人群发通知（只 add 不 commit，与 _maybe_notify_transition 的 commit 同事务）。
+    单轮化后截止（done）不再向学员/导生群发结果——配对结果由老师批量指派时逐人通知。"""
     name = camp.name
-    students = [m.user_id for m in CampMember.query.filter_by(
-        camp_session_id=camp.id, role='student').all()]
-    mentors = [m.user_id for m in CampMember.query.filter_by(
-        camp_session_id=camp.id, role='mentor').all()]
     common = dict(category='camp', source_type=MS_SOURCE_TYPE,
                   source_id=camp.id, camp_session_id=camp.id)
 
     if phase == MS_COLLECTING:
+        students = [m.user_id for m in CampMember.query.filter_by(
+            camp_session_id=camp.id, role='student').all()]
         for uid in students:
             create_notification(uid, "选导生开始",
                                 f"「{name}」选导生开始，请在 {_fmt_dt(camp.ms_preference_deadline)} 前浏览导生名片并提交 3 个志愿。",
                                 **common)
-    elif phase == MS_ROUND1:
-        counts = dict(db.session.query(CampMentorPreference.mentor_user_id, func.count())
-                      .filter(CampMentorPreference.camp_session_id == camp.id,
-                              CampMentorPreference.round == 1)
-                      .group_by(CampMentorPreference.mentor_user_id).all())
-        for uid in mentors:
-            n = counts.get(uid, 0)
-            create_notification(uid, "选导生：开始挑选",
-                                f"「{name}」学员志愿已收集完毕，{n} 位学员选择你，请在 {_fmt_dt(camp.ms_round1_deadline)} 前完成挑选。",
-                                **common)
-    elif phase == MS_ROUND2:
-        unmatched = [m.user_id for m in CampMember.query.filter_by(
-            camp_session_id=camp.id, role='student', team_mentor_id=None).all()]
-        for uid in unmatched:
-            create_notification(uid, "选导生：二轮互选",
-                                f"你在「{name}」一轮未被匹配，请在 {_fmt_dt(camp.ms_round2_deadline)} 前在仍有名额的导生中重新提交志愿。",
-                                is_important=True, **common)
     elif phase == MS_DONE:
-        for uid in students + mentors:
-            create_notification(uid, "选导生结束",
-                                f"「{name}」选导生已结束，结果已公布，可在营期页查看。",
+        # 截止提醒仅告知老师（Phase 1a 后全局「老师」即 super_admin；批量查询无法走
+        # is_admin() 方法收口，按同口径过滤 role）
+        staffs = UserModel.query.filter(UserModel.role == 'super_admin').all()
+        for u in staffs:
+            create_notification(u.id, "选导生：志愿已截止",
+                                f"「{name}」学员志愿已截止，请导出志愿 CSV 完成线下协调，再批量指派导生。",
                                 **common)
 
 
@@ -317,16 +284,12 @@ def phase_view(sid):
     me = {"role": "staff" if not member else member.role}
     if member and member.role == 'student':
         my_mentor = UserModel.query.get(member.team_mentor_id) if member.team_mentor_id else None
-        r1 = _my_preferences(sid, user.id, 1)
-        r2 = _my_preferences(sid, user.id, 2)
-        submittable = None
-        if not member.team_mentor_id:
-            if phase == MS_COLLECTING:
-                submittable = 1
-            elif phase == MS_ROUND2:
-                submittable = 2
+        # 单轮化：只有 collecting 一个提交窗口；round2 键保留但恒空（前端兼容）
+        submittable = 1 if (not member.team_mentor_id and phase == MS_COLLECTING) else None
         me.update({
-            "round1": r1, "round2": r2, "submittable_round": submittable,
+            "round1": _my_preferences(sid, user.id, 1),
+            "round2": [],
+            "submittable_round": submittable,
             "unmatched": member.team_mentor_id is None,
             "my_mentor": ({"user_id": my_mentor.id, "username": my_mentor.username}
                           if my_mentor else None),
@@ -335,19 +298,17 @@ def phase_view(sid):
         profile = CampMentorProfile.query.filter_by(
             camp_session_id=sid, user_id=user.id).first()
         matched = _live_matched(sid, user.id)
-        cur = _current_round(phase) if phase in (MS_ROUND1, MS_ROUND2, MS_COLLECTING) else None
         me.update({
             "has_profile": profile is not None,
             "profile": _profile_dict(profile) if profile else None,
             "profile_locked": phase not in (MS_UPCOMING, MS_COLLECTING),
             "matched_count": matched,
             "remaining": max(0, (profile.capacity if profile else 0) - matched),
-            "suitor_count": (CampMentorPreference.query.filter_by(
-                camp_session_id=sid, mentor_user_id=user.id, round=cur).count()
-                if cur else 0),
+            "suitor_count": CampMentorPreference.query.filter_by(
+                camp_session_id=sid, mentor_user_id=user.id, round=1).count(),
         })
 
-    # 从众信号：一轮已交志愿的去重学员数 / 营内学员总数（前端 collecting/round1 展示用）
+    # 从众信号：已交志愿的去重学员数 / 营内学员总数（前端 collecting 期展示用）
     submitted = (db.session.query(CampMentorPreference.student_user_id)
                  .filter_by(camp_session_id=sid, round=1).distinct().count())
     student_total = CampMember.query.filter_by(
@@ -356,16 +317,14 @@ def phase_view(sid):
     return jsonify({"code": 200, "phase": phase,
                     "enabled": bool(camp.mentor_selection_enabled),
                     "config_error": bool(camp.mentor_selection_enabled and not (
-                        camp.ms_preference_start and camp.ms_preference_deadline
-                        and camp.ms_round1_deadline)),
+                        camp.ms_preference_start and camp.ms_preference_deadline)),
                     "deadlines": {
                         "preference_start": _fmt_dt(camp.ms_preference_start),
                         "preference_deadline": _fmt_dt(camp.ms_preference_deadline),
                         "round1_deadline": _fmt_dt(camp.ms_round1_deadline),
                         "round2_deadline": _fmt_dt(camp.ms_round2_deadline),
                     },
-                    "round2_enabled": bool(camp.ms_round2_deadline
-                                           and camp.ms_round2_deadline > camp.ms_round1_deadline),
+                    "round2_enabled": False,
                     "ms_tags": _ms_tags_list(camp),
                     "stats": {"submitted": submitted, "students": student_total},
                     "me": me})
@@ -446,7 +405,7 @@ def profile_put(sid):
         return jsonify({"code": 400, "message": "capacity 需在 1-30 之间"}), 400
     matched = _live_matched(sid, user.id)
     if capacity < matched:
-        return jsonify({"code": 400, "message": f"capacity 不能低于已收人数（{matched}）"}), 400
+        return jsonify({"code": 400, "message": f"capacity 不能低于已分配人数（{matched}）"}), 400
 
     p = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=user.id).first()
     if not p:
@@ -565,7 +524,7 @@ def preferences_mine(sid):
         return jsonify({"code": 403, "message": "仅本营学员可操作"}), 403
     return jsonify({"code": 200,
                     "round1": _my_preferences(sid, user.id, 1),
-                    "round2": _my_preferences(sid, user.id, 2)})
+                    "round2": []})
 
 
 @bp.route("/<int:sid>/preferences", methods=["POST"])
@@ -587,12 +546,9 @@ def preferences_submit(sid):
     student = _member_row(sid, user.id, role='student')
     if student.team_mentor_id:
         return jsonify({"code": 403, "message": "你已有归属导生，无需再提交志愿"}), 403
-    if phase == MS_COLLECTING:
-        round_ = 1
-    elif phase == MS_ROUND2:
-        round_ = 2
-    else:
+    if phase != MS_COLLECTING:
         return jsonify({"code": 403, "message": "当前不在志愿提交窗口"}), 403
+    round_ = 1                      # 单轮制：round 恒为 1
 
     d = request.json or {}
     lst = d.get("list")
@@ -611,15 +567,12 @@ def preferences_submit(sid):
         note = (it.get("note") or "").strip()
         if len(note) > 200:
             return jsonify({"code": 400, "message": "留言不能超过 200 字"}), 400
-        m = UserModel.query.get(mid)
-        p = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=mid).first()
-        if not _member_row(sid, mid, role='mentor') or not p:
+        if not _member_row(sid, mid, role='mentor') or not CampMentorProfile.query.filter_by(
+                camp_session_id=sid, user_id=mid).first():
             return jsonify({"code": 400, "message": "所选导师不在本营或未发布名片"}), 400
-        if round_ == 2 and _live_matched(sid, mid) >= (p.capacity or 0):
-            return jsonify({"code": 400, "message": f"{m.username if m else '该导师'} 名额已满，请调整志愿"}), 400
         items.append((mid, note))
 
-    # 替换语义：该轮整组删旧插新（截止前可反复改）
+    # 替换语义：整组删旧插新（截止前可反复改）
     CampMentorPreference.query.filter_by(
         camp_session_id=sid, student_user_id=user.id, round=round_).delete(
         synchronize_session=False)
@@ -633,7 +586,7 @@ def preferences_submit(sid):
 
 
 # ─────────────────────────────────────────────
-# 导生挑选（订单式）
+# 导生视角：谁报了我（纯只读名单；收人动作已随单轮化下线，协调由老师线下完成）
 # ─────────────────────────────────────────────
 
 @bp.route("/<int:sid>/suitors")
@@ -651,14 +604,11 @@ def suitors_list(sid):
     phase = _ms_phase(camp)
     if camp.mentor_selection_enabled and phase != MS_DISABLED:
         _maybe_notify_transition(camp, phase)
-    if phase not in (MS_COLLECTING, MS_ROUND1, MS_ROUND2):
-        return jsonify({"code": 400, "message": "当前不在挑选阶段"}), 400
 
-    round_ = _current_round(phase)
     rows = (CampMentorPreference.query
-            .filter_by(camp_session_id=sid, mentor_user_id=user.id, round=round_)
+            .filter_by(camp_session_id=sid, mentor_user_id=user.id, round=1)
             .order_by(CampMentorPreference.rank, CampMentorPreference.created_at).all())
-    # 已被收下的标注归属（学员看得到自己被谁收下，导生端也可看到避免误点）
+    # 标注当前归属（live 链接口径）：collecting 期名单仍在变（preview），done 后供参考
     member_map = {m.user_id: m for m in CampMember.query.filter_by(
         camp_session_id=sid, role='student').all()}
     mentor_ids = {m.team_mentor_id for m in member_map.values() if m.team_mentor_id}
@@ -680,77 +630,12 @@ def suitors_list(sid):
     profile = CampMentorProfile.query.filter_by(
         camp_session_id=sid, user_id=user.id).first()
     matched = _live_matched(sid, user.id)
-    return jsonify({"code": 200, "round": round_, "preview": phase == MS_COLLECTING,
+    return jsonify({"code": 200, "round": 1, "preview": phase == MS_COLLECTING,
                     "phase": phase,
                     "capacity": profile.capacity if profile else 0,
                     "matched": matched,
                     "remaining": max(0, (profile.capacity if profile else 0) - matched),
                     "suitors": data})
-
-
-@bp.route("/<int:sid>/pick", methods=["POST"])
-@jwt_required()
-@audit_log(operation="导生收下学员")
-def pick_student(sid):
-    camp, err = _camp_or_404(sid)
-    if err:
-        return err
-    if not camp.mentor_selection_enabled:
-        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
-    if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
-    user = _current_user()
-    if not _member_row(sid, user.id, role='mentor'):
-        return jsonify({"code": 403, "message": "仅本营导生可操作"}), 403
-
-    phase = _ms_phase(camp)
-    if phase not in (MS_ROUND1, MS_ROUND2):
-        return jsonify({"code": 400, "message": "当前不在挑选窗口"}), 400
-    round_ = _current_round(phase)
-
-    student_id = (request.json or {}).get("student_id")
-    if not student_id:
-        return jsonify({"code": 400, "message": "缺少 student_id"}), 400
-
-    # 锁序：学员成员行 → 我的名片行（全体 pick 同序，无死锁；分别串行化"抢同一学员"与"同导生容量"）
-    student = (CampMember.query.filter_by(
-        camp_session_id=sid, user_id=student_id, role='student')
-        .with_for_update().first())
-    if not student:
-        return jsonify({"code": 404, "message": "学员不在本营"}), 404
-    profile = (CampMentorProfile.query.filter_by(
-        camp_session_id=sid, user_id=user.id).with_for_update().first())
-
-    pref = CampMentorPreference.query.filter_by(
-        camp_session_id=sid, student_user_id=student_id,
-        mentor_user_id=user.id, round=round_).first()
-    if not pref:
-        return jsonify({"code": 400, "message": "该学员本轮未选择你"}), 400
-    if student.team_mentor_id:
-        if student.team_mentor_id == user.id:
-            return jsonify({"code": 409, "message": "该学员已在你团队中"}), 409
-        return jsonify({"code": 409, "message": "该学员已被其他导生收下"}), 409
-    if not profile:
-        return jsonify({"code": 400, "message": "你尚未发布名片，无法收人"}), 400
-    if _live_matched(sid, user.id) >= (profile.capacity or 0):
-        return jsonify({"code": 409, "message": "名额已满"}), 409
-
-    db.session.add(CampMentorMatch(camp_session_id=sid, mentor_user_id=user.id,
-                                   student_user_id=student_id, round=round_,
-                                   source='mentor_pick'))
-    student.team_mentor_id = user.id
-    # 通知学员（同事务）
-    create_notification(student_id, "选导生：你被选中",
-                        f"「{camp.name}」导生 {user.username} 收下了你，你已加入其团队。",
-                        category='camp', source_type=MS_SOURCE_TYPE,
-                        source_id=camp.id, camp_session_id=sid, is_important=True)
-    try:
-        db.session.commit()
-    except IntegrityError:
-        db.session.rollback()
-        return jsonify({"code": 409, "message": "该学员刚被其他导生收下"}), 409
-    return jsonify({"code": 200, "message": "已收下",
-                    "matched_count": _live_matched(sid, user.id)})
 
 
 @bp.route("/<int:sid>/matched")
@@ -801,13 +686,15 @@ def overview(sid):
     student_rows = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
     profiles = {p.user_id: p for p in CampMentorProfile.query.filter_by(
         camp_session_id=sid).all()}
-    chose = {(r[0], r[1]): r[2] for r in db.session.query(
-        CampMentorPreference.mentor_user_id, CampMentorPreference.round, func.count())
-        .filter(CampMentorPreference.camp_session_id == sid)
-        .group_by(CampMentorPreference.mentor_user_id, CampMentorPreference.round).all()}
-    submitted = {(r[0], r[1]) for r in db.session.query(
-        CampMentorPreference.student_user_id, CampMentorPreference.round)
-        .filter(CampMentorPreference.camp_session_id == sid).all()}
+    # 单轮化：志愿只看 round==1；chose_r2 / submitted_r2 / r2_enabled 键保留但恒定（前端兼容）
+    chose = {r[0]: r[1] for r in db.session.query(
+        CampMentorPreference.mentor_user_id, func.count())
+        .filter(CampMentorPreference.camp_session_id == sid,
+                CampMentorPreference.round == 1)
+        .group_by(CampMentorPreference.mentor_user_id).all()}
+    submitted = {r[0] for r in db.session.query(CampMentorPreference.student_user_id)
+                 .filter(CampMentorPreference.camp_session_id == sid,
+                         CampMentorPreference.round == 1).all()}
     users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(
         [m.user_id for m in mentor_rows + student_rows])).all()}
 
@@ -820,8 +707,8 @@ def overview(sid):
             "user_id": m.user_id, "username": u.username if u else "",
             "has_profile": p is not None,
             "capacity": p.capacity if p else 0,
-            "chose_r1": chose.get((m.user_id, 1), 0),
-            "chose_r2": chose.get((m.user_id, 2), 0),
+            "chose_r1": chose.get(m.user_id, 0),
+            "chose_r2": 0,
             "matched": matched,
             "remaining": max(0, (p.capacity if p else 0) - matched),
         })
@@ -833,14 +720,13 @@ def overview(sid):
             "user_id": s.user_id, "username": u.username if u else "",
             "matched": s.team_mentor_id is not None,
             "mentor_name": mu.username if mu else None,
-            "submitted_r1": (s.user_id, 1) in submitted,
-            "submitted_r2": (s.user_id, 2) in submitted,
+            "submitted_r1": s.user_id in submitted,
+            "submitted_r2": False,
         })
     matched_n = sum(1 for s in student_rows if s.team_mentor_id)
     return jsonify({"code": 200, "phase": phase,
                     "config_error": bool(not (camp.ms_preference_start
-                                              and camp.ms_preference_deadline
-                                              and camp.ms_round1_deadline)),
+                                              and camp.ms_preference_deadline)),
                     "deadlines": {
                         "preference_start": _fmt_dt(camp.ms_preference_start),
                         "preference_deadline": _fmt_dt(camp.ms_preference_deadline),
@@ -850,8 +736,7 @@ def overview(sid):
                     "mentors": mentors, "students": students,
                     "stats": {"students": len(student_rows), "matched": matched_n,
                               "unmatched": len(student_rows) - matched_n,
-                              "r2_enabled": bool(camp.ms_round2_deadline
-                                                 and camp.ms_round2_deadline > camp.ms_round1_deadline)}})
+                              "r2_enabled": False}})
 
 
 @bp.route("/<int:sid>/assign", methods=["POST"])
@@ -906,6 +791,131 @@ def assign(sid):
                         source_id=camp.id, camp_session_id=sid, is_important=True)
     db.session.commit()
     return jsonify({"code": 200, "message": "已指派"})
+
+
+@bp.route("/<int:sid>/export")
+@jwt_required()
+@camp_role()
+@audit_log(operation="导出选导生志愿")
+def export_preferences(sid):
+    """导出学员志愿 CSV（utf-8-sig 带 BOM，Excel 可直接打开）：老师线下协调用。
+    每学员一行；志愿按 rank 1-3 填导生名（缺位留空），留言汇总取 rank1 的 note，
+    当前已分配导生取 live 链接 team_mentor_id。只含本营 student 成员。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if not camp.mentor_selection_enabled:
+        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    students = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
+    rows = (CampMentorPreference.query
+            .filter_by(camp_session_id=sid, round=1)
+            .order_by(CampMentorPreference.rank).all())
+    prefs = {}
+    for r in rows:
+        prefs.setdefault(r.student_user_id, []).append(r)
+    user_ids = {r.mentor_user_id for r in rows}
+    for s in students:
+        user_ids.add(s.user_id)
+        if s.team_mentor_id:
+            user_ids.add(s.team_mentor_id)
+    users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(user_ids)).all()} \
+        if user_ids else {}
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["学员ID", "学员姓名", "志愿1", "志愿2", "志愿3", "留言汇总", "当前已分配导生"])
+    for s in students:
+        su = users.get(s.user_id)
+        plist = prefs.get(s.user_id, [])
+        names = []
+        for i in range(3):
+            if i < len(plist):
+                mu = users.get(plist[i].mentor_user_id)
+                names.append(mu.username if mu else str(plist[i].mentor_user_id))
+            else:
+                names.append("")
+        note = (plist[0].note or "") if plist else ""
+        tm = users.get(s.team_mentor_id) if s.team_mentor_id else None
+        w.writerow([s.user_id, su.username if su else "", *names, note,
+                    tm.username if tm else ""])
+    resp = Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f"attachment; filename=camp_{sid}_preferences.csv"
+    return resp
+
+
+@bp.route("/<int:sid>/assign/batch", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="批量指派导生")
+def assign_batch(sid):
+    """线下协调结果批量回填：body {pairs:[{student_user_id, mentor_user_id},...]}。
+    逐项校验（学员 = 本营 student 且未分配；导师 = 本营 mentor），逐项独立提交，
+    单项失败不影响其余：已分配给同一导生 → skipped；已分配给别的导生 → conflict。
+    名额不校验（协调本就允许 teacher 决定是否满额）。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if not camp.mentor_selection_enabled:
+        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    pairs = (request.json or {}).get("pairs")
+    if not isinstance(pairs, list):
+        return jsonify({"code": 400, "message": "缺少 pairs 数组"}), 400
+
+    results = []
+    for pair in pairs:
+        student_id = pair.get("student_user_id") if isinstance(pair, dict) else None
+        mentor_id = pair.get("mentor_user_id") if isinstance(pair, dict) else None
+        item = {"student_user_id": student_id}
+        if not student_id or not mentor_id:
+            results.append({**item, "status": "error",
+                            "message": "缺少 student_user_id/mentor_user_id"})
+            continue
+        # 行锁串行化并发指派；账本 upsert + live 链接写法与单人 /assign 一致
+        student = (CampMember.query.filter_by(
+            camp_session_id=sid, user_id=student_id, role='student')
+            .with_for_update().first())
+        if not student:
+            results.append({**item, "status": "error", "message": "学员不在本营"})
+            continue
+        mentor = _member_row(sid, mentor_id, role='mentor')
+        if not mentor:
+            results.append({**item, "status": "error", "message": "导师不在本营或非导生角色"})
+            continue
+        if student.team_mentor_id == mentor_id:
+            results.append({**item, "status": "skipped", "message": "已分配给该导生，跳过"})
+            continue
+        if student.team_mentor_id:
+            other = UserModel.query.get(student.team_mentor_id)
+            results.append({**item, "status": "conflict",
+                            "message": f"已分配给导生 {other.username if other else student.team_mentor_id}"})
+            continue
+        mu = UserModel.query.get(mentor_id)
+        row = CampMentorMatch.query.filter_by(
+            camp_session_id=sid, student_user_id=student_id).first()
+        if row:
+            row.mentor_user_id = mentor_id
+            row.round = None
+            row.source = 'admin'
+        else:
+            db.session.add(CampMentorMatch(camp_session_id=sid, mentor_user_id=mentor_id,
+                                           student_user_id=student_id, round=None,
+                                           source='admin'))
+        student.team_mentor_id = mentor_id
+        create_notification(student_id, "选导生：导生已指派",
+                            f"老师已将你指派给「{camp.name}」导生 {mu.username if mu else ''}。",
+                            category='camp', source_type=MS_SOURCE_TYPE,
+                            source_id=camp.id, camp_session_id=sid, is_important=True)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            results.append({**item, "status": "error",
+                            "message": "写入冲突（并发指派），请重试"})
+            continue
+        results.append({**item, "status": "assigned", "message": "已指派"})
+    return jsonify({"code": 200, "results": results})
 
 
 @bp.route("/<int:sid>/results")
