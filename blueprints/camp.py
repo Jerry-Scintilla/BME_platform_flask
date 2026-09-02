@@ -427,6 +427,12 @@ def session_update(sid):
     for f in ["name", "weekdays_only", "min_daily_hours"]:  # status 走 /transitions；camp_type 已退役
         if f in d:
             setattr(camp, f, d[f])
+    if "cycle_id" in d:                       # 教学周期可改（需真实存在）
+        cyc = CampCycle.query.get(d["cycle_id"])
+        if not cyc:
+            db.session.rollback()
+            return jsonify({"code": 400, "message": "教学周期不存在"}), 400
+        camp.cycle_id = cyc.id
     try:
         if d.get("start_date"):
             camp.start_date = date.fromisoformat(d["start_date"])
