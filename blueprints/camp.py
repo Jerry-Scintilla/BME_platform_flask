@@ -488,8 +488,8 @@ def session_update(sid):
 # 成员
 # ─────────────────────────────────────────────
 
-def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True):
-    """营期成员分配核心：role 由 user.role 派生 + team_mentor 校验。
+def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="student"):
+    """营期成员分配核心：role 由调用方显式指定 + team_mentor 校验。
     auto_plan=True 学员按工作日自动生成承诺日（member_assign 直接加成员兜底）；
     approve 端点传 False，改由调用方用学生手选日期建 plan。
     返回 (CampMember, None) 成功（未 commit）；或 (None, (message, code)) 失败。"""
@@ -501,10 +501,12 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True):
     user = UserModel.query.get(user_id)
     if not user:
         return None, ("用户不存在", 404)
-    # 营期角色由全局 role 派生（物理杜绝"全局学生当营期导生"等错配）
-    if user.role not in ('student', 'mentor'):
+    # 身份解耦（1a）：营内角色由调用方显式指定（默认学员），不再从全局 user.role 派生；
+    # 仅拒绝 super_admin 入营期成员（管理动作走管理入口）。
+    if user.is_admin():
         return None, ("教师/超管通过营期管理入口操作，不作为营期成员加入", 400)
-    role = user.role
+    if role not in ('student', 'mentor'):
+        return None, ("营内角色仅支持 student/mentor", 400)
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first():
         return None, ("该用户已在营期中", 402)
     # 归属导生仅学员可设，且必须是本营导生
@@ -529,7 +531,7 @@ def member_assign(sid):
     user_id = d.get("user_id")
     if not user_id:
         return jsonify({"code": 400, "message": "缺少 user_id"}), 400
-    m, err = _assign_member(sid, user_id, d.get("team_mentor_id"))
+    m, err = _assign_member(sid, user_id, d.get("team_mentor_id"), role=d.get("role", "student"))
     if err:
         msg, code = err
         return jsonify({"code": code, "message": msg}), code
@@ -1292,7 +1294,7 @@ def join_request_approve(rid):
     # （老师确需给插班生预分配时，走成员管理 member_assign / member_update 显式指定）
     _camp = CampSession.query.get(req.camp_session_id)
     join_mentor = None if (_camp and _camp.mentor_selection_enabled) else d.get("team_mentor_id")
-    m, err = _assign_member(req.camp_session_id, req.user_id, join_mentor, auto_plan=False)
+    m, err = _assign_member(req.camp_session_id, req.user_id, join_mentor, auto_plan=False, role="student")
     if err:
         msg, code = err
         return jsonify({"code": code, "message": msg}), code
