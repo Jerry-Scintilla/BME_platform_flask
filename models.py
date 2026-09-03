@@ -1341,8 +1341,8 @@ class CampMentorMatch(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    round = db.Column(db.Integer, nullable=True)               # 1 | NULL(admin 指派)；2 仅历史数据
-    source = db.Column(db.String(20), nullable=False, default='mentor_pick')   # admin（mentor_pick 已随单轮化退役，仅历史数据）
+    round = db.Column(db.Integer, nullable=True)               # 1 | NULL(admin 指派/导生勾选)；2 仅历史数据
+    source = db.Column(db.String(20), nullable=False, default='mentor_pick')   # admin 老师指派 / mentor_pick 导生自助勾选（协调期）
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'student_user_id', name='uq_ms_match_student'),

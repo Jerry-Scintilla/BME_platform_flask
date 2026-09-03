@@ -316,8 +316,9 @@ def candidates_generate_by_level(sid):
     if camp.status not in ("draft", "upcoming"):
         return jsonify({"code": 400, "message": "候选人维护仅限草稿/待开放阶段"}), 400
     min_level = (request.json or {}).get("min_level", 2)
-    if min_level not in (1, 2, 3, 4):
-        return jsonify({"code": 400, "message": "min_level 仅支持 1-4"}), 400
+    # 下限锁 2（D-2）：LV1 是全体普通学员的默认等级，放行会把整营学生扫进导生资格池
+    if min_level not in (2, 3, 4):
+        return jsonify({"code": 400, "message": "min_level 仅支持 2-4（LV1 为普通学员，不入导生池）"}), 400
     have = {e.user_id for e in CampMentorEligibility.query.filter_by(camp_session_id=sid).all()}
     users = [u for u in UserModel.query.filter(UserModel.level >= min_level).all() if not u.is_admin()]
     batch = CampMentorEligibilityBatch(camp_session_id=sid, imported_by=_current_user().id)

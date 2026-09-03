@@ -2,7 +2,8 @@
 
 开营前置的可选阶段（单轮制）：导生发布名片（照片/简介/分类/名额）→ 学员在收集期
 提交 3 个有序志愿（可附留言，截止前可整组替换）→ 截止后老师导出 CSV → 线下协调 →
-老师批量指派回填。导生不再在系统内收人（旧两轮互选已退役）。
+老师批量指派回填（主路径）；协调期导生也可在人员确认页自助勾选（/pick，共用
+live 链接/账本写入路径，账本 source=mentor_pick）。旧两轮互选已退役。
 
 核心约定：
   - live 师生链接 = camp_member.team_mentor_id（唯一真相，下游考勤看板/请假审批零改动）；
@@ -398,7 +399,9 @@ def profile_put(sid):
     if bad:
         return jsonify({"code": 400, "message": f"标签不在营期可选范围: {', '.join(map(str, bad))}"}), 400
     try:
-        capacity = int(d.get("capacity") or 8)
+        # 显式传 0/null 不再静默落默认 8：缺省才补 8，传了就走范围校验（B-1 falsy 陷阱）
+        raw_cap = d.get("capacity")
+        capacity = 8 if raw_cap is None or raw_cap == "" else int(raw_cap)
     except (ValueError, TypeError):
         return jsonify({"code": 400, "message": "capacity 需为整数"}), 400
     if not (1 <= capacity <= 30):
@@ -665,6 +668,159 @@ def matched_list(sid):
                      "joined_at": _fmt_dt(r.joined_at)})
     data.sort(key=lambda x: x["joined_at"] or "")
     return jsonify({"code": 200, "matched": data})
+
+
+# ─────────────────────────────────────────────
+# 导生自助勾选（D-4：志愿截止后的协调期，导生在人员确认页自行勾选；
+# 与老师批量指派共用 live 链接/账本写入路径，主路径仍是老师回填）
+# ─────────────────────────────────────────────
+
+def _pick_writable(camp):
+    """勾选窗口 = 志愿截止后（done）。收集期内志愿仍在变，不开放；
+    归档营只读由 _camp_writable 另行拦截。"""
+    return _ms_phase(camp) == MS_DONE and _camp_writable(camp)
+
+
+@bp.route("/<int:sid>/pick/roster")
+@jwt_required()
+def pick_roster(sid):
+    """导生视角的勾选名单：本营全部学员 + 志愿信号（是否选我/志愿序/留言）+ 归属状态。
+    status：mine=已在我名下（source 标 admin=老师指派不可释放 / mentor_pick=自助勾选）、
+    taken=已属其他导生、free=未分配。排序：选了我的按志愿序在前，未选/未交居中，被占靠后。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if not camp.mentor_selection_enabled:
+        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    user = _current_user()
+    if not _member_row(sid, user.id, role='mentor'):
+        return jsonify({"code": 403, "message": "仅本营导生可操作"}), 403
+
+    phase = _ms_phase(camp)
+    profile = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    cap = profile.capacity if profile else 0
+    students = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
+    # 志愿信号：该学员 round1 里指向我的 rank/note
+    prefs = {p.student_user_id: p for p in CampMentorPreference.query.filter_by(
+        camp_session_id=sid, mentor_user_id=user.id, round=1).all()}
+    submitted = {r[0] for r in db.session.query(CampMentorPreference.student_user_id)
+                 .filter(CampMentorPreference.camp_session_id == sid,
+                         CampMentorPreference.round == 1).all()}
+    mentor_ids = {s.team_mentor_id for s in students if s.team_mentor_id}
+    users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(
+        [s.user_id for s in students] + list(mentor_ids))).all()} if students else {}
+    ledger = {m.student_user_id: m for m in CampMentorMatch.query.filter_by(
+        camp_session_id=sid, mentor_user_id=user.id).all()}
+
+    data = []
+    for s in students:
+        u = users.get(s.user_id)
+        p = prefs.get(s.user_id)
+        led = ledger.get(s.user_id)
+        mu = users.get(s.team_mentor_id) if s.team_mentor_id else None
+        data.append({
+            "user_id": s.user_id, "username": u.username if u else "",
+            "avatar": _avatar_url(u),
+            "rank": p.rank if p else None,
+            "note": p.note if p else None,
+            "submitted": s.user_id in submitted,
+            "status": ("mine" if s.team_mentor_id == user.id
+                       else "taken" if s.team_mentor_id else "free"),
+            "mentor_name": mu.username if mu else None,
+            "source": led.source if (s.team_mentor_id == user.id and led) else None,
+        })
+    data.sort(key=lambda x: (
+        2 if x["status"] == "taken" else 0,          # 被占的沉底
+        x["rank"] if x["rank"] else 9,               # 选了我的按志愿序
+        0 if x["submitted"] else 1,                  # 交过志愿的靠前
+        x["username"]))
+    matched = _live_matched(sid, user.id)
+    return jsonify({"code": 200, "phase": phase, "writable": _pick_writable(camp),
+                    "capacity": cap, "matched": matched,
+                    "remaining": max(0, cap - matched), "students": data})
+
+
+@bp.route("/<int:sid>/pick", methods=["POST"])
+@jwt_required()
+@audit_log(operation="导生勾选学员")
+def pick(sid):
+    """导生自助勾选/释放：body {student_user_id, action: pick|release（默认 pick）}。
+    仅 done（协调期）开放。pick 硬校验名额（导生无 allow_over 逃生门）与单归属，
+    行锁防并发抢占；release 仅限自己勾选的（source=mentor_pick），老师指派走管理员改派。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if not camp.mentor_selection_enabled:
+        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    if not _pick_writable(camp):
+        return jsonify({"code": 400, "message": "志愿收集期内不可勾选，截止后开放"}), 400
+    user = _current_user()
+    if not _member_row(sid, user.id, role='mentor'):
+        return jsonify({"code": 403, "message": "仅本营导生可操作"}), 403
+    d = request.json or {}
+    student_id = d.get("student_user_id")
+    action = d.get("action") or "pick"
+    if not student_id or action not in ("pick", "release"):
+        return jsonify({"code": 400, "message": "缺少 student_user_id 或 action 非法"}), 400
+
+    # 行锁串行化：两名导生同时勾同一学员时后到者看到最新归属
+    student = (CampMember.query.filter_by(
+        camp_session_id=sid, user_id=student_id, role='student')
+        .with_for_update().first())
+    if not student:
+        return jsonify({"code": 404, "message": "学员不在本营"}), 404
+    su = UserModel.query.get(student_id)
+    su_name = su.username if su else "该学员"
+
+    if action == "pick":
+        if student.team_mentor_id == user.id:
+            return jsonify({"code": 400, "message": "该学员已在你的名下"}), 400
+        if student.team_mentor_id:
+            other = UserModel.query.get(student.team_mentor_id)
+            return jsonify({"code": 409, "message": f"{su_name} 已被导生 "
+                            f"{other.username if other else student.team_mentor_id} 锁定"}), 409
+        profile = CampMentorProfile.query.filter_by(
+            camp_session_id=sid, user_id=user.id).first()
+        cap = profile.capacity if profile else 0
+        if _live_matched(sid, user.id) >= cap:
+            msg = (f"你的名额已满（{cap}），如需增加请联系老师" if cap
+                   else "你未发布名片或名额为 0，无法勾选学员")
+            return jsonify({"code": 409, "message": msg}), 409
+        row = CampMentorMatch.query.filter_by(
+            camp_session_id=sid, student_user_id=student_id).first()
+        if row:
+            row.mentor_user_id = user.id
+            row.round = None
+            row.source = 'mentor_pick'
+        else:
+            db.session.add(CampMentorMatch(camp_session_id=sid, mentor_user_id=user.id,
+                                           student_user_id=student_id, round=None,
+                                           source='mentor_pick'))
+        student.team_mentor_id = user.id
+        create_notification(student_id, "选导生：导生已确认",
+                            f"「{camp.name}」导生 {user.username} 已确认你加入其团队。",
+                            category='camp', source_type=MS_SOURCE_TYPE,
+                            source_id=camp.id, camp_session_id=sid, is_important=True)
+        db.session.commit()
+        return jsonify({"code": 200, "message": f"已锁定 {su_name}"})
+
+    # release：仅自己勾选的可释放；老师指派/预分配的找管理员改派
+    if student.team_mentor_id != user.id:
+        return jsonify({"code": 400, "message": "该学员不在你的名下"}), 400
+    row = CampMentorMatch.query.filter_by(
+        camp_session_id=sid, student_user_id=student_id).first()
+    if not row or row.source != 'mentor_pick':
+        return jsonify({"code": 400, "message": "老师指派的学员请联系管理员改派"}), 400
+    db.session.delete(row)
+    student.team_mentor_id = None
+    create_notification(student_id, "选导生：导生已释放",
+                        f"「{camp.name}」导生 {user.username} 释放了你的归属，你暂未归属任何导生。",
+                        category='camp', source_type=MS_SOURCE_TYPE,
+                        source_id=camp.id, camp_session_id=sid)
+    db.session.commit()
+    return jsonify({"code": 200, "message": f"已释放 {su_name}"})
 
 
 # ─────────────────────────────────────────────
