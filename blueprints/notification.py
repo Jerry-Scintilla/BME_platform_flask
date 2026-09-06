@@ -117,13 +117,25 @@ def _send_email_async(app, user_emails, title, content, html=None, attachments=N
             print(f'[通知邮件] 发送异常: {e}')
 
 
+def _resolve_email_recipients(user_ids):
+    """按 user_id 解析收件人邮箱，过滤掉关闭了邮件通知的用户。
+
+    通知/报告类邮件的统一收口：个人中心「接收邮件通知」关闭后，
+    出勤汇总、系统公告等都不再发送；登录验证码等安全邮件不走这里。
+    """
+    users = UserModel.query.filter(
+        UserModel.id.in_(user_ids),
+        UserModel.email_notify_enabled == True,  # noqa: E712
+    ).all()
+    return [u.email for u in users if u.email and '@' in u.email]
+
+
 def send_notification_emails(user_ids, title, content):
     """异步发送通知邮件给指定用户"""
     from flask import current_app
     app = current_app._get_current_object()
 
-    users = UserModel.query.filter(UserModel.id.in_(user_ids)).all()
-    emails = [u.email for u in users if u.email and '@' in u.email]
+    emails = _resolve_email_recipients(user_ids)
     if not emails:
         return
 
@@ -143,8 +155,7 @@ def send_report_emails(user_ids, title, content, html=None, attachments=None):
     from flask import current_app
     app = current_app._get_current_object()
 
-    users = UserModel.query.filter(UserModel.id.in_(user_ids)).all()
-    emails = [u.email for u in users if u.email and '@' in u.email]
+    emails = _resolve_email_recipients(user_ids)
     if not emails:
         print('[报告邮件] 无有效收件人，跳过发送')
         return
@@ -160,6 +171,48 @@ def send_report_emails(user_ids, title, content, html=None, attachments=None):
 # ────────────────────────────────────────
 # API 端点
 # ────────────────────────────────────────
+
+@bp.route("/email_pref", methods=["GET"])
+@jwt_required()
+def email_pref_get():
+    """查询当前用户的邮件通知开关（个人中心-账户设置）"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户未认证"}), 401
+
+    return jsonify({
+        "code": 200,
+        "data": {"email_notify_enabled": bool(user.email_notify_enabled)},
+    })
+
+
+@bp.route("/email_pref", methods=["POST"])
+@jwt_required()
+def email_pref_set():
+    """
+    设置当前用户的邮件通知开关（个人中心-账户设置）
+
+    Body: { "enabled": true | false }
+    关闭后不再收到通知/报告类邮件；登录验证码不受影响。
+    """
+    user = _get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户未认证"}), 401
+
+    data = request.get_json() or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"code": 400, "message": "enabled 必须为布尔值"}), 400
+
+    user.email_notify_enabled = enabled
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "已更新邮件通知设置",
+        "data": {"email_notify_enabled": enabled},
+    })
+
 
 @bp.route("/list", methods=["GET"])
 @jwt_required()

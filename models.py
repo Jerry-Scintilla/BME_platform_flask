@@ -42,6 +42,10 @@ class UserModel(db.Model):
     github_id = db.Column(db.String(100))
     skill_tags = db.Column(db.String(100))
     college = db.Column(db.String(50))
+    # 邮件通知接收开关：关闭后不再收到通知/报告类邮件（登录验证码不受影响）。
+    # 存量用户默认开启（server_default='1'），历史行为不变；列由
+    # scripts/migrate/migrate_17_email_notify.py 添加（create_all 不补已存在表的列）。
+    email_notify_enabled = db.Column(db.Boolean, nullable=False, server_default='1')
 
     # down_code = db.Column(db.String(100))
     # down_id = db.Column(db.Integer)
