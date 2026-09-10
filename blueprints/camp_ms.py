@@ -32,7 +32,7 @@ from flask_jwt_extended import jwt_required
 from exts import db, redis_client
 from models import (
     CampSession, CampMember, CampMentorProfile, CampMentorPreference,
-    CampMentorMatch, UserModel,
+    CampMentorMatch, CampMentorFavorite, UserModel,
 )
 
 from . import camp_role, audit_log, _current_user
@@ -586,6 +586,74 @@ def preferences_submit(sid):
     db.session.commit()
     return jsonify({"code": 200, "message": "志愿已提交（截止前可修改）",
                     "round": round_, "preferences": _my_preferences(sid, user.id, round_)})
+
+
+# ─────────────────────────────────────────────
+# 学员收藏（市集个人便签：不限数量、不参与配对/导出，仅供浏览整理。
+# 前端契约（60b39fd）：GET → {mentor_ids}；PUT/DELETE → {mentor_id, favorited}）
+# ─────────────────────────────────────────────
+
+def _favorite_base_guard(sid):
+    """收藏三端点共用的前置校验：营存在、启用选导生、未归档、当前用户是本营学员。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return None, None, err
+    if not camp.mentor_selection_enabled:
+        return None, None, (jsonify({"code": 400, "message": "该营期未启用选导生"}), 400)
+    if not _camp_writable(camp):
+        return None, None, (jsonify({"code": 400, "message": "营期已归档，只读"}), 400)
+    user = _current_user()
+    student = _member_row(sid, user.id, role='student')
+    if not student:
+        return None, None, (jsonify({"code": 403, "message": "仅本营学员可操作"}), 403)
+    return camp, student, None
+
+
+@bp.route("/<int:sid>/favorites")
+@jwt_required()
+def favorites_list(sid):
+    _, student, err = _favorite_base_guard(sid)
+    if err:
+        return err
+    rows = CampMentorFavorite.query.filter_by(
+        camp_session_id=sid, student_user_id=student.user_id).all()
+    return jsonify({"code": 200, "mentor_ids": sorted({r.mentor_user_id for r in rows})})
+
+
+@bp.route("/<int:sid>/favorites/<int:mentor_id>", methods=["PUT"])
+@jwt_required()
+def favorite_add(sid, mentor_id):
+    camp, student, err = _favorite_base_guard(sid)
+    if err:
+        return err
+    if student.team_mentor_id:
+        return jsonify({"code": 403, "message": "你已有归属导生，无需再收藏"}), 403
+    if _ms_phase(camp) != MS_COLLECTING:
+        return jsonify({"code": 403, "message": "当前不在收藏窗口（志愿收集期内可标记）"}), 403
+    if not _member_row(sid, mentor_id, role='mentor') or not CampMentorProfile.query.filter_by(
+            camp_session_id=sid, user_id=mentor_id).first():
+        return jsonify({"code": 400, "message": "所选导师不在本营或未发布名片"}), 400
+
+    exists = CampMentorFavorite.query.filter_by(
+        camp_session_id=sid, student_user_id=student.user_id, mentor_user_id=mentor_id).first()
+    if not exists:                      # 幂等：重复收藏直接回成功
+        db.session.add(CampMentorFavorite(
+            camp_session_id=sid, student_user_id=student.user_id, mentor_user_id=mentor_id))
+        db.session.commit()
+    return jsonify({"code": 200, "message": "已收藏", "mentor_id": mentor_id, "favorited": True})
+
+
+@bp.route("/<int:sid>/favorites/<int:mentor_id>", methods=["DELETE"])
+@jwt_required()
+def favorite_remove(sid, mentor_id):
+    _, student, err = _favorite_base_guard(sid)
+    if err:
+        return err
+    CampMentorFavorite.query.filter_by(               # 幂等：不存在也回成功
+        camp_session_id=sid, student_user_id=student.user_id, mentor_user_id=mentor_id).delete(
+        synchronize_session=False)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已取消收藏", "mentor_id": mentor_id, "favorited": False})
 
 
 # ─────────────────────────────────────────────

@@ -1353,6 +1353,20 @@ class CampMentorMatch(db.Model):
     )
 
 
+class CampMentorFavorite(db.Model):
+    """选导生·学员收藏（市集个人便签：不限数量、不参与配对，仅收集期可标记）。
+    与志愿（CampMentorPreference）解耦——收藏只服务浏览整理，导出/协调一律不读此表。"""
+    __tablename__ = 'camp_mentor_favorite'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'student_user_id', 'mentor_user_id', name='uq_ms_fav_mentor'),
+    )
+
+
 class AiTopicLedger(db.Model):
     """AI 每日话题选题账本：全局跨日去重(同一 source_url 不重复选) + 每日幂等(同一天最多 1 篇)。
     选题维度是全局 url/date、非用户级，故不复用 DiscussionReaction 的多态印记结构。"""
