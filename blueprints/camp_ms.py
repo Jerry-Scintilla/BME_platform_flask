@@ -304,7 +304,9 @@ def phase_view(sid):
             "profile": _profile_dict(profile) if profile else None,
             "profile_locked": phase not in (MS_UPCOMING, MS_COLLECTING),
             "matched_count": matched,
-            "remaining": max(0, (profile.capacity if profile else 0) - matched),
+            "remaining": (0 if profile is None
+                          else None if profile.capacity is None
+                          else max(0, profile.capacity - matched)),
             "suitor_count": CampMentorPreference.query.filter_by(
                 camp_session_id=sid, mentor_user_id=user.id, round=1).count(),
         })
@@ -346,9 +348,10 @@ def _profile_dict(p):
         "user_id": p.user_id, "username": u.username if u else "",
         "avatar": _avatar_url(u), "photo_url": _photo_url(p),
         "bio": p.bio or "", "tags": [t for t in tags if isinstance(t, str)],
-        "capacity": p.capacity or 0, "matched": matched,
-        "remaining": max(0, (p.capacity or 0) - matched),
-        "full": matched >= (p.capacity or 0),
+        # capacity None=不限（09-11 起）；remaining None 同义；full 仅有限名额才可能为真
+        "capacity": p.capacity, "matched": matched,
+        "remaining": None if p.capacity is None else max(0, p.capacity - matched),
+        "full": p.capacity is not None and matched >= p.capacity,
         "updated_at": _fmt_dt(p.updated_at),
     }
 
@@ -399,15 +402,16 @@ def profile_put(sid):
     if bad:
         return jsonify({"code": 400, "message": f"标签不在营期可选范围: {', '.join(map(str, bad))}"}), 400
     try:
-        # 显式传 0/null 不再静默落默认 8：缺省才补 8，传了就走范围校验（B-1 falsy 陷阱）
+        # 名额缺省=不限（用户 2026-09-11 拍板，废除 2026-09-03 起的缺省补 8）：
+        # 不传/传 null/空串 → capacity=None（不限）；传数字走 1-30 范围校验，0 仍拒（B-1 语义保留）
         raw_cap = d.get("capacity")
-        capacity = 8 if raw_cap is None or raw_cap == "" else int(raw_cap)
+        capacity = None if raw_cap is None or raw_cap == "" else int(raw_cap)
     except (ValueError, TypeError):
         return jsonify({"code": 400, "message": "capacity 需为整数"}), 400
-    if not (1 <= capacity <= 30):
-        return jsonify({"code": 400, "message": "capacity 需在 1-30 之间"}), 400
+    if capacity is not None and not (1 <= capacity <= 30):
+        return jsonify({"code": 400, "message": "capacity 需在 1-30 之间（不填为不限）"}), 400
     matched = _live_matched(sid, user.id)
-    if capacity < matched:
+    if capacity is not None and capacity < matched:
         return jsonify({"code": 400, "message": f"capacity 不能低于已分配人数（{matched}）"}), 400
 
     p = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=user.id).first()
@@ -705,7 +709,8 @@ def suitors_list(sid):
                     "phase": phase,
                     "capacity": profile.capacity if profile else 0,
                     "matched": matched,
-                    "remaining": max(0, (profile.capacity if profile else 0) - matched),
+                    "remaining": (None if (profile and profile.capacity is None)
+                                  else max(0, (profile.capacity if profile else 0) - matched)),
                     "suitors": data})
 
 
@@ -805,7 +810,8 @@ def pick_roster(sid):
     matched = _live_matched(sid, user.id)
     return jsonify({"code": 200, "phase": phase, "writable": _pick_writable(camp),
                     "capacity": cap, "matched": matched,
-                    "remaining": max(0, cap - matched), "students": data})
+                    "remaining": None if cap is None else max(0, cap - matched),
+                    "students": data})
 
 
 @bp.route("/<int:sid>/pick", methods=["POST"])
@@ -851,11 +857,12 @@ def pick(sid):
                             f"{other.username if other else student.team_mentor_id} 锁定"}), 409
         profile = CampMentorProfile.query.filter_by(
             camp_session_id=sid, user_id=user.id).first()
-        cap = profile.capacity if profile else 0
-        if _live_matched(sid, user.id) >= cap:
-            msg = (f"你的名额已满（{cap}），如需增加请联系老师" if cap
-                   else "你未发布名片或名额为 0，无法勾选学员")
-            return jsonify({"code": 409, "message": msg}), 409
+        if not profile:
+            return jsonify({"code": 409, "message": "你未发布名片，无法勾选学员"}), 409
+        # 名额 None=不限（09-11），不限时不设满额门槛
+        if profile.capacity is not None and _live_matched(sid, user.id) >= profile.capacity:
+            return jsonify({"code": 409,
+                            "message": f"你的名额已满（{profile.capacity}），如需增加请联系老师"}), 409
         row = CampMentorMatch.query.filter_by(
             camp_session_id=sid, student_user_id=student_id).first()
         if row:
@@ -934,7 +941,8 @@ def overview(sid):
             "chose_r1": chose.get(m.user_id, 0),
             "chose_r2": 0,
             "matched": matched,
-            "remaining": max(0, (p.capacity if p else 0) - matched),
+            "remaining": (None if (p and p.capacity is None)
+                          else max(0, (p.capacity if p else 0) - matched)),
         })
     students = []
     for s in student_rows:
@@ -991,7 +999,8 @@ def assign(sid):
     profile = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=mentor_id).first()
     cap = profile.capacity if profile else 0
     mu = UserModel.query.get(mentor_id)
-    if not d.get("allow_over") and _live_matched(sid, mentor_id) >= cap:
+    # 名额 None=不限（09-11）不设满额门槛；无名片仍按 0 拦（allow_over 可越过）
+    if cap is not None and not d.get("allow_over") and _live_matched(sid, mentor_id) >= cap:
         return jsonify({"code": 409,
                         "message": f"{mu.username if mu else '该导生'} 名额已满（{cap}），如需越过请 allow_over"}), 409
     if student.team_mentor_id == mentor_id:

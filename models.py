@@ -1310,7 +1310,7 @@ class CampMentorProfile(db.Model):
     photo = db.Column(db.String(100))            # 相对文件名 {camp}_{user}.{ext}，存 ./data/mentor_photos/
     bio = db.Column(db.Text)
     tags = db.Column(db.Text)                    # JSON 数组字符串，⊆ 营期 ms_tags（服务端校验）
-    capacity = db.Column(db.Integer, default=8)  # 名额上限
+    capacity = db.Column(db.Integer)             # 名额上限;NULL=不限(用户 2026-09-11 定,旧 default=8 废除)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     __table_args__ = (
