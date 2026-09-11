@@ -25,5 +25,6 @@ __pycache__/
 dev_*.py
 docs/
 init_seats_*.py
+litellm_proxy_config.yaml
 log/
 mock_*.py
