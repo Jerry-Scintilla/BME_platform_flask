@@ -99,6 +99,9 @@ def login():
         email = form.User_Email.data
         password = form.User_Password.data
         user = UserModel.query.filter_by(email=email).first()
+        # 封禁拦截（2026-09-11 用户管理）：存量 token 由 app.before_request 统一拦
+        if user and (user.status or 'active') == 'banned':
+            return jsonify({"code": 403, "message": "账号已被封禁，请联系管理员"}), 403
         try:
             User_Email = user.email
             User_Medal = user.medal

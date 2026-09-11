@@ -32,6 +32,9 @@ class UserModel(db.Model):
     # 用户等级地基（LV1-4）：当前仅作为导生候选人等筛选策略的数据源，管理员手动调整；
     # 贡献/学业评价引擎与自动升级属阶段 3。
     level = db.Column(db.Integer, nullable=False, server_default='1')
+    # 账号状态（2026-09-11 用户管理）：active/banned。封禁=禁登录+存量token入口拦截，
+    # 内容与营期归属全保留、可逆——取代删除（user.id 被 25+ 表引用，删除不可行，用户定）
+    status = db.Column(db.String(20), nullable=False, server_default='active')
     avatar_url = db.Column(db.String(100))
     # 添加详细个人信息
     student_id = db.Column(db.Integer)

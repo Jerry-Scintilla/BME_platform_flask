@@ -95,6 +95,104 @@ def admin_set_user_level(user_id):
                     "data": {"user_id": target.id, "username": target.username, "old_level": old, "level": level}})
 
 
+@bp.route("/users/<int:user_id>", methods=["PUT"])
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation="编辑用户资料")
+def admin_update_user(user_id):
+    """用户管理·合并编辑：body 可含 username / role / admin_tag / level（均可选，至少一项）。
+
+    吸收 UserManage 编辑弹窗的全部字段；上方 role / level 两个单点端点保留兼容
+    （营期端调级仍在用）。角色规则与单点端点一致：两级枚举 + 不能撤销自己的管理员。
+    """
+    data = request.get_json(silent=True) or {}
+    target = UserModel.query.get(user_id)
+    if not target:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    changes = {}
+
+    if 'username' in data:
+        username = str(data.get('username') or '').strip()
+        if not (1 <= len(username) <= 50):
+            return jsonify({"code": 400, "message": "用户名需为 1-50 个字符"}), 400
+        if username != target.username:
+            changes['username'] = (target.username, username)
+            target.username = username
+
+    if 'role' in data:
+        role = data.get('role')
+        if role not in ('super_admin', 'user'):
+            return jsonify({"code": 400, "message": "role 仅支持 super_admin / user"}), 400
+        current = _current_user()
+        if current and current.id == target.id and role != 'super_admin':
+            return jsonify({"code": 400, "message": "不能撤销自己的管理员权限"}), 400
+        if role != target.role:
+            changes['role'] = (target.role, role)
+            target.role = role
+
+    if 'admin_tag' in data:
+        admin_tag = data.get('admin_tag')
+        if admin_tag not in ('teacher', 'developer', None):
+            return jsonify({"code": 400, "message": "admin_tag 仅支持 teacher / developer"}), 400
+        if target.role != 'super_admin':
+            admin_tag = None   # 非管理员不保留内部标签（与单点端点同规则）
+        if admin_tag != target.admin_tag:
+            changes['admin_tag'] = (target.admin_tag, admin_tag)
+            target.admin_tag = admin_tag
+
+    if 'level' in data:
+        level = data.get('level')
+        if level not in (1, 2, 3, 4):
+            return jsonify({"code": 400, "message": "level 仅支持 1-4"}), 400
+        if level != target.level:
+            changes['level'] = (target.level, level)
+            target.level = level
+
+    if not changes:
+        return jsonify({"code": 400, "message": "没有可更新字段（username/role/admin_tag/level）"}), 400
+
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已保存",
+                    "data": {"user_id": target.id,
+                             "changes": {k: {"from": v[0], "to": v[1]} for k, v in changes.items()}}})
+
+
+@bp.route("/users/<int:user_id>/status", methods=["PUT"])
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation="封禁/解封用户")
+def admin_set_user_status(user_id):
+    """封禁（banned）/解封（active）。
+
+    封禁语义（2026-09-11 用户定，取代删除——user.id 被 25+ 表引用）：
+    禁登录 + 存量 token 在 app.before_request 入口统一拦截（403）；
+    文章/营期归属/勋章等一切内容保留，解封即完全恢复。
+    保护：不能操作自己；super_admin 不可封（先降级再封）。
+    """
+    status = (request.get_json(silent=True) or {}).get('status')
+    if status not in ('active', 'banned'):
+        return jsonify({"code": 400, "message": "status 仅支持 active / banned"}), 400
+    target = UserModel.query.get(user_id)
+    if not target:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+    current = _current_user()
+    if current and current.id == target.id:
+        return jsonify({"code": 400, "message": "不能封禁自己"}), 400
+    if target.role == 'super_admin':
+        return jsonify({"code": 400, "message": "不能封禁管理员，请先将其降级为普通用户"}), 400
+    if target.status == status:
+        return jsonify({"code": 200, "message": "状态未变化", "data": {"user_id": target.id, "status": status}})
+
+    old = target.status
+    target.status = status
+    db.session.commit()
+    msg = f"已封禁 {target.username}（内容与归属保留，可随时解封）" if status == 'banned' else f"已解封 {target.username}"
+    return jsonify({"code": 200, "message": msg,
+                    "data": {"user_id": target.id, "username": target.username,
+                             "old_status": old, "status": status}})
+
+
 @bp.route("/overview", methods=["GET"])
 @jwt_required()
 @check_permission('system_management')

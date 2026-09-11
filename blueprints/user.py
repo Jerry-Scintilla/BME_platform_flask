@@ -233,7 +233,9 @@ def user_list():
                   "User_Medal": user.medal,
                   "User_Stage": user.study_stage,
                   "role": user.role,
+                  "admin_tag": user.admin_tag,
                   "level": user.level,
+                  "status": user.status or 'active',
                   "join_time": user.join_time
                   }
         data.append(b_list)
