@@ -1621,6 +1621,48 @@ class CampArchiveRevision(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
+# ── 项目广场（功能扩展轮 §五，双来源展示板块）──
+# camp=营期项目「发布」投影（显式动作非自动同步；发布即已审）；community=用户自由分享（免审上架+管理员下架）。
+# 红线：展示不反向驱动营期流程；档案附件/模板引用不复制（引用为安全，档案冻结后不可变）。
+
+class ShowcaseProject(db.Model):
+    """展示条目：全站项目广场的统一单元。camp 条目 UQ(source, source_ref)——一个营期项目只发一条；
+    project_status：community 手标（构思/进行/完成），camp 发布时随营期状态、结营冻结时自动置 done。"""
+    __tablename__ = 'showcase_project'
+    id = db.Column(db.Integer, primary_key=True)
+    source = db.Column(db.String(20), nullable=False)            # camp / community
+    source_ref = db.Column(db.Integer, nullable=True, index=True)  # camp→camp_unit.id；community 空
+    owner_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    title = db.Column(db.String(120), nullable=False)
+    summary = db.Column(db.String(300))                          # 列表页简介
+    description = db.Column(db.Text)                             # 详情正文
+    cover = db.Column(db.String(255))                            # 封面（可空，MVP 用色块兜底）
+    tags = db.Column(db.Text)                                    # JSON 字符串数组
+    project_status = db.Column(db.String(20), nullable=False, default='ongoing')  # idea/ongoing/done
+    status = db.Column(db.String(20), nullable=False, default='visible')          # visible/hidden（治理）
+    members_json = db.Column(db.Text)                            # JSON 展示成员（community 可选公开）
+    links_json = db.Column(db.Text)                              # JSON 资料区链接 [{label,url}]
+    archive_ref = db.Column(db.Integer, nullable=True)           # camp：结营档案 id（引用不复制）
+    view_count = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('source', 'source_ref', name='uq_showcase_source_ref'),
+    )
+
+
+class ShowcaseFavorite(db.Model):
+    """项目广场收藏（复用收藏模式；个人便签性质，与志愿/互动解耦）。"""
+    __tablename__ = 'showcase_favorite'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('showcase_project.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'project_id', name='uq_showcase_fav'),
+    )
+
+
 class AiTopicLedger(db.Model):
     """AI 每日话题选题账本：全局跨日去重(同一 source_url 不重复选) + 每日幂等(同一天最多 1 篇)。
     选题维度是全局 url/date、非用户级，故不复用 DiscussionReaction 的多态印记结构。"""

@@ -879,6 +879,14 @@ def freeze_camp_archive(camp, operator_id):
                           frozen_by=operator_id)
     db.session.add(archive)
     db.session.commit()
+    # 项目广场联动（功能扩展轮 §五）：已发布的营期条目随结营自动标「已完成」并挂档案引用（引用不复制）
+    from models import ShowcaseProject
+    for sp in ShowcaseProject.query.filter(
+            ShowcaseProject.source == 'camp',
+            ShowcaseProject.source_ref.in_([u.id for u in units])).all():
+        sp.project_status = 'done'
+        sp.archive_ref = archive.id
+    db.session.commit()
     return archive
 
 

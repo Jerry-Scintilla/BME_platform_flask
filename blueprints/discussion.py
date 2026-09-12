@@ -136,6 +136,10 @@ def can_post_thread(scope_type, scope_id, user):
         ).first()
         return enrollment is not None
 
+    # project: 项目广场条目评论区——展示板块，登录用户均可参与（条目可见性由广场侧控制）
+    if scope_type == 'project':
+        return True
+
     return False
 
 
@@ -263,7 +267,7 @@ def create_thread():
         return jsonify({"code": 400, "message": "正文至少 10 个字"}), 400
 
     # 校验 scope_type
-    valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task']
+    valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task', 'project']  # project=项目广场（功能扩展轮 §五）
     if scope_type not in valid_scopes:
         return jsonify({"code": 400, "message": f"scope_type 必须为: {', '.join(valid_scopes)}"}), 400
 
@@ -345,9 +349,10 @@ def list_threads():
 
     query = DiscussionThread.query
 
-    # 权限过滤：只返回用户有权限查看的帖子
-    if not user.is_admin():
-        # global 或非 group 的帖子
+    # 权限过滤：只返回用户有权限查看的帖子。
+    # 仅作用于无显式 scope 的 feed 视图——显式按 scope 查询时可见性由 scope 自身决定
+    # （article/course 各自端点已校验；project=广场公开评论区）。group 显式查询保留成员门。
+    if not user.is_admin() and (not scope_type or scope_type == 'group'):
         or_conditions = [
             and_(
                 DiscussionThread.scope_type == 'global',
