@@ -242,7 +242,7 @@ def _send_phase_notifications(camp, phase):
             camp_session_id=camp.id, role='student').all()]
         for uid in students:
             create_notification(uid, "选导生开始",
-                                f"「{name}」选导生开始，请在 {_fmt_dt(camp.ms_preference_deadline)} 前浏览导生名片并提交 3 个志愿。",
+                                f"「{name}」选导生开始，请在 {_fmt_dt(camp.ms_preference_deadline)} 前浏览导生名片并提交 1-3 个志愿。",
                                 **common)
     elif phase == MS_DONE:
         # 截止提醒仅告知老师（Phase 1a 后全局「老师」即 super_admin；批量查询无法走
@@ -497,8 +497,9 @@ def mentors_list(sid):
         if tag and tag not in item["tags"]:
             continue
         data.append(item)
-    # 满员沉底、其余按剩余名额降序（外卖式"还有余量的店排前面"）
-    data.sort(key=lambda x: (x["full"], -x["remaining"]))
+    # 满员沉底、其余按剩余名额降序（外卖式"还有余量的店排前面"）；
+    # capacity=NULL=不限（09-11 D-1）→ remaining=None 视作无限余量排最前，不可取负
+    data.sort(key=lambda x: (x["full"], -(x["remaining"] if x["remaining"] is not None else float("inf"))))
     return jsonify({"code": 200, "phase": phase, "mentors": data})
 
 

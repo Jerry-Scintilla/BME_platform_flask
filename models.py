@@ -1277,7 +1277,7 @@ class CampJoinRequest(db.Model):
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     reason = db.Column(db.Text, nullable=True)
-    preferred_tag = db.Column(db.String(50), nullable=True)   # 报名时选的意向大组（须在本营 ms_tags 内；软件组/硬件组等类别标签，A13）
+    preferred_tag = db.Column(db.String(50), nullable=True)   # 【已退役 2026-09-12】报名时选的意向大组（组别改随归属导生继承）；列保留存历史行，新申请不写
     selected_days = db.Column(db.Text, nullable=True)   # 学员手选承诺出勤日（JSON 数组字符串，approve 后展开为 CampAttendancePlan）
     status = db.Column(db.String(20), default='pending', index=True)   # pending / approved / rejected
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
@@ -1286,9 +1286,9 @@ class CampJoinRequest(db.Model):
 
 
 class CampMentorEligibilityBatch(db.Model):
-    """导生资格名单批次（阶段 2，Q-007）：管理员导入名单→确认；
-    名单内用户在 upcoming（待开放）期定向可见该营的导生报名入口，自行报名无二次审核。
-    与正式营期成员（CampMember）分开：资格 ≠ 任职。"""
+    """【已退役 2026-09-12】导生资格名单批次（阶段 2，Q-007）。导生改自由报名
+    （LV≥2 在 upcoming/selecting 窗口自助提交，管理员审核），资格名单机制下线；
+    表保留不删（免迁移），蓝图已无引用，后续清债再移除。"""
     __tablename__ = 'camp_mentor_eligibility_batch'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), index=True)
@@ -1298,8 +1298,8 @@ class CampMentorEligibilityBatch(db.Model):
 
 
 class CampMentorEligibility(db.Model):
-    """导生资格明细：一名用户在一个营期最多一条（UQ）。
-    唯一标识暂用 email 匹配（老师确认后可扩展学号等，见方案阶段 0）。"""
+    """【已退役 2026-09-12】导生资格明细（资格名单机制，随自由报名上线退役；
+    表保留不删，见 CampMentorEligibilityBatch 说明）。"""
     __tablename__ = 'camp_mentor_eligibility'
     id = db.Column(db.Integer, primary_key=True)
     batch_id = db.Column(db.Integer, db.ForeignKey('camp_mentor_eligibility_batch.id'))
