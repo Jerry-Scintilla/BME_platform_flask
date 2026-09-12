@@ -27,6 +27,7 @@ from models import (
     CampSession, CampPolicy, CampMember,
     CampUnit, ProjectProfile, ProjectApplicationVersion,
     CampUnitMember, CampMembershipEvent, CampProjectPreference,
+    CampUnitActivity, CampUnitActivityCheck,
     UserModel,
 )
 
@@ -437,6 +438,13 @@ def preference_submit(sid):
         u = units.get(uid)
         if not u or u.status == 'terminated':
             return jsonify({"code": 400, "message": f"PROJECT_NOT_APPROVED 项目 {uid} 不存在或已终止"}), 400
+    # 09-13 修复：自己负责/已加入的项目不许再进意向（自选自项目无意义）
+    my_units = {r.unit_id for r in CampUnitMember.query.filter(
+        CampUnitMember.user_id == user.id, CampUnitMember.status == 'active',
+        CampUnitMember.unit_id.in_(unit_ids)).all()}
+    if my_units:
+        in_names = "、".join(units[i].name for i in my_units if i in units)
+        return jsonify({"code": 400, "message": f"你已加入项目「{in_names}」，无需对它提交意向"}), 400
     CampProjectPreference.query.filter_by(
         camp_session_id=sid, student_user_id=user.id).delete(synchronize_session=False)
     for i, it in enumerate(prefs):
@@ -563,7 +571,7 @@ def assign_batch(sid):
             continue
         member = _lock_member(sid, uid)
         if not member or member.role not in ('member', 'student'):
-            results.append({**item, "status": "error", "message": "该用户不在本营（须先入池）"})
+            results.append({**item, "status": "error", "message": "该用户不在本营（须先入营）"})
             continue
         if CampUnitMember.query.filter_by(unit_id=unit.id, user_id=uid,
                                           status='active').first():
@@ -938,3 +946,174 @@ def project_overview(sid):
                                 "reason": e.reason,
                                 "occurred_at": e.occurred_at.isoformat() if e.occurred_at else None}
                                for e in events]})
+
+
+# ─────────────────────────────────────────────
+# 组长活动考勤（2026-09-13 拍板：负责人发起 会议/外出调研/其他 + 勾选出席；
+# 与周打卡统计独立（两区并显不并口径），展示在项目看板与「考勤」视图）
+# ─────────────────────────────────────────────
+
+ACTIVITY_TYPES = {'meeting': '会议', 'field_trip': '外出调研', 'other': '其他'}
+
+
+def _activity_dict(a, checks, member_count, my_uid):
+    mine = next((c for c in checks if c.user_id == my_uid), None)
+    return {
+        "id": a.id, "unit_id": a.unit_id,
+        "type": a.type, "type_text": ACTIVITY_TYPES.get(a.type, a.type),
+        "title": a.title, "happens_on": a.happens_on.isoformat(), "note": a.note,
+        "member_count": member_count,
+        "present_count": sum(1 for c in checks if c.present),
+        "marked": bool(checks),
+        "my_presence": (None if mine is None else bool(mine.present)),
+        "present_user_ids": [c.user_id for c in checks if c.present],
+    }
+
+
+@bp.route("/projects/<int:sid>/activities")
+@jwt_required()
+def my_activities(sid):
+    """「考勤」视图数据源：请求者在本营参与（负责或参加）的各项目活动 + 我的出席态；
+    负责的项目带 is_leader 供前端出发起/勾选入口。周打卡统计另走 /camp/attendance/mine。"""
+    user = _current_user()
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if camp.category != 'project':
+        return jsonify({"code": 400, "message": "该营期不是项目营"}), 400
+    my_rows = (CampUnitMember.query
+               .filter(CampUnitMember.user_id == user.id, CampUnitMember.status == 'active')
+               .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
+               .filter(CampUnit.camp_session_id == sid, CampUnit.unit_type == 'project').all())
+    if not my_rows:
+        return jsonify({"code": 200, "units": []})
+    unit_ids = [r.unit_id for r in my_rows]
+    units = {u.id: u for u in CampUnit.query.filter(CampUnit.id.in_(unit_ids)).all()}
+    member_counts = dict(db.session.query(CampUnitMember.unit_id, db.func.count(CampUnitMember.id))
+                         .filter(CampUnitMember.unit_id.in_(unit_ids), CampUnitMember.status == 'active')
+                         .group_by(CampUnitMember.unit_id).all())
+    acts = (CampUnitActivity.query.filter(CampUnitActivity.unit_id.in_(unit_ids))
+            .order_by(CampUnitActivity.happens_on.desc(), CampUnitActivity.id.desc()).all())
+    checks_by_act = {}
+    if acts:
+        for c in (CampUnitActivityCheck.query
+                  .filter(CampUnitActivityCheck.activity_id.in_([a.id for a in acts])).all()):
+            checks_by_act.setdefault(c.activity_id, []).append(c)
+    # 成员名单（勾选出席弹窗用；全 active 成员含负责人）
+    unit_member_rows = CampUnitMember.query.filter(
+        CampUnitMember.unit_id.in_(unit_ids), CampUnitMember.status == 'active').all()
+    unit_members = {}
+    for m in unit_member_rows:
+        unit_members.setdefault(m.unit_id, []).append(m.user_id)
+    names = _usernames({i for ids in unit_members.values() for i in ids})
+    data = []
+    for r in my_rows:
+        u = units.get(r.unit_id)
+        if not u:
+            continue
+        data.append({
+            "unit_id": u.id, "unit_name": u.name,
+            "is_leader": r.role == 'leader',
+            "members": [{"user_id": i, "username": names.get(i, str(i))}
+                        for i in unit_members.get(u.id, [])],
+            "activities": [_activity_dict(a, checks_by_act.get(a.id, []),
+                                          member_counts.get(u.id, 0), user.id)
+                           for a in acts if a.unit_id == u.id],
+        })
+    return jsonify({"code": 200, "units": data})
+
+
+@bp.route("/units/<int:uid>/activities", methods=["POST"])
+@jwt_required()
+@audit_log(operation="发起项目活动")
+def activity_create(uid):
+    """负责人发起活动（本营未归档即可，预备会/例会都算）。
+    body: {type: meeting|field_trip|other, title, happens_on: YYYY-MM-DD, note?}"""
+    unit, camp, err = _unit_or_404(uid)
+    if err:
+        return err
+    user = _current_user()
+    if not _is_unit_leader(unit, user):
+        return jsonify({"code": 403, "message": "仅项目负责人可发起活动"}), 403
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    d = request.json or {}
+    a_type = d.get("type") or 'meeting'
+    title = (d.get("title") or '').strip()
+    happens_on = d.get("happens_on")
+    if a_type not in ACTIVITY_TYPES:
+        return jsonify({"code": 400, "message": "活动类型须为 meeting/field_trip/other"}), 400
+    if not title or len(title) > 100:
+        return jsonify({"code": 400, "message": "活动标题必填（≤100 字）"}), 400
+    try:
+        happens_on = datetime.strptime(happens_on, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "message": "活动日期格式需 YYYY-MM-DD"}), 400
+    note = (d.get("note") or '').strip() or None
+    act = CampUnitActivity(unit_id=unit.id, type=a_type, title=title,
+                           happens_on=happens_on, note=note, created_by=user.id)
+    db.session.add(act)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"code": 409, "message": "同名同日活动已存在"}), 409
+    return jsonify({"code": 200, "message": "活动已发起",
+                    "activity": _activity_dict(act, [], 0, user.id)})
+
+
+@bp.route("/units/activities/<int:aid>", methods=["DELETE"])
+@jwt_required()
+@audit_log(operation="删除项目活动")
+def activity_delete(aid):
+    act = CampUnitActivity.query.get(aid)
+    if not act:
+        return jsonify({"code": 404, "message": "活动不存在"}), 404
+    unit, camp, err = _unit_or_404(act.unit_id)
+    if err:
+        return err
+    user = _current_user()
+    if not _is_unit_leader(unit, user):
+        return jsonify({"code": 403, "message": "仅项目负责人可删除活动"}), 403
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    CampUnitActivityCheck.query.filter_by(activity_id=act.id).delete(synchronize_session=False)
+    db.session.delete(act)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已删除"})
+
+
+@bp.route("/units/activities/<int:aid>/attendance", methods=["PUT"])
+@jwt_required()
+@audit_log(operation="记录活动出席")
+def activity_mark(aid):
+    """负责人勾选出席（全量替换幂等）：body {present_user_ids: [..]}。
+    为本单元全部 active 成员各写一行（未列=缺席），无行=未记录。"""
+    act = CampUnitActivity.query.get(aid)
+    if not act:
+        return jsonify({"code": 404, "message": "活动不存在"}), 404
+    unit, camp, err = _unit_or_404(act.unit_id)
+    if err:
+        return err
+    user = _current_user()
+    if not _is_unit_leader(unit, user):
+        return jsonify({"code": 403, "message": "仅项目负责人可记录出席"}), 403
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已结营，只读"}), 400
+    ids = (request.json or {}).get("present_user_ids")
+    if not isinstance(ids, list):
+        return jsonify({"code": 400, "message": "缺少 present_user_ids 数组"}), 400
+    members = CampUnitMember.query.filter_by(unit_id=unit.id, status='active').all()
+    member_ids = {m.user_id for m in members}
+    unknown = [i for i in ids if i not in member_ids]
+    if unknown:
+        return jsonify({"code": 400, "message": f"用户 {unknown} 不是本项目在册成员"}), 400
+    present_set = set(ids)
+    CampUnitActivityCheck.query.filter_by(activity_id=act.id).delete(synchronize_session=False)
+    for mid in member_ids:
+        db.session.add(CampUnitActivityCheck(
+            activity_id=act.id, user_id=mid, present=mid in present_set, marked_by=user.id))
+    db.session.commit()
+    checks = CampUnitActivityCheck.query.filter_by(activity_id=act.id).all()
+    return jsonify({"code": 200, "message": f"已记录：出席 {len(present_set & member_ids)} / {len(member_ids)}",
+                    "activity": _activity_dict(act, checks, len(member_ids), user.id)})

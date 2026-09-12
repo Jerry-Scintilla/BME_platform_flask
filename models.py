@@ -1510,6 +1510,39 @@ class CampProjectPreference(db.Model):
     )
 
 
+class CampUnitActivity(db.Model):
+    """项目营·组长活动考勤（2026-09-13，migrate_26）：负责人发起 会议/外出调研/其他，
+    按活动勾选成员出席。独立于周打卡统计（09-13 拍板两区并显，不并口径）。
+    窗口=营期未归档即可发起（selecting 预备会/running 例会都算）。"""
+    __tablename__ = 'camp_unit_activity'
+    id = db.Column(db.Integer, primary_key=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    type = db.Column(db.String(20), nullable=False, default='meeting')   # meeting / field_trip / other
+    title = db.Column(db.String(100), nullable=False)
+    happens_on = db.Column(db.Date, nullable=False)
+    note = db.Column(db.String(500))
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('unit_id', 'title', 'happens_on', name='uq_unit_activity_title_date'),
+    )
+
+
+class CampUnitActivityCheck(db.Model):
+    """活动出席勾选（负责人记录；UQ 一活动一人一行，PUT 全量替换幂等）。
+    未生成行的成员视同「未记录」，present=False 已勾缺席。"""
+    __tablename__ = 'camp_unit_activity_check'
+    id = db.Column(db.Integer, primary_key=True)
+    activity_id = db.Column(db.Integer, db.ForeignKey('camp_unit_activity.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    present = db.Column(db.Boolean, nullable=False, default=False)
+    marked_by = db.Column(db.Integer, db.ForeignKey('user.id'))
+    marked_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('activity_id', 'user_id', name='uq_unit_activity_check_pair'),
+    )
+
+
 # ── 项目营模板交付与档案（设计方案 v1.3 阶段4，migrate_21）──
 # 三层解耦：模板管共性（节点施工图）/ 里程碑管交付（关卡实际发生）/ 课程管学习（阶段5）。
 # 依赖单向：里程碑←模板，模板可引用课程（软链），课程不感知另外两者。
