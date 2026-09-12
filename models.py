@@ -1679,14 +1679,16 @@ class AiTopicLedger(db.Model):
 
 
 # ── 社团干事身份（功能扩展轮 §四，轻量任职档案）──
-# 两套体系并存：管理职位（社长/副社长/团支书/副团支书，固定枚举）+ 分组职位（组长，占位预留）；
+# 两套体系并存：管理职位（社长/副社长/团支书/副团支书，固定枚举）+ 分组体系（组长=每组一个；
+# 组员=普通组员归属，无头衔语义不进社区徽章）；
 # 无任职行 = 普通社员。红线：不挂任何操作权限（权限仍走 super_admin + 营内角色），纯身份/档案语义；
 # department 存组织树叶子组名（15 组名全树唯一，树固化在前端常量，后端不校验组名——换届重组只改前端）。
 
 class ClubOfficer(db.Model):
     """社团干事任职行。卸任 = status 置 ended 不删行（appointed_by/ended_by 操作人留痕）。
     约束在应用层（blueprints/officers.py）：同 (department, title) 至多 1 条 active（社长全局唯一/
-    每组一个组长）；同一社员至多 2 条 active 且组不重复（兼两组上限）；社长不挂组、组长必挂组。"""
+    每组一个组长；组员豁免可多行）；同一社员至多 2 条 active 且组不重复（兼两组上限）；
+    社长不挂组、组长/组员必挂组。"""
     __tablename__ = 'club_officer'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)

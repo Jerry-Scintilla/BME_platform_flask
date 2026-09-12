@@ -6,9 +6,10 @@ user 侧不设端点：user_index / profile/<id> 回包直接附任职（见 use
 
 应用层约束（任命/编辑共用）：
   R1 同 (department, title) 至多 1 条 active —— 社长全局唯一、每组一个组长、职位不重复任命
-  R2 同一社员至多 2 条 active —— 最多兼两组身份
+     （组员豁免：普通组员一组可多人，R1 不适用）
+  R2 同一社员至多 2 条 active —— 最多兼两组身份（组员照算）
   R3 同一社员的 active 行组不重复 —— 同部门兼两职无意义
-  R4 社长必须无 department；组长必须挂组；其余管理职位选填
+  R4 社长必须无 department；组长/组员必须挂组；其余管理职位选填
 """
 from datetime import date, datetime
 
@@ -21,12 +22,12 @@ from . import check_permission, audit_log, _current_user
 
 bp = Blueprint("officers", __name__, url_prefix="/admin/officers")
 
-# 职位白名单（前后端同源；管理职位固定枚举，分组职位组长占位预留，扩枚举=改常量）
+# 职位白名单（前后端同源；管理职位固定枚举；分组体系=组长+组员[普通组员归属，无头衔语义]，扩枚举=改常量）
 TITLE_MANAGEMENT = ("社长", "副社长", "团支书", "副团支书")
-TITLE_GROUP = ("组长",)
+TITLE_GROUP = ("组长", "组员")
 TITLE_CHOICES = TITLE_MANAGEMENT + TITLE_GROUP
 
-# 主职排序（feed 徽章 / 列表排序用）：管理职位在前，组长殿后
+# 主职排序（列表排序用）：管理职位在前，组长次之，组员殿后
 TITLE_RANK = {t: i for i, t in enumerate(TITLE_CHOICES)}
 
 
@@ -52,8 +53,14 @@ def officers_by_user(user_ids):
 
 
 def primary_title_map(user_ids):
-    """{uid: 主职 title}——社区 feed 徽章用；无任职的 uid 不含键。"""
-    return {uid: rows[0].title for uid, rows in officers_by_user(user_ids).items()}
+    """{uid: 主职 title}——社区 feed 徽章用；无任职/仅有组员行的 uid 不含键
+    （徽章只认头衔：管理层+组长；组员是归属不是头衔，不进徽章）。"""
+    result = {}
+    for uid, rows in officers_by_user(user_ids).items():
+        titled = [r for r in rows if r.title != '组员']
+        if titled:
+            result[uid] = titled[0].title
+    return result
 
 
 def public_officers(user_id):
@@ -105,25 +112,27 @@ def _validate_appointment(user_id, title, department, exclude_id=None):
     # R4：挂组约束
     if title == '社长' and department:
         return 400, "社长统领全局，不挂组"
-    if title == '组长' and not department:
-        return 400, "组长必须归属一个组"
+    if title in ('组长', '组员') and not department:
+        return 400, f"{title}必须归属一个组"
     if department and len(department) > 50:
         return 400, "组名过长（≤50 字）"
 
-    # R1：同 (department, title) 至多 1 条 active（== None 自动转 IS NULL）
-    q1 = ClubOfficer.query.filter(
-        ClubOfficer.title == title,
-        ClubOfficer.department == department,
-        ClubOfficer.status == 'active',
-    )
-    if exclude_id:
-        q1 = q1.filter(ClubOfficer.id != exclude_id)
-    dup = q1.first()
-    if dup:
-        holder = UserModel.query.get(dup.user_id)
-        holder_name = holder.username if holder else f"#{dup.user_id}"
-        where = f"{department}·" if department else ""
-        return 409, f"{where}{title} 已由 {holder_name} 在任，请先卸任再任命"
+    # R1：同 (department, title) 至多 1 条 active（== None 自动转 IS NULL）。
+    # 组员豁免——一组可有多名组员；组长仍每组一个。
+    if title != '组员':
+        q1 = ClubOfficer.query.filter(
+            ClubOfficer.title == title,
+            ClubOfficer.department == department,
+            ClubOfficer.status == 'active',
+        )
+        if exclude_id:
+            q1 = q1.filter(ClubOfficer.id != exclude_id)
+        dup = q1.first()
+        if dup:
+            holder = UserModel.query.get(dup.user_id)
+            holder_name = holder.username if holder else f"#{dup.user_id}"
+            where = f"{department}·" if department else ""
+            return 409, f"{where}{title} 已由 {holder_name} 在任，请先卸任再任命"
 
     # R2/R3：同一社员 active ≤2 且组不重复
     mine = [m for m in ClubOfficer.query.filter(
