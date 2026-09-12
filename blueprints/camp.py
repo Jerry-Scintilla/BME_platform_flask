@@ -165,15 +165,34 @@ def _approved_leave_dates(camp_id, frm, to):
 
 
 def _policy_dict(p, category):
-    """CampPolicy 序列化（无策略行时回退该营类型的代码默认值，保证契约形状稳定）"""
+    """CampPolicy 序列化（无策略行时回退该营类型的代码默认值，保证契约形状稳定）。
+    capabilities（v1.3）：行值与类型默认值合并——行上显式 false 关、未提到的位回退类型默认，
+    永远返回完整位图（前端按位渲染 tab / 后端门禁端点用）。"""
+    caps = dict(CAMP_CATEGORY_DEFAULTS.get(category or 'learning', {}).get('capabilities') or {})
+    if p and p.capabilities:
+        try:
+            caps.update(json.loads(p.capabilities))
+        except (ValueError, TypeError):
+            pass
     if p:
         return {
             "application": p.application, "formation": p.formation,
             "match_rule": p.match_rule, "project_limit": p.project_limit,
-            "course_policy": p.course_policy,
+            "course_policy": p.course_policy, "capabilities": caps,
         }
-    return {k: v for k, v in CAMP_CATEGORY_DEFAULTS.get(
+    d = {k: v for k, v in CAMP_CATEGORY_DEFAULTS.get(
         category or 'learning', {}).items() if k != 'label'}
+    d["capabilities"] = caps
+    return d
+
+
+def _capabilities(camp):
+    """营期能力位图完整值（camp.py 内部门禁用；project 营首期考勤/请假/座位全关，v1.3）。"""
+    return _policy_dict(camp.policy, camp.category)["capabilities"]
+
+
+def _capability_enabled(camp, name):
+    return bool(_capabilities(camp).get(name))
 
 
 def _session_dict(c):
@@ -441,7 +460,8 @@ def session_create():
     policy = CampPolicy(
         application=defaults['application'], formation=defaults['formation'],
         match_rule=defaults['match_rule'], project_limit=defaults['project_limit'],
-        course_policy=defaults['course_policy'])
+        course_policy=defaults['course_policy'],
+        capabilities=json.dumps(defaults.get('capabilities') or {}))
     try:
         camp = CampSession(
             name=name, category=category, cycle_id=cycle.id,
@@ -603,10 +623,11 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
         return None, ("用户不存在", 404)
     # 身份解耦（1a）：营内角色由调用方显式指定（默认学员），不再从全局 user.role 派生；
     # 仅拒绝 super_admin 入营期成员（管理动作走管理入口）。
+    # v1.3：+ 'member'=项目营通用入池值（负责人身份在单元层 CampUnitMember.role=leader）。
     if user.is_admin():
         return None, ("教师/超管通过营期管理入口操作，不作为营期成员加入", 400)
-    if role not in ('student', 'mentor'):
-        return None, ("营内角色仅支持 student/mentor", 400)
+    if role not in ('student', 'mentor', 'member'):
+        return None, ("营内角色仅支持 student/mentor/member", 400)
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first():
         return None, ("该用户已在营期中", 402)
     # 归属导生仅学员可设，且必须是本营导生
@@ -637,6 +658,46 @@ def member_assign(sid):
         return jsonify({"code": code, "message": msg}), code
     db.session.commit()
     return jsonify({"code": 200, "message": "已加入", "member_id": m.id})
+
+
+@bp.route("/sessions/<int:sid>/members/batch", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="批量分配营期成员")
+def member_assign_batch(sid):
+    """事务批量加成员（v1.3 阶段3 收编 admin 前端逐人并发 POST）。逐项校验+逐项回报，
+    契约红线：部分成功必须在回包逐项列出，不允许把部分成功显示为全部成功。
+    body: {items: [{user_id, role?, team_mentor_id?}, ...]}；role 缺省按营 category
+    （project=member / learning=student）。单事务提交，全部失败不落库。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    items = (request.json or {}).get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"code": 400, "message": "缺少 items 数组"}), 400
+    if len(items) > 200:
+        return jsonify({"code": 400, "message": "单次批量上限 200 人"}), 400
+    default_role = 'member' if camp.category == 'project' else 'student'
+    results, ok = [], 0
+    for it in items:
+        uid = it.get("user_id") if isinstance(it, dict) else None
+        if not uid:
+            results.append({"user_id": uid, "status": "failed", "message": "缺少 user_id"})
+            continue
+        m, err = _assign_member(sid, uid, it.get("team_mentor_id"),
+                                role=it.get("role") or default_role)
+        if err:
+            msg, _code = err
+            results.append({"user_id": uid, "status": "failed", "message": msg})
+        else:
+            results.append({"user_id": uid, "status": "added", "member_id": m.id})
+            ok += 1
+    if ok:
+        db.session.commit()
+    return jsonify({"code": 200, "message": f"已加入 {ok}/{len(items)} 人",
+                    "added": ok, "results": results})
 
 
 @bp.route("/sessions/<int:sid>/members")
@@ -802,6 +863,8 @@ def plan_regenerate(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _capability_enabled(camp, 'attendance'):
+        return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     cnt = _sync_plans(camp)
@@ -823,6 +886,8 @@ def attendance_dashboard(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _capability_enabled(camp, 'attendance'):
+        return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     user = _current_user()
 
     # 1. 范围（缺省=营期范围）
@@ -1029,6 +1094,8 @@ def leave_submit():
     camp = CampSession.query.get(sid)
     if not camp or not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，不可请假"}), 400
+    if not _capability_enabled(camp, 'leave'):
+        return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
     try:
         sd_d, ed_d = date.fromisoformat(sd), date.fromisoformat(ed)
     except (ValueError, TypeError):
@@ -1067,6 +1134,9 @@ def leave_approve(lid):
         return jsonify({"code": 404, "message": "请假记录不存在"}), 404
     if lv.status != 'pending':
         return jsonify({"code": 400, "message": "该请假已处理，不能重复审批（如需改判请先撤回）"}), 400
+    _lv_camp = CampSession.query.get(lv.camp_session_id)
+    if _lv_camp and not _capability_enabled(_lv_camp, 'leave'):
+        return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
     # 导生仅限本团队；老师/超管不限
     if not (user.is_admin()):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
@@ -1093,6 +1163,11 @@ def leave_revoke(lid):
     之后可再次批准或拒绝。考勤按 status='approved' 实时聚合（_approved_leave_dates），
     撤回即生效，看板/我的考勤中该段自动回算，无需迁移历史。"""
     user = _current_user()
+    _rk_lv = CampLeave.query.get(lid)
+    if _rk_lv:
+        _rk_camp = CampSession.query.get(_rk_lv.camp_session_id)
+        if _rk_camp and not _capability_enabled(_rk_camp, 'leave'):
+            return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
     lv = CampLeave.query.get(lid)
     if not lv:
         return jsonify({"code": 404, "message": "请假记录不存在"}), 404
@@ -1119,6 +1194,9 @@ def leave_revoke(lid):
 @camp_role('mentor')
 def leave_list(sid):
     user = _current_user()
+    _camp_lv = CampSession.query.get(sid)
+    if _camp_lv and not _capability_enabled(_camp_lv, 'leave'):
+        return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
     q = CampLeave.query.filter_by(camp_session_id=sid)
     visible = set(_visible_student_ids(sid, user))
     see_all = user.is_admin()
@@ -1212,6 +1290,8 @@ def seat_assign():
     camp = CampSession.query.get(sid)
     if not camp or not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    if not _capability_enabled(camp, 'seat'):
+        return jsonify({"code": 400, "message": "本营期未启用座位（能力开关关闭）"}), 400
     if not SeatModel.query.get(seat_id):
         return jsonify({"code": 404, "message": "座位不存在"}), 404
     if uid:
@@ -1234,6 +1314,9 @@ def seat_assign():
 @bp.route("/sessions/<int:sid>/seats")
 @jwt_required()
 def seat_list(sid):
+    _st_camp = CampSession.query.get(sid)
+    if _st_camp and not _capability_enabled(_st_camp, 'seat'):
+        return jsonify({"code": 400, "message": "本营期未启用座位（能力开关关闭）"}), 400
     rows = CampSeat.query.filter_by(camp_session_id=sid).all()
     data = []
     for cs in rows:
@@ -1316,6 +1399,11 @@ def join_request_submit(sid):
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
         return jsonify({"code": 409, "message": "已有待审批的申请，请等待审核"}), 409
     d = request.json or {}
+    # 项目营（v1.3 阶段3）：apply_role='member'（通用入池值，负责人身份在单元层）；
+    # 考勤能力未开时承诺出勤日不收集（前端 CampJoin 按 category+capability 分发表单）
+    is_project = camp.category == 'project'
+    apply_role = 'member' if is_project else 'student'
+    need_days = (not is_project) or _capability_enabled(camp, 'attendance')
     # 报名选意向大组（A13 类别标签，须在本营 ms_tags 内；营未配置标签则不接受该字段）
     preferred_tag = (d.get("preferred_tag") or "").strip() or None
     if preferred_tag:
@@ -1335,12 +1423,13 @@ def join_request_submit(sid):
             valid.append(dv.isoformat())
     except (ValueError, TypeError):
         return jsonify({"code": 400, "message": "承诺出勤日格式错误"}), 400
-    if not valid:
+    if need_days and not valid:
         return jsonify({"code": 400, "message": "请至少选择一个有效的承诺出勤日（未来、营期范围内" +
                         ("、工作日" if camp.weekdays_only else "") + "）"}), 400
     # 个别无效日静默剔除（前端日期格已限可选范围，此处兜底）；去重排序后落库
     db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
                                    reason=d.get("reason"), preferred_tag=preferred_tag,
+                                   apply_role=apply_role,
                                    selected_days=json.dumps(sorted(set(valid)))))
     db.session.commit()
     return jsonify({"code": 200, "message": "申请已提交，等待审批"})

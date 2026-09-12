@@ -1120,6 +1120,8 @@ CAMP_CATEGORY_DEFAULTS = {
         'match_rule': 'single_mentor',      # 学习营单归属（每生一导生，强唯一）
         'project_limit': None,
         'course_policy': 'admin_managed',   # 阶段 5 生效：管理员负责课程，导生范围内共建
+        # v1.3 能力开关（营期行可覆盖；后端按位门禁端点，前端按位渲染 tab）
+        'capabilities': {'attendance': True, 'leave': True, 'seat': True},
     },
     'project': {
         'label': '项目营',
@@ -1128,6 +1130,7 @@ CAMP_CATEGORY_DEFAULTS = {
         'match_rule': 'multi_project',      # 每人最多参与 N 个项目（负责人自己的计入）
         'project_limit': 3,
         'course_policy': 'unit_creator',    # 阶段 5 生效：负责人在自己项目范围开课
+        'capabilities': {'attendance': False, 'leave': False, 'seat': False},  # 首期全关（09-12 拍板）
     },
 }
 
@@ -1149,8 +1152,11 @@ class CampCycle(db.Model):
 
 
 class CampPolicy(db.Model):
-    """营期策略（阶段 1 落表，阶段 3/5 开始消费）：报名方式 / 组队方式 / 归属规则 / 项目上限 / 课程策略。
-    建营时按 CAMP_CATEGORY_DEFAULTS[category] 生成一行，营期行可覆盖（方案 §3.3）。"""
+    """营期策略（阶段 1 落表，阶段 3/5 开始消费）：报名方式 / 组队方式 / 归属规则 / 项目上限 / 课程策略 / 能力开关。
+    建营时按 CAMP_CATEGORY_DEFAULTS[category] 生成一行，营期行可覆盖（方案 §3.3）。
+    capabilities（v1.3）：JSON 位图文本 {'attendance':bool,'leave':bool,'seat':bool,...}——
+    考勤/请假/座位等能力不定死于 category，CATEGORY_DEFAULTS 给默认值（learning 开、project 首期关），
+    营期行可覆盖（某项目营要考勤=管理端打开，零代码）；后端按位门禁端点，前端按位渲染 tab。"""
     __tablename__ = 'camp_policy'
     id = db.Column(db.Integer, primary_key=True)
     application = db.Column(db.String(30), nullable=False, default='join_request')
@@ -1158,6 +1164,7 @@ class CampPolicy(db.Model):
     match_rule = db.Column(db.String(30), nullable=False, default='single_mentor')
     project_limit = db.Column(db.Integer)                       # None = 不限（学习营）
     course_policy = db.Column(db.String(30), nullable=False, default='admin_managed')
+    capabilities = db.Column(db.Text)                            # JSON 能力位图；NULL=按类型默认值
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -1367,6 +1374,118 @@ class CampMentorFavorite(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'student_user_id', 'mentor_user_id', name='uq_ms_fav_mentor'),
+    )
+
+
+# ── 项目营组织与申报组队（设计方案 v1.3 阶段3，migrate_20）──
+
+class CampUnit(db.Model):
+    """营期组织单元。unit_type=mentor_team（学习营，导生报名确认时自动建，1 导生 1 组；
+    首期学习营现役流不落本表，统一 API 建成 unit 通用型，迁移窗口=下个学习营开营前）
+    / project（项目营，申报过审时建，owner=负责人）。"""
+    __tablename__ = 'camp_unit'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    unit_type = db.Column(db.String(20), nullable=False, default='project')   # mentor_team / project
+    name = db.Column(db.String(100), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='active')       # active / paused / terminated
+    visibility = db.Column(db.String(20), nullable=False, default='camp')     # camp（营内）/ public（可发布到项目展示平台）
+    owner_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)  # 负责人
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'unit_type', 'name', name='uq_unit_camp_type_name'),
+    )
+
+
+class ProjectProfile(db.Model):
+    """项目档案（申报快照的现行版；随结营档案冻结）。visibility 与 CampUnit.visibility 同步冗余，
+    是发布到项目展示平台的权限基础（v1.3 §3.7）。"""
+    __tablename__ = 'project_profile'
+    id = db.Column(db.Integer, primary_key=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, unique=True)
+    background = db.Column(db.Text)          # 项目背景
+    goal = db.Column(db.Text)                # 目标
+    required_abilities = db.Column(db.Text)  # 所需能力
+    recruit_note = db.Column(db.Text)        # 招募说明
+    plan = db.Column(db.Text)                # 计划
+    visibility = db.Column(db.String(20), nullable=False, default='camp')
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ProjectApplicationVersion(db.Model):
+    """项目申报版本（退回重提=新行不覆盖；过审时才建 CampUnit）。
+    一人一营最多 1 个进行中申报 + 最多负责 1 个过审项目（Q-006，服务端双重校验）。"""
+    __tablename__ = 'project_application_version'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=True, index=True)  # 过审时回填
+    version = db.Column(db.Integer, nullable=False, default=1)
+    submitted_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    leader_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    # 申报快照（过审时落入 ProjectProfile）
+    name = db.Column(db.String(100), nullable=False)
+    background = db.Column(db.Text)
+    goal = db.Column(db.Text)
+    required_abilities = db.Column(db.Text)
+    recruit_note = db.Column(db.Text)
+    plan = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)  # pending / approved / rejected
+    reject_reason = db.Column(db.String(500))
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'leader_user_id', 'version', name='uq_pav_camp_leader_ver'),
+    )
+
+
+class CampUnitMember(db.Model):
+    """单元成员（单元身份：leader/member）。项目 3 上限按 status=active 行计数（负责人自己的计入）。
+    变更一律行状态化 ended（H-005 定稿：无锁定环节，running 起变更走管理员通道），不物理删。"""
+    __tablename__ = 'camp_unit_member'
+    id = db.Column(db.Integer, primary_key=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False, default='member')   # leader / member
+    status = db.Column(db.String(20), nullable=False, default='active')  # active / ended
+    started_at = db.Column(db.DateTime, default=datetime.now)
+    ended_at = db.Column(db.DateTime, nullable=True)
+    __table_args__ = (
+        db.UniqueConstraint('unit_id', 'user_id', name='uq_unit_member'),
+    )
+
+
+class CampMembershipEvent(db.Model):
+    """单元成员变更事件（只追加，不更新不删除）：勾选/移除/退出/调剂/负责人变更均落一行，
+    before/after 记录变更前后状态，作为审计与追溯底座（方案 §3.8）。"""
+    __tablename__ = 'camp_membership_event'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    action = db.Column(db.String(30), nullable=False)   # select/deselect/exit/remove/adjust/leader_change/unit_status
+    source = db.Column(db.String(30), nullable=False, default='leader_pick')  # leader_pick/admin_adjust/apply/approve
+    operator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    before = db.Column(db.Text)     # JSON：变更前 {role,status,unit...}
+    after = db.Column(db.Text)      # JSON：变更后
+    reason = db.Column(db.String(500))   # 管理员通道原因必填（H-005）
+    occurred_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampProjectPreference(db.Model):
+    """项目志愿（单轮 1~3 条有序；提交=整组替换，selecting 期内可改）。
+    与导生志愿 CampMentorPreference 同构不共表（FK 主体不同，防多态外键），v1.3 §3.7。"""
+    __tablename__ = 'camp_project_preference'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    rank = db.Column(db.Integer, nullable=False)     # 1-3
+    note = db.Column(db.String(200))                 # 学员可选留言
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'student_user_id', 'rank', name='uq_pp_rank'),
+        db.UniqueConstraint('camp_session_id', 'student_user_id', 'unit_id', name='uq_pp_unit'),
     )
 
 
