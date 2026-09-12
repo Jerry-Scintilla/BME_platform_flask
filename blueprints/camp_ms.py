@@ -32,7 +32,7 @@ from flask_jwt_extended import jwt_required
 from exts import db, redis_client
 from models import (
     CampSession, CampMember, CampMentorProfile, CampMentorPreference,
-    CampMentorMatch, CampMentorFavorite, UserModel,
+    CampMentorMatch, CampMentorFavorite, UserModel, UserCourseModel,
 )
 
 from . import camp_role, audit_log, _current_user
@@ -63,18 +63,48 @@ def _camp_writable(camp):
     return camp.status != 'archived'
 
 
-def _ms_tags_list(camp):
-    """营级分类标签：ms_tags JSON 数组字符串 → list；未配置/脏数据回退默认集。"""
+def _ms_directions_raw(camp):
+    """ms_tags 原始解析：兼容两种形状——
+    新：[{"name":"硬件组","course_id":12},...]（09-12 方向制：分类=方向+课程）
+    旧：["硬件组",...]（纯字符串，legacy 营；无课程绑定，编辑时强制补齐）
+    返回 list（元素为 dict 或 str），未配置/脏数据回退默认集字符串。"""
     if camp.ms_tags:
         try:
             tags = json.loads(camp.ms_tags)
-            if isinstance(tags, list):
-                out = [t for t in tags if isinstance(t, str) and t.strip()]
+            if isinstance(tags, list) and tags:
+                out = []
+                for t in tags[:20]:
+                    if isinstance(t, dict) and str(t.get("name") or "").strip():
+                        out.append({"name": str(t["name"]).strip(),
+                                    "course_id": t.get("course_id")})
+                    elif isinstance(t, str) and t.strip():
+                        out.append(t.strip())
                 if out:
-                    return out[:20]
+                    return out
         except (ValueError, TypeError):
             pass
     return list(MS_DEFAULT_TAGS)
+
+
+def _ms_tags_list(camp):
+    """营级分类标签名数组（方向制后的统一读出口）：dict 取 name、str 原样。
+    现有消费方（名片校验/市集过滤/phase/session dict）零改动。"""
+    return [d["name"] if isinstance(d, dict) else d for d in _ms_directions_raw(camp)]
+
+
+def _ms_directions(camp):
+    """方向定义（继承与课程派生/管理端配置回显的唯一取用口）：[{name, course_id}]。
+    legacy 纯字符串条目归一为 {name, course_id: None}（老营未补绑课程的过渡态，可见可补）。"""
+    from models import CourseModel
+    out = []
+    for d in _ms_directions_raw(camp):
+        name = d["name"] if isinstance(d, dict) else d
+        cid = d.get("course_id") if isinstance(d, dict) else None
+        cid = int(cid) if cid is not None and str(cid).isdigit() else None
+        if cid is not None and not CourseModel.query.get(cid):
+            cid = None
+        out.append({"name": name, "course_id": cid})
+    return out
 
 
 def _parse_ms_dt(val):
@@ -91,7 +121,9 @@ def _parse_ms_dt(val):
 
 def _apply_ms_fields(camp, d):
     """从请求体应用选导生配置（只处理出现的键；datetime 解析失败 raise ValueError）。
-    空字符串/None → 置 NULL。round 截止键已随单轮化废弃，传入一律忽略。"""
+    空字符串/None → 置 NULL。round 截止键已随单轮化废弃，传入一律忽略。
+    ms_tags 接受两种形状（09-12 方向制）：[{name, course_id}] 对象数组（新）或纯字符串数组
+    （legacy 容忍直存，_validate_ms 在 enabled 时会拦截缺课程的形状）。"""
     if "mentor_selection_enabled" in d:
         camp.mentor_selection_enabled = bool(d.get("mentor_selection_enabled"))
     for f in ("ms_preference_start", "ms_preference_deadline"):
@@ -101,7 +133,14 @@ def _apply_ms_fields(camp, d):
     if "ms_tags" in d:
         tags = d.get("ms_tags")
         if isinstance(tags, list):
-            clean = [str(t).strip() for t in tags if str(t).strip()]
+            clean = []
+            for t in tags:
+                if isinstance(t, dict) and str(t.get("name") or "").strip():
+                    cid = t.get("course_id")
+                    cid = int(cid) if cid is not None and str(cid).isdigit() else None
+                    clean.append({"name": str(t["name"]).strip(), "course_id": cid})
+                elif isinstance(t, str) and t.strip():
+                    clean.append(t.strip())
             camp.ms_tags = json.dumps(clean, ensure_ascii=False) if clean else None
         else:
             camp.ms_tags = None
@@ -110,7 +149,8 @@ def _apply_ms_fields(camp, d):
 def _validate_ms(camp):
     """选导生配置校验（create/update 存库前调用）。返回 None 或错误 message。
     规则：enabled 时需志愿开始 < 志愿截止，且不得晚于开营日当天末（选导生是开营前置
-    阶段）。round 截止字段已随单轮化废弃，不参与校验。关闭 enabled 随时允许。"""
+    阶段）；且每个分类必须绑定一门存在的课程（09-12 方向制：分类=方向+课程）。
+    round 截止字段已随单轮化废弃，不参与校验。关闭 enabled 随时允许。"""
     if not camp.mentor_selection_enabled:
         return None
     ps, pd_ = camp.ms_preference_start, camp.ms_preference_deadline
@@ -122,6 +162,12 @@ def _validate_ms(camp):
     for label, v in (("志愿开始", ps), ("志愿截止", pd_)):
         if v and v > camp_end:
             return f"选导生{label}时间不得晚于开营日（{camp.start_date.isoformat()}）"
+    dirs = _ms_directions(camp)
+    if not dirs:
+        return "启用选导生需至少配置一个分类方向"
+    for d in dirs:
+        if d["course_id"] is None:
+            return f"分类「{d['name']}」未关联有效课程（方向制：每个分类必须绑定一门课程）"
     return None
 
 
@@ -155,6 +201,8 @@ def _ms_dict(camp):
         "ms_round1_deadline": _fmt(camp.ms_round1_deadline),
         "ms_round2_deadline": _fmt(camp.ms_round2_deadline),
         "ms_tags": _ms_tags_list(camp),
+        # 09-12 方向制：管理端配置回显用（含课程绑定；legacy 未绑为 null）
+        "ms_directions": _ms_directions(camp),
     }
 
 
@@ -184,6 +232,38 @@ def _live_matched(camp_id, mentor_id):
     """导生名下学员数（live 链接口径：含 teacher 预分配的插班生）。"""
     return CampMember.query.filter_by(
         camp_session_id=camp_id, role='student', team_mentor_id=mentor_id).count()
+
+
+def _inherit_direction_course(camp, student_uid, mentor_uid):
+    """方向制继承（09-12）：学员归属导生 → 自动入读该导生方向绑定的课程。
+    - 方向取导生名片 tags[0] → _ms_directions 的 course_id；无名片/legacy 无课程 → 静默跳过
+    - UserCourse UQ(user, course)：已有行（同课跨营）复用并重打 camp_session_id 戳（同旧 /camp/selection 口径）
+    - 不 commit（由调用方事务一并提交）；release/移除导生不回收旧课行（学习历史保留）
+    """
+    profile = CampMentorProfile.query.filter_by(
+        camp_session_id=camp.id, user_id=mentor_uid).first()
+    if not profile or not profile.tags:
+        return None
+    try:
+        tags = json.loads(profile.tags)
+    except (ValueError, TypeError):
+        return None
+    if not (isinstance(tags, list) and tags):
+        return None
+    direction = next((d for d in _ms_directions(camp)
+                      if d["name"] == str(tags[0])), None)
+    if not direction or direction["course_id"] is None:
+        return None
+    uc = UserCourseModel.query.filter_by(
+        user_id=student_uid, course_id=direction["course_id"]).first()
+    if uc:
+        uc.camp_session_id = camp.id
+        return uc
+    uc = UserCourseModel(user_id=student_uid, course_id=direction["course_id"],
+                         camp_session_id=camp.id,
+                         status=UserCourseModel.STATUS_ACTIVE)
+    db.session.add(uc)
+    return uc
 
 
 def _avatar_url(u):
@@ -397,6 +477,9 @@ def profile_put(sid):
     tags = d.get("tags") or []
     if not isinstance(tags, list):
         return jsonify({"code": 400, "message": "tags 需为数组"}), 400
+    # 09-12 方向制：导生只能选一个分类方向（学员随导生继承方向与课程）
+    if len(tags) != 1:
+        return jsonify({"code": 400, "message": "请选择恰好 1 个分类方向"}), 400
     allowed = set(_ms_tags_list(camp))
     bad = [t for t in tags if t not in allowed]
     if bad:
@@ -875,6 +958,7 @@ def pick(sid):
                                            student_user_id=student_id, round=None,
                                            source='mentor_pick'))
         student.team_mentor_id = user.id
+        _inherit_direction_course(camp, student_id, user.id)   # 方向制继承（09-12）
         create_notification(student_id, "选导生：导生已确认",
                             f"「{camp.name}」导生 {user.username} 已确认你加入其团队。",
                             category='camp', source_type=MS_SOURCE_TYPE,
@@ -1019,6 +1103,7 @@ def assign(sid):
                                        student_user_id=student_id, round=None,
                                        source='admin'))
     student.team_mentor_id = mentor_id
+    _inherit_direction_course(camp, student_id, mentor_id)   # 方向制继承（09-12）
     create_notification(student_id, "选导生：导生已指派",
                         f"老师已将你指派给「{camp.name}」导生 {mu.username if mu else ''}。",
                         category='camp', source_type=MS_SOURCE_TYPE,
@@ -1137,6 +1222,7 @@ def assign_batch(sid):
                                            student_user_id=student_id, round=None,
                                            source='admin'))
         student.team_mentor_id = mentor_id
+        _inherit_direction_course(camp, student_id, mentor_id)   # 方向制继承（09-12）
         create_notification(student_id, "选导生：导生已指派",
                             f"老师已将你指派给「{camp.name}」导生 {mu.username if mu else ''}。",
                             category='camp', source_type=MS_SOURCE_TYPE,

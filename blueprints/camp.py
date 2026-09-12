@@ -21,12 +21,14 @@ from models import (
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
+    CampChapterCertification, Chapter, LessonModel, LearningProgressModel,
     CAMP_CATEGORY_DEFAULTS,
 )
 
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
-from .camp_ms import _apply_ms_fields, _validate_ms, _ms_dict, _ms_phase, _ms_tags_list
+from .camp_ms import (_apply_ms_fields, _validate_ms, _ms_dict, _ms_phase, _ms_tags_list,
+                      _ms_directions, _inherit_direction_course)
 
 bp = Blueprint("camp", __name__, url_prefix="/camp")
 
@@ -594,6 +596,9 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
     db.session.add(m)
     if auto_plan and role == 'student':
         _gen_plan(camp, user_id)          # 直接加成员：按工作日生成（兜底）
+    # 方向制继承（09-12）：学员归属导生 → 自动入读该方向绑定的课程（不 commit，随调用方事务）
+    if role == 'student' and team_mentor_id:
+        _inherit_direction_course(camp, user_id, team_mentor_id)
     return m, None
 
 
@@ -723,6 +728,9 @@ def course_add(sid):
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    # 09-12 方向制砍双源：learning 营课程由分类方向定义，不再手动挂课（CampCourse 留给项目营）
+    if camp.category == 'learning':
+        return jsonify({"code": 400, "message": "培训营课程由分类方向定义，请在营期设置的分类中绑定课程"}), 400
     d = request.json or {}
     course_id = d.get("course_id")
     if not course_id or not CourseModel.query.get(course_id):
@@ -745,6 +753,8 @@ def course_remove(sid, cid):
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    if camp.category == 'learning':
+        return jsonify({"code": 400, "message": "培训营课程由分类方向定义，无手动移除"}), 400
     cc = CampCourse.query.filter_by(camp_session_id=sid, course_id=cid).first()
     if not cc:
         return jsonify({"code": 404, "message": "该课程不在营期中"}), 404
@@ -756,53 +766,32 @@ def course_remove(sid, cid):
 @bp.route("/sessions/<int:sid>/courses")
 @jwt_required()
 def course_list(sid):
-    ccs = CampCourse.query.filter_by(camp_session_id=sid).order_by(CampCourse.sort_order).all()
-    data = []
-    for cc in ccs:
-        c = CourseModel.query.get(cc.course_id)
-        if c:
-            data.append({"course_id": c.id, "title": c.title, "difficulty": c.difficulty})
-    return jsonify({"code": 200, "courses": data})
-
-
-@bp.route("/selection", methods=["POST"])
-@jwt_required()
-def selection_pick():
-    user = _current_user()
-    d = request.json or {}
-    sid, course_id = d.get("camp_session_id"), d.get("course_id")
-    if not sid or not course_id:
-        return jsonify({"code": 400, "message": "缺少 camp_session_id/course_id"}), 400
-    if not CampMember.query.filter_by(camp_session_id=sid, user_id=user.id, role='student').first():
-        return jsonify({"code": 403, "message": "非该营期学员"}), 403
     camp = CampSession.query.get(sid)
-    if not camp or camp.status != 'active':
-        return jsonify({"code": 400, "message": "营期未开放选课"}), 400
-    if not CampCourse.query.filter_by(camp_session_id=sid, course_id=course_id).first():
-        return jsonify({"code": 404, "message": "营期未开放该课程"}), 404
-    uc = UserCourseModel.query.filter_by(user_id=user.id, course_id=course_id).first()
-    if not uc:
-        uc = UserCourseModel(user_id=user.id, course_id=course_id, status='active')
-        db.session.add(uc)
-    uc.camp_session_id = sid                      # 标记营期选课（触发既有 LearningProgress）
-    db.session.commit()
-    return jsonify({"code": 200, "message": "选课成功"})
-
-
-@bp.route("/selection/mine")
-@jwt_required()
-def selection_mine():
-    user = _current_user()
-    sid = request.args.get("camp_session_id", type=int)
-    q = UserCourseModel.query.filter_by(user_id=user.id)
-    if sid:
-        q = q.filter_by(camp_session_id=sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
     data = []
-    for uc in q.all():
-        c = CourseModel.query.get(uc.course_id)
-        if c:
-            data.append({"course_id": c.id, "title": c.title, "camp_session_id": uc.camp_session_id})
+    if camp.category == 'learning':
+        # 方向制（09-12）：learning 营课程目录从分类方向派生（course 去重，形状不变）
+        seen = set()
+        for d in _ms_directions(camp):
+            if d["course_id"] is None or d["course_id"] in seen:
+                continue
+            c = CourseModel.query.get(d["course_id"])
+            if c:
+                data.append({"course_id": c.id, "title": c.title, "difficulty": c.difficulty})
+                seen.add(c.id)
+    else:
+        ccs = CampCourse.query.filter_by(camp_session_id=sid).order_by(CampCourse.sort_order).all()
+        for cc in ccs:
+            c = CourseModel.query.get(cc.course_id)
+            if c:
+                data.append({"course_id": c.id, "title": c.title, "difficulty": c.difficulty})
     return jsonify({"code": 200, "courses": data})
+
+
+# 09-12 方向制：学生自主选课整体下线（POST /camp/selection 与 GET /camp/selection/mine 已删）。
+# 入课唯一途径 = 归属导生继承方向课程（camp_ms._inherit_direction_course，挂 _assign_member/
+# member_update/pick/assign/assign_batch 五处写入点）。
 
 
 # ─────────────────────────────────────────────
@@ -1575,5 +1564,178 @@ def member_update(sid, uid):
                                                student_user_id=uid, round=None, source='admin'))
         elif row:
             db.session.delete(row)
+    # 方向制继承（09-12）：改派到新导生 → 继承其方向课程（旧课程行保留为学习历史）
+    if team_mentor_id:
+        _inherit_direction_course(camp, uid, team_mentor_id)
     db.session.commit()
     return jsonify({"code": 200, "message": "已更新"})
+
+
+# ─────────────────────────────────────────────
+# 方向制学习（2026-09-12，migrate_24）：团队进度 + 导生按章认证
+# ─────────────────────────────────────────────
+
+def _direction_of_mentor(camp, mentor_uid):
+    """导生的方向定义：名片 tags[0] → _ms_directions 匹配；无名片/无课程返回 None。"""
+    p = CampMentorProfile.query.filter_by(camp_session_id=camp.id, user_id=mentor_uid).first()
+    if not p or not p.tags:
+        return None
+    try:
+        tags = json.loads(p.tags)
+    except (ValueError, TypeError):
+        return None
+    if not (isinstance(tags, list) and tags):
+        return None
+    return next((d for d in _ms_directions(camp) if d["name"] == str(tags[0])), None)
+
+
+def _chapters_payload(camp, course_id, student_uid):
+    """章节平铺 + 学员自报完成比 + 认证态。返回 (chapters, certified_count)。"""
+    chs = (Chapter.query.filter_by(course_id=course_id)
+           .order_by(Chapter.order, Chapter.id).all())
+    lesson_total = defaultdict(int)
+    for l in LessonModel.query.filter_by(course_id=course_id).all():
+        lesson_total[l.chapter_id] += 1
+    done_rows = LearningProgressModel.query.filter(
+        LearningProgressModel.user_id == student_uid,
+        LearningProgressModel.course_id == course_id,
+        LearningProgressModel.status == LearningProgressModel.STATUS_COMPLETED).all()
+    lesson_done = defaultdict(int)
+    for r in done_rows:
+        lesson_done[r.chapter_id] += 1
+    certs = {c.chapter_id: c for c in CampChapterCertification.query.filter_by(
+        camp_session_id=camp.id, student_user_id=student_uid).all()
+        if c.course_id == course_id}
+    out = []
+    for ch in chs:
+        cert = certs.get(ch.id)
+        out.append({
+            "chapter_id": ch.id, "name": ch.name, "order": ch.order,
+            "lessons": lesson_total.get(ch.id, 0),
+            "lessons_completed": min(lesson_done.get(ch.id, 0), lesson_total.get(ch.id, 0)),
+            "certified": cert is not None,
+            "certified_at": cert.certified_at.strftime("%Y-%m-%d %H:%M") if cert else None,
+            "certified_by": cert.mentor_user_id if cert else None,
+        })
+    return out, sum(1 for c in out if c["certified"])
+
+
+@bp.route("/sessions/<int:sid>/team/progress")
+@jwt_required()
+@camp_role('mentor')
+def team_progress(sid):
+    """导生视角：本团队每学员的方向课程章节进度 + 认证态（按章认证的读端点）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    user = _current_user()
+    direction = _direction_of_mentor(camp, user.id)
+    base = {"direction": direction["name"] if direction else None,
+            "course_id": direction["course_id"] if direction else None}
+    if not direction or direction["course_id"] is None:
+        return jsonify({"code": 200, **base, "students": [],
+                        "message": "尚未设置方向或方向未绑定课程"})
+    course = CourseModel.query.get(direction["course_id"])
+    students = (CampMember.query.filter_by(camp_session_id=sid, role='student')
+                .order_by(CampMember.user_id).all())
+    data = []
+    for s in students:
+        if not _in_my_team(sid, user, s.user_id) and not user.is_admin():
+            continue
+        chapters, certified = _chapters_payload(camp, direction["course_id"], s.user_id)
+        u = UserModel.query.get(s.user_id)
+        uc = UserCourseModel.query.filter_by(
+            user_id=s.user_id, course_id=direction["course_id"]).first()
+        data.append({
+            "student_user_id": s.user_id, "username": u.username if u else "",
+            "chapters": chapters, "certified_chapters": certified,
+            "total_chapters": len(chapters),
+            "course_status": uc.status if uc else None,
+        })
+    return jsonify({"code": 200, **base, "course_title": course.title if course else "",
+                    "students": data})
+
+
+@bp.route("/sessions/<int:sid>/team/progress/certify", methods=["POST", "DELETE"])
+@jwt_required()
+@camp_role('mentor')
+@audit_log(operation="认证学员章节进度")
+def team_progress_certify(sid):
+    """导生按章认证（幂等）/撤销。body: {student_user_id, chapter_id}。
+    全章认证齐 → user_course.status 自动置 completed（汇总态，撤销不回滚）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    user = _current_user()
+    d = request.json or {}
+    student_uid, chapter_id = d.get("student_user_id"), d.get("chapter_id")
+    if not student_uid or not chapter_id:
+        return jsonify({"code": 400, "message": "缺少 student_user_id/chapter_id"}), 400
+    if not user.is_admin() and not _in_my_team(sid, user, student_uid):
+        return jsonify({"code": 403, "message": "仅本团队学员可认证"}), 403
+    direction = _direction_of_mentor(camp, user.id)
+    if not direction or direction["course_id"] is None:
+        return jsonify({"code": 400, "message": "你尚未设置方向（或方向未绑定课程）"}), 400
+    ch = Chapter.query.filter_by(id=chapter_id, course_id=direction["course_id"]).first()
+    if not ch:
+        return jsonify({"code": 404, "message": "章节不在你的方向课程内"}), 404
+    row = CampChapterCertification.query.filter_by(
+        camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id).first()
+    if request.method == "DELETE":
+        if not row:
+            return jsonify({"code": 404, "message": "该章节尚未认证"}), 404
+        db.session.delete(row)
+        db.session.commit()
+        return jsonify({"code": 200, "message": "已撤销认证"})
+    if not row:
+        db.session.add(CampChapterCertification(
+            camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id,
+            course_id=direction["course_id"], mentor_user_id=user.id))
+    # 全章认证齐 → 课程级 completed（死常量启用；撤销不回滚）
+    chapters, certified = _chapters_payload(camp, direction["course_id"], student_uid)
+    if chapters and certified >= len(chapters):
+        uc = UserCourseModel.query.filter_by(
+            user_id=student_uid, course_id=direction["course_id"]).first()
+        if uc and uc.status == UserCourseModel.STATUS_ACTIVE:
+            uc.status = UserCourseModel.STATUS_COMPLETED
+            create_notification(student_uid, "学习进度已认证",
+                                f"「{camp.name}」全部章节已由导生认证，课程学习完成。",
+                                category='camp', source_type='mentor_selection',
+                                source_id=camp.id, camp_session_id=sid, is_important=True)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已认证"})
+
+
+@bp.route("/sessions/<int:sid>/my-direction")
+@jwt_required()
+def my_direction(sid):
+    """学员视角：我的方向（随归属导生继承）+ 课程 + 章节认证进度 + 自报完成比。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    user = _current_user()
+    m = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    if not m or m.role != 'student':
+        return jsonify({"code": 403, "message": "仅本营学员可查看"}), 403
+    if not m.team_mentor_id:
+        return jsonify({"code": 200, "direction": None, "course": None,
+                        "hint": "尚未归属导生——开放报名后选择导生，将自动继承其方向与课程"})
+    direction = _direction_of_mentor(camp, m.team_mentor_id)
+    if not direction or direction["course_id"] is None:
+        return jsonify({"code": 200, "direction": direction["name"] if direction else None,
+                        "course": None,
+                        "hint": "归属导生尚未设置方向，请联系导生完善名片"})
+    course = CourseModel.query.get(direction["course_id"])
+    chapters, certified = _chapters_payload(camp, direction["course_id"], user.id)
+    uc = UserCourseModel.query.filter_by(
+        user_id=user.id, course_id=direction["course_id"]).first()
+    mentor = UserModel.query.get(m.team_mentor_id)
+    return jsonify({"code": 200, "direction": direction["name"],
+                    "mentor_name": mentor.username if mentor else "",
+                    "course": {"course_id": course.id, "title": course.title,
+                               "difficulty": course.difficulty} if course else None,
+                    "chapters": chapters, "certified_chapters": certified,
+                    "total_chapters": len(chapters),
+                    "course_status": uc.status if uc else None})
