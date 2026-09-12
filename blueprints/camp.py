@@ -431,8 +431,19 @@ def session_transition(sid):
         return jsonify({"code": 409, "message": f"迁移失败：当前状态为 {camp.status}，{action} 要求 {src_status}"}), 409
     db.session.commit()
     camp = CampSession.query.get(sid)
-    return jsonify({"code": 200, "message": f"已{'发布' if action=='publish' else '撤回发布' if action=='retract' else '开放报名' if action=='open_enrollment' else '开营' if action=='open' else '结营'}",
-                    "session": _session_dict(camp)})
+    # v1.3 阶段4：结营自动冻结档案（幂等；项目营快照含项目/里程碑/成果+资产回流打标）。
+    # 延迟导入防循环依赖（camp_delivery 反向引用本模块的 _camp_writable）。
+    archived = False
+    if dst_status == 'archived':
+        try:
+            from .camp_delivery import freeze_camp_archive
+            archived = freeze_camp_archive(camp, _current_user().id) is not None
+        except Exception:
+            db.session.rollback()   # 冻结失败不阻断结营本身；档案可事后手动补冻结
+    msg = f"已{'发布' if action=='publish' else '撤回发布' if action=='retract' else '开放报名' if action=='open_enrollment' else '开营' if action=='open' else '结营'}"
+    if archived:
+        msg += "（档案已冻结）"
+    return jsonify({"code": 200, "message": msg, "session": _session_dict(camp)})
 
 
 # ─────────────────────────────────────────────

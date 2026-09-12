@@ -1489,6 +1489,138 @@ class CampProjectPreference(db.Model):
     )
 
 
+# ── 项目营模板交付与档案（设计方案 v1.3 阶段4，migrate_21）──
+# 三层解耦：模板管共性（节点施工图）/ 里程碑管交付（关卡实际发生）/ 课程管学习（阶段5）。
+# 依赖单向：里程碑←模板，模板可引用课程（软链），课程不感知另外两者。
+
+class ProjectTemplate(db.Model):
+    """项目模板=节点施工图（管共性）。scope='platform'=平台默认模板（admin 维护，负责人选起点）；
+    scope='unit'=项目模板（负责人创建）。结营冻结时 status→'archived'——可被后来负责人复制起步
+    =资产回流入口（cloned_from 溯源链）。"""
+    __tablename__ = 'project_template'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    scope = db.Column(db.String(20), nullable=False, default='unit')       # platform / unit
+    category = db.Column(db.String(50))                                    # 适用项目类别（筛选用，可空）
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=True, unique=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    cloned_from_id = db.Column(db.Integer, db.ForeignKey('project_template.id'), nullable=True)  # 复制链
+    status = db.Column(db.String(20), nullable=False, default='active')    # active / archived
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ProjectTemplateNode(db.Model):
+    """模板节点：序号/标题/说明/交付要求/材料模板说明/推荐课程引用（软链 JSON）/提交主体（节点级）。"""
+    __tablename__ = 'project_template_node'
+    id = db.Column(db.Integer, primary_key=True)
+    template_id = db.Column(db.Integer, db.ForeignKey('project_template.id'), nullable=False, index=True)
+    sort_order = db.Column(db.Integer, nullable=False, default=1)
+    title = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    deliverable_req = db.Column(db.Text)              # 交付要求
+    material_note = db.Column(db.Text)                # 材料模板说明
+    recommended_course_ids = db.Column(db.Text)       # JSON 课程 id 数组（软链不复制）
+    submit_mode = db.Column(db.String(10), nullable=False, default='team')  # team 整队交 / member 个人交
+
+
+class CampMilestone(db.Model):
+    """里程碑=关卡的实际发生（管交付）：实例化自模板节点（node_id 溯源，删节点不级联）；
+    实例化后负责人可增删调时。status 聚合最新审核态（member 模式=全员 approved 才 approved）。"""
+    __tablename__ = 'camp_milestone'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    node_id = db.Column(db.Integer, db.ForeignKey('project_template_node.id'), nullable=True)
+    title = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    requirement = db.Column(db.Text)                  # 交付要求（实例化随节点，可改）
+    due_date = db.Column(db.Date)
+    order_no = db.Column(db.Integer, nullable=False, default=1)
+    submit_mode = db.Column(db.String(10), nullable=False, default='team')
+    status = db.Column(db.String(20), nullable=False, default='open')     # open/submitted/returned/approved
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class CampSubmissionVersion(db.Model):
+    """版本化提交：退回重提=新版本（旧版 superseded）。member 模式每人一条版本链
+    （负责人自己份额交老师审——防自审红线），team 模式一条链（负责人交老师审）。"""
+    __tablename__ = 'camp_submission_version'
+    id = db.Column(db.Integer, primary_key=True)
+    milestone_id = db.Column(db.Integer, db.ForeignKey('camp_milestone.id'), nullable=False, index=True)
+    version = db.Column(db.Integer, nullable=False)
+    submitted_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    content = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='submitted')  # submitted/returned/approved/superseded
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    review_note = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('milestone_id', 'submitted_by', 'version', name='uq_csv_milestone_sub_ver'),
+    )
+
+
+class CampSubmissionAttachment(db.Model):
+    """提交附件（MinIO 对象引用；course resources 同款 multipart 上传+代理下载）。
+    结营冻结时对验收通过版本的附件打 is_asset=true——数字资产留存标记（资产回流）。"""
+    __tablename__ = 'camp_submission_attachment'
+    id = db.Column(db.Integer, primary_key=True)
+    submission_id = db.Column(db.Integer, db.ForeignKey('camp_submission_version.id'), nullable=False, index=True)
+    object_key = db.Column(db.String(255), nullable=False)
+    filename = db.Column(db.String(200), nullable=False)
+    size = db.Column(db.Integer)
+    content_type = db.Column(db.String(100))
+    is_asset = db.Column(db.Boolean, default=False)   # 资产回流打标（冻结时对 approved 版本置位）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampOutcome(db.Model):
+    """项目成果：负责人登记 → admin 核验。未核验（verified）不入结营档案（纪律沿用）。"""
+    __tablename__ = 'camp_outcome'
+    id = db.Column(db.Integer, primary_key=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    contributor_ids = db.Column(db.Text)              # JSON 贡献者 user_id 数组
+    status = db.Column(db.String(20), nullable=False, default='submitted')  # submitted/verified/rejected
+    submitted_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    verified_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    verified_at = db.Column(db.DateTime, nullable=True)
+    reject_reason = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class CampArchive(db.Model):
+    """结营档案：close 迁移自动触发冻结（幂等：已有行跳过；旧 archived 营不补建，v1.3 裁定）。
+    snapshot=关键事实 JSON（成员/项目/里程碑终态/已核验成果/事件计数）；此后全端点只读，
+    修正走 CampArchiveRevision 版本化留痕。"""
+    __tablename__ = 'camp_archive'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, unique=True)
+    snapshot = db.Column(db.Text)                     # JSON 快照
+    version = db.Column(db.Integer, nullable=False, default=1)
+    frozen_at = db.Column(db.DateTime, default=datetime.now)
+    frozen_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+
+class CampArchiveRevision(db.Model):
+    """档案受控修正：专门权限（admin）+原因必填+期望版本→新版本递增；修正以 patch 描述留痕
+    （不重写 snapshot 原文，快照不可变原则——展示层按需要叠加修订说明）。"""
+    __tablename__ = 'camp_archive_revision'
+    id = db.Column(db.Integer, primary_key=True)
+    archive_id = db.Column(db.Integer, db.ForeignKey('camp_archive.id'), nullable=False, index=True)
+    version = db.Column(db.Integer, nullable=False)   # 对应档案修正后的版本号
+    reason = db.Column(db.String(500), nullable=False)
+    patch = db.Column(db.Text)                        # JSON：修正内容描述
+    operator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
 class AiTopicLedger(db.Model):
     """AI 每日话题选题账本：全局跨日去重(同一 source_url 不重复选) + 每日幂等(同一天最多 1 篇)。
     选题维度是全局 url/date、非用户级，故不复用 DiscussionReaction 的多态印记结构。"""
