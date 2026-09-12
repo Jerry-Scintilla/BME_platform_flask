@@ -148,8 +148,9 @@ def _apply_ms_fields(camp, d):
 
 def _validate_ms(camp):
     """选导生配置校验（create/update 存库前调用）。返回 None 或错误 message。
-    规则：enabled 时需志愿开始 < 志愿截止，且不得晚于开营日当天末（选导生是开营前置
-    阶段）；且每个分类必须绑定一门存在的课程（09-12 方向制：分类=方向+课程）。
+    09-12 时间统领拍板：选导生是营期的第一个阶段——志愿时间窗必须落在营期起止之内
+    （营期开始日 00:00 ≤ 志愿开始 < 志愿截止 ≤ 营期结束日 23:59，不再压在营期开始之前）；
+    且每个分类必须绑定一门存在的课程（方向制：分类=方向+课程）。
     round 截止字段已随单轮化废弃，不参与校验。关闭 enabled 随时允许。"""
     if not camp.mentor_selection_enabled:
         return None
@@ -158,10 +159,13 @@ def _validate_ms(camp):
         return "启用选导生需设置志愿开始 / 志愿截止时间"
     if not ps < pd_:
         return "选导生时间需满足：志愿开始 < 志愿截止"
-    camp_end = datetime.combine(camp.start_date, time(23, 59, 59))
+    camp_start = datetime.combine(camp.start_date, time(0, 0, 0))
+    camp_end = datetime.combine(camp.end_date, time(23, 59, 59))
+    if ps < camp_start:
+        return f"志愿开始不得早于营期开始日（{camp.start_date.isoformat()}）——选导生是营期内的第一阶段"
     for label, v in (("志愿开始", ps), ("志愿截止", pd_)):
         if v and v > camp_end:
-            return f"选导生{label}时间不得晚于开营日（{camp.start_date.isoformat()}）"
+            return f"选导生{label}时间不得晚于营期结束日（{camp.end_date.isoformat()}）"
     dirs = _ms_directions(camp)
     if not dirs:
         return "启用选导生需至少配置一个分类方向"

@@ -64,7 +64,10 @@ def _gen_plan(camp, user_id):
 
 def _sync_plans(camp):
     """营期日期/weekdays/成员变更后同步全部学员的 plan：删范围外（及工作日营的周末日）+ 补范围内缺的。幂等。
-    返回同步后 plan 总数。（旧 plan_regenerate 只补不删，缩短营期后范围外脏 plan 残留继续判缺勤）"""
+    返回同步后 plan 总数。（旧 plan_regenerate 只补不删，缩短营期后范围外脏 plan 残留继续判缺勤）
+    09-12 三模式：非 daily（按周累计/不考勤）无承诺日体系，不同步只返回现存计数。"""
+    if not _pledge_daily(camp):
+        return CampAttendancePlan.query.filter_by(camp_session_id=camp.id).count()
     out_q = CampAttendancePlan.query.filter(
         CampAttendancePlan.camp_session_id == camp.id,
         ~CampAttendancePlan.date.between(camp.start_date, camp.end_date)
@@ -165,10 +168,46 @@ def _approved_leave_dates(camp_id, frm, to):
     return leave_set
 
 
+def _weekly_stats(camp, user_ids):
+    """按周累计考勤（09-12 模式 C：学期校区）：CheckRecord 按周一~周日分桶，
+    周内出勤天数（有打卡记录的日）+ 时长合计；范围=营期起止 ∩ 昨日封顶（今天不完整不计）。
+    返回 {uid: {"weeks": [{label, start, end, days, hours}], "total_days", "total_hours"}}。
+    周边界算法与 codecheck /weekly_records 同款（weekday() 推算周一）。"""
+    today = date.today()
+    frm = camp.start_date
+    to = min(camp.end_date, max(frm, today - timedelta(days=1)))
+    buckets = {uid: {} for uid in user_ids}      # uid -> {week_start: {"dates": set, "hours": float}}
+    if user_ids and frm <= to:
+        records = CheckRecord.query.filter(
+            CheckRecord.user_id.in_(list(user_ids)),
+            CheckRecord.date.between(frm, to)).all()
+        for r in records:
+            ws = r.date - timedelta(days=r.date.weekday())
+            b = buckets[r.user_id].setdefault(ws, {"dates": set(), "hours": 0.0})
+            b["dates"].add(r.date)
+            b["hours"] += r.duration or 0
+    out = {}
+    for uid in user_ids:
+        weeks = []
+        for ws in sorted(buckets[uid]):
+            weeks.append({
+                "label": f"{ws.isocalendar()[0]}-W{ws.isocalendar()[1]:02d}",
+                "start": ws.isoformat(), "end": (ws + timedelta(days=6)).isoformat(),
+                "days": len(buckets[uid][ws]["dates"]),
+                "hours": round(buckets[uid][ws]["hours"], 2),
+            })
+        out[uid] = {"weeks": weeks,
+                    "total_days": sum(w["days"] for w in weeks),
+                    "total_hours": round(sum(w["hours"] for w in weeks), 2)}
+    return out
+
+
 def _policy_dict(p, category):
     """CampPolicy 序列化（无策略行时回退该营类型的代码默认值，保证契约形状稳定）。
     capabilities（v1.3）：行值与类型默认值合并——行上显式 false 关、未提到的位回退类型默认，
-    永远返回完整位图（前端按位渲染 tab / 后端门禁端点用）。"""
+    永远返回完整位图（前端按位渲染 tab / 后端门禁端点用）。
+    attendance_mode（09-12 三模式）：daily=假期营每日承诺出勤 / weekly=学期校区按周累计；
+    模式 B（学期远程·不考勤）由 capabilities.attendance=false 承载。"""
     caps = dict(CAMP_CATEGORY_DEFAULTS.get(category or 'learning', {}).get('capabilities') or {})
     if p and p.capabilities:
         try:
@@ -180,10 +219,12 @@ def _policy_dict(p, category):
             "application": p.application, "formation": p.formation,
             "match_rule": p.match_rule, "project_limit": p.project_limit,
             "course_policy": p.course_policy, "capabilities": caps,
+            "attendance_mode": p.attendance_mode if (p.attendance_mode in ('daily', 'weekly')) else 'daily',
         }
     d = {k: v for k, v in CAMP_CATEGORY_DEFAULTS.get(
         category or 'learning', {}).items() if k != 'label'}
     d["capabilities"] = caps
+    d["attendance_mode"] = 'daily'
     return d
 
 
@@ -194,6 +235,20 @@ def _capabilities(camp):
 
 def _capability_enabled(camp, name):
     return bool(_capabilities(camp).get(name))
+
+
+def _attendance_mode(camp):
+    """考勤模式（09-12 三模式）：考勤能力关（模式 B）一律视为无承诺日；
+    开着时按 policy.attendance_mode（daily/weekly，脏值回退 daily）。"""
+    if not _capability_enabled(camp, 'attendance'):
+        return 'off'
+    return _policy_dict(camp.policy, camp.category).get('attendance_mode') or 'daily'
+
+
+def _pledge_daily(camp):
+    """是否启用「承诺出勤日」体系（模式 A）：plan 生成/同步/报名收日的总门。
+    修现存缺陷：此前 attendance 能力关的营直接加成员仍照建 plan。"""
+    return _attendance_mode(camp) == 'daily'
 
 
 def _session_dict(c):
@@ -504,8 +559,10 @@ def session_update(sid):
             camp.start_date = date.fromisoformat(d["start_date"])
         if d.get("end_date"):
             camp.end_date = date.fromisoformat(d["end_date"])
-        if d.get("expected_check_in"):
-            camp.expected_check_in = time.fromisoformat(d["expected_check_in"])
+        # 09-12 修：按键出现与否更新（原来只认真值——期望到岗一旦设置无法清空）
+        if "expected_check_in" in d:
+            camp.expected_check_in = (time.fromisoformat(d["expected_check_in"])
+                                      if d.get("expected_check_in") else None)
     except (ValueError, TypeError) as e:
         db.session.rollback()
         return jsonify({"code": 400, "message": f"参数格式错误: {e}"}), 400
@@ -536,12 +593,32 @@ def session_update(sid):
         for f in ("application", "formation", "match_rule", "project_limit", "course_policy"):
             if f in d["policy"]:
                 setattr(policy, f, d["policy"][f])
+        # 09-12 考勤三模式配置：attendance_mode（daily/weekly）+ attendance_enabled（bool，
+        # 只覆写 capabilities.attendance 位，其余位不动；False=模式 B 不考勤）
+        pd_ = d["policy"]
+        old_mode = _attendance_mode(camp)
+        if "attendance_mode" in pd_:
+            if pd_["attendance_mode"] not in ("daily", "weekly"):
+                db.session.rollback()
+                return jsonify({"code": 400, "message": "attendance_mode 仅支持 daily/weekly"}), 400
+            policy.attendance_mode = pd_["attendance_mode"]
+        if "attendance_enabled" in pd_:
+            try:
+                caps = json.loads(policy.capabilities) if policy.capabilities else {}
+            except (ValueError, TypeError):
+                caps = {}
+            caps["attendance"] = bool(pd_["attendance_enabled"])
+            policy.capabilities = json.dumps(caps)
+        db.session.flush()
+        # 切离「每日承诺出勤」体系 → 清空本营承诺日（按周/不考勤不再用；切回 daily 手动重生成）
+        if old_mode == 'daily' and _attendance_mode(camp) != 'daily':
+            CampAttendancePlan.query.filter_by(camp_session_id=sid).delete(synchronize_session=False)
     # 同步冗余副本：改出勤时间/工时阈值后，已展开的 CampAttendancePlan 也跟着刷新，
     # 否则 _eval_day 仍按旧副本判定迟到/工时（见 _eval_day），管理员改的设置不生效。
-    if d.get("expected_check_in") or "min_daily_hours" in d:
+    if "expected_check_in" in d or "min_daily_hours" in d:
         plans = CampAttendancePlan.query.filter_by(camp_session_id=sid).all()
         for p in plans:
-            if d.get("expected_check_in"):
+            if "expected_check_in" in d:
                 p.expected_check_in = camp.expected_check_in
             if "min_daily_hours" in d:
                 p.min_daily_hours = camp.min_daily_hours
@@ -594,8 +671,8 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
         team_mentor_id = None
     m = CampMember(camp_session_id=sid, user_id=user_id, role=role, team_mentor_id=team_mentor_id)
     db.session.add(m)
-    if auto_plan and role == 'student':
-        _gen_plan(camp, user_id)          # 直接加成员：按工作日生成（兜底）
+    if auto_plan and role == 'student' and _pledge_daily(camp):
+        _gen_plan(camp, user_id)          # 直接加成员：按工作日生成（兜底；按周/不考勤模式无承诺日）
     # 方向制继承（09-12）：学员归属导生 → 自动入读该方向绑定的课程（不 commit，随调用方事务）
     if role == 'student' and team_mentor_id:
         _inherit_direction_course(camp, user_id, team_mentor_id)
@@ -810,6 +887,8 @@ def plan_regenerate(sid):
         return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    if not _pledge_daily(camp):
+        return jsonify({"code": 400, "message": "本营考勤模式为按周累计，无承诺出勤日"}), 400
     cnt = _sync_plans(camp)
     db.session.commit()
     return jsonify({"code": 200, "message": "已重生成", "plan_count": cnt})
@@ -832,6 +911,18 @@ def attendance_dashboard(sid):
     if not _capability_enabled(camp, 'attendance'):
         return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     user = _current_user()
+
+    # 09-12 模式 C（学期校区·按周累计）：导生/老师看本团队学员的周分桶统计
+    if _attendance_mode(camp) == 'weekly':
+        visible = _visible_student_ids(sid, user)
+        stats = _weekly_stats(camp, visible)
+        users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(visible))} if visible else {}
+        rows = [{"user_id": uid, "username": users[uid].username if uid in users else "",
+                 **stats[uid]} for uid in visible]
+        return jsonify({"code": 200, "mode": "weekly",
+                        "range": {"from": camp.start_date.isoformat(),
+                                  "to": camp.end_date.isoformat()},
+                        "rows": rows})
 
     # 1. 范围（缺省=营期范围）
     try:
@@ -945,7 +1036,7 @@ def attendance_dashboard(sid):
         "attendance_rate": round(g_attended / g_elapsed, 3) if g_elapsed else None,
     }
     return jsonify({
-        "code": 200,
+        "code": 200, "mode": "daily",
         "range": {"from": frm.isoformat(), "to": to.isoformat()},
         "dates": sorted(d.isoformat() for d in dates_set),
         "summary": summary,
@@ -965,6 +1056,12 @@ def attendance_mine():
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    # 09-12 模式 C（学期校区·按周累计）：无承诺日，返回周分桶统计
+    if _attendance_mode(camp) == 'weekly':
+        stats = _weekly_stats(camp, [user.id])[user.id]
+        return jsonify({"code": 200, "mode": "weekly",
+                        "range": {"from": camp.start_date.isoformat(), "to": camp.end_date.isoformat()},
+                        **stats})
     frm, to = camp.start_date, camp.end_date
     plans = CampAttendancePlan.query.filter(
         CampAttendancePlan.camp_session_id == sid,
@@ -1012,7 +1109,7 @@ def attendance_mine():
         "attendance_rate": round(satisfied / elapsed_pledged, 3) if elapsed_pledged else None,
     }
     return jsonify({
-        "code": 200,
+        "code": 200, "mode": "daily",
         "range": {"from": frm.isoformat(), "to": to.isoformat()},
         "dates": sorted(d.isoformat() for d in dates_set),
         "daily": daily,
@@ -1346,7 +1443,8 @@ def join_request_submit(sid):
     # 考勤能力未开时承诺出勤日不收集（前端 CampJoin 按 category+capability 分发表单）
     is_project = camp.category == 'project'
     apply_role = 'member' if is_project else 'student'
-    need_days = (not is_project) or _capability_enabled(camp, 'attendance')
+    # 09-12 三模式：承诺出勤日仅模式 A（假期营·每日）收集；按周累计（C）/不考勤（B）不收
+    need_days = _pledge_daily(camp)
     # 09-12 砍意向大组：学员报名不再选组，组别随归属导生继承（导生组=名片 tags）；
     # preferred_tag 列保留存历史行，新申请不再写入（客户端误传也忽略）
     # 学员手选承诺出勤日（JSON 数组），校验格式 + 范围内 + 未来日 + 工作日营不含周末
@@ -1454,8 +1552,9 @@ def join_request_approve(rid):
         msg, code = err
         return jsonify({"code": code, "message": msg}), code
     # 用学员申请时手选的承诺日建 CampAttendancePlan（替代 _gen_plan 自动工作日）
-    if m.role == 'student':
-        camp = CampSession.query.get(req.camp_session_id)
+    # 09-12 三模式：仅模式 A（每日承诺出勤）建 plan；按周累计/不考勤跳过
+    plan_camp = CampSession.query.get(req.camp_session_id) if m.role == 'student' else None
+    if plan_camp and _pledge_daily(plan_camp):
         days = []
         try:
             days = json.loads(req.selected_days) if req.selected_days else []
@@ -1473,9 +1572,9 @@ def join_request_approve(rid):
                     continue
                 db.session.add(CampAttendancePlan(
                     camp_session_id=req.camp_session_id, user_id=req.user_id, date=dv,
-                    expected_check_in=camp.expected_check_in, min_daily_hours=camp.min_daily_hours))
+                    expected_check_in=plan_camp.expected_check_in, min_daily_hours=plan_camp.min_daily_hours))
         else:
-            _gen_plan(camp, req.user_id)   # 兜底：申请没带手选日则按工作日
+            _gen_plan(plan_camp, req.user_id)   # 兜底：申请没带手选日则按工作日
     req.status = 'approved'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()

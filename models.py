@@ -1165,6 +1165,10 @@ class CampPolicy(db.Model):
     project_limit = db.Column(db.Integer)                       # None = 不限（学习营）
     course_policy = db.Column(db.String(30), nullable=False, default='admin_managed')
     capabilities = db.Column(db.Text)                            # JSON 能力位图；NULL=按类型默认值
+    # 考勤模式（2026-09-12 三模式拍板，migrate_25）：daily=假期营每日承诺出勤+逐日评估（默认）；
+    # weekly=学期校区·无承诺日，按周累计出勤次数+时长。模式 B（学期远程·不考勤）由
+    # capabilities.attendance=false 承载（现有门禁/端点/tab 渲染零改动自然生效）。
+    attendance_mode = db.Column(db.String(20), nullable=False, server_default='daily')
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
