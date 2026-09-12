@@ -355,6 +355,7 @@ from .showcase import bp as showcase_bp
 from .admin import bp as admin_bp
 from .ai_topic import bp as ai_topic_bp
 from .gratitude import bp as gratitude_bp
+from .officers import bp as officers_bp
 
 __all__ = [
     'auth_bp',
@@ -383,5 +384,6 @@ __all__ = [
     'showcase_bp',
     'admin_bp',
     'ai_topic_bp',
-    'gratitude_bp'
+    'gratitude_bp',
+    'officers_bp'
 ]

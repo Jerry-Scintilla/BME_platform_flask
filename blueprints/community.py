@@ -260,6 +260,16 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
         for it in page_items
     ]
 
+    # ── 干事徽章：按页收集作者一次 IN 查询（author_badge=主职职位；非用户特定，可进公共缓存）──
+    from .officers import primary_title_map
+    page_author_ids = list({it.get('author_id') for it in page_items if it.get('author_id')})
+    if page_author_ids:
+        badge_map = primary_title_map(page_author_ids)
+        for it in page_items:
+            badge = badge_map.get(it.get('author_id'))
+            if badge:
+                it['author_badge'] = badge
+
     # ── 附带每条讨论帖前 2 条顶级回复预览（一次 IN 查询，消灭前端 N+1 #1） ──
     feed_thread_ids = [it['id'] for it in page_items if it['type'] == 'discussion']
     if feed_thread_ids:
