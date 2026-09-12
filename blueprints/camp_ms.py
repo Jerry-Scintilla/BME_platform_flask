@@ -262,6 +262,10 @@ def _inherit_direction_course(camp, student_uid, mentor_uid):
         user_id=student_uid, course_id=direction["course_id"]).first()
     if uc:
         uc.camp_session_id = camp.id
+        # 复用旧选课行：曾退课（dropped）拉回在读——否则进营后「在学习」列表看不到该课
+        # （退课只标状态不删行，UQ 保证复用）；completed 不降级（学完就是学完）
+        if uc.status == UserCourseModel.STATUS_DROPPED:
+            uc.status = UserCourseModel.STATUS_ACTIVE
         return uc
     uc = UserCourseModel(user_id=student_uid, course_id=direction["course_id"],
                          camp_session_id=camp.id,
