@@ -6,13 +6,15 @@
   - 学员操作（选课/请假）→ 仅营期成员
 营期看板（混合考勤算法）见 Phase D 的 /camp/attendance/dashboard/<sid>。
 """
+import csv
+import io
 import json
 from collections import defaultdict, Counter
 from datetime import date, time, timedelta, datetime
 
 from sqlalchemy import or_
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, Response, request, jsonify
 from flask_jwt_extended import jwt_required
 
 from exts import db, redis_client
@@ -1042,6 +1044,101 @@ def attendance_dashboard(sid):
         "summary": summary,
         "rows": rows,
     })
+
+
+@bp.route("/attendance/export/<int:sid>")
+@jwt_required()
+@camp_role('mentor')
+@audit_log(operation="导出营期考勤")
+def attendance_export(sid):
+    """考勤 CSV（utf-8-sig 带 BOM，Excel 可直接打开）：存档/线下核算用。
+    可见范围同 dashboard（导生=本团队，老师/超管=全营）。
+    daily=学员×日期矩阵+个人汇总列（?from=&to= 生效，缺省营期全范围）；
+    weekly=学员×周分桶（每格 次数/小时）+累计列（range 钉营期，参数不生效）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _capability_enabled(camp, 'attendance'):
+        return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
+    user = _current_user()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    visible = _visible_student_ids(sid, user)
+    users = {u.id: u.username for u in
+             UserModel.query.filter(UserModel.id.in_(visible))} if visible else {}
+
+    if _attendance_mode(camp) == 'weekly':
+        stats = _weekly_stats(camp, visible)
+        weeks = sorted({wk["label"] for st in stats.values() for wk in st["weeks"]})
+        w.writerow(["学员ID", "学员", *weeks, "累计次数", "累计时长(h)"])
+        for uid in visible:
+            st = stats[uid]
+            by_label = {wk["label"]: wk for wk in st["weeks"]}
+            w.writerow([uid, users.get(uid, ""),
+                        *[f"{by_label[lbl]['days']}次/{by_label[lbl]['hours']}h"
+                          if lbl in by_label else "" for lbl in weeks],
+                        st["total_days"], st["total_hours"]])
+        fname = f"camp_{sid}_attendance_weekly.csv"
+    else:
+        try:
+            frm = date.fromisoformat(request.args.get("from")) if request.args.get("from") else camp.start_date
+            to = date.fromisoformat(request.args.get("to")) if request.args.get("to") else camp.end_date
+        except ValueError:
+            return jsonify({"code": 400, "message": "日期格式错误，需 YYYY-MM-DD"}), 400
+        if frm > to:
+            return jsonify({"code": 400, "message": "from 不能晚于 to"}), 400
+        today = date.today()
+        # 与 dashboard 同口径：plans 按 (user,date) 索引，CheckRecord 聚合，_eval_day 判日
+        all_days = _weekdays(frm, to)
+        plan_map = defaultdict(dict)
+        if visible:
+            for p in CampAttendancePlan.query.filter(
+                    CampAttendancePlan.camp_session_id == sid,
+                    CampAttendancePlan.user_id.in_(visible),
+                    CampAttendancePlan.date.between(frm, to)).all():
+                plan_map[p.user_id][p.date] = p
+        checks_map = defaultdict(list)
+        if visible:
+            for r in CheckRecord.query.filter(
+                    CheckRecord.user_id.in_(visible),
+                    CheckRecord.date.between(frm, to)).all():
+                checks_map[(r.user_id, r.date)].append(r)
+        leave_set = _approved_leave_dates(sid, frm, to)
+        # 矩阵格文案：9 态收敛（今天 absent 不下结论 → 待考勤），未承诺留空
+        CELL_TEXT = {"present": "出勤", "late": "出勤·迟到", "short_hours": "未达标",
+                     "late_and_short": "未达标·迟到", "absent": "缺勤", "on_leave": "请假",
+                     "pledged": "待考勤", "in_progress": "进行中", "unpledged": ""}
+        w.writerow(["学员ID", "学员", "出勤(准时)", "出勤(迟到)", "未达标", "缺勤", "请假", "达标率",
+                    *[d.isoformat() for d in all_days]])
+        for uid in visible:
+            pm = plan_map.get(uid, {})
+            cells, psum = [], Counter()
+            for d in all_days:
+                p = pm.get(d)
+                if not p:
+                    res = {"status": "unpledged"}
+                elif d > today:
+                    res = {"status": "pledged"}
+                else:
+                    res = _eval_day(checks_map.get((uid, d), []), p, (uid, d) in leave_set,
+                                    is_today=(d == today))
+                    if res["status"] == "absent" and d == today:
+                        res = {"status": "pledged"}
+                psum[res["status"]] += 1
+                cells.append(CELL_TEXT.get(res["status"], res["status"]))
+            satisfied = psum.get("present", 0) + psum.get("late", 0)
+            elapsed = sum(1 for d in pm if d < today)
+            rate = f"{round(satisfied / elapsed * 100)}%" if elapsed else ""
+            w.writerow([uid, users.get(uid, ""),
+                        psum.get("present", 0), psum.get("late", 0),
+                        psum.get("short_hours", 0) + psum.get("late_and_short", 0),
+                        psum.get("absent", 0), psum.get("on_leave", 0), rate, *cells])
+        fname = f"camp_{sid}_attendance_daily.csv"
+
+    resp = Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f"attachment; filename={fname}"
+    return resp
 
 
 @bp.route("/attendance/mine")

@@ -1023,9 +1023,19 @@ def overview(sid):
         u = users.get(m.user_id)
         p = profiles.get(m.user_id)
         matched = _live_matched(sid, m.user_id)
+        # 方向 = 名片 tags[0]（与 _inherit_direction_course 的继承口径一致；无名片/未选为 None）
+        direction = None
+        if p and p.tags:
+            try:
+                t = json.loads(p.tags)
+                if isinstance(t, list) and t and str(t[0]).strip():
+                    direction = str(t[0]).strip()
+            except (ValueError, TypeError):
+                pass
         mentors.append({
             "user_id": m.user_id, "username": u.username if u else "",
             "has_profile": p is not None,
+            "direction": direction,
             "capacity": p.capacity if p else 0,
             "chose_r1": chose.get(m.user_id, 0),
             "chose_r2": 0,
