@@ -1435,7 +1435,9 @@ class ProjectProfile(db.Model):
 
 class ProjectApplicationVersion(db.Model):
     """项目申报版本（退回重提=新行不覆盖；过审时才建 CampUnit）。
-    一人一营最多 1 个进行中申报 + 最多负责 1 个过审项目（Q-006，服务端双重校验）。"""
+    09-13 放宽：可多申报/多负责/多加入，参与不设数量上限；申报即设计模板——
+    template_nodes 为申报时的节点序列快照，过审时建 ProjectTemplate+实例化里程碑。
+    plan 列存历史行（09-13 起申报表单用模板节点替代「计划」栏，新行不再写）。"""
     __tablename__ = 'project_application_version'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -1450,6 +1452,8 @@ class ProjectApplicationVersion(db.Model):
     required_abilities = db.Column(db.Text)
     recruit_note = db.Column(db.Text)
     plan = db.Column(db.Text)
+    # 申报时设计的模板节点序列（JSON 数组，_norm_nodes 规范化后落库；至少 1 节点）
+    template_nodes = db.Column(db.Text)
     status = db.Column(db.String(20), nullable=False, default='pending', index=True)  # pending / approved / rejected
     reject_reason = db.Column(db.String(500))
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)

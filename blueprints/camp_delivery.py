@@ -32,7 +32,8 @@ from models import (
 
 from . import camp_role, audit_log, _current_user
 from .camp import _camp_writable
-from .camp_project import _camp_or_404, _unit_or_404, _is_unit_leader, _notify
+from .camp_project import (_camp_or_404, _unit_or_404, _is_unit_leader, _notify,
+                           _norm_nodes, _write_nodes, _instantiate_milestones)
 
 bp = Blueprint("camp_delivery", __name__, url_prefix="/camp")
 
@@ -72,41 +73,6 @@ def _template_dict(t, nodes=None):
                             ProjectTemplateNode.query.filter_by(template_id=t.id)
                             .order_by(ProjectTemplateNode.sort_order, ProjectTemplateNode.id).all())],
     }
-
-
-def _norm_nodes(payload_nodes):
-    """入参节点列表规范化：[{title, description?, deliverable_req?, material_note?, submit_mode?, recommended_course_ids?}]
-    → (ok, nodes|message)。sort_order 按数组序生成。"""
-    if payload_nodes is None:
-        return True, []
-    if not isinstance(payload_nodes, list) or len(payload_nodes) > 50:
-        return False, "nodes 须为列表（最多 50 个节点）"
-    out = []
-    for i, n in enumerate(payload_nodes, 1):
-        if not isinstance(n, dict) or not (n.get("title") or "").strip():
-            return False, f"第 {i} 个节点缺少 title"
-        mode = n.get("submit_mode") or 'team'
-        if mode not in VALID_SUBMIT_MODES:
-            return False, f"第 {i} 个节点 submit_mode 仅支持 team/member"
-        cids = n.get("recommended_course_ids")
-        if cids is not None and not isinstance(cids, list):
-            return False, f"第 {i} 个节点 recommended_course_ids 须为数组"
-        out.append({
-            "sort_order": i,
-            "title": n["title"].strip()[:100],
-            "description": n.get("description"),
-            "deliverable_req": n.get("deliverable_req"),
-            "material_note": n.get("material_note"),
-            "submit_mode": mode,
-            "recommended_course_ids": json.dumps([int(c) for c in cids]) if cids else None,
-        })
-    return True, out
-
-
-def _write_nodes(template_id, nodes):
-    ProjectTemplateNode.query.filter_by(template_id=template_id).delete(synchronize_session=False)
-    for n in nodes:
-        db.session.add(ProjectTemplateNode(template_id=template_id, **n))
 
 
 def _latest_chain(milestone_id, submitted_by):
@@ -230,12 +196,15 @@ def platform_template_update(tid):
 @jwt_required()
 def template_sources(sid):
     """可复制模板源（三起点的 clone 半边）：已归档模板（往届，任意营）+ 本营其他项目模板。
-    供负责人创建模板时选择；防越权——进行中他营模板不出现。"""
+    供负责人创建模板/申报人设计申报模板（09-13 申报即模板）时选择；
+    项目营 upcoming 申报期对非成员放开（申报起点），其余期间仅营期成员可看；
+    防越权——进行中他营模板不出现。附节点明细供申报端预填。"""
     camp, err = _camp_or_404(sid)
     if err:
         return err
     user = _current_user()
-    if not user.is_admin() and not CampMember.query.filter_by(
+    apply_open = camp.category == 'project' and camp.status == 'upcoming'
+    if not user.is_admin() and not apply_open and not CampMember.query.filter_by(
             camp_session_id=sid, user_id=user.id).first():
         return jsonify({"code": 403, "message": "仅营期成员可查看模板源"}), 403
     q = ProjectTemplate.query.filter(ProjectTemplate.scope == 'unit').filter(
@@ -245,13 +214,18 @@ def template_sources(sid):
         unit = CampUnit.query.get(t.unit_id) if t.unit_id else None
         if not unit:
             continue
+        nodes = [{"title": n.title, "deliverable_req": n.deliverable_req,
+                  "submit_mode": n.submit_mode}
+                 for n in ProjectTemplateNode.query.filter_by(template_id=t.id)
+                 .order_by(ProjectTemplateNode.sort_order)]
         out.append({
             "template_id": t.id, "unit_id": t.unit_id, "name": t.name,
             "camp_name": camp.name if t.camp_session_id == sid else
             (CampSession.query.get(t.camp_session_id).name if t.camp_session_id else ''),
             "archived": t.status == 'archived',
             "cloned_from_id": t.cloned_from_id,
-            "node_count": ProjectTemplateNode.query.filter_by(template_id=t.id).count(),
+            "node_count": len(nodes),
+            "nodes": nodes,
         })
     return jsonify({"code": 200, "sources": out})
 

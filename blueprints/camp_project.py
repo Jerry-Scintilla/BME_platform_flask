@@ -25,6 +25,7 @@ from exts import db, redis_client
 from models import (
     CampSession, CampPolicy, CampMember,
     CampUnit, ProjectProfile, ProjectApplicationVersion,
+    ProjectTemplate, ProjectTemplateNode, CampMilestone,
     CampUnitMember, CampMembershipEvent, CampProjectPreference,
     CampUnitActivity, CampUnitActivityCheck,
     UserModel,
@@ -66,6 +67,58 @@ def _project_limit(camp):
     CampPolicy.project_limit 列保留存历史，不再被消费。志愿 1-3 是意向提交口径
     （preference_submit 硬校验），与加入上限无关，不受影响。"""
     return None
+
+
+VALID_SUBMIT_MODES = ('team', 'member')
+
+
+def _norm_nodes(payload_nodes):
+    """入参节点列表规范化：[{title, description?, deliverable_req?, material_note?, submit_mode?, recommended_course_ids?}]
+    → (ok, nodes|message)。sort_order 按数组序生成。（申报与模板编辑共用）"""
+    if payload_nodes is None:
+        return True, []
+    if not isinstance(payload_nodes, list) or len(payload_nodes) > 50:
+        return False, "nodes 须为列表（最多 50 个节点）"
+    out = []
+    for i, n in enumerate(payload_nodes, 1):
+        if not isinstance(n, dict) or not (n.get("title") or "").strip():
+            return False, f"第 {i} 个节点缺少 title"
+        mode = n.get("submit_mode") or 'team'
+        if mode not in VALID_SUBMIT_MODES:
+            return False, f"第 {i} 个节点 submit_mode 仅支持 team/member"
+        cids = n.get("recommended_course_ids")
+        if cids is not None and not isinstance(cids, list):
+            return False, f"第 {i} 个节点 recommended_course_ids 须为数组"
+        out.append({
+            "sort_order": i,
+            "title": n["title"].strip()[:100],
+            "description": n.get("description"),
+            "deliverable_req": n.get("deliverable_req"),
+            "material_note": n.get("material_note"),
+            "submit_mode": mode,
+            "recommended_course_ids": json.dumps([int(c) for c in cids]) if cids else None,
+        })
+    return True, out
+
+
+def _write_nodes(template_id, nodes):
+    ProjectTemplateNode.query.filter_by(template_id=template_id).delete(synchronize_session=False)
+    for n in nodes:
+        db.session.add(ProjectTemplateNode(template_id=template_id, **n))
+
+
+def _instantiate_milestones(camp, unit, nodes):
+    """按节点序列实例化里程碑（仅当项目还没有里程碑时）；返回实例化数。
+    申报过审（09-13 申报即模板）与模板三起点创建共用。"""
+    if CampMilestone.query.filter_by(unit_id=unit.id).count():
+        return 0
+    for n in nodes:
+        db.session.add(CampMilestone(
+            camp_session_id=camp.id, unit_id=unit.id, node_id=n["id"],
+            title=n["title"], description=n["description"],
+            requirement=n["deliverable_req"],
+            order_no=n["sort_order"], submit_mode=n["submit_mode"]))
+    return len(nodes)
 
 
 def _active_project_count(sid, user_id):
@@ -136,13 +189,18 @@ def _usernames(ids):
 
 def _app_dict(a, names=None):
     names = names or _usernames([a.leader_user_id])
+    try:
+        nodes = json.loads(a.template_nodes) if a.template_nodes else []
+    except (ValueError, TypeError):
+        nodes = []
     return {
         "id": a.id, "camp_session_id": a.camp_session_id, "unit_id": a.unit_id,
         "version": a.version, "leader_user_id": a.leader_user_id,
         "leader_name": names.get(a.leader_user_id, str(a.leader_user_id)),
         "name": a.name, "background": a.background, "goal": a.goal,
         "required_abilities": a.required_abilities, "recruit_note": a.recruit_note,
-        "plan": a.plan, "status": a.status, "reject_reason": a.reject_reason,
+        "plan": a.plan, "template_nodes": nodes,
+        "status": a.status, "reject_reason": a.reject_reason,
         "created_at": a.created_at.isoformat() if a.created_at else None,
     }
 
@@ -226,8 +284,9 @@ def project_mine(sid):
 @audit_log(operation="提交项目申报")
 def application_submit(sid):
     """负责人提交申报（09-13 复盘放宽：可同时申报/负责多个项目——申报即资格，
-    审核把关交给 admin；参与总数仍受 CampPolicy.project_limit 约束（负责的计入），
-    在 approve 时校验）。窗口仅 upcoming（09-12 拍板）。"""
+    审核把关交给 admin；参与不设数量上限）。窗口仅 upcoming（09-12 拍板）。
+    09-13 申报即设计模板：template_nodes 节点序列替代「计划」栏（至少 1 节点），
+    过审时据此建 ProjectTemplate 并实例化里程碑。"""
     user = _current_user()
     camp, err = _camp_or_404(sid)
     if err:
@@ -248,6 +307,12 @@ def application_submit(sid):
             camp_session_id=sid, leader_user_id=user.id,
             status='pending', name=name).first():
         return jsonify({"code": 409, "message": f"已有同名项目「{name}」的待审申报，请勿重复提交"}), 409
+    # 申报即模板：节点序列规范化（至少 1 个有标题的节点）
+    ok, nodes = _norm_nodes(d.get("template_nodes"))
+    if not ok:
+        return jsonify({"code": 400, "message": nodes}), 400
+    if not nodes:
+        return jsonify({"code": 400, "message": "请设计至少 1 个交付节点（审核时可见，过审即生成项目流程）"}), 400
     latest = (ProjectApplicationVersion.query
               .filter_by(camp_session_id=sid, leader_user_id=user.id)
               .order_by(ProjectApplicationVersion.version.desc()).first())
@@ -256,7 +321,8 @@ def application_submit(sid):
         submitted_by=user.id, leader_user_id=user.id, name=name,
         background=d.get("background"), goal=d.get("goal"),
         required_abilities=d.get("required_abilities"),
-        recruit_note=d.get("recruit_note"), plan=d.get("plan"))
+        recruit_note=d.get("recruit_note"),
+        template_nodes=json.dumps(nodes))
     db.session.add(row)
     db.session.commit()
     return jsonify({"code": 200, "message": "申报已提交，等待管理员审核",
@@ -322,6 +388,26 @@ def application_review(sid, vid):
             unit_id=unit.id, background=app.background, goal=app.goal,
             required_abilities=app.required_abilities, recruit_note=app.recruit_note,
             plan=app.plan, visibility='camp'))
+        # 申报即模板（09-13）：申报时设计的节点序列 → 项目模板 + 实例化里程碑，
+        # 过审即自带完整交付流程；存量申报无节点则留空（负责人事后走三起点自建）
+        instantiated = 0
+        if app.template_nodes:
+            try:
+                nodes = json.loads(app.template_nodes)
+            except (ValueError, TypeError):
+                nodes = []
+            t = ProjectTemplate(name=app.name[:100], scope='unit',
+                                camp_session_id=sid, unit_id=unit.id,
+                                created_by=app.leader_user_id)
+            db.session.add(t)
+            db.session.flush()
+            _write_nodes(t.id, nodes)
+            node_rows = [{"id": n.id, "sort_order": n.sort_order, "title": n.title,
+                          "description": n.description, "deliverable_req": n.deliverable_req,
+                          "submit_mode": n.submit_mode}
+                         for n in ProjectTemplateNode.query.filter_by(template_id=t.id)
+                         .order_by(ProjectTemplateNode.sort_order)]
+            instantiated = _instantiate_milestones(camp, unit, node_rows)
         if not CampMember.query.filter_by(
                 camp_session_id=sid, user_id=app.leader_user_id).first():
             db.session.add(CampMember(camp_session_id=sid, user_id=app.leader_user_id,
@@ -331,10 +417,12 @@ def application_review(sid, vid):
         app.reviewed_by, app.reviewed_at = admin.id, datetime.now()
         _notify(app.leader_user_id, "项目申报已通过",
                 f"你在「{camp.name}」申报的项目「{app.name}」已通过审核，"
-                f"你已成为该项目负责人，可开始在营期工作台管理项目。",
+                f"你已成为该项目负责人，可在营期工作台管理项目。"
+                + (f"申报设计的 {instantiated} 个交付节点已生成。" if instantiated else ""),
                 sid, source_id=unit.id, important=True)
         db.session.commit()
-        return jsonify({"code": 200, "message": "已通过：项目已创建，负责人关系生效",
+        return jsonify({"code": 200, "message": "已通过：项目已创建，负责人关系生效"
+                        + (f"，已生成 {instantiated} 个交付节点" if instantiated else ""),
                         "unit_id": unit.id})
     if action == 'reject':
         reason = (d.get("reason") or "").strip()
