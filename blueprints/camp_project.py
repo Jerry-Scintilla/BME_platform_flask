@@ -5,9 +5,8 @@
 
 关键规则：
 - 申报窗口仅 upcoming（09-12 拍板）；过审即建 CampUnit+ProjectProfile+负责人关系生效+自动入池。
-- 一人一营最多 1 个进行中申报 + 最多负责 1 个过审项目（Q-006）。
-- 3 上限（CampPolicy.project_limit，负责人自己的计入）：勾选/回填事务内锁 (camp,user) 成员行
-  重计数后写入；批量按 user_id 排序加锁防死锁，逐人独立成败（PROJECT_MEMBERSHIP_LIMIT_REACHED）。
+- 09-13 放宽：可多申报/多负责/多加入——参与不设数量上限（project_limit 退役恒 None），
+  把关在 admin 审核 + 负责人勾选；志愿 1-3 仍为意向提交口径（preference_submit）。
 - 勾选窗口=营期状态：selecting 自由勾选/回填；running 起普通勾选关闭（CAMP_FORMATION_CLOSED）。
 - 成员变更一律行状态化 ended + CampMembershipEvent 只追加，不物理删（历史提交与贡献保留）。
 - 错误码沿用方案 §5 稳定契约：CAMP_FORMATION_CLOSED / PROJECT_MEMBERSHIP_LIMIT_REACHED /
@@ -62,10 +61,11 @@ def _unit_or_404(uid):
 
 
 def _project_limit(camp):
-    p = camp.policy
-    if p and p.project_limit is not None:
-        return p.project_limit
-    return 3 if camp.category == 'project' else None
+    """09-13 用户拍板：参与不设数量上限——负责/加入均不限制，project_limit 整体退役。
+    恒返 None 使所有上限拦截（勾选/批量回填/余量显示）自动失效；
+    CampPolicy.project_limit 列保留存历史，不再被消费。志愿 1-3 是意向提交口径
+    （preference_submit 硬校验），与加入上限无关，不受影响。"""
+    return None
 
 
 def _active_project_count(sid, user_id):
