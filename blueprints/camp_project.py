@@ -210,22 +210,22 @@ def project_mine(sid):
         (leading if r.role == 'leader' else joining).append(d)
     limit = _project_limit(camp)
     count = _active_project_count(sid, user.id)
-    has_pending = any(a.status == 'pending' for a in apps)
     has_leading = any(r.role == 'leader' for r in my_rows)
     return jsonify({"code": 200,
                     "applications": [_app_dict(a, names) for a in apps],
                     "leading": leading, "joining": joining,
                     "project_count": count, "project_limit": limit,
                     "remaining_slots": max(0, (limit - count)) if limit is not None else None,
-                    "can_apply": camp.status == 'upcoming' and not has_pending and not has_leading})
+                    "can_apply": camp.status == 'upcoming'})
 
 
 @bp.route("/projects/<int:sid>/applications", methods=["POST"])
 @jwt_required()
 @audit_log(operation="提交项目申报")
 def application_submit(sid):
-    """负责人提交申报（新版本；退回重提=新行不覆盖）。
-    窗口仅 upcoming（09-12 拍板）；一人一营一个进行中申报 + 最多负责 1 个过审项目（Q-006）。"""
+    """负责人提交申报（09-13 复盘放宽：可同时申报/负责多个项目——申报即资格，
+    审核把关交给 admin；参与总数仍受 CampPolicy.project_limit 约束（负责的计入），
+    在 approve 时校验）。窗口仅 upcoming（09-12 拍板）。"""
     user = _current_user()
     camp, err = _camp_or_404(sid)
     if err:
@@ -243,14 +243,9 @@ def application_submit(sid):
     if not name or len(name) > 100:
         return jsonify({"code": 400, "message": "请填写项目名（100 字内）"}), 400
     if ProjectApplicationVersion.query.filter_by(
-            camp_session_id=sid, leader_user_id=user.id, status='pending').first():
-        return jsonify({"code": 409, "message": "已有待审核的申报，请等待管理员处理（退回后可重提新版本）"}), 409
-    if CampUnitMember.query.filter(
-            CampUnitMember.user_id == user.id, CampUnitMember.role == 'leader',
-            CampUnitMember.status == 'active'
-    ).join(CampUnit, CampUnit.id == CampUnitMember.unit_id).filter(
-            CampUnit.camp_session_id == sid).first():
-        return jsonify({"code": 402, "message": "你已负责本营一个项目，不能再申报（一人最多负责 1 个）"}), 402
+            camp_session_id=sid, leader_user_id=user.id,
+            status='pending', name=name).first():
+        return jsonify({"code": 409, "message": f"已有同名项目「{name}」的待审申报，请勿重复提交"}), 409
     latest = (ProjectApplicationVersion.query
               .filter_by(camp_session_id=sid, leader_user_id=user.id)
               .order_by(ProjectApplicationVersion.version.desc()).first())
@@ -309,15 +304,12 @@ def application_review(sid, vid):
     action = d.get("action")
     admin = _current_user()
     if action == 'approve':
-        if CampUnitMember.query.filter(
-                CampUnitMember.user_id == app.leader_user_id, CampUnitMember.role == 'leader',
-                CampUnitMember.status == 'active'
-        ).join(CampUnit, CampUnit.id == CampUnitMember.unit_id).filter(
-                CampUnit.camp_session_id == sid).first():
-            app.status, app.reject_reason = 'rejected', '审核时发现该负责人已负责其他项目'
-            app.reviewed_by, app.reviewed_at = admin.id, datetime.now()
-            db.session.commit()
-            return jsonify({"code": 402, "message": "PROJECT_NOT_APPROVED 该负责人已负责本营其他项目，不可再负责新的"}), 402
+        # 09-13 放宽：可负责多个项目——唯一硬约束=参与总数上限（负责的计入，
+        # 与成员勾选同口径 PROJECT_MEMBERSHIP_LIMIT_REACHED）
+        limit = _project_limit(camp)
+        if limit is not None and _active_project_count(sid, app.leader_user_id) >= limit:
+            return jsonify({"code": 400, "message": "该负责人参与数已达上限"
+                            + (f"（{limit}）" if limit else "") + "，不可再负责新项目"}), 400
         if CampUnit.query.filter_by(camp_session_id=sid, unit_type='project',
                                     name=app.name).first():
             return jsonify({"code": 400, "message": "已存在同名项目，请让负责人改名后重提"}), 400
