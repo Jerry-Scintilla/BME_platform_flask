@@ -1608,7 +1608,8 @@ class CampMilestone(db.Model):
 
 class CampSubmissionVersion(db.Model):
     """版本化提交：退回重提=新版本（旧版 superseded）。member 模式每人一条版本链
-    （负责人自己份额交老师审——防自审红线），team 模式一条链（负责人交老师审）。"""
+    （负责人自己份额交老师审——防自审红线），team 模式一条链（负责人交老师审）。
+    09-13 起前端入口下线（节点评价制替代），表与端点保留待文件提交管理上线复用。"""
     __tablename__ = 'camp_submission_version'
     id = db.Column(db.Integer, primary_key=True)
     milestone_id = db.Column(db.Integer, db.ForeignKey('camp_milestone.id'), nullable=False, index=True)
@@ -1622,6 +1623,29 @@ class CampSubmissionVersion(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('milestone_id', 'submitted_by', 'version', name='uq_csv_milestone_sub_ver'),
+    )
+
+
+class CampNodeEvaluation(db.Model):
+    """项目营·节点评价（2026-09-13，migrate_29）：负责人对每位成员在各交付节点的
+    分数（0-100）+ 评语。评价制交付（文件提交入口本轮下线，老师验收退出）：
+    - 评价对象 = active 单元成员中除负责人本人（无自评）
+    - 可见性：成员仅见本人评价；负责人/admin 见全部
+    - 节点完成态读时派生（评齐=完成），不落 milestone.status
+    - upsert 语义：重复 PUT 即改分改评（leader_user_id 留痕更新）"""
+    __tablename__ = 'camp_node_evaluation'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=False, index=True)
+    milestone_id = db.Column(db.Integer, db.ForeignKey('camp_milestone.id'), nullable=False, index=True)
+    member_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    score = db.Column(db.Integer, nullable=False)          # 0-100
+    comment = db.Column(db.String(500))
+    leader_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('milestone_id', 'member_user_id', name='uq_neval_milestone_member'),
     )
 
 

@@ -1047,6 +1047,39 @@ def attendance_dashboard(sid):
     })
 
 
+@bp.route("/units/<int:uid>/attendance/weekly")
+@jwt_required()
+def unit_weekly_attendance(uid):
+    """项目营·单元周考勤面板（09-13）：负责人看本项目成员的按周出勤统计。
+    项目营成员是 CampMember.role='member'，进不了 @camp_role('mentor') 的营级 dashboard，
+    此处以单元负责人视角出数（admin 亦可）；周分桶复用 _weekly_stats 同口径。"""
+    from models import CampUnit, CampUnitMember
+    unit = CampUnit.query.get(uid)
+    if not unit or unit.unit_type != 'project':
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+    camp = CampSession.query.get(unit.camp_session_id)
+    user = _current_user()
+    is_leader = user.is_admin() or CampUnitMember.query.filter_by(
+        unit_id=unit.id, user_id=user.id, role='leader', status='active').first()
+    if not is_leader:
+        return jsonify({"code": 403, "message": "仅项目负责人可查看项目周考勤"}), 403
+    if not _capability_enabled(camp, 'attendance'):
+        return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
+    if _attendance_mode(camp) != 'weekly':
+        return jsonify({"code": 400, "message": "本营期考勤模式非按周累计"}), 400
+    members = (CampUnitMember.query.filter_by(unit_id=unit.id, status='active')
+               .order_by(CampUnitMember.user_id).all())
+    uids = [m.user_id for m in members]
+    stats = _weekly_stats(camp, uids)
+    users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(uids))} if uids else {}
+    rows = [{"user_id": uid, "username": users[uid].username if uid in users else "",
+             **stats[uid]} for uid in uids]
+    return jsonify({"code": 200, "mode": "weekly",
+                    "range": {"from": camp.start_date.isoformat(),
+                              "to": camp.end_date.isoformat()},
+                    "rows": rows})
+
+
 @bp.route("/attendance/export/<int:sid>")
 @jwt_required()
 @camp_role('mentor')

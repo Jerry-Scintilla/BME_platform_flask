@@ -26,6 +26,7 @@ from models import (
     CampSession, CampMember, CampUnit, CampUnitMember,
     ProjectTemplate, ProjectTemplateNode,
     CampMilestone, CampSubmissionVersion, CampSubmissionAttachment,
+    CampNodeEvaluation,
     CampOutcome, CampArchive, CampArchiveRevision,
     CampMembershipEvent, UserModel,
 )
@@ -354,10 +355,33 @@ def unit_template_update(uid):
 # 里程碑 CRUD（负责人；实例化后可增删调时）
 # ─────────────────────────────────────────────
 
+def _eval_payload(m, unit, all_evals, members, user, names):
+    """节点评价块（09-13 评价制交付）：应评=active 成员除负责人本人（无自评）；
+    成员仅见本人评价；完成态读时派生（评齐=完），不落 milestone.status。"""
+    target_ids = [r.user_id for r in members if r.user_id != unit.owner_user_id]
+    target_set = set(target_ids)
+    evals = [e for e in all_evals if e.milestone_id == m.id and e.member_user_id in target_set]
+    is_leader = user.is_admin() or unit.owner_user_id == user.id
+    visible = [e for e in evals if is_leader or e.member_user_id == user.id]
+    return {
+        "evaluations": [{
+            "member_user_id": e.member_user_id,
+            "member_name": names.get(e.member_user_id, str(e.member_user_id)),
+            "score": e.score, "comment": e.comment,
+            "leader_user_id": e.leader_user_id,
+            "updated_at": e.updated_at.strftime("%Y-%m-%d %H:%M") if e.updated_at else None,
+        } for e in sorted(visible, key=lambda x: x.member_user_id)],
+        "member_count": len(target_ids),
+        "evaluated_count": len({e.member_user_id for e in evals}),
+        "node_complete": bool(target_ids) and len({e.member_user_id for e in evals}) >= len(target_set),
+    }
+
+
 @bp.route("/units/<int:uid>/milestones")
 @jwt_required()
 def milestone_list(uid):
-    """里程碑列表（带请求者可见的版本链：member=自己；leader/admin=全部链）。"""
+    """里程碑列表（带请求者可见的版本链 + 节点评价块）。
+    09-13 评价制：submissions 链保留返回（存量/后续文件提交管理），前端消费 evaluations。"""
     unit, camp, err = _unit_or_404(uid)
     if err:
         return err
@@ -370,6 +394,10 @@ def milestone_list(uid):
     chains_all = CampSubmissionVersion.query.filter(
         CampSubmissionVersion.milestone_id.in_([m.id for m in ms])).all() if ms else []
     names = _names({s.submitted_by for s in chains_all})
+    members = _active_unit_members(unit.id)
+    evals_all = CampNodeEvaluation.query.filter(
+        CampNodeEvaluation.milestone_id.in_([m.id for m in ms])).all() if ms else []
+    eval_names = _names({r.user_id for r in members} | {e.member_user_id for e in evals_all})
     out = []
     for m in ms:
         chains = [s for s in chains_all if s.milestone_id == m.id]
@@ -377,9 +405,65 @@ def milestone_list(uid):
         # member（非负责人）只见自己的链；leader/admin 见全部
         visible = [s for s in chains if user.is_admin() or unit.owner_user_id == user.id
                    or s.submitted_by == user.id]
-        out.append(_ms_dict(m, visible, names))
+        out.append({**_ms_dict(m, visible, names),
+                    **_eval_payload(m, unit, evals_all, members, user, eval_names)})
+    # 评价对象花名册（应评=active 成员除负责人）：leader 端渲染"未评价"行用；成员端忽略
+    eval_members = [{"user_id": r.user_id,
+                     "username": eval_names.get(r.user_id, str(r.user_id))}
+                    for r in members if r.user_id != unit.owner_user_id]
     return jsonify({"code": 200, "milestones": out,
+                    "eval_members": eval_members,
                     "my_role": 'leader' if (user.is_admin() or unit.owner_user_id == user.id) else 'member'})
+
+
+@bp.route("/milestones/<int:mid>/evaluations/<int:member_uid>", methods=["PUT"])
+@jwt_required()
+@audit_log(operation="节点评价")
+def node_evaluation_put(mid, member_uid):
+    """负责人对成员的节点评价 upsert（09-13 评价制交付）：分数 0-100 + 评语 ≤500。
+    重复 PUT 即改分改评；评价对象=active 成员且非负责人本人（无自评）。"""
+    m = CampMilestone.query.get(mid)
+    if not m:
+        return jsonify({"code": 404, "message": "节点不存在"}), 404
+    unit = CampUnit.query.get(m.unit_id)
+    camp = CampSession.query.get(m.camp_session_id)
+    user = _current_user()
+    if not _is_unit_leader(unit, user):
+        return jsonify({"code": 403, "message": "仅项目负责人可评价节点"}), 403
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    if unit.status != 'active':
+        return jsonify({"code": 400, "message": f"项目状态为 {unit.status}，不可评价"}), 400
+    row = CampUnitMember.query.filter_by(
+        unit_id=unit.id, user_id=member_uid, status='active').first()
+    if not row or member_uid == unit.owner_user_id:
+        return jsonify({"code": 400, "message": "评价对象须为本项目在职成员（不含负责人本人）"}), 400
+    d = request.json or {}
+    score = d.get("score")
+    try:
+        score = int(score)
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "评分须为 0-100 的整数"}), 400
+    if not 0 <= score <= 100:
+        return jsonify({"code": 400, "message": "评分须为 0-100 的整数"}), 400
+    comment = (d.get("comment") or "").strip() or None
+    if comment and len(comment) > 500:
+        return jsonify({"code": 400, "message": "评语最多 500 字"}), 400
+    ev = CampNodeEvaluation.query.filter_by(
+        milestone_id=m.id, member_user_id=member_uid).first()
+    if ev:
+        ev.score, ev.comment, ev.leader_user_id = score, comment, user.id
+    else:
+        db.session.add(CampNodeEvaluation(
+            camp_session_id=camp.id, unit_id=unit.id, milestone_id=m.id,
+            member_user_id=member_uid, score=score, comment=comment,
+            leader_user_id=user.id))
+    _notify(member_uid, "节点评价已出",
+            f"「{camp.name}」项目「{unit.name}」节点「{m.title}」负责人给出了评价：{score} 分"
+            + (f"——{comment}" if comment else ""),
+            camp.id, source_id=unit.id)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "评价已保存", "score": score})
 
 
 @bp.route("/units/<int:uid>/milestones", methods=["POST"])
