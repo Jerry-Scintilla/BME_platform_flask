@@ -1384,7 +1384,9 @@ class CampMentorFavorite(db.Model):
 class CampChapterCertification(db.Model):
     """方向制学习·导生按章认证（2026-09-12，migrate_24）：学员随导生继承方向课程后，
     导生逐章认证其学习进度；全章认证齐 → user_course.status 自动置 completed（汇总态，撤销不回滚）。
-    认证人留痕（改派后新导师可继续认证/撤销自己名下的行）。"""
+    认证人留痕（改派后新导师可继续认证/撤销自己名下的行）。
+    2026-09-13 多课制+按章评分（migrate_28）：方向可绑多门课程（course_id 标识所属课）；
+    score=该章评分 0-100（可空=认证未打分；课程均分读时聚合不落库）。"""
     __tablename__ = 'camp_chapter_certification'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -1393,6 +1395,7 @@ class CampChapterCertification(db.Model):
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
     mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)   # 认证导生（留痕）
     certified_at = db.Column(db.DateTime, default=datetime.now)
+    score = db.Column(db.Integer)   # 章节评分 0-100（可空=认证未打分；重复 POST 带 score=改分）
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'student_user_id', 'chapter_id', name='uq_cert_camp_student_chapter'),
     )

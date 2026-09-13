@@ -64,8 +64,9 @@ def _camp_writable(camp):
 
 
 def _ms_directions_raw(camp):
-    """ms_tags 原始解析：兼容两种形状——
-    新：[{"name":"硬件组","course_id":12},...]（09-12 方向制：分类=方向+课程）
+    """ms_tags 原始解析：兼容三种形状——
+    新：[{"name":"硬件组","course_ids":[12,13]},...]（09-13 多课制：方向可绑多门课程）
+    中：[{"name":"硬件组","course_id":12},...]（09-12 单课制存量，读时归一为单元素 course_ids）
     旧：["硬件组",...]（纯字符串，legacy 营；无课程绑定，编辑时强制补齐）
     返回 list（元素为 dict 或 str），未配置/脏数据回退默认集字符串。"""
     if camp.ms_tags:
@@ -75,8 +76,11 @@ def _ms_directions_raw(camp):
                 out = []
                 for t in tags[:20]:
                     if isinstance(t, dict) and str(t.get("name") or "").strip():
+                        cids = t.get("course_ids")
+                        if not isinstance(cids, list):
+                            cids = [t.get("course_id")] if t.get("course_id") is not None else []
                         out.append({"name": str(t["name"]).strip(),
-                                    "course_id": t.get("course_id")})
+                                    "course_ids": cids})
                     elif isinstance(t, str) and t.strip():
                         out.append(t.strip())
                 if out:
@@ -93,17 +97,25 @@ def _ms_tags_list(camp):
 
 
 def _ms_directions(camp):
-    """方向定义（继承与课程派生/管理端配置回显的唯一取用口）：[{name, course_id}]。
-    legacy 纯字符串条目归一为 {name, course_id: None}（老营未补绑课程的过渡态，可见可补）。"""
+    """方向定义（继承与课程派生/管理端配置回显的唯一取用口）：[{name, course_ids: [...]}]。
+    09-13 多课制：一方向可绑多门课程；单课存量与 legacy 字符串读时归一
+    （字符串 → 空列表，老营未补绑课程的过渡态，可见可补）；死课程 id 剔除、去重保序。"""
     from models import CourseModel
     out = []
     for d in _ms_directions_raw(camp):
         name = d["name"] if isinstance(d, dict) else d
-        cid = d.get("course_id") if isinstance(d, dict) else None
-        cid = int(cid) if cid is not None and str(cid).isdigit() else None
-        if cid is not None and not CourseModel.query.get(cid):
-            cid = None
-        out.append({"name": name, "course_id": cid})
+        raw_ids = d.get("course_ids") if isinstance(d, dict) else None
+        cids, seen = [], set()
+        for cid in (raw_ids or []):
+            try:
+                cid = int(cid)
+            except (ValueError, TypeError):
+                continue
+            if cid in seen or not CourseModel.query.get(cid):
+                continue
+            seen.add(cid)
+            cids.append(cid)
+        out.append({"name": name, "course_ids": cids})
     return out
 
 
@@ -122,8 +134,8 @@ def _parse_ms_dt(val):
 def _apply_ms_fields(camp, d):
     """从请求体应用选导生配置（只处理出现的键；datetime 解析失败 raise ValueError）。
     空字符串/None → 置 NULL。round 截止键已随单轮化废弃，传入一律忽略。
-    ms_tags 接受两种形状（09-12 方向制）：[{name, course_id}] 对象数组（新）或纯字符串数组
-    （legacy 容忍直存，_validate_ms 在 enabled 时会拦截缺课程的形状）。"""
+    ms_tags 接受三种形状（09-13 多课制）：[{name, course_ids:[...]}]（新）/[{name, course_id}]
+    单课存量 / 纯字符串数组（legacy 容忍直存，_validate_ms 在 enabled 时会拦截缺课程的形状）。"""
     if "mentor_selection_enabled" in d:
         camp.mentor_selection_enabled = bool(d.get("mentor_selection_enabled"))
     for f in ("ms_preference_start", "ms_preference_deadline"):
@@ -136,9 +148,19 @@ def _apply_ms_fields(camp, d):
             clean = []
             for t in tags:
                 if isinstance(t, dict) and str(t.get("name") or "").strip():
-                    cid = t.get("course_id")
-                    cid = int(cid) if cid is not None and str(cid).isdigit() else None
-                    clean.append({"name": str(t["name"]).strip(), "course_id": cid})
+                    raw = t.get("course_ids")
+                    if not isinstance(raw, list):
+                        raw = [t.get("course_id")] if t.get("course_id") is not None else []
+                    cids, seen = [], set()
+                    for cid in raw:
+                        try:
+                            cid = int(cid)
+                        except (ValueError, TypeError):
+                            continue
+                        if cid not in seen:
+                            seen.add(cid)
+                            cids.append(cid)
+                    clean.append({"name": str(t["name"]).strip(), "course_ids": cids})
                 elif isinstance(t, str) and t.strip():
                     clean.append(t.strip())
             camp.ms_tags = json.dumps(clean, ensure_ascii=False) if clean else None
@@ -150,7 +172,7 @@ def _validate_ms(camp):
     """选导生配置校验（create/update 存库前调用）。返回 None 或错误 message。
     09-12 时间统领拍板：选导生是营期的第一个阶段——志愿时间窗必须落在营期起止之内
     （营期开始日 00:00 ≤ 志愿开始 < 志愿截止 ≤ 营期结束日 23:59，不再压在营期开始之前）；
-    且每个分类必须绑定一门存在的课程（方向制：分类=方向+课程）。
+    且每个方向至少绑定一门存在的课程（09-13 多课制：一方向可绑多门）。
     round 截止字段已随单轮化废弃，不参与校验。关闭 enabled 随时允许。"""
     if not camp.mentor_selection_enabled:
         return None
@@ -170,8 +192,8 @@ def _validate_ms(camp):
     if not dirs:
         return "启用选导生需至少配置一个分类方向"
     for d in dirs:
-        if d["course_id"] is None:
-            return f"分类「{d['name']}」未关联有效课程（方向制：每个分类必须绑定一门课程）"
+        if not d["course_ids"]:
+            return f"分类「{d['name']}」未关联有效课程（方向制：每个方向至少绑定一门课程）"
     return None
 
 
@@ -205,7 +227,7 @@ def _ms_dict(camp):
         "ms_round1_deadline": _fmt(camp.ms_round1_deadline),
         "ms_round2_deadline": _fmt(camp.ms_round2_deadline),
         "ms_tags": _ms_tags_list(camp),
-        # 09-12 方向制：管理端配置回显用（含课程绑定；legacy 未绑为 null）
+        # 09-12 方向制 / 09-13 多课制：管理端配置回显用（含课程绑定；legacy 未绑为空数组）
         "ms_directions": _ms_directions(camp),
     }
 
@@ -239,8 +261,8 @@ def _live_matched(camp_id, mentor_id):
 
 
 def _inherit_direction_course(camp, student_uid, mentor_uid):
-    """方向制继承（09-12）：学员归属导生 → 自动入读该导生方向绑定的课程。
-    - 方向取导生名片 tags[0] → _ms_directions 的 course_id；无名片/legacy 无课程 → 静默跳过
+    """方向制继承（09-12；09-13 多课制）：学员归属导生 → 自动入读该导生方向绑定的全部课程。
+    - 方向取导生名片 tags[0] → _ms_directions 的 course_ids；无名片/legacy 无课程 → 静默跳过
     - UserCourse UQ(user, course)：已有行（同课跨营）复用并重打 camp_session_id 戳（同旧 /camp/selection 口径）
     - 不 commit（由调用方事务一并提交）；release/移除导生不回收旧课行（学习历史保留）
     """
@@ -256,22 +278,26 @@ def _inherit_direction_course(camp, student_uid, mentor_uid):
         return None
     direction = next((d for d in _ms_directions(camp)
                       if d["name"] == str(tags[0])), None)
-    if not direction or direction["course_id"] is None:
+    if not direction or not direction["course_ids"]:
         return None
-    uc = UserCourseModel.query.filter_by(
-        user_id=student_uid, course_id=direction["course_id"]).first()
-    if uc:
-        uc.camp_session_id = camp.id
-        # 复用旧选课行：曾退课（dropped）拉回在读——否则进营后「在学习」列表看不到该课
-        # （退课只标状态不删行，UQ 保证复用）；completed 不降级（学完就是学完）
-        if uc.status == UserCourseModel.STATUS_DROPPED:
-            uc.status = UserCourseModel.STATUS_ACTIVE
-        return uc
-    uc = UserCourseModel(user_id=student_uid, course_id=direction["course_id"],
-                         camp_session_id=camp.id,
-                         status=UserCourseModel.STATUS_ACTIVE)
-    db.session.add(uc)
-    return uc
+    last = None
+    for cid in direction["course_ids"]:
+        uc = UserCourseModel.query.filter_by(
+            user_id=student_uid, course_id=cid).first()
+        if uc:
+            uc.camp_session_id = camp.id
+            # 复用旧选课行：曾退课（dropped）拉回在读——否则进营后「在学习」列表看不到该课
+            # （退课只标状态不删行，UQ 保证复用）；completed 不降级（学完就是学完）
+            if uc.status == UserCourseModel.STATUS_DROPPED:
+                uc.status = UserCourseModel.STATUS_ACTIVE
+            last = uc
+            continue
+        uc = UserCourseModel(user_id=student_uid, course_id=cid,
+                             camp_session_id=camp.id,
+                             status=UserCourseModel.STATUS_ACTIVE)
+        db.session.add(uc)
+        last = uc
+    return last
 
 
 def _avatar_url(u):
