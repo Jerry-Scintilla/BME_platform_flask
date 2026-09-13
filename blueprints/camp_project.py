@@ -28,7 +28,7 @@ from models import (
     CampUnit, ProjectProfile, ProjectApplicationVersion,
     CampUnitMember, CampMembershipEvent, CampProjectPreference,
     CampUnitActivity, CampUnitActivityCheck,
-    CampJoinRequest, UserModel,
+    UserModel,
 )
 
 from . import camp_role, audit_log, _current_user
@@ -162,30 +162,6 @@ def _project_dict(unit, profile, names, member_count=0, my_role=None, my_pref_ra
     }
 
 
-def _leader_request_dict(r):
-    return {"id": r.id, "status": r.status, "reason": r.reason,
-            "created_at": r.created_at.isoformat() if r.created_at else None}
-
-
-def _has_leader_role(sid, user_id):
-    """本营 active 负责人判定（申报/资格接口共用）。"""
-    return CampUnitMember.query.filter(
-        CampUnitMember.user_id == user_id, CampUnitMember.role == 'leader',
-        CampUnitMember.status == 'active'
-    ).join(CampUnit, CampUnit.id == CampUnitMember.unit_id).filter(
-        CampUnit.camp_session_id == sid).first()
-
-
-def _leader_eligible(sid, user_id, has_applied_before, has_leading):
-    """负责人资格判定（09-13 两段式：资格过审才可申报）。
-    eligible = approved 资格申请 / 已是本营负责人 / 有申报历史的存量用户（旧流程豁免）。"""
-    if has_leading or has_applied_before:
-        return True
-    return bool(CampJoinRequest.query.filter_by(
-        camp_session_id=sid, user_id=user_id,
-        apply_role='leader', status='approved').first())
-
-
 def _notify(user_id, title, content, camp_id, source_id=None, important=False):
     try:
         create_notification(user_id, title, content, category='camp',
@@ -236,63 +212,12 @@ def project_mine(sid):
     count = _active_project_count(sid, user.id)
     has_pending = any(a.status == 'pending' for a in apps)
     has_leading = any(r.role == 'leader' for r in my_rows)
-    leader_req = (CampJoinRequest.query.filter(
-        CampJoinRequest.camp_session_id == sid, CampJoinRequest.user_id == user.id,
-        CampJoinRequest.apply_role == 'leader')
-        .order_by(CampJoinRequest.created_at.desc()).first())
-    eligible = _leader_eligible(sid, user.id, has_applied_before=bool(apps), has_leading=has_leading)
     return jsonify({"code": 200,
                     "applications": [_app_dict(a, names) for a in apps],
                     "leading": leading, "joining": joining,
                     "project_count": count, "project_limit": limit,
                     "remaining_slots": max(0, (limit - count)) if limit is not None else None,
-                    "leader_request": _leader_request_dict(leader_req) if leader_req else None,
-                    "leader_eligible": eligible,
-                    "can_apply": camp.status == 'upcoming' and not has_pending and not has_leading and eligible,
-                    "need_leader_request": camp.status == 'upcoming' and not eligible})
-
-
-@bp.route("/projects/<int:sid>/leader-requests", methods=["POST"])
-@jwt_required()
-@audit_log(operation="申请项目负责人资格")
-def leader_request_submit(sid):
-    """申请项目负责人资格（09-13 拍板两段式前置：资格审人、申报审项目，均 admin 审）。
-    复用 CampJoinRequest（apply_role='leader'，admin 在学员申请区审批）；资格≠入营——
-    approve 只发放申报许可不入池，入营仍走选择期报名 / 申报过审自动入池。撤回复用
-    join-request/cancel。窗口=upcoming（与申报同窗）；被拒可重提（新行）。"""
-    user = _current_user()
-    camp, err = _camp_or_404(sid)
-    if err:
-        return err
-    if camp.category != 'project':
-        return jsonify({"code": 400, "message": "该营期不是项目营"}), 400
-    if camp.status != 'upcoming':
-        return jsonify({"code": 400, "message": "负责人资格申请仅在「待开放」阶段开放"}), 400
-    if user.is_admin():
-        return jsonify({"code": 400, "message": "管理员不作为项目负责人；如需代管请使用成员账号"}), 400
-    if _has_leader_role(sid, user.id):
-        return jsonify({"code": 402, "message": "你已是本营项目负责人，无需再申请资格"}), 402
-    latest = (CampJoinRequest.query.filter(
-        CampJoinRequest.camp_session_id == sid, CampJoinRequest.user_id == user.id,
-        CampJoinRequest.apply_role == 'leader')
-        .order_by(CampJoinRequest.created_at.desc()).first())
-    if latest and latest.status == 'pending':
-        return jsonify({"code": 409, "message": "已有待审核的资格申请，请等待管理员处理（可撤回后重新提交）"}), 409
-    if latest and latest.status == 'approved':
-        return jsonify({"code": 402, "message": "资格已通过，请直接提交项目申报"}), 402
-    # 与入营申请共用「一人一营一条 pending」口径（camp.py join_request_submit 同款）
-    if CampJoinRequest.query.filter_by(
-            camp_session_id=sid, user_id=user.id, status='pending').first():
-        return jsonify({"code": 409, "message": "已有待审批的申请，请先撤回或等待处理"}), 409
-    reason = ((request.json or {}).get("reason") or "").strip()
-    if not reason:
-        return jsonify({"code": 400, "message": "请填写申请理由（想负责的方向、相关经历）"}), 400
-    row = CampJoinRequest(camp_session_id=sid, user_id=user.id,
-                          reason=reason[:500], apply_role='leader')
-    db.session.add(row)
-    db.session.commit()
-    return jsonify({"code": 200, "message": "资格申请已提交，等待管理员审核",
-                    "leader_request": _leader_request_dict(row)})
+                    "can_apply": camp.status == 'upcoming' and not has_pending and not has_leading})
 
 
 @bp.route("/projects/<int:sid>/applications", methods=["POST"])
@@ -326,14 +251,6 @@ def application_submit(sid):
     ).join(CampUnit, CampUnit.id == CampUnitMember.unit_id).filter(
             CampUnit.camp_session_id == sid).first():
         return jsonify({"code": 402, "message": "你已负责本营一个项目，不能再申报（一人最多负责 1 个）"}), 402
-    # 09-13 两段式：申报前置负责人资格（approved 资格申请）；存量豁免=有申报历史的老用户
-    # （旧流程「申报即资格」，被拒重提不被新门槛卡死）
-    if not _leader_eligible(sid, user.id,
-                            has_applied_before=ProjectApplicationVersion.query.filter_by(
-                                camp_session_id=sid, leader_user_id=user.id).first() is not None,
-                            has_leading=False):
-        return jsonify({"code": 403, "message": "LEADER_APPROVAL_REQUIRED 请先申请成为项目负责人，"
-                                               "资格通过后即可申报项目"}), 403
     latest = (ProjectApplicationVersion.query
               .filter_by(camp_session_id=sid, leader_user_id=user.id)
               .order_by(ProjectApplicationVersion.version.desc()).first())

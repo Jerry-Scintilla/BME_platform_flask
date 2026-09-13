@@ -1637,21 +1637,6 @@ def join_request_approve(rid):
         return jsonify({"code": 404, "message": "申请不存在"}), 404
     if req.status != 'pending':
         return jsonify({"code": 400, "message": "该申请已处理"}), 400
-    # 项目营负责人资格申请（09-13 两段式）：approve 只发放申报许可，不入池不建考勤；
-    # 入营仍走选择期报名 / 项目申报过审自动入池（camp_project.application_review）
-    if req.apply_role == 'leader':
-        req.status = 'approved'
-        req.reviewed_by = _current_user().id
-        req.reviewed_at = datetime.now()
-        camp_l = CampSession.query.get(req.camp_session_id)
-        create_notification(req.user_id, "负责人资格已通过",
-                            f"你在「{camp_l.name if camp_l else '营期'}」的项目负责人资格已通过，"
-                            f"现在可以在「待开放」阶段申报项目了。",
-                            category='camp', source_type='join_request',
-                            source_id=req.id, camp_session_id=req.camp_session_id,
-                            is_important=True)
-        db.session.commit()
-        return jsonify({"code": 200, "message": "已通过：负责人资格生效，可申报项目"})
     d = request.json or {}
     # 学员审批时老师选定归属导生（body team_mentor_id）；auto_plan=False 改由手选日期建 plan
     # 启用选导生的营期：忽略 body 导生——学员先进营无导生，归属由开营前的选导生活动决定
@@ -1723,19 +1708,16 @@ def join_request_reject(rid):
     req.status = 'rejected'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
-    # 通知申请人未通过（同事务，commit 之前；拒绝原因从 body 读，不入库）
+    # 通知学生：入营申请未通过（同事务，commit 之前；拒绝原因从 body 读，不入库）
     d = request.json or {}
     reason = (d.get("reason") or "").strip()
     camp = CampSession.query.get(req.camp_session_id)
     camp_name = camp.name if camp else '该营期'
-    if req.apply_role == 'leader':
-        title, content = "负责人资格申请未通过", f"很遗憾，你对「{camp_name}」的项目负责人资格申请未通过。"
-    else:
-        title, content = "入营申请未通过", f"很遗憾，你对「{camp_name}」的入营申请未通过。"
+    content = f"很遗憾，你对「{camp_name}」的入营申请未通过。"
     if reason:
         content += f"原因：{reason}。"
     content += "如有疑问请联系老师。"
-    create_notification(req.user_id, title, content,
+    create_notification(req.user_id, "入营申请未通过", content,
                         category='camp', source_type='join_request',
                         source_id=req.id, camp_session_id=req.camp_session_id,
                         is_important=True)
