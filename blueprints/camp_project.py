@@ -69,9 +69,11 @@ def _project_limit(camp):
 
 
 def _active_project_count(sid, user_id):
-    """该用户在本营 active 的项目参与数（leader 与 member 均计入；负责人自己的计入，Q-006）。"""
+    """该用户在本营以成员身份（member）active 加入的项目数——project_limit 只管加入位；
+    负责人（leader）位不占上限（09-13 放宽多负责：申报/负责无数量限制，把关在 admin 审核）。"""
     return (CampUnitMember.query
-            .filter(CampUnitMember.user_id == user_id, CampUnitMember.status == 'active')
+            .filter(CampUnitMember.user_id == user_id, CampUnitMember.status == 'active',
+                    CampUnitMember.role == 'member')
             .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
             .filter(CampUnit.camp_session_id == sid, CampUnit.unit_type == 'project')
             .count())
@@ -304,12 +306,7 @@ def application_review(sid, vid):
     action = d.get("action")
     admin = _current_user()
     if action == 'approve':
-        # 09-13 放宽：可负责多个项目——唯一硬约束=参与总数上限（负责的计入，
-        # 与成员勾选同口径 PROJECT_MEMBERSHIP_LIMIT_REACHED）
-        limit = _project_limit(camp)
-        if limit is not None and _active_project_count(sid, app.leader_user_id) >= limit:
-            return jsonify({"code": 400, "message": "该负责人参与数已达上限"
-                            + (f"（{limit}）" if limit else "") + "，不可再负责新项目"}), 400
+        # 09-13 放宽：可负责多个项目，负责位不占 project_limit——审核即放行（同名项目仍拦）
         if CampUnit.query.filter_by(camp_session_id=sid, unit_type='project',
                                     name=app.name).first():
             return jsonify({"code": 400, "message": "已存在同名项目，请让负责人改名后重提"}), 400
@@ -571,7 +568,7 @@ def assign_batch(sid):
             continue
         if limit is not None and _active_project_count(sid, uid) >= limit:
             results.append({**item, "status": "conflict",
-                            "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 该成员已参与 {limit} 个项目（上限含负责的项目）"})
+                            "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 该成员加入的项目数已达上限 {limit}（自己负责的不计）"})
             continue
         _add_unit_member(unit, uid, 'member', 'admin', admin.id)
         _notify(uid, "已加入项目",
@@ -616,7 +613,8 @@ def selection_roster(uid):
                            CampUnit.unit_type == 'project').all()) if pool_ids else []
     cnt = {}
     for r in active_rows:
-        cnt[r.user_id] = cnt.get(r.user_id, 0) + 1
+        if r.role == 'member':          # 上限只管加入位；leader 位不占（09-13 多负责放宽）
+            cnt[r.user_id] = cnt.get(r.user_id, 0) + 1
     unit_names = {u.id: u.name for u in CampUnit.query.filter(
         CampUnit.id.in_({r.unit_id for r in active_rows})).all()} if active_rows else {}
     prefs = {p.student_user_id: p.rank for p in CampProjectPreference.query.filter_by(
@@ -713,7 +711,7 @@ def member_selection(uid):
                 continue
             if limit is not None and _active_project_count(camp.id, target) >= limit:
                 results.append({**item, "result": "conflict",
-                                "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 该成员参与数已达上限 {limit}"})
+                                "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 该成员加入的项目数已达上限 {limit}（自己负责的不计）"})
                 continue
             _add_unit_member(unit, target, 'member', 'leader_pick', user.id)
             results.append({**item, "result": "added"})
@@ -818,12 +816,9 @@ def leader_change(uid):
         db.session.add(CampMember(camp_session_id=camp.id, user_id=new_leader, role='member'))
     elif member.role not in ('member', 'student'):
         return jsonify({"code": 400, "message": "新负责人营内身份异常"}), 400
-    # 3 上限：新负责人不在本项目时计入 +1
     already = CampUnitMember.query.filter_by(
         unit_id=unit.id, user_id=new_leader, status='active').first()
-    limit = _project_limit(camp)
-    if not already and limit is not None and _active_project_count(camp.id, new_leader) >= limit:
-        return jsonify({"code": 409, "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 新负责人参与数已达上限 {limit}"}), 409
+    # 09-13 多负责放宽：新负责人以 leader 位接手，不占 project_limit（上限只管加入位）
     old_row = CampUnitMember.query.filter_by(unit_id=unit.id, user_id=old_leader).first()
     if old_row and old_row.status == 'active':
         old_row.role = 'member'                      # 旧负责人转普通成员，贡献保留
