@@ -14,6 +14,11 @@ from .forms import HomeCoverForm
 # 导入token验证模块
 from flask_jwt_extended import (get_jwt_identity, jwt_required)
 
+import config
+
+# 封面图目录（DATA_ROOT 可配置，默认 ./data）
+HOMECOVER_DIR = os.path.join(config.DATA_ROOT, 'homeCover')
+
 # 导入api文档模块
 from flasgger import swag_from
 
@@ -82,7 +87,7 @@ def upgrade():
         #保存图片数据
         file = form.HomeCover.data
         filename = file.filename
-        file.save('./data/homeCover/' + str(cover.id) + '.' + filename.rsplit(".", 1)[1].lower())
+        file.save(os.path.join(HOMECOVER_DIR, f"{cover.id}.{filename.rsplit('.', 1)[1].lower()}"))
         # 保存头像路径到数据库
         cover.url = str(cover.id) + '.' + filename.rsplit(".", 1)[1].lower()
         db.session.commit()
@@ -131,7 +136,7 @@ def delete():
     image_path = cover.url
     if image_path:
         # 构造完整文件路径
-        full_image_path = os.path.join('./data/homeCover/', image_path)
+        full_image_path = os.path.join(HOMECOVER_DIR, image_path)
 
         # 检查文件是否存在并删除
         if os.path.exists(full_image_path):
@@ -194,7 +199,7 @@ def list():
             continue
 
         # 构造完整文件路径
-        full_image_path = os.path.join('./data/homeCover/', image_path)
+        full_image_path = os.path.join(HOMECOVER_DIR, image_path)
 
         # 定义 Redis 缓存键
         cache_key = f"homeCover:base64:{cover.id}"
@@ -266,7 +271,7 @@ def search():
     coverid = None
 
     # 构造完整文件路径
-    full_image_path = os.path.join('./data/homeCover/', image_path)
+    full_image_path = os.path.join(HOMECOVER_DIR, image_path)
 
     # 定义 Redis 缓存键
     cache_key = f"homeCover:base64:{cover.id}"

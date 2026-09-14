@@ -12,6 +12,11 @@ from exts import db, redis_client
 # 导入数据库表
 from models import UserModel, CourseModel, Chapter, LessonModel, CourseResourceModel
 
+import config
+
+# 教材 zip 目录（DATA_ROOT 可配置，默认 ./data；DB 存文件名）
+BOOK_DIR = os.path.join(config.DATA_ROOT, 'course', 'book')
+
 # 导入对象存储
 from storage import storage
 
@@ -739,10 +744,10 @@ def book_upgrade():
     course = CourseModel.query.filter_by(id=course_id).first()
     url = course.url
     if url:
-        os.remove('./data/course/book/' + url)
+        os.remove(os.path.join(BOOK_DIR, url))
 
     book_name = str(course.id) + '_' + course.title + '.zip'
-    book.save('./data/course/book/' + book_name)
+    book.save(os.path.join(BOOK_DIR, book_name))
 
     # 更新课程的 url
     course.url = book_name
@@ -832,7 +837,7 @@ def book_download():
                 'message': "课程pdf不存在"
             }), 403
 
-        return send_file('./data/course/book/' + url, as_attachment=True)
+        return send_file(os.path.join(BOOK_DIR, url), as_attachment=True)
     else:
         return jsonify({
             "code": 404,

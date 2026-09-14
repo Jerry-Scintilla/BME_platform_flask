@@ -12,6 +12,11 @@ from models import UserModel, GroupModel, CourseModel, LearningProgressModel, Ch
 
 # 导入表单验证
 from .forms import AvatarForm
+
+import config
+
+# 头像目录（DATA_ROOT 可配置，默认 ./data；与 app.py 静态映射同根）
+AVATAR_DIR = os.path.join(config.DATA_ROOT, 'avatars')
 from .forms import UserInfoForm
 from . import get_user_permissions  # RBAC：user_index 返回当前用户角色/权限
 
@@ -260,13 +265,13 @@ def user_avatars_upgrade():
         url = user.avatar_url
         if url:
             try:
-                os.remove('./data/avatars/' + url)
+                os.remove(os.path.join(AVATAR_DIR, url))
             except:
                 print("删除旧头像失败")
         # 保存新头像到data文件
         file = form.avatar.data
         filename = file.filename
-        file.save('./data/avatars/' + str(avatar_id) + '.' + filename.rsplit(".", 1)[1].lower())
+        file.save(os.path.join(AVATAR_DIR, f"{avatar_id}.{filename.rsplit('.', 1)[1].lower()}"))
         # 保存头像路径到数据库
         user.avatar_url = str(avatar_id) + '.' + filename.rsplit(".", 1)[1].lower()
         db.session.commit()
@@ -296,7 +301,7 @@ def user_avatars():
             "User_Name": user.username,
             'message': "用户头像不存在"
         })
-    a_url = './data/avatars/' + user.avatar_url
+    a_url = os.path.join(AVATAR_DIR, user.avatar_url)
     with open(a_url, 'rb') as image_file:
         image_stream = image_file.read()
         image_stream = base64.b64encode(image_stream).decode()
@@ -322,7 +327,7 @@ def user_avatars_id():
             "User_Name": user.username,
             'message': "用户头像不存在"
         })
-    a_url = './data/avatars/' + user.avatar_url
+    a_url = os.path.join(AVATAR_DIR, user.avatar_url)
     with open(a_url, 'rb') as image_file:
         image_stream = image_file.read()
         image_stream = base64.b64encode(image_stream).decode()

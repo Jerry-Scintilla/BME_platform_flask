@@ -13,6 +13,12 @@ from models import UserModel, GroupModel, InformationModel
 # 导入token验证模块
 from flask_jwt_extended import (get_jwt_identity, jwt_required)
 
+import config
+
+# 本地文件目录（DATA_ROOT 可配置，默认 ./data）
+ERROR_IMAGE_DIR = os.path.join(config.DATA_ROOT, 'error_images')
+HOMEWORK_DIR = os.path.join(config.DATA_ROOT, 'homework')
+
 # 导入api文档模块
 from flasgger import swag_from
 
@@ -1474,11 +1480,11 @@ def error_add():
         file = request.files['image']
         if file and file.filename:
             # 确保目录存在
-            os.makedirs('./data/error_images', exist_ok=True)
+            os.makedirs(ERROR_IMAGE_DIR, exist_ok=True)
             
             # 保存图片
             filename = f"{error_info.id}.{file.filename.rsplit('.', 1)[1].lower()}"
-            file_path = os.path.join('./data/error_images', filename)
+            file_path = os.path.join(ERROR_IMAGE_DIR, filename)
             file.save(file_path)
             
             # 更新数据库中的资源路径
@@ -1549,7 +1555,7 @@ def error_query():
                 error_data["image"] = cached_base64.decode('utf-8')
             else:
                 # 如果缓存未命中，从文件系统读取
-                image_path = os.path.join('./data/error_images', error.resource)
+                image_path = os.path.join(ERROR_IMAGE_DIR, error.resource)
                 if os.path.exists(image_path):
                     try:
                         with open(image_path, 'rb') as image_file:
@@ -1617,7 +1623,7 @@ def error_delete():
     # 如果有图片资源，删除相关文件和缓存
     if error.resource:
         # 删除图片文件
-        image_path = os.path.join('./data/error_images', error.resource)
+        image_path = os.path.join(ERROR_IMAGE_DIR, error.resource)
         if os.path.exists(image_path):
             try:
                 os.remove(image_path)
@@ -1751,7 +1757,7 @@ def homework_add():
     # 如果有文件，保存文件
     if files and files[0].filename != '':
         # 创建作业文件目录
-        homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+        homework_dir = os.path.join(HOMEWORK_DIR, str(homework.id))
         os.makedirs(homework_dir, exist_ok=True)
         
         # 保存文件
@@ -1856,7 +1862,7 @@ def homework_update():
             }), 400
         
         # 删除旧文件
-        homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+        homework_dir = os.path.join(HOMEWORK_DIR, str(homework.id))
         if os.path.exists(homework_dir):
             for filename in os.listdir(homework_dir):
                 os.remove(os.path.join(homework_dir, filename))
@@ -1958,7 +1964,7 @@ def homework_delete():
     reminders_deleted = delete_related_reminders(homework_id)
     
     # 删除作业文件
-    homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+    homework_dir = os.path.join(HOMEWORK_DIR, str(homework.id))
     if os.path.exists(homework_dir):
         import shutil
         shutil.rmtree(homework_dir)
@@ -2177,7 +2183,7 @@ def homework_query():
         files_info = []
         if homework.resource:
             file_names = homework.resource.split(',')
-            homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+            homework_dir = os.path.join(HOMEWORK_DIR, str(homework.id))
             
             for file_name in file_names:
                 file_path = os.path.join(homework_dir, file_name)
@@ -2309,7 +2315,7 @@ def homework_download():
         }), 404
     
     # 准备文件目录
-    homework_dir = os.path.join('BME_platform_flask/data/homework', str(homework.id))
+    homework_dir = os.path.join(HOMEWORK_DIR, str(homework.id))
     if not os.path.exists(homework_dir):
         return jsonify({
             "code": 404,

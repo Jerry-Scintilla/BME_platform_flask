@@ -23,7 +23,7 @@ from models import (
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
-    CampChapterCertification, Chapter, LessonModel, LearningProgressModel,
+    CampChapterCertification, CampChapterMaterial, Chapter, LessonModel, LearningProgressModel,
     CAMP_CATEGORY_DEFAULTS,
 )
 
@@ -1821,7 +1821,8 @@ def _direction_of_mentor(camp, mentor_uid):
 
 
 def _chapters_payload(camp, course_id, student_uid):
-    """章节平铺 + 学员自报完成比 + 认证态（09-13 含按章评分 score，未打分为 null）。"""
+    """章节平铺 + 学员自报完成比 + 认证态（09-13 含按章评分 score，未打分为 null；
+    09-14 含 material_count 材料数，学员卡与导生成员页的「材料 n」chip 数据源）。"""
     chs = (Chapter.query.filter_by(course_id=course_id)
            .order_by(Chapter.order, Chapter.id).all())
     lesson_total = defaultdict(int)
@@ -1837,6 +1838,10 @@ def _chapters_payload(camp, course_id, student_uid):
     certs = {c.chapter_id: c for c in CampChapterCertification.query.filter_by(
         camp_session_id=camp.id, student_user_id=student_uid).all()
         if c.course_id == course_id}
+    material_count = defaultdict(int)
+    for m in CampChapterMaterial.query.filter_by(
+            camp_session_id=camp.id, student_user_id=student_uid, course_id=course_id).all():
+        material_count[m.chapter_id] += 1
     out = []
     for ch in chs:
         cert = certs.get(ch.id)
@@ -1848,6 +1853,7 @@ def _chapters_payload(camp, course_id, student_uid):
             "certified_at": cert.certified_at.strftime("%Y-%m-%d %H:%M") if cert else None,
             "certified_by": cert.mentor_user_id if cert else None,
             "score": cert.score if cert else None,
+            "material_count": material_count.get(ch.id, 0),
         })
     return out
 

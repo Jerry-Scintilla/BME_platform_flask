@@ -14,6 +14,11 @@ from .forms import ArticleForm
 # 导入token验证模块
 from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
 
+import config
+
+# 文章 HTML 目录（DATA_ROOT 可配置，默认 ./data；DB 存文件名）
+ARTICLE_DIR = os.path.join(config.DATA_ROOT, 'article')
+
 # 导入api文档模块
 from flasgger import swag_from
 
@@ -83,10 +88,10 @@ def article_public():
             url = article.url
             name = title
             if url:
-                os.remove('./data/article/' + url)
+                os.remove(os.path.join(ARTICLE_DIR, url))
 
             article_name = str(article_id) + '_' + name
-            file_path = os.path.join('./data/article', f"{article_name}.html")
+            file_path = os.path.join(ARTICLE_DIR, f"{article_name}.html")
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
 
@@ -131,10 +136,10 @@ def article_detail():
     article = ArticleModel.query.filter_by(id=article_id).first()
     url = article.url
     if url:
-        os.remove('./data/article/' + url)
+        os.remove(os.path.join(ARTICLE_DIR, url))
 
     article_name = article_id + '_' + file.filename
-    file.save('./data/article/' + article_name)
+    file.save(os.path.join(ARTICLE_DIR, article_name))
 
     ArticleModel.query.filter_by(id=article_id).update({'url': article_name})
     db.session.commit()
@@ -178,10 +183,10 @@ def article_detail_json():
         url = article.url
         name = article_title
         if url:
-            os.remove('./data/article/' + url)
+            os.remove(os.path.join(ARTICLE_DIR, url))
 
         article_name = str(article_id) + '_' + name
-        file_path = os.path.join('./data/article', f"{article_name}.html")
+        file_path = os.path.join(ARTICLE_DIR, f"{article_name}.html")
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
@@ -222,7 +227,7 @@ def article_delete():
 
     url = article.url
     if url:
-        os.remove('./data/article/' + url)
+        os.remove(os.path.join(ARTICLE_DIR, url))
 
     # 删除文章统计量
     comments = ArticleComment.query.filter_by(article_id=article_id).all()
@@ -314,7 +319,7 @@ def article():
             "message": '文章不存在'
         }), 404
     path = article.url
-    article_path = './data/article/' + path
+    article_path = os.path.join(ARTICLE_DIR, path)
     # print(article_path)
     # return send_file(article_path)
     with open(article_path, 'r', encoding='utf-8') as file:

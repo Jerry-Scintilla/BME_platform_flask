@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, redirect
 import config
 from exts import db, mail, limiter, redis_client
@@ -17,7 +19,9 @@ from flasgger import Swagger
 
 from flask_redis import FlaskRedis
 
-app = Flask(__name__, static_folder='./data/avatars', static_url_path='/data/avatars')
+app = Flask(__name__,
+            static_folder=os.path.join(config.DATA_ROOT, 'avatars'),
+            static_url_path='/data/avatars')
 
 # 配置CORS，允许特定域名访问API
 CORS(app, supports_credentials=True)
@@ -59,6 +63,7 @@ app.register_blueprint(camp_bp)
 app.register_blueprint(camp_ms_bp)
 app.register_blueprint(camp_project_bp)
 app.register_blueprint(camp_delivery_bp)
+app.register_blueprint(camp_material_bp)
 app.register_blueprint(showcase_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(ai_topic_bp)

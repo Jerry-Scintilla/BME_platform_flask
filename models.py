@@ -1401,6 +1401,33 @@ class CampChapterCertification(db.Model):
     )
 
 
+class CampChapterMaterial(db.Model):
+    """方向制学习·章节材料（2026-09-14，migrate_30）：学员对每门课每章节追加式提交
+    文字+附件，提交即可见（无审核流——按章认证本身即验收）；导生按章认证/评分时
+    查看下载作为依据。无版本链语义，纯追加列表，可删（本人/本团队导生/老师）。"""
+    __tablename__ = 'camp_chapter_material'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)   # 章节所属课（冗余，聚合用）
+    chapter_id = db.Column(db.Integer, db.ForeignKey('chapter.id'), nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    content = db.Column(db.Text)                    # 文字说明（可空=纯附件）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampChapterMaterialAttachment(db.Model):
+    """章节材料附件（对象存储引用；不复用 camp_submission_attachment——其 FK 绑项目营版本链）。"""
+    __tablename__ = 'camp_chapter_material_attachment'
+    id = db.Column(db.Integer, primary_key=True)
+    material_id = db.Column(db.Integer, db.ForeignKey('camp_chapter_material.id', ondelete='CASCADE'),
+                            nullable=False, index=True)
+    object_key = db.Column(db.String(255), nullable=False)
+    filename = db.Column(db.String(200), nullable=False)
+    size = db.Column(db.Integer)
+    content_type = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
 # ── 项目营组织与申报组队（设计方案 v1.3 阶段3，migrate_20）──
 
 class CampUnit(db.Model):

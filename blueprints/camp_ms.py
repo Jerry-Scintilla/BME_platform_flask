@@ -39,10 +39,12 @@ from . import camp_role, audit_log, _current_user
 from .notification import create_notification
 from .forms import AvatarForm
 
+import config
+
 bp = Blueprint("camp_ms", __name__, url_prefix="/camp/ms")
 
-# 名片照片目录（相对项目根；迁移脚本负责创建。DB 只存相对文件名）
-MENTOR_PHOTO_DIR = os.path.join('.', 'data', 'mentor_photos')
+# 名片照片目录（DATA_ROOT 可配置，默认 ./data；迁移脚本负责创建。DB 只存相对文件名）
+MENTOR_PHOTO_DIR = os.path.join(config.DATA_ROOT, 'mentor_photos')
 
 # 营级分类标签默认集（session 未配置 ms_tags 时应用层默认）
 MS_DEFAULT_TAGS = ["硬件组", "软件组", "深度学习", "机械设计", "其他"]

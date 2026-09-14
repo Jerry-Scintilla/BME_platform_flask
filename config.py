@@ -47,8 +47,15 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
 ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shanghai")
 
+# 本地数据根目录：头像/名片照片/文章/作业/错误图等本地文件的统一根（存量默认 ./data 不变）；
+# 部署时指到数据盘挂载点即离开系统盘。local 存储后端的附件仓库在其下 storage/ 子目录
+DATA_ROOT = os.getenv("DATA_ROOT", "./data")
+
+# 对象存储后端选择：minio（默认，向后兼容）| local（本地磁盘，无需 MinIO 服务）
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "minio")
+
 # 对象存储（MinIO / 任意 S3 兼容服务）：课程资源等文件的本体存储，
-# 后端只做上传/下载代理，不在本地磁盘持久化文件
+# 后端只做上传/下载代理，不在本地磁盘持久化文件（STORAGE_BACKEND=local 时本组配置不生效）
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
