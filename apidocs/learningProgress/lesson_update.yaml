@@ -40,7 +40,7 @@ parameters:
 
 responses:
   200:
-    description: 更新成功
+    description: 更新成功（09-14 起按 user_course 营期戳自动分流：戳指向非 archived 营 → 写营期快照表，响应含 scope="camp"+camp_session_id；否则写全局表，scope="global"。请求体无需传营期字段）
   400:
     description: 参数错误或状态无效
   404:

@@ -23,7 +23,8 @@ from models import (
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
-    CampChapterCertification, CampChapterMaterial, Chapter, LessonModel, LearningProgressModel,
+    CampChapterCertification, CampChapterMaterial, CampLearningProgress,
+    Chapter, LessonModel, LearningProgressModel,
     CAMP_CATEGORY_DEFAULTS,
 )
 
@@ -425,12 +426,20 @@ def session_transition(sid):
     # v1.3 阶段4：结营自动冻结档案（幂等；项目营快照含项目/里程碑/成果+资产回流打标）。
     # 延迟导入防循环依赖（camp_delivery 反向引用本模块的 _camp_writable）。
     archived = False
+    merged_lessons = 0
     if dst_status == 'archived':
         try:
             from .camp_delivery import freeze_camp_archive
             archived = freeze_camp_archive(camp, _current_user().id) is not None
         except Exception:
             db.session.rollback()   # 冻结失败不阻断结营本身；档案可事后手动补冻结
+        # 09-14 快照合并：营期学习进度（completed）并回全局——与冻结各自独立 try/except，
+        # 互不阻断；merge 天然幂等，失败可事后手动补跑
+        try:
+            merged_lessons = merge_camp_learning_progress(camp)
+        except Exception:
+            db.session.rollback()
+            merged_lessons = 0
     # 09-12 用户拍板：开营即选导生收官——open 时若志愿截止仍在未来，一律压到当前时刻
     # （演示/实战杠杆：一步停掉选导生阶段直接进正式开营）；清 Redis 阶段游标让 done 通知可发。
     ms_closed = False
@@ -447,6 +456,8 @@ def session_transition(sid):
     msg = f"已{'发布' if action=='publish' else '撤回发布' if action=='retract' else '开放报名' if action=='open_enrollment' else '开营' if action=='open' else '结营'}"
     if archived:
         msg += "（档案已冻结）"
+    if merged_lessons:
+        msg += f"，学习进度已并入总进度（{merged_lessons} 课时）"
     if ms_closed:
         msg += "，选导生志愿已同步截止"
     return jsonify({"code": 200, "message": msg, "session": _session_dict(camp)})
@@ -1187,6 +1198,10 @@ def attendance_mine():
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    # 09-14 修复：远程不考勤营（模式 B）显式返回 mode=off，不再走 daily 空承诺日分支
+    # （此前前端拿到无 mode 的空数据回退 daily 画每日看板）
+    if _attendance_mode(camp) == 'off':
+        return jsonify({"code": 200, "mode": "off"})
     # 09-12 模式 C（学期校区·按周累计）：无承诺日，返回周分桶统计
     if _attendance_mode(camp) == 'weekly':
         stats = _weekly_stats(camp, [user.id])[user.id]
@@ -1821,20 +1836,31 @@ def _direction_of_mentor(camp, mentor_uid):
 
 
 def _chapters_payload(camp, course_id, student_uid):
-    """章节平铺 + 学员自报完成比 + 认证态（09-13 含按章评分 score，未打分为 null；
-    09-14 含 material_count 材料数，学员卡与导生成员页的「材料 n」chip 数据源）。"""
+    """学习单元平铺 + 学员自学完成比 + 认证态（09-13 含按章评分 score，未打分为 null；
+    09-14 含 material_count 材料数，学员卡与导生成员页的「材料 n」chip 数据源；
+    09-14 层级过滤：只留学习单元章——历史课程两级设计（L1=分组大标题 0 课时、L2=挂课时
+    单元，parent_id 全空不可用），课程存在 L>=2 时 L1 是纯标题不下发，防「大标题被认证」）。"""
     chs = (Chapter.query.filter_by(course_id=course_id)
            .order_by(Chapter.order, Chapter.id).all())
+    if any(ch.level and ch.level >= 2 for ch in chs):
+        chs = [ch for ch in chs if not (ch.level and ch.level < 2)]
     lesson_total = defaultdict(int)
+    lesson_ch = {}
     for l in LessonModel.query.filter_by(course_id=course_id).all():
         lesson_total[l.chapter_id] += 1
-    done_rows = LearningProgressModel.query.filter(
-        LearningProgressModel.user_id == student_uid,
-        LearningProgressModel.course_id == course_id,
-        LearningProgressModel.status == LearningProgressModel.STATUS_COMPLETED).all()
+        lesson_ch[l.id] = l.chapter_id
+    # 09-14 快照隔离：营内自学完成读营期快照表（从零，不看营外全局历史进度）；
+    # archived 营读历史仍走快照——营期口径正确保留。
+    # 注：进度行只有 lesson_id，须经 lesson→chapter 映射归章（原代码直接读 r.chapter_id
+    # 是存量 bug——模型无此列，此前全局表恰无 completed 行循环体未执行而未显形）
+    done_rows = CampLearningProgress.query.filter(
+        CampLearningProgress.camp_session_id == camp.id,
+        CampLearningProgress.user_id == student_uid,
+        CampLearningProgress.course_id == course_id,
+        CampLearningProgress.status == CampLearningProgress.STATUS_COMPLETED).all()
     lesson_done = defaultdict(int)
     for r in done_rows:
-        lesson_done[r.chapter_id] += 1
+        lesson_done[lesson_ch.get(r.lesson_id)] += 1
     certs = {c.chapter_id: c for c in CampChapterCertification.query.filter_by(
         camp_session_id=camp.id, student_user_id=student_uid).all()
         if c.course_id == course_id}
@@ -1877,6 +1903,33 @@ def _course_block(camp, course_id, student_uid):
         "score_avg": round(sum(scores) / len(scores)) if scores else None,
         "course_status": uc.status if uc else None,
     }
+
+
+def merge_camp_learning_progress(camp):
+    """结营合并（09-14，close 迁移触发）：营期快照 completed 行 upsert 进全局
+    learning_progress——只升不降：全局无行→建 completed；有行非 completed→升
+    completed（补 completed_time）；已 completed→不动（completed_time 留原值）。
+    learning 态丢弃（用户拍板）。天然幂等（重复执行结果不变），快照行保留作营期
+    历史。返回合并课时数。"""
+    rows = CampLearningProgress.query.filter_by(
+        camp_session_id=camp.id,
+        status=CampLearningProgress.STATUS_COMPLETED).all()
+    now = datetime.now()
+    for r in rows:
+        g = LearningProgressModel.query.filter_by(
+            user_id=r.user_id, course_id=r.course_id, lesson_id=r.lesson_id).first()
+        if g is None:
+            db.session.add(LearningProgressModel(
+                user_id=r.user_id, course_id=r.course_id, lesson_id=r.lesson_id,
+                status=LearningProgressModel.STATUS_COMPLETED,
+                duration=r.duration or 0, detail=r.detail,
+                start_time=r.start_time, completed_time=r.completed_time or now))
+        elif g.status != LearningProgressModel.STATUS_COMPLETED:
+            g.status = LearningProgressModel.STATUS_COMPLETED
+            if not g.completed_time:
+                g.completed_time = r.completed_time or now
+    db.session.commit()
+    return len(rows)
 
 
 @bp.route("/sessions/<int:sid>/team/progress")

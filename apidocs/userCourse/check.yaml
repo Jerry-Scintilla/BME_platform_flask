@@ -20,7 +20,7 @@ parameters:
 
 responses:
   200:
-    description: 查询成功
+    description: 查询成功（data 含 camp_session_id，09-14：选课行的营期戳，仅戳指向非 archived 营时返回，供前端做营期快照进度口径分流；无营戳或已结营为 null）
   400:
     description: 课程ID为空
   404:

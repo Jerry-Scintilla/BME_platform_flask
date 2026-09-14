@@ -7,7 +7,8 @@ from sqlalchemy.orm import joinedload
 from exts import db, redis_client
 
 # 导入数据库表
-from models import UserModel, CourseModel, LearningProgressModel, GroupModel, LessonModel, UserCourseModel
+from models import (UserModel, CourseModel, LearningProgressModel, GroupModel,
+                    LessonModel, UserCourseModel, CampSession, CampLearningProgress)
 
 # 导入表单验证
 from .forms import LearningProgressForm
@@ -477,6 +478,18 @@ def group_through_courseid():
 
 # ==================== 课时进度管理 API ====================
 
+def _camp_scope(user_id, course_id):
+    """营期快照分流判定（09-14）：user_course 营戳指向非 archived 营 → 返回 camp；
+    无戳/营不存在/已 archived → None（走全局表）。就地判定 status 避免循环 import。"""
+    uc = UserCourseModel.query.filter_by(user_id=user_id, course_id=course_id).first()
+    if not uc or not uc.camp_session_id:
+        return None
+    camp = CampSession.query.get(uc.camp_session_id)
+    if camp and camp.status != 'archived':
+        return camp
+    return None
+
+
 @bp.route("/learningProgress/lesson/update", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/learningProgress/lesson_update.yaml')
@@ -524,14 +537,43 @@ def update_lesson_progress():
     if status not in valid_status:
         return jsonify({"code": 400, "message": f"状态必须为: {', '.join(valid_status)}"}), 400
 
+    now = datetime.now()
+
+    # 营期快照分流（09-14）：营戳指向非 archived 营 → 写快照表（营期维度从零），不碰全局
+    camp = _camp_scope(user.id, course_id)
+    if camp is not None:
+        snap = CampLearningProgress.query.filter_by(
+            camp_session_id=camp.id, user_id=user.id, lesson_id=lesson_id).first()
+        if snap:
+            snap.status = status
+            snap.duration = duration or snap.duration
+            snap.detail = detail or snap.detail
+            if status == 'completed' and not snap.completed_time:
+                snap.completed_time = now
+            if status == 'learning' and not snap.start_time:
+                snap.start_time = now
+        else:
+            snap = CampLearningProgress(
+                camp_session_id=camp.id, user_id=user.id, course_id=course_id,
+                lesson_id=lesson_id, status=status,
+                duration=duration, detail=detail,
+                start_time=now if status != 'not_started' else None,
+                completed_time=now if status == 'completed' else None)
+            db.session.add(snap)
+        db.session.commit()
+        return jsonify({
+            "code": 200,
+            "message": "课时进度更新成功（营期快照）",
+            "scope": "camp", "camp_session_id": camp.id,
+            "progress": snap.to_dict(),
+        })
+
     # 查找是否已有记录
     progress = LearningProgressModel.query.filter_by(
         user_id=user.id,
         course_id=course_id,
         lesson_id=lesson_id
     ).first()
-
-    now = datetime.now()
 
     if progress:
         # 更新现有记录
@@ -561,6 +603,7 @@ def update_lesson_progress():
     return jsonify({
         "code": 200,
         "message": "课时进度更新成功",
+        "scope": "global",
         "progress": progress.to_dict()
     })
 
@@ -590,11 +633,20 @@ def list_lesson_progress():
     # 获取该课程所有课时
     lessons = LessonModel.query.filter_by(course_id=course_id).order_by(LessonModel.order).all()
 
-    # 获取用户所有课时进度
-    progress_list = LearningProgressModel.query.filter_by(
-        user_id=user.id,
-        course_id=course_id
-    ).all()
+    # 获取用户所有课时进度（09-14：带 camp_session_id 参数 → 查营期快照表，营内口径从零；
+    # 查的永远是自己名下的行，sid 只决定口径，传错最多拿到自己空集，无需额外鉴权）
+    camp_sid = request.args.get('camp_session_id')
+    if camp_sid:
+        progress_list = CampLearningProgress.query.filter_by(
+            camp_session_id=camp_sid,
+            user_id=user.id,
+            course_id=course_id
+        ).all()
+    else:
+        progress_list = LearningProgressModel.query.filter_by(
+            user_id=user.id,
+            course_id=course_id
+        ).all()
 
     # 构建进度映射
     progress_map = {p.lesson_id: p for p in progress_list}
@@ -806,6 +858,14 @@ def check_course():
         course_id=course_id
     ).first()
 
+    # 营期戳透出（09-14）：仅戳指向非 archived 营时返回——结营后全局才是有效口径；
+    # 前端用它做进度口径分流（effectiveSid），保证从任意路径进详情页口径一致
+    camp_sid = None
+    if user_course and user_course.camp_session_id:
+        cs = CampSession.query.get(user_course.camp_session_id)
+        if cs and cs.status != 'archived':
+            camp_sid = cs.id
+
     if user_course and user_course.status == UserCourseModel.STATUS_ACTIVE:
         return jsonify({
             "code": 200,
@@ -813,7 +873,8 @@ def check_course():
             "data": {
                 "enrolled": True,
                 "status": user_course.status,
-                "enroll_time": user_course.enroll_time.strftime('%Y-%m-%d %H:%M:%S') if user_course.enroll_time else None
+                "enroll_time": user_course.enroll_time.strftime('%Y-%m-%d %H:%M:%S') if user_course.enroll_time else None,
+                "camp_session_id": camp_sid
             }
         })
     else:
@@ -822,7 +883,8 @@ def check_course():
             "message": "未选课",
             "data": {
                 "enrolled": False,
-                "status": user_course.status if user_course else None
+                "status": user_course.status if user_course else None,
+                "camp_session_id": camp_sid
             }
         })
 

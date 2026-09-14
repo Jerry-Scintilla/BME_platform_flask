@@ -1428,6 +1428,44 @@ class CampChapterMaterialAttachment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
+class CampLearningProgress(db.Model):
+    """营期学习进度快照（2026-09-14，migrate_31）：营内打点写本表（营期维度从零，
+    不读不写全局 learning_progress——营外历史自学进度不污染营期统计）。
+    写入分流 = /learningProgress/lesson/update 按 user_course.camp_session_id 戳
+    （戳指向非 archived 营 → 快照；否则全局）。结营 close 迁移把 completed 行
+    合并回全局（learning 态丢弃，09-14 用户拍板），快照行保留作营期历史。
+    跨营同课重打戳：UQ 含 camp_session_id，天然互不污染。"""
+    __tablename__ = 'camp_learning_progress'
+    STATUS_LEARNING = 'learning'
+    STATUS_COMPLETED = 'completed'
+
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)   # 冗余（章节聚合/合并用）
+    lesson_id = db.Column(db.Integer, db.ForeignKey('lesson.id'), nullable=False, index=True)
+    status = db.Column(db.String(20), default=STATUS_LEARNING)   # learning / completed（营内无 not_started 行）
+    duration = db.Column(db.Integer, default=0)
+    detail = db.Column(db.JSON)
+    start_time = db.Column(db.DateTime)
+    completed_time = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'user_id', 'lesson_id', name='uq_clp_camp_user_lesson'),
+    )
+
+    def to_dict(self):
+        """与 LearningProgressModel.to_dict 同构 + camp_session_id，前端无需分叉解析。"""
+        return {
+            "id": self.id, "camp_session_id": self.camp_session_id,
+            "user_id": self.user_id, "course_id": self.course_id, "lesson_id": self.lesson_id,
+            "status": self.status, "duration": self.duration, "detail": self.detail,
+            "start_time": self.start_time.strftime('%Y-%m-%d %H:%M:%S') if self.start_time else None,
+            "completed_time": self.completed_time.strftime('%Y-%m-%d %H:%M:%S') if self.completed_time else None,
+        }
+
+
 # ── 项目营组织与申报组队（设计方案 v1.3 阶段3，migrate_20）──
 
 class CampUnit(db.Model):

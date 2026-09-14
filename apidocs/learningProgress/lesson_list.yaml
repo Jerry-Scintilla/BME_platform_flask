@@ -18,6 +18,12 @@ parameters:
     required: true
     description: 课程ID
 
+  - name: camp_session_id
+    in: query
+    type: integer
+    required: false
+    description: 营期ID（09-14）——传入则查该营学习进度快照（营期口径从零），不传查全局进度
+
 responses:
   200:
     description: 查询成功
