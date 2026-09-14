@@ -570,9 +570,9 @@ def milestone_delete(mid):
 @jwt_required()
 @audit_log(operation="提交里程碑材料")
 def submission_create(mid):
-    """版本化提交（multipart：content 文本 + Files[] 附件）。
-    team 模式=负责人提交；member 模式=成员各自提交（负责人亦交自己的份额，由老师审）。
-    退回重提=新版本，旧版自动 superseded。"""
+    """版本化提交（multipart：content 文本 + Files[] 附件）——成员提交制（09-14 用户复盘定）：
+    只有成员交付材料，负责人不提交（看成员交付+直接评价）；重提=新版本，旧版自动 superseded。
+    submit_mode 列保留历史数据，不再起提交门禁作用（team/member 分支与负责人份额语义已退役）。"""
     m = CampMilestone.query.get(mid)
     if not m:
         return jsonify({"code": 404, "message": "里程碑不存在"}), 404
@@ -581,18 +581,18 @@ def submission_create(mid):
         return err
     user = _current_user()
     if user.is_admin():
-        return jsonify({"code": 400, "message": "管理员不提交材料（审核方）"}), 400
+        return jsonify({"code": 400, "message": "管理员不提交材料"}), 400
     role = _unit_role(unit, user)
     if not role:
         return jsonify({"code": 403, "message": "仅项目成员可提交"}), 403
+    if role == 'leader':
+        return jsonify({"code": 400, "message": "负责人不提交材料——查看成员交付并直接评价即可"}), 400
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
     if unit.status != 'active':
         return jsonify({"code": 400, "message": f"项目状态为 {unit.status}，材料提交已冻结"}), 400
     if m.status == 'approved':
         return jsonify({"code": 400, "message": "该里程碑已验收通过，不再接受提交"}), 400
-    if m.submit_mode == 'team' and role != 'leader':
-        return jsonify({"code": 403, "message": "本节点为整队交付，由项目负责人统一提交"}), 403
     content = (request.form.get("content") or "").strip() or None
     files = [f for f in request.files.getlist("Files") if f.filename]
     if not content and not files:
@@ -600,7 +600,7 @@ def submission_create(mid):
     prev = _latest_chain(m.id, user.id)
     version = (prev.version + 1) if prev else 1
     if prev and prev.status == 'submitted':
-        prev.status = 'superseded'          # 重提覆盖待审版本
+        prev.status = 'superseded'          # 重提覆盖旧版
     s = CampSubmissionVersion(milestone_id=m.id, version=version,
                               submitted_by=user.id, content=content)
     db.session.add(s)
@@ -623,11 +623,10 @@ def submission_create(mid):
             size=size, content_type=f.mimetype))
     _recompute_milestone_status(m)
     db.session.commit()
-    # 通知审核人（team=老师不逐个通知 admin，通知负责人以外成员省略；member 模式通知负责人审）
-    if m.submit_mode == 'member' and role == 'member':
-        _notify(unit.owner_user_id, "有材料待你审核",
-                f"「{unit.name}」成员 {user.username} 提交了节点「{m.title}」第 {version} 版，请审核。",
-                camp.id, source_id=m.id)
+    # 提交即通知负责人查看评价（09-14 撤审核后文案随之调整）
+    _notify(unit.owner_user_id, "有成员提交了节点材料",
+            f"「{unit.name}」成员 {user.username} 提交了节点「{m.title}」第 {version} 版，请查看并评价。",
+            camp.id, source_id=m.id)
     return jsonify({"code": 200, "message": f"已提交（第 {version} 版）", "submission": _sub_dict(s)})
 
 
