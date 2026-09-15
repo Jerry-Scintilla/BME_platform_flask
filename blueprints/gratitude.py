@@ -87,11 +87,12 @@ def gratitude_send():
         db.session.rollback()
         return jsonify({"code": 409, "message": "本期已经给这位导生写过感谢信"}), 409
 
-    # 送达提醒：通知只是铃铛角标与跳转入口，信件本体在 gratitude 表
+    # 送达提醒：通知只是铃铛角标与跳转入口，信件本体在 gratitude 表。
+    # category=业务域（私信域），source_type=具体事件（感谢信是私信的第一种）
     create_notification(
         recipient.id, "收到一封感谢信",
         f"{user.username} 寄来一封感谢信，点开看看吧",
-        category='gratitude', source_type='gratitude', source_id=g.id,
+        category='message', source_type='gratitude', source_id=g.id,
         camp_session_id=camp_session_id,
     )
     db.session.commit()
