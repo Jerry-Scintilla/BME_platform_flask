@@ -247,6 +247,13 @@ def camp_role(*roles):
                 return jsonify({"code": 403, "message": "需要管理员权限"}), 403
             sid = kwargs.get('sid')
             if sid is None:
+                # 无 sid 路由段的营期端点（/camp/medals、/camp/reward）：
+                # 回落 query ?sid= 与 body camp_session_id（Phase 1a 门禁改读路由参数时漏的）
+                sid = request.args.get('sid')
+                if sid is None:
+                    body = request.get_json(silent=True) or {}
+                    sid = body.get('camp_session_id')
+            if sid is None:
                 return jsonify({"code": 500, "message": "路由缺少营期参数 sid"}), 500
             from models import CampMember
             try:
