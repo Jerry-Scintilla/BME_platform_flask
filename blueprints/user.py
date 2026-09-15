@@ -1,4 +1,6 @@
+import io
 import os
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from flask import Blueprint, request, redirect, jsonify
@@ -9,6 +11,11 @@ from exts import db, redis_client
 
 # 导入数据库表
 from models import UserModel, GroupModel, CourseModel, LearningProgressModel, CheckRecord,MedalUserModel
+
+# 对象存储 + 图片转码（09-15 头像切 storage，media/ 公开命名空间）
+from storage import storage
+import imaging
+from .media import media_url
 
 # 导入表单验证
 from .forms import AvatarForm
@@ -258,33 +265,67 @@ def user_list():
 def user_avatars_upgrade():
     User_Email = get_jwt_identity()
     user = UserModel.query.filter_by(email=User_Email).first()
-    avatar_id = user.id
     form = AvatarForm(request.files)
     if form.validate():
-        # 删除旧头像
-        url = user.avatar_url
-        if url:
-            try:
-                os.remove(os.path.join(AVATAR_DIR, url))
-            except:
-                print("删除旧头像失败")
-        # 保存新头像到data文件
         file = form.avatar.data
-        filename = file.filename
-        file.save(os.path.join(AVATAR_DIR, f"{avatar_id}.{filename.rsplit('.', 1)[1].lower()}"))
-        # 保存头像路径到数据库
-        user.avatar_url = str(avatar_id) + '.' + filename.rsplit(".", 1)[1].lower()
+        # 转码 256x256 WebP（坏图直接 400，不再落到磁盘后才失败）
+        try:
+            data = imaging.avatar_bytes(file.stream)
+        except imaging.ImageError as e:
+            return jsonify({"code": 400, 'message': f"图片无效：{e}"}), 400
+
+        key = f"media/avatars/{user.id}/{uuid.uuid4().hex}.webp"
+        try:
+            storage.put_object(key, io.BytesIO(data), len(data), "image/webp")
+        except Exception as e:
+            return jsonify({"code": 500, 'message': f"头像存储失败：{e}"}), 500
+
+        old = user.avatar_url
+        user.avatar_url = media_url(key)          # '/media/avatars/...'
         db.session.commit()
+        # commit 后 best-effort 删旧对象（仅新链路；旧裸文件名留给迁移/兜底期）
+        if old and old.startswith("/media/"):
+            try:
+                storage.remove_object(old.lstrip("/"))
+            except Exception:
+                print("删除旧头像对象失败")
 
         return jsonify({
             "code": 200,
-            'message': "头像上传完成"
+            'message': "头像上传完成",
+            "avatar_path": user.avatar_url
         })
     else:
         return jsonify({
             "code": 400,
             'message': form.errors
         }), 400
+
+
+def _avatar_b64(user):
+    """头像字节双源读取：新链路 /media/ 走 storage；旧裸文件名走磁盘（过渡一版，下版删 base64）。"""
+    if user.avatar_url.startswith("/media/"):
+        obj = None
+        try:
+            obj = storage.get_object(user.avatar_url.lstrip("/"))
+            return base64.b64encode(obj.read()).decode()
+        except Exception:
+            return None
+        finally:
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+                try:
+                    obj.release_conn()
+                except Exception:
+                    pass
+    try:
+        with open(os.path.join(AVATAR_DIR, user.avatar_url), 'rb') as f:
+            return base64.b64encode(f.read()).decode()
+    except OSError:
+        return None
 
 
 @bp.route("/user_avatars")
@@ -298,16 +339,14 @@ def user_avatars():
         return jsonify({
             "code": 200,
             "User_Avatar": None,
+            "avatar_path": None,
             "User_Name": user.username,
             'message': "用户头像不存在"
         })
-    a_url = os.path.join(AVATAR_DIR, user.avatar_url)
-    with open(a_url, 'rb') as image_file:
-        image_stream = image_file.read()
-        image_stream = base64.b64encode(image_stream).decode()
     return jsonify({
         "code": 200,
-        "User_Avatar": image_stream,
+        "User_Avatar": _avatar_b64(user),
+        "avatar_path": avatar_url,
         "User_Name": user.username,
         "message": "头像图片流传输成功"
     })
@@ -324,16 +363,14 @@ def user_avatars_id():
         return jsonify({
             "code": 200,
             "User_Avatar": None,
+            "avatar_path": None,
             "User_Name": user.username,
             'message': "用户头像不存在"
         })
-    a_url = os.path.join(AVATAR_DIR, user.avatar_url)
-    with open(a_url, 'rb') as image_file:
-        image_stream = image_file.read()
-        image_stream = base64.b64encode(image_stream).decode()
     return jsonify({
         "code": 200,
-        "User_Avatar": image_stream,
+        "User_Avatar": _avatar_b64(user),
+        "avatar_path": avatar_url,
         "User_Name": user.username,
         "message": "头像图片流传输成功"
     })

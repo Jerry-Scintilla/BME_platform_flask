@@ -10,6 +10,7 @@ from models import ArticleModel, UserModel, ArticleComment, DiscussionThread, Pe
 
 # 导入表单验证
 from .forms import ArticleForm
+from .media import public_avatar_url
 
 # 导入token验证模块
 from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required, JWTManager)
@@ -282,7 +283,7 @@ def article_by_author(user_id):
         au = a.author.avatar_url if a.author else None
         avatar = ''
         if au:
-            avatar = au if au.startswith('http') else f"/data/avatars/{au}"
+            avatar = public_avatar_url(au)
         data.append({
             "type": "article",
             "id": a.id,
@@ -327,7 +328,7 @@ def article():
     author_avatar = ''
     if article.author and article.author.avatar_url:
         au = article.author.avatar_url
-        author_avatar = au if au.startswith('http') else '/data/avatars/' + au
+        author_avatar = public_avatar_url(au)
     return jsonify({
         "code": 200,
         "message": "获取文章详情成功",

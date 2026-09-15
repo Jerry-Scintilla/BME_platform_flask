@@ -16,7 +16,7 @@ from exts import db
 from models import (
     UserModel, CourseModel, Chapter, LessonModel,
     UserCourseModel, MedalModel, MedalUserModel,
-    PermissionModel, HomeCover,
+    PermissionModel,
     NotificationModel,
     UserPermissionModel,
 )
@@ -296,14 +296,6 @@ def seed():
                 description="首批注册用户奖励"
             ))
             print(f"  ✅ 给 {student1.username} 颁发「先驱者」勋章")
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 7. 首页封面
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if not HomeCover.query.first():
-            db.session.add(HomeCover(url="/data/covers/default.jpg", cover_id=1))
-            db.session.add(HomeCover(url="/data/covers/default.jpg", cover_id=2))
-            print(f"  ✅ 创建首页封面")
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 8. 通知测试数据

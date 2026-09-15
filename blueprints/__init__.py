@@ -336,7 +336,6 @@ from .article import bp as article_bp
 from .article_v2 import bp as article_v2_bp
 from .medal import bp as medal_bp
 from .codecheck import bp as codecheck_bp
-from .homeCover import bp as homeCover_bp
 from .learningProgress import bp as learningprogress_bp
 from .information import bp as information_bp
 from .permissionACL import bp as permission_bp
@@ -357,6 +356,8 @@ from .admin import bp as admin_bp
 from .ai_topic import bp as ai_topic_bp
 from .gratitude import bp as gratitude_bp
 from .officers import bp as officers_bp
+from .media import bp as media_bp
+from .banner import bp as banner_bp
 
 __all__ = [
     'auth_bp',
@@ -367,7 +368,6 @@ __all__ = [
     'article_v2_bp',
     'medal_bp',
     'codecheck_bp',
-    'homeCover_bp',
     'learningprogress_bp',
     'information_bp',
     'permission_bp',
@@ -387,5 +387,7 @@ __all__ = [
     'admin_bp',
     'ai_topic_bp',
     'gratitude_bp',
-    'officers_bp'
+    'officers_bp',
+    'media_bp',
+    'banner_bp'
 ]

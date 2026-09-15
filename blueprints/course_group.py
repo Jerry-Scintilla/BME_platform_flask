@@ -5,6 +5,7 @@ from sqlalchemy.orm import joinedload
 from datetime import datetime
 
 from exts import db
+from .media import public_avatar_url
 
 from models import UserModel, CourseModel, CourseGroup, CourseGroupMember, CourseGroupJoinRequest, LearningProgressModel, UserCourseModel, LessonModel
 from flask_jwt_extended import get_jwt_identity, jwt_required
@@ -377,11 +378,8 @@ def list_members(group_id):
         # 直接通过student_id查询用户信息
         student = UserModel.query.get(member.student_id)
         student_name = student.username if student else ""
-        # 构造完整的头像URL
-        student_avatar = None
-        if student and student.avatar_url:
-            base_url = request.host_url.rstrip('/')
-            student_avatar = f"{base_url}/data/avatars/{student.avatar_url}"
+        # 头像相对路径（新链路 /media/，旧值兜底 /data/avatars/），前端 assetUrl 拼前缀
+        student_avatar = public_avatar_url(student.avatar_url) if student and student.avatar_url else None
 
         # 计算该成员在此课程下的学习完成率
         completion_rate = 0.0

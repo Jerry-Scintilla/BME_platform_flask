@@ -18,6 +18,7 @@ from flask_jwt_extended import (get_jwt_identity, jwt_required)
 from flasgger import swag_from
 
 from . import check_permission, audit_log
+from .media import public_avatar_url
 
 bp = Blueprint("codecheck", __name__, url_prefix="")
 
@@ -603,7 +604,7 @@ def records_top10():
             "rank": rank,  # 添加排名字段
             "user_name": user_info.get(user_id, {}).get("name", ""),
             "user_id": user_info.get(user_id, {}).get("id", ""),
-            "avatar": f"/data/avatars/{au}" if au else "",  # 相对路径头像，无则前端首字兜底
+            "avatar": public_avatar_url(au),  # 相对路径头像，无则前端首字兜底
             "total_duration": formatted_duration,
             "total_hours": round(total_hours, 2)
         })

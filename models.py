@@ -401,6 +401,7 @@ class MedalModel(db.Model):
     medal_name = db.Column(db.String(100))
     description = db.Column(db.String(100))
     tags = db.Column(db.String(100))
+    image = db.Column(db.String(200))   # 勋章图 '/media/medals/...'（migrate_32 加列，存量由迁移回填）
 
 class MedalUserModel(db.Model):
     __tablename__ = 'medal_user'
@@ -720,12 +721,6 @@ class SeatModel(db.Model):
     room_id = db.Column(db.Integer, db.ForeignKey('study_room.id'), nullable=False)
     label = db.Column(db.String(20), nullable=False)  # 如 'A1'（字母=八角形，数字=三角形）
     bound_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), unique=True)  # 固定绑定，可空；unique=一人一座
-
-class HomeCover(db.Model):
-    __tablename__ = 'home_cover'
-    id = db.Column(db.Integer, primary_key=True)
-    url = db.Column(db.String(100))
-    cover_id = db.Column(db.Integer, nullable=False)
 
 class InformationModel(db.Model):
     __tablename__ = 'information'
@@ -1850,5 +1845,23 @@ class ClubOfficer(db.Model):
     appointed_by = db.Column(db.Integer)                          # 任命操作人（审计留痕，非 FK）
     ended_by = db.Column(db.Integer)                              # 卸任操作人
     end_reason = db.Column(db.String(200))                        # 卸任原因（选填）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class BannerModel(db.Model):
+    """首页轮播帧（DB 驱动，图走 storage media/banners/）。
+    is_camp_frame 是能力位：1 时前端拉 /camp/featured 叠加主推营动态角标（09-14 撤动态帧后
+    seed 置 0，恢复动态帧改标志即可零代码）；banner 表只管帧的静态部分，不耦合营期状态。"""
+    __tablename__ = 'banner'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    sort_order = db.Column(db.Integer, nullable=False, unique=True)     # 展示顺序，小在前
+    title = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(200))
+    image_key = db.Column(db.String(300), nullable=False)               # '/media/banners/{id}/{uuid32}.webp'
+    link_type = db.Column(db.String(20), nullable=False, server_default='route')   # route / external / none
+    link_value = db.Column(db.String(300))                              # '/camp' 或 '/3dfarm/'
+    is_camp_frame = db.Column(db.Boolean, nullable=False, server_default='0')
+    visible = db.Column(db.Boolean, nullable=False, server_default='1')
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)

@@ -72,13 +72,7 @@ def public_officers(user_id):
     ]
 
 
-def _avatar_url(avatar_url):
-    """头像完整 URL（与 gratitude/discussion 同语义：相对路径按当前页 origin 解析）"""
-    if not avatar_url:
-        return ""
-    if avatar_url.startswith('http://') or avatar_url.startswith('https://'):
-        return avatar_url
-    return f"/data/avatars/{avatar_url}"
+from .media import public_avatar_url as _avatar_url     # 新链路 /media/，旧值兜底 /data/avatars/
 
 
 def _officer_dict(o, user=None):

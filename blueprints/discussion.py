@@ -24,15 +24,7 @@ def options_handler(path):
     return jsonify({"code": 200}), 200
 
 
-def get_avatar_url(avatar_url):
-    """获取完整的头像URL"""
-    if not avatar_url:
-        return ""
-    # 检查是否已经是完整URL
-    if avatar_url.startswith('http://') or avatar_url.startswith('https://'):
-        return avatar_url
-    # 相对路径：浏览器按当前页 origin 解析，避免反代/端口转发下 host/端口失配
-    return f"/data/avatars/{avatar_url}"
+from .media import public_avatar_url as get_avatar_url   # 新链路 /media/，旧值兜底 /data/avatars/
 
 
 # ==================== 权限辅助函数 ====================

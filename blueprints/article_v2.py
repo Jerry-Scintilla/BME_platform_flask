@@ -27,6 +27,7 @@ from flasgger import swag_from
 
 # 导入审计 / 当前用户
 from . import audit_log, _current_user
+from .media import public_avatar_url
 
 
 bp = Blueprint("article_v2", __name__, url_prefix="/v2/article")
@@ -77,7 +78,7 @@ def _article_to_dict(a, with_author_avatar=False, summary=False):
     if with_author_avatar:
         au = a.author.avatar_url if a.author else None
         if au:
-            d['author_avatar'] = au if au.startswith('http') else f"/data/avatars/{au}"
+            d['author_avatar'] = public_avatar_url(au)
         else:
             d['author_avatar'] = ''
     return d
@@ -266,7 +267,7 @@ def article_v2_get(article_id):
     author_avatar = ''
     if article.author and article.author.avatar_url:
         au = article.author.avatar_url
-        author_avatar = au if au.startswith('http') else '/data/avatars/' + au
+        author_avatar = public_avatar_url(au)
     # 互动计数：取该 v2 文章的汇总 thread（只读，不创建）；匿名阅读页也能直接拿到
     thread = DiscussionThread.query.filter_by(
         scope_type='article_v2', scope_id=article_id,

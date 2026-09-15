@@ -1,3 +1,4 @@
+import io
 import os
 import uuid
 import hashlib
@@ -19,6 +20,8 @@ BOOK_DIR = os.path.join(config.DATA_ROOT, 'course', 'book')
 
 # 导入对象存储
 from storage import storage
+import imaging
+from .media import media_url
 
 # 导入表单验证
 from .forms import CourseForm
@@ -220,6 +223,88 @@ def course_import():
 
 
 # 发布课程
+def _cover_thumb_url(course):
+    """课程封面缩略 URL：cover 存母版 '/media/course-covers/{cid}/{uuid32}.webp'，
+    缩略 key = 母版 stem + '_thumb' + 同扩展（上传时成对写入）；无封面返回 None。"""
+    if not course.cover:
+        return None
+    stem, ext = course.cover.rsplit('.', 1)
+    return f"{stem}_thumb.{ext}"
+
+
+def _remove_cover_objects(course):
+    """删除封面母版 + 缩略两个对象（best-effort，对象缺失静默）。"""
+    if not course.cover:
+        return
+    stem, ext = course.cover.lstrip('/').rsplit('.', 1)
+    for key in (course.cover.lstrip('/'), f"{stem}_thumb.{ext}"):
+        try:
+            storage.remove_object(key)
+        except Exception:
+            pass
+
+
+# 课程封面：上传/替换（转码 3:4 母版 <=1200x1600 + 缩略 600x800，成对入 storage media/ 命名空间）
+@bp.route("/course/cover/update", methods=["POST"])
+@jwt_required()
+@check_permission('course_management')
+@audit_log(operation="上传课程封面")
+def course_cover_update():
+    course_id = request.form.get("Course_Id")
+    file = request.files.get("cover")
+    if not course_id or not course_id.isdigit():
+        return jsonify({"code": 402, "message": "Course_Id 必须是正整数"}), 402
+    course = CourseModel.query.filter_by(id=int(course_id)).first()
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+    if not file or not file.filename:
+        return jsonify({"code": 402, "message": "缺少封面文件 cover"}), 402
+    ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        return jsonify({"code": 402, "message": "封面仅支持 jpg/jpeg/png/webp"}), 402
+    if file.content_length and file.content_length > 10 * 1024 * 1024:
+        return jsonify({"code": 402, "message": "封面不能超过 10MB"}), 402
+
+    try:
+        master, thumb = imaging.course_cover_pair(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"封面图无效：{e}"}), 400
+
+    uid = uuid.uuid4().hex
+    master_key = f"media/course-covers/{course.id}/{uid}.webp"
+    thumb_key = f"media/course-covers/{course.id}/{uid}_thumb.webp"
+    try:
+        storage.put_object(master_key, io.BytesIO(master), len(master), "image/webp")
+        storage.put_object(thumb_key, io.BytesIO(thumb), len(thumb), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"封面存储失败：{e}"}), 500
+
+    _remove_cover_objects(course)                    # 替换：清旧对象（best-effort）
+    course.cover = media_url(master_key)              # 存母版完整相对 URL
+    db.session.commit()
+    return jsonify({"code": 200, "message": "封面上传成功",
+                    "Course_Cover": course.cover, "Course_Cover_Thumb": _cover_thumb_url(course)})
+
+
+# 课程封面：删除（回退标题色块）
+@bp.route("/course/cover/delete", methods=["POST"])
+@jwt_required()
+@check_permission('course_management')
+@audit_log(operation="删除课程封面")
+def course_cover_delete():
+    data = request.get_json(silent=True) or {}
+    course_id = data.get("Course_Id")
+    if not course_id:
+        return jsonify({"code": 402, "message": "缺少 Course_Id"}), 402
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+    _remove_cover_objects(course)
+    course.cover = None
+    db.session.commit()
+    return jsonify({"code": 200, "message": "封面已删除"})
+
+
 @bp.route("/course/public", methods=["POST"])
 @jwt_required()
 @check_permission('course_management')
@@ -251,10 +336,6 @@ def public():
         db.session.flush()
         db.session.refresh(course)
 
-        # filename = cover.filename
-        # cover.save('./data/cover/' + str(course.id) + '.' + filename.rsplit(".", 1)[1].lower())
-        # course.cover = str(course.id) + '.' + filename.rsplit(".", 1)[1].lower()
-        #
         db.session.commit()
 
         data = {
@@ -391,6 +472,7 @@ def course_list():
                   'Course_Class_Hour': course.class_hour or 0,
                   'Course_Difficulty': course.difficulty,
                   'Course_Other_Tags': other_tags_list,
+                  'Course_Cover_Thumb': _cover_thumb_url(course),
                   }
         data.append(b_list)
 
@@ -668,7 +750,8 @@ def search_courses():
                 'Course_Class_Hour': course.class_hour or 0,
                 'Course_Difficulty': course.difficulty,
                 'Course_Other_Tags': other_tags_list,
-                # 'Cover': course.cover
+                'Cover': course.cover,
+                'Cover_Thumb': _cover_thumb_url(course),
             }
             course_list.append(course_info)
         return jsonify({
@@ -705,7 +788,8 @@ def search_courses():
             'Course_Class_Hour': course.class_hour or 0,
             'Course_Difficulty': course.difficulty,
             'Course_Other_Tags': other_tags_list,
-            # 'Cover': course.cover
+            'Cover': course.cover,
+            'Cover_Thumb': _cover_thumb_url(course),
         })
     return jsonify({
         "code": 402,

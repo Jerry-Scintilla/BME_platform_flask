@@ -37,14 +37,7 @@ def get_current_user():
     return UserModel.query.filter_by(email=user_email).first()
 
 
-def get_avatar_url(avatar_url):
-    """获取完整的头像URL（与 discussion 蓝图同逻辑）"""
-    if not avatar_url:
-        return ""
-    if avatar_url.startswith('http://') or avatar_url.startswith('https://'):
-        return avatar_url
-    # 相对路径：浏览器按当前页 origin 解析，避免绝对 URL 的 host/端口在反代/端口转发下失配
-    return f"/data/avatars/{avatar_url}"
+from .media import public_avatar_url as get_avatar_url   # 新链路 /media/，旧值兜底 /data/avatars/
 
 
 # ==================== 热度排序 ====================

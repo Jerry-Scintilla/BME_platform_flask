@@ -1,3 +1,6 @@
+import io
+import re
+
 from flask import Blueprint, request, redirect, jsonify
 
 # 导入拓展
@@ -17,8 +20,18 @@ from flasgger import swag_from
 
 # 导入权限检查模块
 from . import check_permission, audit_log
+from storage import storage
+import imaging
+from .media import media_url
 
 bp = Blueprint("medal", __name__, url_prefix="/medal")
+
+# 兜底勋章图（migrate_32 会把 Default.webp 放进 storage；前端在 medal.image 为空时也可用它）
+MEDAL_DEFAULT_KEY = "media/medals/Default.webp"
+
+
+def medal_default_image_url():
+    return media_url(MEDAL_DEFAULT_KEY)
 
 
 # 创建勋章
@@ -87,7 +100,8 @@ def medal_list():
             "Medal_Name": medal.medal_name,
             "Medal_Description": medal.description,
             "Medal_Tag": medal.tags,
-            "Medal_Id": medal.id
+            "Medal_Id": medal.id,
+            "Medal_Image": medal.image
         })
 
     return jsonify({
@@ -95,6 +109,39 @@ def medal_list():
         "message": "获取勋章列表成功",
         "medal": data
     })
+
+
+# 勋章图：上传/替换（稳定 key media/medals/{mid}_{safe_name}.webp，重传覆盖天然幂等，不堆积对象）
+@bp.route("/image/update", methods=["POST"])
+@jwt_required()
+@check_permission('medal_management')
+@audit_log(operation="更换勋章图")
+def medal_image_update():
+    medal_id = request.form.get("Medal_Id")
+    file = request.files.get("image")
+    if not medal_id or not medal_id.isdigit():
+        return jsonify({"code": 402, "message": "Medal_Id 必须是正整数"}), 402
+    medal = MedalModel.query.filter_by(id=int(medal_id)).first()
+    if not medal:
+        return jsonify({"code": 404, "message": "勋章不存在"}), 404
+    if not file or not file.filename:
+        return jsonify({"code": 402, "message": "缺少勋章图文件 image"}), 402
+
+    try:
+        data = imaging.medal_bytes(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"勋章图无效：{e}"}), 400
+
+    safe_name = re.sub(r"[^0-9A-Za-z_-]+", "", medal.medal_name or "")[:40] or "medal"
+    key = f"media/medals/{medal.id}_{safe_name}.webp"
+    try:
+        storage.put_object(key, io.BytesIO(data), len(data), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"勋章图存储失败：{e}"}), 500
+
+    medal.image = media_url(key)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "勋章图已更新", "Medal_Image": medal.image})
 
 
 # 删除勋章
@@ -228,7 +275,8 @@ def user_medal_list():
             "Medal_Id": medal.id,
             "Medal_Name": medal.medal.medal_name,
             "Medal_Tag": medal.medal.tags,
-            "Medal_Name_CN": medal.medal.description
+            "Medal_Name_CN": medal.medal.description,
+            "Medal_Image": medal.medal.image
         })
 
     return jsonify({
@@ -265,7 +313,8 @@ def user_medal_show():
                     "Medal_Tag": medal_.tags,
                     "Medal_Name_CN": medal_.description,
                     "Get_Time": medal.get_time.strftime('%Y-%m-%d'),
-                    "Description": medal.description
+                    "Description": medal.description,
+                    "Medal_Image": medal_.image
                 })
                 found = True
                 break  # 找到后立即跳出内层循环
@@ -278,7 +327,8 @@ def user_medal_show():
                 "Medal_Tag": medal_.tags,
                 "Medal_Name_CN": medal_.description,
                 "Get_Time": None,
-                "Description": None
+                "Description": None,
+                "Medal_Image": medal_.image
             })
 
     return jsonify({

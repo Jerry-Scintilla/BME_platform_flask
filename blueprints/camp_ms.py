@@ -38,12 +38,16 @@ from models import (
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
 from .forms import AvatarForm
+from .media import public_avatar_url
+from storage import storage
+import imaging
+import uuid
 
 import config
 
 bp = Blueprint("camp_ms", __name__, url_prefix="/camp/ms")
 
-# 名片照片目录（DATA_ROOT 可配置，默认 ./data；迁移脚本负责创建。DB 只存相对文件名）
+# 名片照片目录（旧链路读兜底用；09-15 起新照片入 storage media/mentors/，migrate_32 搬完存量后只留旧路由）
 MENTOR_PHOTO_DIR = os.path.join(config.DATA_ROOT, 'mentor_photos')
 
 # 营级分类标签默认集（session 未配置 ms_tags 时应用层默认）
@@ -303,11 +307,16 @@ def _inherit_direction_course(camp, student_uid, mentor_uid):
 
 
 def _avatar_url(u):
-    return f"/data/avatars/{u.avatar_url}" if u and u.avatar_url else None
+    return public_avatar_url(u.avatar_url) if u and u.avatar_url else None
 
 
 def _photo_url(p):
-    return f"/camp/ms/photo/{p.photo}" if p and p.photo else None
+    """新值 '/media/...' 原样；旧裸文件名回退旧路由（过渡一版，migrate_32 后只剩新值）。"""
+    if not (p and p.photo):
+        return None
+    if p.photo.startswith("/media/"):
+        return p.photo
+    return f"/camp/ms/photo/{p.photo}"
 
 
 def _fmt_dt(v):
@@ -569,21 +578,30 @@ def profile_photo_upload(sid):
     if ext not in ("jpg", "jpeg", "png"):
         return jsonify({"code": 400, "message": "照片仅支持 jpg/jpeg/png"}), 400
 
-    filename = f"{sid}_{user.id}.{ext}"
-    os.makedirs(MENTOR_PHOTO_DIR, exist_ok=True)
+    # 转码保比例 WebP 后入 storage（09-15 切 media/ 公开命名空间）
+    try:
+        data = imaging.mentor_photo_bytes(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"照片无效：{e}"}), 400
+    key = f"media/mentors/{sid}/{user.id}/{uuid.uuid4().hex}.webp"
+    try:
+        storage.put_object(key, io.BytesIO(data), len(data), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"照片存储失败：{e}"}), 500
+
     p = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    if p and p.photo and p.photo != filename:
-        try:
-            os.remove(os.path.join(MENTOR_PHOTO_DIR, p.photo))
-        except OSError:
-            pass
-    file.save(os.path.join(MENTOR_PHOTO_DIR, filename))
+    old = p.photo if p else None
     if not p:
-        p = CampMentorProfile(camp_session_id=sid, user_id=user.id, photo=filename)
+        p = CampMentorProfile(camp_session_id=sid, user_id=user.id, photo="/" + key)
         db.session.add(p)
     else:
-        p.photo = filename
+        p.photo = "/" + key
     db.session.commit()
+    if old and old.startswith("/media/"):                # 旧对象 best-effort 清理
+        try:
+            storage.remove_object(old.lstrip("/"))
+        except Exception:
+            pass
     return jsonify({"code": 200, "message": "照片已上传", "photo_url": _photo_url(p)})
 
 
