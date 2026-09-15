@@ -356,6 +356,8 @@ from .admin import bp as admin_bp
 from .ai_topic import bp as ai_topic_bp
 from .gratitude import bp as gratitude_bp
 from .officers import bp as officers_bp
+from .organization import bp as organization_bp
+from .club_admin import bp as club_admin_bp
 from .media import bp as media_bp
 from .banner import bp as banner_bp
 
@@ -388,6 +390,8 @@ __all__ = [
     'ai_topic_bp',
     'gratitude_bp',
     'officers_bp',
+    'organization_bp',
+    'club_admin_bp',
     'media_bp',
     'banner_bp'
 ]

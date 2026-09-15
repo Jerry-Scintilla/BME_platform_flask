@@ -1823,22 +1823,69 @@ class AiTopicLedger(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
-# ── 社团干事身份（功能扩展轮 §四，轻量任职档案）──
-# 两套体系并存：管理职位（社长/副社长/团支书/副团支书，固定枚举）+ 分组体系（组长=每组一个；
-# 组员=普通组员归属，无头衔语义不进社区徽章）；
-# 无任职行 = 普通社员。红线：不挂任何操作权限（权限仍走 super_admin + 营内角色），纯身份/档案语义；
-# department 存组织树叶子组名（15 组名全树唯一，树固化在前端常量，后端不校验组名——换届重组只改前端）。
+# ── 社团身份体系（设计方案 docs/社团身份体系-设计方案.md v1.2，职位与组别解耦为可配数据）──
+# 四概念：职位 ClubPosition（治理身份定义）/ 组别 ClubGroup（树状组织节点，admin 可配）/
+# 任职 ClubOfficer（人×职位×组 实例，任期档案）/ 归属 ClubMembership（全员干活地点，primary/secondary 两槽）。
+# 「组员」不再是任职头衔（存量已迁移为 membership）；红线不变：不挂任何操作权限，纯身份/档案语义。
+
+class ClubGroup(db.Model):
+    """组别树节点。组名全树唯一（徽标只显组名不显路径的唯一性前提）；层级沿 parent_id 推导，
+    应用层限深 ≤4；改名 id 键控零迁移；删除仅零引用，有引用走 archived（架构页隐藏、历史可解析）。"""
+    __tablename__ = 'club_group'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)
+    parent_id = db.Column(db.Integer, db.ForeignKey('club_group.id'), nullable=True, index=True)
+    sort_order = db.Column(db.Integer, nullable=False, default=0)     # 同父内排序，小在前
+    status = db.Column(db.String(20), nullable=False, default='active', index=True)  # active / archived
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ClubPosition(db.Model):
+    """职位定义：规则字段全部可配（原硬编码 R1-R4 语义转字段）。
+    group_rule 挂组约束；per_group_limit 同组同时在任上限（0=不限）；global_limit 全社上限（0=不限）；
+    sort_rank 排序+徽标优先级（小=高；列名避开 MySQL 保留字 rank）；badge_tier 徽标样式层；
+    badge_with_group 徽标是否拼组段。"""
+    __tablename__ = 'club_position'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(30), nullable=False, unique=True)
+    sort_rank = db.Column(db.Integer, nullable=False, default=99)
+    badge_tier = db.Column(db.Integer, nullable=False, default=3)     # 1 干事强调 / 2 组长次强调 / 3 组名中性
+    badge_with_group = db.Column(db.Boolean, nullable=False, default=False)
+    group_rule = db.Column(db.String(20), nullable=False, default='optional')  # forbidden / optional / required
+    per_group_limit = db.Column(db.Integer, nullable=False, default=1)
+    global_limit = db.Column(db.Integer, nullable=False, default=0)
+    status = db.Column(db.String(20), nullable=False, default='active', index=True)  # active / retired
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ClubMembership(db.Model):
+    """全员组归属（主要干活 primary ×1 + 帮忙 secondary ×0~1）。非治理事实：调整即覆盖更新，
+    无卸任留痕；(user_id, slot) 唯一；同人两槽不同组、组须 active 在应用层校验。"""
+    __tablename__ = 'club_membership'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('club_group.id'), nullable=False, index=True)
+    slot = db.Column(db.String(20), nullable=False)                   # primary / secondary
+    joined_at = db.Column(db.Date, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (db.UniqueConstraint('user_id', 'slot', name='uq_club_membership_user_slot'),)
+
 
 class ClubOfficer(db.Model):
     """社团干事任职行。卸任 = status 置 ended 不删行（appointed_by/ended_by 操作人留痕）。
-    约束在应用层（blueprints/officers.py）：同 (department, title) 至多 1 条 active（社长全局唯一/
-    每组一个组长；组员豁免可多行）；同一社员至多 2 条 active 且组不重复（兼两组上限）；
-    社长不挂组、组长/组员必挂组。"""
+    title_id/group_id 为真相源（职位/组别解耦，校验读职位规则字段）；title/department 冗余存名
+    双写过渡（旧 admin UI 与 e2e 兼容，Phase C admin 改版后退役删列）。
+    约束（应用层，读 ClubPosition 配置）：挂组按 group_rule；同组/全社限额按 per_group_limit/
+    global_limit；一人至多 1 条 active（原「兼两组」由 membership 两槽承接）。"""
     __tablename__ = 'club_officer'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    title = db.Column(db.String(20), nullable=False)              # 职位白名单：社长/副社长/团支书/副团支书/组长
-    department = db.Column(db.String(50))                         # 归属组名；社长统领全局为空
+    title_id = db.Column(db.Integer, db.ForeignKey('club_position.id'), nullable=True, index=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('club_group.id'), nullable=True, index=True)
+    title = db.Column(db.String(30), nullable=False)              # 冗余：职位名（双写过渡）
+    department = db.Column(db.String(50))                         # 冗余：组名（双写过渡；空=不挂组）
     term_start = db.Column(db.Date, nullable=False)               # 任期起
     term_end = db.Column(db.Date)                                 # 任期止（空 = 在任）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)  # active / ended

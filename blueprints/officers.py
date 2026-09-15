@@ -1,15 +1,16 @@
-"""社团干事身份蓝图（功能扩展轮 §四，轻量任职档案——不挂任何权限）。
+"""社团干事身份蓝图（v1.2 职位/组别解耦版，设计方案 docs/社团身份体系-设计方案.md）。
 
-admin 侧 CRUD：任命 / 编辑 / 卸任（状态化不删行）/ 批量导入（预留，逐项回报）。
-user 侧不设端点：user_index / profile/<id> 回包直接附任职（见 user.py），
+admin 侧 CRUD：任命 / 编辑 / 卸任（状态化不删行）/ 批量导入（逐项回报）。
+校验不再硬编码：全部读 ClubPosition 规则字段——
+  group_rule（forbidden 职位禁挂组 / required 必挂组）
+  per_group_limit（同组同时在任上限，0=不限）
+  global_limit（全社同时在任上限，0=不限）
+  一人至多 1 条 active 任职（原「兼两组」由 club_membership 两槽承接，「组员」头衔已退役）
+兼容：入参 title/department 传名（旧 admin UI）或 title_id/group_id 传 id 均可；
+出参双份（title/title_id、department/group_id）；title/department 列为双写冗余，Phase C 退役。
+
+user 侧不设端点：user_index / profile/<id> 回包直接附任职与归属（见 user.py），
 社区 feed 的 author_badge 见 community.py——三者都 import 本文件的查询助手。
-
-应用层约束（任命/编辑共用）：
-  R1 同 (department, title) 至多 1 条 active —— 社长全局唯一、每组一个组长、职位不重复任命
-     （组员豁免：普通组员一组可多人，R1 不适用）
-  R2 同一社员至多 2 条 active —— 最多兼两组身份（组员照算）
-  R3 同一社员的 active 行组不重复 —— 同部门兼两职无意义
-  R4 社长必须无 department；组长/组员必须挂组；其余管理职位选填
 """
 from datetime import date, datetime
 
@@ -17,26 +18,131 @@ from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 
 from exts import db
-from models import UserModel, ClubOfficer
+from models import UserModel, ClubOfficer, ClubPosition, ClubGroup, ClubMembership
 from . import check_permission, audit_log, _current_user
 
 bp = Blueprint("officers", __name__, url_prefix="/admin/officers")
 
-# 职位白名单（前后端同源；管理职位固定枚举；分组体系=组长+组员[普通组员归属，无头衔语义]，扩枚举=改常量）
-TITLE_MANAGEMENT = ("社长", "副社长", "团支书", "副团支书")
-TITLE_GROUP = ("组长", "组员")
-TITLE_CHOICES = TITLE_MANAGEMENT + TITLE_GROUP
+# 管理层阈值（组织架构页顶部区判定，与 organization.py 同源）
+MANAGEMENT_RANK_MAX = 9
 
-# 主职排序（列表排序用）：管理职位在前，组长次之，组员殿后
-TITLE_RANK = {t: i for i, t in enumerate(TITLE_CHOICES)}
+from .media import public_avatar_url as _avatar_url     # 新链路 /media/，旧值兜底 /data/avatars/
 
 
-# ────────────────────────────────────────
-# 查询助手（user.py / community.py 复用）
-# ────────────────────────────────────────
+# ────────────────────────────────
+# 解析助手（名/id 双轨入参）
+# ────────────────────────────────
+
+def _resolve_position(data):
+    """title_id 优先，否则按 title 名精确匹配 active 职位。返回 (职位, 错误响应)。"""
+    if data.get("title_id"):
+        pos = ClubPosition.query.get(int(data["title_id"]))
+        if pos and pos.status == 'active':
+            return pos, None
+        return None, (jsonify({"code": 404, "message": "职位不存在或已退役"}), 404)
+    name = (data.get("title") or "").strip()
+    if not name:
+        return None, (jsonify({"code": 400, "message": "缺少职位"}), 400)
+    pos = ClubPosition.query.filter_by(name=name, status='active').first()
+    if not pos:
+        return None, (jsonify({"code": 404, "message": f"职位「{name}」不存在或已退役"}), 404)
+    return pos, None
+
+
+def _resolve_group(data):
+    """group_id 优先，否则按 department 名匹配 active 组。返回 (组|None, 错误响应)。
+    None（含入参 null/空串）= 不挂组——是否合法交给 group_rule 判断。"""
+    raw_id, raw_name = data.get("group_id"), data.get("department")
+    if raw_id:
+        g = ClubGroup.query.get(int(raw_id))
+        if not g or g.status != 'active':
+            return None, (jsonify({"code": 404, "message": "组不存在或已归档"}), 404)
+        return g, None
+    if raw_name is not None:
+        name = str(raw_name).strip()
+        if not name:
+            return None, None
+        if len(name) > 50:
+            return None, (jsonify({"code": 400, "message": "组名过长（≤50 字）"}), 400)
+        g = ClubGroup.query.filter_by(name=name, status='active').first()
+        if not g:
+            return None, (jsonify({"code": 404, "message": f"组「{name}」不存在（组树见后台配置）"}), 404)
+        return g, None
+    return None, None
+
+
+# ────────────────────────────────
+# 校验（任命与编辑共用）
+# ────────────────────────────────
+
+def _validate_appointment(user_id, pos, group, exclude_id=None):
+    """读职位规则校验，通过返回 None，否则返回 (错误码, 中文原因)。"""
+    # group_rule
+    if pos.group_rule == 'forbidden' and group:
+        return 400, f"{pos.name}不挂组"
+    if pos.group_rule == 'required' and not group:
+        return 400, f"{pos.name}必须归属一个组"
+
+    # 一人至多 1 条 active
+    mine = ClubOfficer.query.filter(
+        ClubOfficer.user_id == user_id,
+        ClubOfficer.status == 'active',
+    )
+    if exclude_id:
+        mine = mine.filter(ClubOfficer.id != exclude_id)
+    if mine.first():
+        return 409, "该成员已有在任职位（一人至多一职）"
+
+    # per_group_limit：同职位同组同时在任
+    if pos.per_group_limit:
+        q1 = ClubOfficer.query.filter(
+            ClubOfficer.title_id == pos.id,
+            ClubOfficer.group_id == (group.id if group else None),
+            ClubOfficer.status == 'active',
+        )
+        if exclude_id:
+            q1 = q1.filter(ClubOfficer.id != exclude_id)
+        dup = q1.first()
+        if dup:
+            holder = UserModel.query.get(dup.user_id)
+            holder_name = holder.username if holder else f"#{dup.user_id}"
+            where = f"{group.name}·" if group else ""
+            return 409, f"{where}{pos.name} 已由 {holder_name} 在任，请先卸任再任命"
+
+    # global_limit：全社同时在任
+    if pos.global_limit:
+        q2 = ClubOfficer.query.filter(
+            ClubOfficer.title_id == pos.id,
+            ClubOfficer.status == 'active',
+        )
+        if exclude_id:
+            q2 = q2.filter(ClubOfficer.id != exclude_id)
+        if q2.count() >= pos.global_limit:
+            return 409, f"{pos.name} 编制已满（{pos.global_limit} 名）"
+
+    return None
+
+
+def _parse_term_start(raw, fallback=None):
+    """任期起解析，非法返回 (None, 错误信息)。"""
+    if not raw:
+        return (fallback or date.today()), None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date(), None
+    except (TypeError, ValueError):
+        return None, "任期起格式应为 YYYY-MM-DD"
+
+
+# ────────────────────────────────
+# 查询助手（user.py / community.py / organization.py 复用）
+# ────────────────────────────────
+
+def _rank_map():
+    return {p.id: p for p in ClubPosition.query.all()}
+
 
 def officers_by_user(user_ids):
-    """批量查 active 任职 {uid: [行]}，按职级 rank + 任期起排序（主职在前）。空入参返回 {}。"""
+    """批量查 active 任职 {uid: [行]}，按职位 rank + 任期起排序（主职在前）。空入参返回 {}。"""
     ids = [i for i in {u for u in user_ids if u} if i is not None]
     if not ids:
         return {}
@@ -44,23 +150,50 @@ def officers_by_user(user_ids):
         ClubOfficer.user_id.in_(ids),
         ClubOfficer.status == 'active',
     ).all()
+    ranks = _rank_map()
     result = {}
     for r in rows:
         result.setdefault(r.user_id, []).append(r)
     for rows_of_user in result.values():
-        rows_of_user.sort(key=lambda r: (TITLE_RANK.get(r.title, 99), r.term_start or date.min, r.id))
+        rows_of_user.sort(key=lambda r: (
+            ranks[r.title_id].sort_rank if r.title_id in ranks else 99,
+            r.term_start or date.min, r.id))
     return result
 
 
-def primary_title_map(user_ids):
-    """{uid: 主职 title}——社区 feed 徽章用；无任职/仅有组员行的 uid 不含键
-    （徽章只认头衔：管理层+组长；组员是归属不是头衔，不进徽章）。"""
+def badge_map(user_ids):
+    """社区 feed 徽章：{uid: {text, tier}}。
+    优先级 = 在任职位（text=职位名[·组名]，tier=badge_tier，组段由 badge_with_group 决定）；
+    无任职 → 主要组组名（tier 3）；未分组无键。"""
     result = {}
+    ranks = _rank_map()
     for uid, rows in officers_by_user(user_ids).items():
-        titled = [r for r in rows if r.title != '组员']
-        if titled:
-            result[uid] = titled[0].title
+        r = rows[0]
+        pos = ranks.get(r.title_id)
+        if not pos:
+            continue
+        text = pos.name
+        if pos.badge_with_group and r.group_id:
+            g = ClubGroup.query.get(r.group_id)
+            if g:
+                text = f"{pos.name} · {g.name}"
+        result[uid] = {"text": text, "tier": pos.badge_tier}
+    missing = [u for u in user_ids if u and u not in result]
+    if missing:
+        prim = {m.user_id: m for m in ClubMembership.query.filter(
+            ClubMembership.user_id.in_(missing), ClubMembership.slot == 'primary').all()}
+        gids = {m.group_id for m in prim.values()}
+        gnames = {g.id: g.name for g in ClubGroup.query.filter(ClubGroup.id.in_(gids)).all()} if gids else {}
+        for uid in missing:
+            m = prim.get(uid)
+            if m and m.group_id in gnames:
+                result[uid] = {"text": gnames[m.group_id], "tier": 3}
     return result
+
+
+# 兼容别名（过渡期社区 feed 未切结构前仍取纯文本）
+def primary_title_map(user_ids):
+    return {uid: b["text"] for uid, b in badge_map(user_ids).items()}
 
 
 def public_officers(user_id):
@@ -72,18 +205,28 @@ def public_officers(user_id):
     ]
 
 
-from .media import public_avatar_url as _avatar_url     # 新链路 /media/，旧值兜底 /data/avatars/
+def public_groups(user_id):
+    """单用户组归属公开形态：{primary: 组名|None, secondary: 组名|None}。"""
+    rows = ClubMembership.query.filter_by(user_id=user_id).all()
+    gids = {m.group_id for m in rows}
+    gnames = {g.id: g.name for g in ClubGroup.query.filter(ClubGroup.id.in_(gids)).all()} if gids else {}
+    data = {"primary": None, "secondary": None}
+    for m in rows:
+        data[m.slot] = gnames.get(m.group_id)
+    return data
 
 
 def _officer_dict(o, user=None):
-    """admin 列表行形态（含治理字段）"""
+    """admin 列表行形态（含治理字段；名/id 双份）"""
     return {
         "id": o.id,
         "user_id": o.user_id,
         "username": user.username if user else "已注销用户",
         "avatar": _avatar_url(user.avatar_url) if user else "",
         "title": o.title,
+        "title_id": o.title_id,
         "department": o.department,
+        "group_id": o.group_id,
         "term_start": o.term_start.isoformat() if o.term_start else None,
         "term_end": o.term_end.isoformat() if o.term_end else None,
         "status": o.status,
@@ -92,58 +235,9 @@ def _officer_dict(o, user=None):
     }
 
 
-# ────────────────────────────────────────
-# 校验（任命与编辑共用；pending 为同事务内先行 add 的行，供批量导入批内互查）
-# ────────────────────────────────────────
-
-def _validate_appointment(user_id, title, department, exclude_id=None):
-    """R1-R4 校验，通过返回 None，否则返回 (错误码, 中文原因)。
-    批量导入场景调用前已 flush 同批先行行，本查询（同会话）天然批内互查。"""
-    if title not in TITLE_CHOICES:
-        return 400, f"职位仅支持 {'/'.join(TITLE_CHOICES)}"
-    if department is not None:
-        department = department.strip() or None
-    # R4：挂组约束
-    if title == '社长' and department:
-        return 400, "社长统领全局，不挂组"
-    if title in ('组长', '组员') and not department:
-        return 400, f"{title}必须归属一个组"
-    if department and len(department) > 50:
-        return 400, "组名过长（≤50 字）"
-
-    # R1：同 (department, title) 至多 1 条 active（== None 自动转 IS NULL）。
-    # 组员豁免——一组可有多名组员；组长仍每组一个。
-    if title != '组员':
-        q1 = ClubOfficer.query.filter(
-            ClubOfficer.title == title,
-            ClubOfficer.department == department,
-            ClubOfficer.status == 'active',
-        )
-        if exclude_id:
-            q1 = q1.filter(ClubOfficer.id != exclude_id)
-        dup = q1.first()
-        if dup:
-            holder = UserModel.query.get(dup.user_id)
-            holder_name = holder.username if holder else f"#{dup.user_id}"
-            where = f"{department}·" if department else ""
-            return 409, f"{where}{title} 已由 {holder_name} 在任，请先卸任再任命"
-
-    # R2/R3：同一社员 active ≤2 且组不重复
-    mine = [m for m in ClubOfficer.query.filter(
-        ClubOfficer.user_id == user_id,
-        ClubOfficer.status == 'active',
-    ).all() if m.id != exclude_id]
-    if len(mine) >= 2:
-        return 409, "该社员已兼两组身份（上限 2）"
-    if any(m.department == department for m in mine):
-        return 409, f"该社员在{department or '管理层'}已有任职，同组不可兼两职"
-
-    return None
-
-
-# ────────────────────────────────────────
+# ────────────────────────────────
 # admin 端点
-# ────────────────────────────────────────
+# ────────────────────────────────
 
 @bp.route("", methods=["GET"])
 @jwt_required()
@@ -174,16 +268,17 @@ def list_officers():
             conds.append(ClubOfficer.user_id.in_(hit_ids))
         query = query.filter(or_(*conds))
 
-    # 在任在前、职级序、新任命在前
-    rank_case = db.case(TITLE_RANK, value=ClubOfficer.title, else_=99)
-    query = query.order_by(
-        (ClubOfficer.status != 'active'),
-        rank_case,
-        ClubOfficer.created_at.desc(),
-        ClubOfficer.id.desc(),
-    )
-    total = query.count()
-    rows = query.offset((page - 1) * per_page).limit(per_page).all()
+    rows = query.all()
+    # 在任在前、职位 rank 序、新任命在前（数据量小，内存排序后分页）
+    ranks = _rank_map()
+    rows.sort(key=lambda r: (
+        r.status != 'active',
+        ranks[r.title_id].sort_rank if r.title_id in ranks else 99,
+        -(r.created_at.timestamp() if r.created_at else 0),
+        -r.id,
+    ))
+    total = len(rows)
+    rows = rows[(page - 1) * per_page:page * per_page]
 
     # 用户信息一次取齐，避免 N+1
     user_map = {}
@@ -208,41 +303,42 @@ def list_officers():
 @check_permission('system_management')
 @audit_log(operation="任命社团干事")
 def appoint_officer():
-    """任命：body {user_id, title, department?, term_start?(默认今天)}"""
+    """任命：body {user_id, title|title_id, department|group_id?, term_start?(默认今天)}"""
     data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
-    title = (data.get("title") or "").strip()
-    department = (data.get("department") or "").strip() or None
-
-    if not user_id:
+    if not data.get("user_id"):
         return jsonify({"code": 400, "message": "缺少 user_id"}), 400
-    user = UserModel.query.get(int(user_id))
+    user = UserModel.query.get(int(data["user_id"]))
     if not user:
         return jsonify({"code": 404, "message": "用户不存在"}), 404
 
-    err = _validate_appointment(user.id, title, department)
+    pos, err = _resolve_position(data)
     if err:
-        return jsonify({"code": err[0], "message": err[1]}), err[0]
+        return err
+    group, err = _resolve_group(data)
+    if err:
+        return err
 
-    term_start = date.today()
-    if data.get("term_start"):
-        try:
-            term_start = datetime.strptime(data["term_start"], "%Y-%m-%d").date()
-        except (TypeError, ValueError):
-            return jsonify({"code": 400, "message": "任期起格式应为 YYYY-MM-DD"}), 400
+    verr = _validate_appointment(user.id, pos, group)
+    if verr:
+        return jsonify({"code": verr[0], "message": verr[1]}), verr[0]
+
+    term_start, terr = _parse_term_start(data.get("term_start"))
+    if terr:
+        return jsonify({"code": 400, "message": terr}), 400
 
     current = _current_user()
     officer = ClubOfficer(
         user_id=user.id,
-        title=title,
-        department=department,
+        title_id=pos.id, title=pos.name,
+        group_id=group.id if group else None,
+        department=group.name if group else None,
         term_start=term_start,
         status='active',
         appointed_by=current.id if current else None,
     )
     db.session.add(officer)
     db.session.commit()
-    return jsonify({"code": 200, "message": f"已任命 {user.username} 为 {department + '·' if department else ''}{title}",
+    return jsonify({"code": 200, "message": f"已任命 {user.username} 为 {pos.name}",
                     "data": _officer_dict(officer, user)})
 
 
@@ -251,8 +347,8 @@ def appoint_officer():
 @check_permission('system_management')
 @audit_log(operation="批量任命社团干事")
 def batch_appoint():
-    """批量导入（预留接口，本期无前端 UI）：body {items: [{user_id|username, title, department?, term_start?}]}
-    逐项校验逐项回报（对齐批量加成员先例）；批内互查（同批两条同职位只过第一条）。"""
+    """批量导入：body {items: [{user_id|username, title|title_id, department|group_id?, term_start?}]}
+    逐项校验逐项回报；批内互查（同批任命先行 flush 后续可读）。"""
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     if not isinstance(items, list) or not items:
@@ -262,7 +358,6 @@ def batch_appoint():
 
     current = _current_user()
     results = []
-    added_rows = []          # 本批已 add 未 commit 的行，供后续项 R1/R2/R3 互查
     added = rejected = 0
 
     for idx, item in enumerate(items):
@@ -271,53 +366,55 @@ def batch_appoint():
             rejected += 1
             continue
 
-        # 用户解析：user_id 优先，否则按 username 精确匹配
-        user = None
         if item.get("user_id"):
             user = UserModel.query.get(int(item["user_id"]))
-            if not user:
-                results.append({"index": idx, "ok": False, "reason": f"用户 {item['user_id']} 不存在"})
-                rejected += 1
-                continue
         elif item.get("username"):
             user = UserModel.query.filter_by(username=(item["username"] or "").strip()).first()
-            if not user:
-                results.append({"index": idx, "ok": False, "reason": f"用户「{item['username']}」不存在"})
-                rejected += 1
-                continue
         else:
-            results.append({"index": idx, "ok": False, "reason": "缺少 user_id 或 username"})
+            user = None
+        if not user:
+            reason = f"用户 {item.get('user_id') or '「' + str(item.get('username')) + '」'} 不存在"
+            results.append({"index": idx, "ok": False, "reason": reason})
             rejected += 1
             continue
 
-        title = (item.get("title") or "").strip()
-        department = (item.get("department") or "").strip() or None
-
-        err = _validate_appointment(user.id, title, department)
+        pos, err = _resolve_position(item)
         if err:
-            results.append({"index": idx, "ok": False, "reason": err[1], "username": user.username})
+            results.append({"index": idx, "ok": False,
+                            "reason": err[0].get_json()["message"], "username": user.username})
+            rejected += 1
+            continue
+        group, err = _resolve_group(item)
+        if err:
+            results.append({"index": idx, "ok": False,
+                            "reason": err[0].get_json()["message"], "username": user.username})
             rejected += 1
             continue
 
-        term_start = date.today()
-        if item.get("term_start"):
-            try:
-                term_start = datetime.strptime(item["term_start"], "%Y-%m-%d").date()
-            except (TypeError, ValueError):
-                results.append({"index": idx, "ok": False, "reason": "任期起格式应为 YYYY-MM-DD", "username": user.username})
-                rejected += 1
-                continue
+        verr = _validate_appointment(user.id, pos, group)
+        if verr:
+            results.append({"index": idx, "ok": False, "reason": verr[1], "username": user.username})
+            rejected += 1
+            continue
+
+        term_start, terr = _parse_term_start(item.get("term_start"))
+        if terr:
+            results.append({"index": idx, "ok": False, "reason": terr, "username": user.username})
+            rejected += 1
+            continue
 
         row = ClubOfficer(
-            user_id=user.id, title=title, department=department,
+            user_id=user.id,
+            title_id=pos.id, title=pos.name,
+            group_id=group.id if group else None,
+            department=group.name if group else None,
             term_start=term_start, status='active',
             appointed_by=current.id if current else None,
         )
         db.session.add(row)
         db.session.flush()          # 拿 id，同时让同批后续项能读到
-        added_rows.append(row)
         results.append({"index": idx, "ok": True, "officer_id": row.id, "username": user.username,
-                        "title": title, "department": department})
+                        "title": pos.name, "department": group.name if group else None})
         added += 1
 
     db.session.commit()
@@ -330,33 +427,48 @@ def batch_appoint():
 @check_permission('system_management')
 @audit_log(operation="编辑社团干事任职")
 def edit_officer(officer_id):
-    """编辑：active 行可改 title/department/term_start（重跑 R1-R4）；ended 行仅许修正 term_end/end_reason。"""
+    """编辑：active 行可改职位/组/任期起（重跑规则校验）；ended 行仅许修正 term_end/end_reason。"""
     officer = ClubOfficer.query.get(officer_id)
     if not officer:
         return jsonify({"code": 404, "message": "任职记录不存在"}), 404
     data = request.get_json(silent=True) or {}
 
     if officer.status == 'active':
-        title = (data.get("title") or officer.title).strip()
-        # department 键缺失=保留原值；显式传 null/空串=清空（社长）
-        if "department" in data:
-            raw = data.get("department")
-            department = (str(raw).strip() or None) if raw is not None else None
+        # 入参只认一种轨道：显式 id 优先；传名则不带旧 id（否则 id 解析会盖掉改名入参）；
+        # 都不传回落当前值（组转原组名解析）。department 显式 null = 清空（不挂组职位）。
+        if "title_id" in data:
+            title_key = {"title_id": data["title_id"]}
+        elif "title" in data:
+            title_key = {"title": data["title"]}
         else:
-            department = officer.department
-        term_start = officer.term_start
-        if data.get("term_start"):
-            try:
-                term_start = datetime.strptime(data["term_start"], "%Y-%m-%d").date()
-            except (TypeError, ValueError):
-                return jsonify({"code": 400, "message": "任期起格式应为 YYYY-MM-DD"}), 400
-
-        err = _validate_appointment(officer.user_id, title, department, exclude_id=officer.id)
+            title_key = {"title": officer.title}
+        if "group_id" in data:
+            group_key = {"group_id": data["group_id"]}
+        elif "department" in data:
+            group_key = {"department": data["department"]}
+        elif officer.group_id:
+            group_key = {"group_id": officer.group_id}
+        else:
+            group_key = {}
+        merged = {**title_key, **group_key}
+        pos, err = _resolve_position(merged)
         if err:
-            return jsonify({"code": err[0], "message": err[1]}), err[0]
+            return err
+        group, err = _resolve_group(merged)
+        if err:
+            return err
 
-        officer.title = title
-        officer.department = department
+        verr = _validate_appointment(officer.user_id, pos, group, exclude_id=officer.id)
+        if verr:
+            return jsonify({"code": verr[0], "message": verr[1]}), verr[0]
+
+        term_start, terr = _parse_term_start(data.get("term_start"), fallback=officer.term_start)
+        if terr:
+            return jsonify({"code": 400, "message": terr}), 400
+
+        officer.title_id, officer.title = pos.id, pos.name
+        officer.group_id = group.id if group else None
+        officer.department = group.name if group else None
         officer.term_start = term_start
     else:
         # ended 行：受控修正，只动卸任留痕两字段

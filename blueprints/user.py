@@ -35,7 +35,7 @@ from flasgger import swag_from
 
 # 导入权限检查模块
 from . import check_permission, audit_log
-from .officers import public_officers   # 社团干事任职（身份档案，不挂权限）附进 user_index/profile 回包
+from .officers import public_officers, public_groups   # 社团任职+组归属（身份档案，不挂权限）附进 user_index/profile 回包
 
 bp = Blueprint("user", __name__, url_prefix="/user")
 
@@ -147,6 +147,7 @@ def user_index():
         "role_rank": user.role_rank,
         "permissions": get_user_permissions(user.id),
         "officers": public_officers(user.id),
+        "groups": public_groups(user.id),
     }
     return jsonify(data)
 
@@ -223,6 +224,7 @@ def user_profile(user_id):
         "role": user.role,
         "role_rank": user.role_rank,
         "officers": public_officers(user.id),
+        "groups": public_groups(user.id),
         "data": {
             "total_days": total_days,
             "total_hours": total_hours,

@@ -68,6 +68,8 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(ai_topic_bp)
 app.register_blueprint(gratitude_bp)
 app.register_blueprint(officers_bp)
+app.register_blueprint(organization_bp)
+app.register_blueprint(club_admin_bp)
 app.register_blueprint(media_bp)
 app.register_blueprint(banner_bp)
 
@@ -114,5 +116,6 @@ def hello_world():  # put application's code here
 
 
 if __name__ == '__main__':
-    # app.run(debug = True)
-    app.run(host='0.0.0.0', port=5001)
+    # 只开 reloader（改动即自动重启），不开 debug=True 的交互式调试器：host 0.0.0.0 下
+    # 调试器控制台等于把任意代码执行暴露给局域网
+    app.run(host='0.0.0.0', port=5001, use_reloader=True)
