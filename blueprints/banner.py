@@ -34,6 +34,7 @@ def _row_payload(b):
         "link_value": b.link_value,
         "is_camp_frame": bool(b.is_camp_frame),
         "visible": bool(b.visible),
+        "image_focus_y": b.image_focus_y if b.image_focus_y is not None else 50,
         "sort_order": b.sort_order,
     }
 
@@ -65,6 +66,10 @@ def banner_create():
     link_type = request.form.get("link_type") or "route"
     link_value = (request.form.get("link_value") or "").strip()
     is_camp_frame = request.form.get("is_camp_frame") in ("1", "true", "True")
+    try:
+        focus_y = max(0, min(100, int(request.form.get("image_focus_y", 50))))
+    except ValueError:
+        focus_y = 50
     file = request.files.get("image")
 
     if not title:
@@ -82,7 +87,8 @@ def banner_create():
     max_sort = db.session.query(db.func.max(BannerModel.sort_order)).scalar() or 0
     b = BannerModel(sort_order=max_sort + 1, title=title, description=description or None,
                     image_key="", link_type=link_type, link_value=link_value or None,
-                    is_camp_frame=is_camp_frame, visible=False)   # 建帧默认隐藏，传完图在管理页放开
+                    is_camp_frame=is_camp_frame, visible=False,   # 建帧默认隐藏，传完图在管理页放开
+                    image_focus_y=focus_y)
     db.session.add(b)
     db.session.flush()                                            # 拿 id 组 key
 
@@ -127,6 +133,12 @@ def banner_update():
         b.link_value = (data.get("link_value") or "").strip() or None
     if "is_camp_frame" in data:
         b.is_camp_frame = bool(data["is_camp_frame"])
+    if "image_focus_y" in data:
+        try:
+            focus = int(data["image_focus_y"])
+        except (TypeError, ValueError):
+            return jsonify({"code": 402, "message": "image_focus_y 须是 0-100 整数"}), 402
+        b.image_focus_y = max(0, min(100, focus))
     if "visible" in data:
         if data["visible"] and not b.image_key:
             return jsonify({"code": 402, "message": "无底图不能设为可见"}), 402

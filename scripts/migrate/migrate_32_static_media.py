@@ -76,7 +76,16 @@ def step_1_columns():
 def step_2_banner_table():
     with engine.connect() as conn:
         if insp.has_table('banner'):
-            print("[=] banner 表已存在")
+            # 已建过的表补新列（image_focus_y：显示条纵向焦点，09-15 裁切控制加的）
+            cols = [c['name'] for c in insp.get_columns('banner')]
+            if 'image_focus_y' not in cols:
+                conn.execute(text(
+                    "ALTER TABLE banner ADD COLUMN image_focus_y INT NOT NULL DEFAULT 50 "
+                    "COMMENT 'display strip vertical focus 0-100'"))
+                conn.commit()
+                print("[+] banner.image_focus_y 已加列（存量表）")
+            else:
+                print("[=] banner 表已存在（含 image_focus_y）")
             return
         conn.execute(text("""
             CREATE TABLE banner (
@@ -89,6 +98,7 @@ def step_2_banner_table():
                 link_value VARCHAR(300),
                 is_camp_frame TINYINT(1) NOT NULL DEFAULT 0,
                 visible TINYINT(1) NOT NULL DEFAULT 1,
+                image_focus_y INT NOT NULL DEFAULT 50 COMMENT 'display strip vertical focus 0-100',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_banner_sort (sort_order)

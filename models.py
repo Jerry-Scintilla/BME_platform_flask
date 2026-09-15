@@ -1863,5 +1863,6 @@ class BannerModel(db.Model):
     link_value = db.Column(db.String(300))                              # '/camp' 或 '/3dfarm/'
     is_camp_frame = db.Column(db.Boolean, nullable=False, server_default='0')
     visible = db.Column(db.Boolean, nullable=False, server_default='1')
+    image_focus_y = db.Column(db.Integer, nullable=False, server_default='50')   # 显示条纵向焦点 0-100（首页展示为全宽x160px 横带，50=中带）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
