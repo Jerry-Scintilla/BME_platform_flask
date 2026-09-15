@@ -24,7 +24,7 @@ python scripts/migrate/migrate_09_mentor_selection.py     # camp_session 加选�
 
 ## 不要跑
 - `seed.py` 会灌测试账号 / 演示课程 / 测试通知，生产**禁整体跑**。权限已由 `migrate_05` 处理。
-- 本目录**不含**测试 / 清理脚本（`dev_camp_dashboard_test.py` / `dev_test_checkin.py` / `dev_normalize_camp_members.py`，仍 gitignored 留本地）。
+- 本目录**不含**测试 / 清理脚本（`dev_*` 为本地自用冒烟脚本，gitignored 不入库，用完即删）。
 
 ## 回滚
 - 加列均 nullable / 有默认值，回滚用 `ALTER TABLE ... DROP COLUMN ...`，不伤老数据。
