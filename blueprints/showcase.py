@@ -39,6 +39,8 @@ def _p_dict(p, user=None, favorited=None):
         "project_status": p.project_status,
         "project_status_text": STATUS_TEXT.get(p.project_status, p.project_status),
         "status": p.status, "view_count": p.view_count,
+        # 09-16 详情页 meta 补收藏数（社团级数据量，逐行 count 可接受）
+        "favorite_count": ShowcaseFavorite.query.filter_by(project_id=p.id).count(),
         "members": json.loads(p.members_json) if p.members_json else [],
         "links": json.loads(p.links_json) if p.links_json else [],
         "archive_ref": p.archive_ref,
