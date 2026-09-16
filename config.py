@@ -20,7 +20,18 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 # JWT密匙
 JWT_SECRET_KEY = os.getenv("JWT_SECRET")
-JWT_ACCESS_TOKEN_EXPIRES = timedelta(days=7)
+# 2026-09-16 安全加固：access 短时效（2h，泄露窗口小）+ refresh 14d 静默续期；
+# 退出/轮换即时吊销走 Redis blocklist（app.py），旧前端不感知 refresh 也只是 2h 后重新登录
+JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=2)
+JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=14)
+
+# JWT_SECRET 启动强校验：弱/缺失密钥 = 任何人可伪造 token，直接拒绝启动。
+# 生成：python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+if not JWT_SECRET_KEY or len(JWT_SECRET_KEY) < 32:
+    raise RuntimeError(
+        "JWT_SECRET 缺失或长度不足 32 字符，拒绝启动。"
+        '请在 .env 写入随机密钥：python3 -c "import secrets; print(secrets.token_urlsafe(48))"'
+    )
 
 # 邮箱授权码
 # MBWa73BLhWMgkEmJ

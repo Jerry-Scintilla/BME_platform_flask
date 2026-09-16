@@ -1,6 +1,6 @@
 import os
 
-from flask import Flask, redirect
+from flask import Flask, redirect, jsonify
 import config
 from exts import db, mail, limiter, redis_client
 from storage import storage
@@ -23,8 +23,15 @@ app = Flask(__name__,
             static_folder=os.path.join(config.DATA_ROOT, 'avatars'),
             static_url_path='/data/avatars')
 
-# 配置CORS，允许特定域名访问API
-CORS(app, supports_credentials=True)
+# 配置CORS（2026-09-16 安全加固）：来源白名单由 CORS_ORIGINS 指定（逗号分隔，
+# 含协议与端口，如 https://xxx.example.edu.cn,http://127.0.0.1:8081）。
+# 未配置时放行全部并打警告——存量部署兼容，上线环境必须配置。
+_cors_origins = [o.strip() for o in (os.getenv("CORS_ORIGINS") or "").split(",") if o.strip()]
+if _cors_origins:
+    CORS(app, resources={r"/*": {"origins": _cors_origins}}, supports_credentials=True)
+else:
+    print("[warn] CORS_ORIGINS 未配置，API 暂对所有来源开放——上线环境必须配置白名单")
+    CORS(app, supports_credentials=True)
 
 # 绑定配置文件
 app.config.from_object(config)
@@ -34,6 +41,41 @@ mail.init_app(app)
 limiter.init_app(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+
+
+# ── JWT 吊销 blocklist（2026-09-16 安全加固）──
+# 登出/刷新轮换的 jti 由 exts.revoke_token 写入 Redis；此处每个带 token 请求校验一次。
+# Redis 异常时 fail-open（放行）：吊销是短时效 access(2h) 的补充防线，不能因缓存故障打死全站
+@jwt.token_in_blocklist_loader
+def _check_if_token_revoked(jwt_header, jwt_payload):
+    try:
+        return redis_client.get(f"jwt:blocklist:{jwt_payload['jti']}") is not None
+    except Exception:
+        print("[auth] JWT blocklist 校验异常（Redis 故障），本次放行")
+        return False
+
+
+# ── JWT 错误统一 401（2026-09-16 加固）──
+# flask-jwt-extended 默认对缺失/无效/过期/吊销令牌回 422，而前端约定 401=登录失效；
+# 统一 401 后，静默续期（401→refresh→重放）与踢下线逻辑才能咬合
+def _jwt_error_response(message):
+    return jsonify({"code": 401, "message": message}), 401
+
+@jwt.unauthorized_loader
+def _jwt_no_token(_reason):
+    return _jwt_error_response("未提供访问令牌")
+
+@jwt.invalid_token_loader
+def _jwt_bad_token(_reason):
+    return _jwt_error_response("访问令牌无效")
+
+@jwt.expired_token_loader
+def _jwt_expired_token(_jwt_header, _jwt_payload):
+    return _jwt_error_response("访问令牌已过期，请重新登录")
+
+@jwt.revoked_token_loader
+def _jwt_revoked_token(_jwt_header, _jwt_payload):
+    return _jwt_error_response("登录已失效，请重新登录")
 swagger = Swagger(app)
 redis_client.init_app(app)
 # 对象存储（懒连接，服务未起不影响启动）

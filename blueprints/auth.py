@@ -6,9 +6,13 @@ from flask_limiter.util import get_remote_address
 
 from .forms import RegisterForm, LoginForm
 from models import UserModel, UserPermissionModel
-from exts import db, mail, redis_client
+from exts import db, mail, redis_client, limiter, revoke_token
 from flask import jsonify
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    JWTManager, create_access_token, create_refresh_token,
+    jwt_required, get_jwt_identity, get_jwt, decode_token,
+)
+from datetime import datetime, timezone
 
 from flask_mail import Message
 import string
@@ -28,6 +32,7 @@ from . import audit_log
 
 # 注册端口
 @bp.route("/register", methods=["POST"])
+@limiter.limit("5/minute")
 @swag_from('../apidocs/user/register.yaml')
 @audit_log(operation="用户注册", is_login=True)
 def register():
@@ -71,6 +76,7 @@ def register():
                 "code": 200,
                 "message": "注册成功",
                 "token": token,
+                "refresh_token": create_refresh_token(identity=email),
                 "User_Name": username,
             }
 
@@ -91,6 +97,7 @@ def register():
 
 # 登录端口
 @bp.route("/login", methods=["POST"])
+@limiter.limit("10/minute")
 @swag_from('../apidocs/user/login.yaml')
 @audit_log(operation="用户登录", is_login=True)
 def login():
@@ -102,6 +109,9 @@ def login():
         # 封禁拦截（2026-09-11 用户管理）：存量 token 由 app.before_request 统一拦
         if user and (user.status or 'active') == 'banned':
             return jsonify({"code": 403, "message": "账号已被封禁，请联系管理员"}), 403
+        # 用户不存在与密码错误同一话术（2026-09-16 加固）：防注册邮箱枚举探测
+        if not user:
+            return jsonify({"code": 402, "message": "邮箱或密码错误"}), 402
         try:
             User_Email = user.email
             User_Medal = user.medal
@@ -131,6 +141,7 @@ def login():
                     "code": code,
                     "message": msg,
                     "token": token,
+                    "refresh_token": create_refresh_token(identity=email),
                     "User_Name": User_Name,
                     "role": user.role,
                     "role_rank": user.role_rank,
@@ -153,12 +164,10 @@ def login():
 
             else:
                 code = 402
-                msg = "密码错误"
-                token = "Null"
-                User_Name = "Null"
                 data = {
                     "code": code,
-                    "message": msg,
+                    # 与「用户不存在」同话术，防邮箱枚举（2026-09-16 加固）
+                    "message": "邮箱或密码错误",
                 }
                 return jsonify(data),402
 
@@ -183,10 +192,11 @@ def login():
             #     "Skill_Tags": user.skill_tags,
             # }
 
-        except:
+        except Exception:
+            # 走到这里只剩服务端异常（用户不存在已前置）；话术保持中性防信息泄露
             return jsonify({
                 "code": 400,
-                "message": "用户不存在，请检查邮箱输入是否正确",
+                "message": "登录失败，请稍后重试",
                 "token": "Null",
                 "User_Name": "Null",
             }), 400
@@ -200,6 +210,7 @@ def login():
 
 
 @bp.route("/admin_login", methods=["POST"])
+@limiter.limit("10/minute")
 @swag_from('../apidocs/user/admin_login.yaml')
 @audit_log(operation="管理员登录", is_login=True)
 def admin_login():
@@ -209,14 +220,14 @@ def admin_login():
         password = form.User_Password.data
         admin = UserModel.query.filter_by(email=email).first()
 
-        # 先检查用户是否存在
+        # 用户不存在与密码错误同一话术（2026-09-16 加固）：防邮箱枚举
         if not admin:
             return jsonify({
-                "code": 400,
-                "message": "用户不存在，请检查邮箱输入是否正确",
+                "code": 402,
+                "message": "邮箱或密码错误",
                 "token": "Null",
                 "User_Name": "Null",
-            }), 400
+            }), 402
 
         try:
             user_permission = UserPermissionModel.query.filter_by(
@@ -224,15 +235,17 @@ def admin_login():
             ).first()
 
             if not user_permission and not admin.is_staff():
+                # 403 而非 401：401 在前端语义是「登录失效」会触发清 token 踢下线
+                # （packages/api 401 处理器），权限不足不该走那条路
                 return jsonify({
-                    "code": 401,
-                    'message': "用户权限不够"
-                }), 401
+                    "code": 403,
+                    'message': "无管理端访问权限"
+                }), 403
 
             if not admin.check_password(password):
                 return jsonify({
                     "code": 402,
-                    'msg':"密码错误",
+                    'msg': "邮箱或密码错误",
                     'token' : "Null",
                     'User_Name' : "Null"
                 }),402
@@ -246,6 +259,7 @@ def admin_login():
                 'code' : 200,
                 'msg' : "登录成功",
                 'token' : create_access_token(identity=email),
+                'refresh_token' : create_refresh_token(identity=email),
                 'User_Name' : admin.username,
                 'role' : admin.role,
                 'role_rank' : admin.role_rank,
@@ -270,15 +284,62 @@ def admin_login():
         return jsonify(data),403
 
 
+# ── 令牌续期与吊销（2026-09-16 安全加固）──
+# access 2h / refresh 14d：前端 packages/api 对 401 静默调 /auth/refresh 续期并重放原请求；
+# 每次刷新轮换 refresh（旧的即时吊销），退出时 access+refresh 双吊销。
+
+def _revoke_claims(claims):
+    """按 JWT claims 吊销令牌（jti + exp）。"""
+    revoke_token(claims["jti"], datetime.fromtimestamp(claims["exp"], tz=timezone.utc))
+
+
+@bp.route("/refresh", methods=["POST"])
+@jwt_required(refresh=True)
+def refresh():
+    """用 refresh token 换发全新令牌对；旧 refresh 即时吊销（轮换防重放）。"""
+    identity = get_jwt_identity()
+    # 封禁/注销兜底：/auth/* 不经过 app.before_request 的封禁拦截，这里自查
+    user = UserModel.query.filter_by(email=identity).first()
+    if not user or (user.status or 'active') == 'banned':
+        return jsonify({"code": 403, "message": "账号不可用"}), 403
+    _revoke_claims(get_jwt())  # 旧 refresh 进 blocklist
+    return jsonify({
+        "code": 200,
+        "token": create_access_token(identity=identity),
+        "refresh_token": create_refresh_token(identity=identity),
+    }), 200
+
+
+@bp.route("/logout", methods=["POST"])
+def logout():
+    """退出登录：吊销当前 access（Bearer）与请求体携带的 refresh_token。
+
+    幂等设计——不挂 @jwt_required：token 已过期/已吊销时退出仍应成功，
+    前端本地清理不依赖本端点结果（fire-and-forget）。
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            _revoke_claims(decode_token(auth_header[7:]))
+        except Exception:
+            pass  # 无效/过期 access：无甚可吊销
+
+    body = request.get_json(silent=True) or {}
+    refresh_raw = body.get("refresh_token")
+    if refresh_raw and isinstance(refresh_raw, str):
+        try:
+            _revoke_claims(decode_token(refresh_raw))
+        except Exception:
+            pass
+
+    return jsonify({"code": 200, "message": "已退出"}), 200
+
 
 # @bp.route("/mail/test")
 # def mail_test():
 #     messages = Message(subject="mail test", recipients=["jerrycaocao@126.com"], body="mail test")
 #     mail.send(messages)
 #     return "mail send succeed"
-
-
-from exts import limiter
 
 
 # 邮件验证码获取端口
@@ -311,6 +372,7 @@ def get_email_captcha():
 
 
 @bp.route("/find_password", methods=["POST"])
+@limiter.limit("5/minute")
 @swag_from('../apidocs/user/find_password.yaml')
 @audit_log(operation="找回密码", is_login=True)
 def find_password():
@@ -320,9 +382,10 @@ def find_password():
     captcha = data['Captcha']
     user = UserModel.query.filter_by(email=email).first()
     if user is None:
+        # 中性话术（2026-09-16 加固）：防邮箱枚举；找回流程由邮箱验证码把关
         return jsonify({
             "code": 400,
-            "message": "用户不存在"
+            "message": "账号或验证码有误"
         }), 400
 
     # 从Redis中获取验证码
