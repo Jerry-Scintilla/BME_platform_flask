@@ -91,8 +91,8 @@ def _sync_plans(camp):
 
 
 def _camp_writable(camp):
-    """archived 营只读：禁止一切营期内写操作（列表/看板等读取不受限）。"""
-    return camp.status != 'archived'
+    """archived/deleted 营只读：禁止一切营期内写操作（列表/看板等读取不受限）。"""
+    return camp.status not in ('archived', 'deleted')
 
 
 def _visible_student_ids(camp_id, user):
@@ -511,11 +511,35 @@ def session_create():
                     "session": _session_dict(camp)})
 
 
+@bp.route("/sessions/<int:sid>", methods=["DELETE"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="删除营期（逻辑删除）")
+def session_delete(sid):
+    """营期逻辑删除（09-16）：status='deleted'（讨论区 STATUS_DELETED 同款先例），
+    成员/考勤/档案等物理数据全保留，恢复走数据库层。全部列表出口过滤 deleted；
+    写操作由 _camp_writable 一律拒绝；若为招募指针同时清 is_featured。
+    running 营不可直接删（在营成员仍在使用）——先结营归档再删；条件更新防并发。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if camp.status == 'running':
+        return jsonify({"code": 400, "message": "进行中的营期不可直接删除，请先结营归档再删除"}), 400
+    n = CampSession.query.filter(CampSession.id == sid,
+                                 CampSession.status != 'deleted')\
+        .update({"status": 'deleted', "is_featured": False, "updated_at": datetime.now()})
+    if not n:
+        return jsonify({"code": 409, "message": "删除失败：该营期已是删除状态"}), 409
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已删除（逻辑删除，数据保留，可由管理员恢复）"})
+
+
 @bp.route("/sessions")
 @jwt_required()
 def session_list():
     user = _current_user()
-    q = CampSession.query
+    # 逻辑删除的营对所有人不可见（admin 亦然；恢复走数据库层）
+    q = CampSession.query.filter(CampSession.status != 'deleted')
     # 当前用户的营内身份（非管理员可见性判定 + 卡片身份标记共用）
     my_rows = CampMember.query.filter_by(user_id=user.id).all()
     member_ids = {m.camp_session_id for m in my_rows}
@@ -663,7 +687,7 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
     if not camp:
         return None, ("营期不存在", 404)
     if not _camp_writable(camp):
-        return None, ("营期已归档，只读", 400)
+        return None, ("营期已归档或删除，只读", 400)
     user = UserModel.query.get(user_id)
     if not user:
         return None, ("用户不存在", 404)
@@ -722,7 +746,7 @@ def member_assign_batch(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     items = (request.json or {}).get("items")
     if not isinstance(items, list) or not items:
         return jsonify({"code": 400, "message": "缺少 items 数组"}), 400
@@ -777,7 +801,7 @@ def member_remove(sid, uid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
     if not m:
         return jsonify({"code": 404, "message": "成员不存在"}), 404
@@ -817,7 +841,7 @@ def course_add(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     # 09-12 方向制砍双源：learning 营课程由分类方向定义，不再手动挂课（CampCourse 留给项目营）
     if camp.category == 'learning':
         return jsonify({"code": 400, "message": "培训营课程由分类方向定义，请在营期设置的分类中绑定课程"}), 400
@@ -842,7 +866,7 @@ def course_remove(sid, cid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     if camp.category == 'learning':
         return jsonify({"code": 400, "message": "培训营课程由分类方向定义，无手动移除"}), 400
     cc = CampCourse.query.filter_by(camp_session_id=sid, course_id=cid).first()
@@ -900,7 +924,7 @@ def plan_regenerate(sid):
     if not _capability_enabled(camp, 'attendance'):
         return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     if not _pledge_daily(camp):
         return jsonify({"code": 400, "message": "本营考勤模式为按周累计，无承诺出勤日"}), 400
     cnt = _sync_plans(camp)
@@ -1435,7 +1459,7 @@ def reward_issue():
         return jsonify({"code": 400, "message": "缺少参数"}), 400
     camp = CampSession.query.get(sid)
     if not camp or not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     if not (user.is_admin()):
         if not _in_my_team(sid, user, uid):
             return jsonify({"code": 403, "message": "无权给该学员发奖励"}), 403
@@ -1475,7 +1499,7 @@ def seat_assign():
         return jsonify({"code": 400, "message": "缺少参数"}), 400
     camp = CampSession.query.get(sid)
     if not camp or not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     if not _capability_enabled(camp, 'seat'):
         return jsonify({"code": 400, "message": "本营期未启用座位（能力开关关闭）"}), 400
     if not SeatModel.query.get(seat_id):
@@ -1766,7 +1790,7 @@ def join_request_batch_approve(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     items = (request.json or {}).get("items")
     if not isinstance(items, list) or not items:
         return jsonify({"code": 400, "message": "缺少 items 数组"}), 400
@@ -1835,7 +1859,7 @@ def member_update(sid, uid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
     if not m:
         return jsonify({"code": 404, "message": "成员不存在"}), 404
@@ -2105,7 +2129,7 @@ def team_progress_certify(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     user = _current_user()
     d = request.json or {}
     student_uid, chapter_id = d.get("student_user_id"), d.get("chapter_id")
