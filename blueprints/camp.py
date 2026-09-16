@@ -1676,30 +1676,23 @@ def join_request_list(sid):
     return jsonify({"code": 200, "requests": data, "mentors": _camp_mentors(sid)})
 
 
-@bp.route("/join-requests/<int:rid>/approve", methods=["POST"])
-@jwt_required()
-@camp_role()
-@audit_log(operation="批准营期申请")
-def join_request_approve(rid):
-    req = CampJoinRequest.query.get(rid)
-    if not req:
-        return jsonify({"code": 404, "message": "申请不存在"}), 404
-    if req.status != 'pending':
-        return jsonify({"code": 400, "message": "该申请已处理"}), 400
-    d = request.json or {}
-    # 学员审批时老师选定归属导生（body team_mentor_id）；auto_plan=False 改由手选日期建 plan
-    # 启用选导生的营期：忽略 body 导生——学员先进营无导生，归属由开营前的选导生活动决定
+def _apply_join_approval(req, join_mentor):
+    """单条加入申请审批落地（approve / batch-approve 共用，09-16 抽取）：
+    建成员（申请角色）+ 学员手选承诺日建 plan + 状态翻转 + 通过通知。
+    不 commit（随调用方事务）；_assign_member 失败即返回不落任何写。
+    返回 (CampMember, None) 或 (None, (message, code))。"""
+    # 学员审批时老师选定归属导生（join_mentor）；auto_plan=False 改由手选日期建 plan。
+    # 启用选导生的营期：忽略指定导生——学员先进营无导生，归属由开营前的选导生活动决定
     # （老师确需给插班生预分配时，走成员管理 member_assign / member_update 显式指定）
     _camp = CampSession.query.get(req.camp_session_id)
-    join_mentor = None if (_camp and _camp.mentor_selection_enabled) else d.get("team_mentor_id")
-    m, err = _assign_member(req.camp_session_id, req.user_id, join_mentor, auto_plan=False,
+    mentor = None if (_camp and _camp.mentor_selection_enabled) else join_mentor
+    m, err = _assign_member(req.camp_session_id, req.user_id, mentor, auto_plan=False,
                             role=(req.apply_role or "student"))
     if err:
-        msg, code = err
-        return jsonify({"code": code, "message": msg}), code
+        return None, err
     # 用学员申请时手选的承诺日建 CampAttendancePlan（替代 _gen_plan 自动工作日）
     # 09-12 三模式：仅模式 A（每日承诺出勤）建 plan；按周累计/不考勤跳过
-    plan_camp = CampSession.query.get(req.camp_session_id) if m.role == 'student' else None
+    plan_camp = _camp if m.role == 'student' else None
     if plan_camp and _pledge_daily(plan_camp):
         days = []
         try:
@@ -1725,8 +1718,7 @@ def join_request_approve(rid):
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
     # 通知学生：入营申请已通过（同事务，commit 之前）
-    camp = CampSession.query.get(req.camp_session_id)
-    camp_name = camp.name if camp else '营期'
+    camp_name = _camp.name if _camp else '营期'
     mentor_name = None
     if getattr(m, 'team_mentor_id', None):      # 老师审批时可能未指定归属导生
         mu = UserModel.query.get(m.team_mentor_id)
@@ -1735,13 +1727,72 @@ def join_request_approve(rid):
     content = f"你的入营申请已通过，欢迎加入「{camp_name}」。"
     if mentor_name:
         content += f"你的导生是 {mentor_name}，可在营期内联系。"
-    elif camp and camp.mentor_selection_enabled:
+    elif _camp and _camp.mentor_selection_enabled:
         content += "你的导生将通过开营前的选导生活动确定，请留意通知。"
     create_notification(req.user_id, "入营申请已通过", content,
                         category='camp', source_type='join_request',
                         source_id=req.id, camp_session_id=req.camp_session_id)
+    return m, None
+
+
+@bp.route("/join-requests/<int:rid>/approve", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="批准营期申请")
+def join_request_approve(rid):
+    req = CampJoinRequest.query.get(rid)
+    if not req:
+        return jsonify({"code": 404, "message": "申请不存在"}), 404
+    if req.status != 'pending':
+        return jsonify({"code": 400, "message": "该申请已处理"}), 400
+    m, err = _apply_join_approval(req, (request.json or {}).get("team_mentor_id"))
+    if err:
+        msg, code = err
+        return jsonify({"code": code, "message": msg}), code
     db.session.commit()
     return jsonify({"code": 200, "message": "已批准并加入营期", "member_id": m.id})
+
+
+@bp.route("/sessions/<int:sid>/join-requests/batch-approve", methods=["POST"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="批量批准营期申请")
+def join_request_batch_approve(sid):
+    """批量批准加入申请（09-16 多选/一键通过，学员与导生申请通用）：
+    body {items: [{id, team_mentor_id?}, ...]}，members/batch 同款契约——逐项校验
+    逐项回报，部分成功必须逐项列明；单事务提交，全部失败不落库。
+    仅收本营申请；已处理/已在营的项回报 failed 不阻断其余项。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    items = (request.json or {}).get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"code": 400, "message": "缺少 items 数组"}), 400
+    if len(items) > 200:
+        return jsonify({"code": 400, "message": "单次批量上限 200 项"}), 400
+    results, ok = [], 0
+    for it in items:
+        rid = it.get("id") if isinstance(it, dict) else None
+        req = CampJoinRequest.query.get(rid) if rid else None
+        if not req or req.camp_session_id != sid:
+            results.append({"id": rid, "status": "failed", "message": "申请不存在"})
+            continue
+        if req.status != 'pending':
+            results.append({"id": rid, "status": "failed", "message": "该申请已处理"})
+            continue
+        m, err = _apply_join_approval(req, it.get("team_mentor_id"))
+        if err:
+            msg, _code = err
+            results.append({"id": rid, "status": "failed", "message": msg})
+        else:
+            results.append({"id": rid, "status": "approved", "member_id": m.id})
+            ok += 1
+    if ok:
+        db.session.commit()
+    return jsonify({"code": 200, "message": f"已通过 {ok}/{len(items)} 项",
+                    "approved": ok, "results": results})
 
 
 @bp.route("/join-requests/<int:rid>/reject", methods=["POST"])
