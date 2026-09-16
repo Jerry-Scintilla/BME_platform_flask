@@ -1967,6 +1967,81 @@ def team_progress(sid):
                     "courses": courses_summary, "students": data})
 
 
+@bp.route("/sessions/<int:sid>/progress/board")
+@jwt_required()
+@camp_role('mentor')
+def progress_board(sid):
+    """营期学习进度看板（管理端营详情「学习进度」tab 数据源，09-16）：
+    按导生团队（CampMember.team_mentor_id）分桶，每组课程列 = 该组导生名片方向绑定的课程
+    ——方向制下各组课程不同，故组=独立子矩阵而非全营单矩阵；学员行逐课进度块与
+    team/progress / my-direction 同口径（_course_block）。导生调用仅返回本组
+    （_visible_student_ids），与将来导生端看板化共用本端点；archived 营可读（结营复盘，
+    快照口径保留）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    user = _current_user()
+    visible = set(_visible_student_ids(sid, user))
+    buckets = defaultdict(list)                     # team_mentor_id -> [CampMember]
+    for s in CampMember.query.filter_by(camp_session_id=sid, role='student').all():
+        if s.user_id in visible:
+            buckets[s.team_mentor_id].append(s)
+
+    groups, sum_cert, sum_total, sum_done = [], 0, 0, 0
+    for mentor_id, rows in buckets.items():
+        if mentor_id is None:
+            g = {"mentor_user_id": None, "mentor_name": None, "direction": None,
+                 "hint": "尚未归属导生（开放报名后随导生继承方向）",
+                 "courses": [], "students": []}
+        else:
+            m_user = UserModel.query.get(mentor_id)
+            direction = _direction_of_mentor(camp, mentor_id)
+            g = {"mentor_user_id": mentor_id,
+                 "mentor_name": m_user.username if m_user else "",
+                 "direction": direction["name"] if direction else None,
+                 "hint": (None if direction and direction["course_ids"]
+                          else "导生尚未设置方向（或方向未绑定课程）"),
+                 "courses": [], "students": []}
+            if direction and direction["course_ids"]:
+                g["courses"] = [
+                    {"course_id": cid,
+                     "course_title": (CourseModel.query.get(cid).title
+                                      if CourseModel.query.get(cid) else "")}
+                    for cid in direction["course_ids"]]
+        g_cert = g_total = 0
+        for s in rows:
+            u = UserModel.query.get(s.user_id)
+            blocks = [_course_block(camp, c["course_id"], s.user_id)
+                      for c in g["courses"]]
+            s_cert = sum(b["certified_chapters"] for b in blocks)
+            s_total = sum(b["total_chapters"] for b in blocks)
+            sum_done += sum(1 for b in blocks
+                            if b["course_status"] == UserCourseModel.STATUS_COMPLETED)
+            g_cert, g_total = g_cert + s_cert, g_total + s_total
+            g["students"].append({
+                "student_user_id": s.user_id, "username": u.username if u else "",
+                "certified_rate": round(100 * s_cert / s_total) if s_total else None,
+                "courses": blocks,
+            })
+        g["students"].sort(key=lambda x: (-(x["certified_rate"] if x["certified_rate"] is not None else -1),
+                                          x["username"]))
+        g["certified_rate"] = round(100 * g_cert / g_total) if g_total else None
+        sum_cert, sum_total = sum_cert + g_cert, sum_total + g_total
+        groups.append(g)
+    # 有方向组按方向名→导生名排前，无方向组次之，未分组殿后
+    groups.sort(key=lambda g: (g["mentor_user_id"] is None,
+                               g["direction"] is None,
+                               g["direction"] or "zz", g["mentor_name"] or ""))
+    summary = {
+        "group_count": sum(1 for g in groups if g["mentor_user_id"] is not None),
+        "student_count": sum(len(g["students"]) for g in groups),
+        "certified_chapters": sum_cert, "total_chapters": sum_total,
+        "completed_courses": sum_done,
+        "certified_rate": round(100 * sum_cert / sum_total) if sum_total else None,
+    }
+    return jsonify({"code": 200, "summary": summary, "groups": groups})
+
+
 @bp.route("/sessions/<int:sid>/team/progress/certify", methods=["POST", "DELETE"])
 @jwt_required()
 @camp_role('mentor')
