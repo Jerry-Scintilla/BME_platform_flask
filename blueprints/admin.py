@@ -95,6 +95,40 @@ def admin_set_user_level(user_id):
                     "data": {"user_id": target.id, "username": target.username, "old_level": old, "level": level}})
 
 
+@bp.route("/users/level/batch", methods=["POST"])
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation="批量升级用户等级")
+def admin_level_batch():
+    """批量升级一级（09-16）：body {user_ids: [...]}，每人在当前等级上 +1；
+    LV4 不再上升（逐项 failed 回报），camp/members 批量同款契约——逐项校验逐项
+    列明、单事务提交、全部失败不落库；上限 200 人。"""
+    user_ids = (request.get_json(silent=True) or {}).get('user_ids')
+    if not isinstance(user_ids, list) or not user_ids:
+        return jsonify({"code": 400, "message": "缺少 user_ids 数组"}), 400
+    if len(user_ids) > 200:
+        return jsonify({"code": 400, "message": "单次批量上限 200 人"}), 400
+    results, ok = [], 0
+    for uid in user_ids:
+        target = UserModel.query.get(uid)
+        if not target:
+            results.append({"user_id": uid, "status": "failed", "message": "用户不存在"})
+            continue
+        old = target.level or 1
+        if old >= 4:
+            results.append({"user_id": uid, "username": target.username,
+                            "status": "failed", "message": "已是最高等级 LV4"})
+            continue
+        target.level = old + 1
+        results.append({"user_id": uid, "username": target.username, "status": "upgraded",
+                        "old_level": old, "level": old + 1})
+        ok += 1
+    if ok:
+        db.session.commit()
+    return jsonify({"code": 200, "message": f"已升级 {ok}/{len(user_ids)} 人",
+                    "upgraded": ok, "results": results})
+
+
 @bp.route("/users/<int:user_id>", methods=["PUT"])
 @jwt_required()
 @check_permission('system_management')
