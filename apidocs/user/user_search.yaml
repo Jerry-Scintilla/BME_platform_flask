@@ -1,0 +1,33 @@
+站内用户搜索（全站搜索·用户域，登录即可）
+---
+tags:
+  - 用户模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: token
+  - name: keyword
+    in: query
+    type: string
+    required: true
+    description: 搜索关键词（用户名模糊匹配）
+  - name: page
+    in: query
+    type: integer
+    required: false
+    default: 1
+  - name: page_size
+    in: query
+    type: integer
+    required: false
+    default: 20
+    description: 上限 50
+
+responses:
+  200:
+    description: 搜索成功（仅公开字段：id/username/avatar_url/level/institute/major，不含邮箱学号）
+  400:
+    description: 关键词为空或分页参数错误

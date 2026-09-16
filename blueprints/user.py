@@ -4,6 +4,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from flask import Blueprint, request, redirect, jsonify
+from sqlalchemy import or_
 import base64
 
 # 导入拓展
@@ -234,6 +235,37 @@ def user_profile(user_id):
         },
     }
     return jsonify(data)
+
+
+# 全站搜索·用户域（2026-09-16，待办 B.2 第一步）：登录即可搜；
+# 字段走 /user/profile 同款隐私口径（不含邮箱/学号），与 admin 的 user_list 完全独立
+@bp.route("/search")
+@jwt_required()
+@swag_from('../apidocs/user/user_search.yaml')
+def user_search():
+    """站内用户搜索：username 模糊匹配（%/_ 转义），排除封禁用户。
+    ?keyword= 必填；?page=1&page_size=20（上限 50）。"""
+    keyword = (request.args.get("keyword") or "").strip()
+    if not keyword:
+        return jsonify({"code": 400, "message": "请输入搜索关键词"}), 400
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        page_size = min(50, max(1, int(request.args.get("page_size", 20))))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "分页参数错误"}), 400
+    like = "%" + keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    # status 可空（NULL != 'banned' 在 SQL 里恒假，须显式兼容），封禁用户不入结果
+    q = UserModel.query.filter(
+        or_(UserModel.status.is_(None), UserModel.status != 'banned'),
+        UserModel.username.like(like, escape="\\"))
+    total = q.count()
+    rows = q.order_by(UserModel.id).offset((page - 1) * page_size).limit(page_size).all()
+    users = [{
+        "id": u.id, "username": u.username, "avatar_url": u.avatar_url,
+        "level": u.level, "institute": u.institute, "major": u.major,
+    } for u in rows]
+    return jsonify({"code": 200, "total": total, "page": page,
+                    "page_size": page_size, "users": users})
 
 
 @bp.route("/user_list")
