@@ -1772,6 +1772,41 @@ class CampArchiveRevision(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
+# ── 营期组会留档（2026-09-17，migrate_34）──
+# 培训组与项目组通用：组长（导生）/项目负责人提交，组员可查看下载；结营整体只读。
+# 双作用域：team=培训组（现役学习营不落 camp_unit，组锚点=导生本人）；unit=项目组（挂 camp_unit）。
+
+class CampMeeting(db.Model):
+    """组会纪要：标题+会议日期+文字纪要+附件（文件/视频）。窗口=营期未归档即可提交
+    （selecting 预备会 / running 例会都算，与组长活动考勤同口径）；结营 _camp_writable 只读。"""
+    __tablename__ = 'camp_meeting'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    scope = db.Column(db.String(10), nullable=False)            # team（培训组）/ unit（项目组）
+    unit_id = db.Column(db.Integer, db.ForeignKey('camp_unit.id'), nullable=True, index=True)   # scope=unit 时必填
+    mentor_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)      # scope=team 时的组长（导生）
+    title = db.Column(db.String(200), nullable=False)
+    meeting_date = db.Column(db.Date, nullable=False)
+    content = db.Column(db.Text)                                # 文字纪要（可空=纯附件/视频）
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class CampMeetingAttachment(db.Model):
+    """组会附件（对象存储引用；独立建表不复用既有附件表——FK 各绑本域）。
+    视频/文件之别由 content_type 派生（video/* 走代理端点 inline+Range 播放），不落列。"""
+    __tablename__ = 'camp_meeting_attachment'
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey('camp_meeting.id', ondelete='CASCADE'),
+                           nullable=False, index=True)
+    object_key = db.Column(db.String(255), nullable=False)
+    filename = db.Column(db.String(200), nullable=False)
+    size = db.Column(db.Integer)
+    content_type = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
 # ── 项目广场（功能扩展轮 §五，双来源展示板块）──
 # camp=营期项目「发布」投影（显式动作非自动同步；发布即已审）；community=用户自由分享（免审上架+管理员下架）。
 # 红线：展示不反向驱动营期流程；档案附件/模板引用不复制（引用为安全，档案冻结后不可变）。

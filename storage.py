@@ -37,6 +37,34 @@ class _LocalObject:
         pass    # no-op：minio 调用方有 close+release_conn 双调先例，保持同构
 
 
+class _BoundedReader:
+    """限定最多读 length 字节的文件包装（HTTP Range 分段读取用）。
+    兼容 _LocalObject 的使用方式（read/close），__iter__ 按块耗尽后自然停止。"""
+
+    def __init__(self, fh, length):
+        self._fh = fh
+        self._remaining = max(int(length), 0)
+
+    def read(self, size=-1):
+        if self._remaining <= 0:
+            return b""
+        if size is None or size < 0:
+            size = self._remaining
+        chunk = self._fh.read(min(size, self._remaining))
+        self._remaining -= len(chunk)
+        return chunk
+
+    def __iter__(self):
+        while True:
+            chunk = self.read(1024 * 1024)
+            if not chunk:
+                break
+            yield chunk
+
+    def close(self):
+        self._fh.close()
+
+
 class MinioStorage:
     """MinIO / S3 兼容后端（原 Storage 逻辑平移）。"""
 
@@ -72,9 +100,10 @@ class MinioStorage:
     def stat_object(self, key):
         return self._client.stat_object(self.bucket, key)
 
-    def get_object(self, key):
-        """返回可读响应流（调用方负责关闭并 release_conn）。"""
-        return self._client.get_object(self.bucket, key)
+    def get_object(self, key, offset=None, length=None):
+        """返回可读响应流（调用方负责关闭并 release_conn）。
+        offset/length 用于 HTTP Range 分段读取（视频拖动进度条依赖 206）。"""
+        return self._client.get_object(self.bucket, key, offset=offset, length=length)
 
     def remove_object(self, key):
         """删除对象；对象已不存在时静默成功（幂等），其他错误抛出。"""
@@ -125,8 +154,13 @@ class LocalStorage:
         st = os.stat(self._path(key))    # 不存在抛 FileNotFoundError，对齐 minio 抛错语义
         return types.SimpleNamespace(size=st.st_size)
 
-    def get_object(self, key):
-        return _LocalObject(open(self._path(key), "rb"))
+    def get_object(self, key, offset=None, length=None):
+        fh = open(self._path(key), "rb")
+        if offset is not None:
+            fh.seek(offset)
+        if length is None:
+            return _LocalObject(fh)
+        return _LocalObject(_BoundedReader(fh, length))
 
     def remove_object(self, key):
         try:
@@ -174,9 +208,10 @@ class Storage:
     def stat_object(self, key):
         return self._impl_or_fail().stat_object(key)
 
-    def get_object(self, key):
-        """返回可读响应流（调用方负责关闭并 release_conn——local 后端两者皆可用）。"""
-        return self._impl_or_fail().get_object(key)
+    def get_object(self, key, offset=None, length=None):
+        """返回可读响应流（调用方负责关闭并 release_conn——local 后端两者皆可用）。
+        offset/length 为 HTTP Range 分段读取参数，缺省整读（既有调用方不受影响）。"""
+        return self._impl_or_fail().get_object(key, offset=offset, length=length)
 
     def remove_object(self, key):
         """删除对象；对象已不存在时静默成功（幂等），其他错误抛出。"""
