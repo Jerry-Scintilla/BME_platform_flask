@@ -311,10 +311,16 @@ def refresh():
     if not user or (user.status or 'active') == 'banned':
         return jsonify({"code": 403, "message": "账号不可用"}), 403
     _revoke_claims(get_jwt())  # 旧 refresh 进 blocklist
+    # 身份随行（2026-09-17）：前端 store 的 role/permissions 只在登录时写一次、
+    # 永不更新，后台改身份后旧客户端要到重新登录才生效（降级用户营期页 isStaff
+    # 假真）。续期响应带上最新身份，前端 401 静默续期时同步回 store 自愈。
     return jsonify({
         "code": 200,
         "token": create_access_token(identity=identity),
         "refresh_token": create_refresh_token(identity=identity),
+        "role": user.role,
+        "permissions": get_user_permissions(user.id),
+        "level": user.level,
     }), 200
 
 
