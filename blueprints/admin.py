@@ -129,6 +129,48 @@ def admin_level_batch():
                     "upgraded": ok, "results": results})
 
 
+@bp.route("/users/level/batch_set", methods=["POST"])
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation="批量设定用户等级")
+def admin_level_batch_set():
+    """批量设为指定等级（09-17）：body {user_ids: [...], level: 1-4}；
+    已在目标等级的逐项 skipped（不算失败），与 batch 同款契约——逐项校验逐项
+    列明、单事务提交、全部失败不落库；上限 200 人。"""
+    data = request.get_json(silent=True) or {}
+    user_ids = data.get('user_ids')
+    level = data.get('level')
+    if level not in (1, 2, 3, 4):
+        return jsonify({"code": 400, "message": "level 仅支持 1-4"}), 400
+    if not isinstance(user_ids, list) or not user_ids:
+        return jsonify({"code": 400, "message": "缺少 user_ids 数组"}), 400
+    if len(user_ids) > 200:
+        return jsonify({"code": 400, "message": "单次批量上限 200 人"}), 400
+    results, ok, skipped = [], 0, 0
+    for uid in user_ids:
+        target = UserModel.query.get(uid)
+        if not target:
+            results.append({"user_id": uid, "status": "failed", "message": "用户不存在"})
+            continue
+        old = target.level or 1
+        if old == level:
+            skipped += 1
+            results.append({"user_id": uid, "username": target.username, "status": "skipped",
+                            "old_level": old, "level": level})
+            continue
+        target.level = level
+        results.append({"user_id": uid, "username": target.username, "status": "set",
+                        "old_level": old, "level": level})
+        ok += 1
+    if ok:
+        db.session.commit()
+    message = f"已调整 {ok}/{len(user_ids)} 人"
+    if skipped:
+        message += f"（{skipped} 人已是 LV{level}）"
+    return jsonify({"code": 200, "message": message,
+                    "updated": ok, "results": results})
+
+
 @bp.route("/users/<int:user_id>", methods=["PUT"])
 @jwt_required()
 @check_permission('system_management')
