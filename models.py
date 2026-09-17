@@ -1807,6 +1807,65 @@ class CampMeetingAttachment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
+class CampMeetingChapterPlan(db.Model):
+    """组会·课内进度布置（2026-09-17，migrate_35）：本次组会指定到下次组会前
+    完成/认证的章节（多选）。认证态不落本表——读 camp_chapter_certification
+    投影（单一真相源），仅 team 域使用（项目营无按章认证）。"""
+    __tablename__ = 'camp_meeting_chapter_plan'
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey('camp_meeting.id', ondelete='CASCADE'),
+                           nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False)   # 冗余（矩阵列分组用）
+    chapter_id = db.Column(db.Integer, db.ForeignKey('chapter.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('meeting_id', 'chapter_id', name='uq_cmtplan_chapter'),
+    )
+
+
+class CampMeetingTask(db.Model):
+    """组会·课外任务：导生布置、组员提交。一次组会=一个教学单元（纪要+课内布置+课外任务），
+    submit_type 约束学生交什么：file=需交文件 / text=需交文字 / any=任一（缺省）。"""
+    __tablename__ = 'camp_meeting_task'
+    id = db.Column(db.Integer, primary_key=True)
+    meeting_id = db.Column(db.Integer, db.ForeignKey('camp_meeting.id', ondelete='CASCADE'),
+                           nullable=False, index=True)
+    title = db.Column(db.String(200), nullable=False)
+    note = db.Column(db.String(500))                      # 任务说明（导生口述内容的书面化）
+    submit_type = db.Column(db.String(10), nullable=False, default='any')
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class CampMeetingTaskSubmission(db.Model):
+    """组会任务提交：每人每任务一条 upsert（改文字/补删附件），审阅以最新态为准；
+    有效性按 submit_type 判（file=有附件 / text=有文字 / any=任一）。"""
+    __tablename__ = 'camp_meeting_task_submission'
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('camp_meeting_task.id', ondelete='CASCADE'),
+                        nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    content = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('task_id', 'student_user_id', name='uq_cmtsub_task_student'),
+    )
+
+
+class CampMeetingTaskAttachment(db.Model):
+    """组会任务附件（对象存储引用；审阅打包按 学生/任务 分文件夹流式 zip 直出）。"""
+    __tablename__ = 'camp_meeting_task_attachment'
+    id = db.Column(db.Integer, primary_key=True)
+    submission_id = db.Column(db.Integer, db.ForeignKey('camp_meeting_task_submission.id', ondelete='CASCADE'),
+                              nullable=False, index=True)
+    object_key = db.Column(db.String(255), nullable=False)
+    filename = db.Column(db.String(200), nullable=False)
+    size = db.Column(db.Integer)
+    content_type = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
 # ── 项目广场（功能扩展轮 §五，双来源展示板块）──
 # camp=营期项目「发布」投影（显式动作非自动同步；发布即已审）；community=用户自由分享（免审上架+管理员下架）。
 # 红线：展示不反向驱动营期流程；档案附件/模板引用不复制（引用为安全，档案冻结后不可变）。

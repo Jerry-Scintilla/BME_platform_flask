@@ -22,6 +22,9 @@ MEDIA_PATHS = {
     'meeting': '/camp/meetings/attachments',
     'material': '/camp/materials/attachments',
     'submission': '/camp/submissions/attachments',
+    'meeting_task': '/camp/meetings/task-attachments',   # 组会任务附件（详情回包内嵌直链）
+    # meeting_zip：组会提交打包（路径含后缀，调 media_signed_url 时显式传 path）
+    'meeting_zip': '/camp/meetings',
 }
 
 
@@ -31,12 +34,19 @@ def sign_media_token(kind, oid, uid, exp):
                     msg, hashlib.sha256).hexdigest()
 
 
-def media_token_response(kind, oid, uid):
-    """各 /token 端点统一回包：短签直连相对 URL（前端拼 API_URL）。"""
+def media_signed_url(kind, oid, uid, path=None):
+    """生成短签直连相对 URL（media_token_response 与详情回包内嵌直链共用）。
+    path 显式给出时用完整路径（如 zip 端点带后缀），缺省按 kind 拼 {前缀}/{oid}。"""
     exp = int(time.time()) + MEDIA_TOKEN_TTL
     st = sign_media_token(kind, oid, uid, exp)
+    base = path if path is not None else f"{MEDIA_PATHS[kind]}/{oid}"
+    return f"{base}?u={uid}&e={exp}&st={st}"
+
+
+def media_token_response(kind, oid, uid, path=None):
+    """各 /token 端点统一回包：短签直连相对 URL（前端拼 API_URL）。path 缺省按 kind 拼标准端点。"""
     return jsonify({"code": 200, "expires_in": MEDIA_TOKEN_TTL,
-                    "url": f"{MEDIA_PATHS[kind]}/{oid}?u={uid}&e={exp}&st={st}"})
+                    "url": media_signed_url(kind, oid, uid, path)})
 
 
 def resolve_media_request(kind, oid):
