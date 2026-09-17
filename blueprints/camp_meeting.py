@@ -689,6 +689,42 @@ def meeting_detail(mid):
     return jsonify(_detail_payload(m, user, _can_manage(user, m)))
 
 
+@bp.route("/sessions/<int:sid>/team/task-summary")
+@jwt_required()
+def team_task_summary(sid):
+    """导生「学员进度」页的作业维度（09-17）：本团队每学员的组会任务提交汇总
+    （已交数 / 任务总数），与章节认证并显——学习全貌一页看齐。admin 无归属组返回空。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    user = _current_user()
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    if not user.is_admin() and (not member or member.role != 'mentor'):
+        return jsonify({"code": 403, "message": "仅本营导生可查看任务汇总"}), 403
+    mentor_id = None if user.is_admin() else user.id
+    meeting_ids = ([m.id for m in CampMeeting.query.filter_by(
+        camp_session_id=sid, scope='team', mentor_id=mentor_id).all()]
+        if mentor_id else [])
+    student_ids = ([r.user_id for r in CampMember.query.filter_by(
+        camp_session_id=sid, role='student', team_mentor_id=mentor_id).all()]
+        if mentor_id else [])
+    tasks = (CampMeetingTask.query.filter(
+        CampMeetingTask.meeting_id.in_(meeting_ids)).all() if meeting_ids else [])
+    subs = (CampMeetingTaskSubmission.query
+            .filter(CampMeetingTaskSubmission.task_id.in_([t.id for t in tasks])).all()
+            if tasks else [])
+    att_counts = _att_counts_of([s.id for s in subs])
+    task_by_id = {t.id: t for t in tasks}
+    done = set()   # (task_id, student_id) 有效提交对
+    for s in subs:
+        t = task_by_id[s.task_id]
+        if s.student_user_id in student_ids and _submission_valid(s, t, att_counts.get(s.id, 0)):
+            done.add((t.id, s.student_user_id))
+    return jsonify({"code": 200, "meeting_count": len(meeting_ids), "task_total": len(tasks),
+                    "summary": [{"user_id": uid, "submitted": sum(
+                        1 for (tid, su) in done if su == uid)} for uid in student_ids]})
+
+
 @bp.route("/meetings/<int:mid>/assignments", methods=["PUT"])
 @jwt_required()
 @audit_log(operation="保存组会布置")
