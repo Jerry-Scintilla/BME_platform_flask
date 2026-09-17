@@ -359,6 +359,32 @@ def mentor_import_candidates_by_level(sid):
                              "emails": [u.email for u in users]}})
 
 
+@bp.route("/sessions/<int:sid>/mentor-import/search", methods=["GET"])
+@jwt_required()
+@camp_role()
+def mentor_import_search(sid):
+    """导入导生·按姓名搜人（只读选人器）：手头只有名字没有邮箱时用。
+    username 模糊匹配（%/_ 转义口径同 /user/search），回邮箱/等级/院系辅助挑人；
+    附 already_member 供前端置灰；排除管理员与封禁用户（口径同 candidates-by-level）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    keyword = (request.args.get("keyword") or "").strip()
+    if not keyword:
+        return jsonify({"code": 400, "message": "请输入搜索关键词"}), 400
+    like = "%" + keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    member_ids = {m.user_id for m in CampMember.query.filter_by(camp_session_id=sid).all()}
+    rows = (UserModel.query
+            .filter(or_(UserModel.status.is_(None), UserModel.status != 'banned'),
+                    UserModel.username.like(like, escape="\\"))
+            .order_by(UserModel.id).limit(20).all())
+    users = [{"user_id": u.id, "username": u.username, "email": u.email,
+              "level": u.level or 1, "institute": u.institute, "major": u.major,
+              "already_member": u.id in member_ids}
+             for u in rows if not u.is_admin()]
+    return jsonify({"code": 200, "data": {"keyword": keyword, "users": users}})
+
+
 @bp.route("/sessions/<int:sid>/mentor-registration", methods=["POST"])
 @jwt_required()
 @audit_log(operation="导生报名入营")
