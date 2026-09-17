@@ -6,6 +6,7 @@ Seed 脚本 — 初始化开发数据
     python seed.py     # 再填充数据
 """
 import hashlib
+import secrets
 import sys
 import os
 
@@ -36,11 +37,16 @@ def seed():
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 1. 用户
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 09-17 安全加固：超管种子密码随机生成、seed 时打印一次——
+        # 旧版硬编码 admin123/123456 写在仓库里，等同于公开的后门凭据
+        admin_plain_pwd = secrets.token_urlsafe(12)
+        teacher_plain_pwd = secrets.token_urlsafe(12)
         users_data = [
             {
                 "username": "管理员",
                 "email": "admin@bme.sysu.edu.cn",
-                "password": md5("admin123"),
+                "password": md5(admin_plain_pwd),
+                "_plain": admin_plain_pwd,
                 "role": "super_admin",
                 "admin_tag": "developer",
                 "sex": "男",
@@ -62,7 +68,8 @@ def seed():
             {
                 "username": "李老师",
                 "email": "liteacher@bme.sysu.edu.cn",
-                "password": md5("123456"),
+                "password": md5(teacher_plain_pwd),
+                "_plain": teacher_plain_pwd,
                 "role": "super_admin",
                 "admin_tag": "teacher",
                 "sex": "女",
@@ -105,6 +112,8 @@ def seed():
             db.session.add(user)
             created_users.append(user)
             print(f"  ✅ 创建用户: {u['username']} ({u['email']})")
+            if u.get("_plain"):
+                print(f"  [随机密码] {u['username']}：{u['_plain']}（仅打印此一次，请立即保存或登录后改密）")
 
         db.session.flush()
         admin_user, student1, teacher, student2 = created_users

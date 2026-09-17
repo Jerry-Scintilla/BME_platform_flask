@@ -229,6 +229,14 @@ def admin_login():
                 "User_Name": "Null",
             }), 402
 
+        # 封禁拦截（2026-09-17 补洞：/auth/* 不走全局 before_request，此处自查。
+        # 此前漏检——被封禁账号虽被业务端点拦，但仍能从管理端登录页成功换新 token）
+        if (admin.status or 'active') == 'banned':
+            return jsonify({
+                "code": 403,
+                "message": "账号已被封禁，请联系管理员"
+            }), 403
+
         try:
             user_permission = UserPermissionModel.query.filter_by(
                 user_id=admin.id,
