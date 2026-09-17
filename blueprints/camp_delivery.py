@@ -35,6 +35,7 @@ from . import camp_role, audit_log, _current_user
 from .camp import _camp_writable
 from .camp_project import (_camp_or_404, _unit_or_404, _is_unit_leader, _notify,
                            _norm_nodes, _write_nodes, _instantiate_milestones)
+from .media_sign import media_token_response, resolve_media_request
 
 bp = Blueprint("camp_delivery", __name__, url_prefix="/camp")
 
@@ -708,10 +709,11 @@ def submission_review(sid):
                     "milestone_status": m.status})
 
 
-@bp.route("/submissions/attachments/<int:aid>")
+@bp.route("/submissions/attachments/<int:aid>/token")
 @jwt_required()
-def attachment_download(aid):
-    """附件代理下载（MinIO 对象不暴露直链；仅项目成员/admin）。"""
+def attachment_token(aid):
+    """换取附件短签直连（2026-09-17 修旧链裸链 401：`<a target=_blank>` 带不了
+    Authorization 头，前端点击下载时先来换签；权限同下载，2h 多次有效）。"""
     a = CampSubmissionAttachment.query.get(aid)
     if not a:
         return jsonify({"code": 404, "message": "附件不存在"}), 404
@@ -721,6 +723,26 @@ def attachment_download(aid):
     if err:
         return err
     user = _current_user()
+    if not _unit_role(unit, user):
+        return jsonify({"code": 403, "message": "仅项目成员可下载附件"}), 403
+    return media_token_response('submission', aid, user.id)
+
+
+@bp.route("/submissions/attachments/<int:aid>")
+def attachment_download(aid):
+    """附件代理下载（MinIO 对象不暴露直链；仅项目成员/admin）。
+    双通道鉴权：短签（/token 换取）或常规 JWT 均可，见 media_sign.py。"""
+    a = CampSubmissionAttachment.query.get(aid)
+    if not a:
+        return jsonify({"code": 404, "message": "附件不存在"}), 404
+    s = CampSubmissionVersion.query.get(a.submission_id)
+    m = CampMilestone.query.get(s.milestone_id)
+    unit, camp, err = _unit_or_404(m.unit_id)
+    if err:
+        return err
+    user, auth_err = resolve_media_request('submission', aid)
+    if auth_err:
+        return auth_err
     if not _unit_role(unit, user):
         return jsonify({"code": 403, "message": "仅项目成员可下载附件"}), 403
     try:

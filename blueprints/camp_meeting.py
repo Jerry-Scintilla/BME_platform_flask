@@ -14,16 +14,13 @@
 camp/{sid}/meeting/{meeting_id}/{uuid}{ext}；下载走鉴权代理端点
 /camp/meetings/attachments/<aid>，视频 inline 直播并支持 HTTP Range（206）。
 """
-import hashlib
-import hmac
 import os
 import re
-import time
 import uuid
 from datetime import datetime
 
 from flask import Blueprint, request, jsonify, Response
-from flask_jwt_extended import jwt_required, verify_jwt_in_request
+from flask_jwt_extended import jwt_required
 from urllib.parse import quote
 
 from exts import db
@@ -35,6 +32,8 @@ from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team
 from .camp_project import _camp_or_404, _unit_or_404, _is_unit_leader, _usernames
 from .camp_delivery import _unit_role
+from .media_sign import media_token_response, resolve_media_request
+from .notification import create_notification
 
 bp = Blueprint("camp_meeting", __name__, url_prefix="/camp")
 
@@ -189,6 +188,22 @@ def _scope_write_denied(m, camp):
     return None
 
 
+def _notify_new_meeting(user_ids, camp_id, meeting, by_name, role_label):
+    """新纪要通知组员（调用方剔除创建人；失败不阻断主流程）。
+    source_type='camp_meeting' → 通知中心点击深链 /camp?tab=meetings&sid=
+    （项目营无营期层 tab，CampView 自动回落 ProjectHub，同链两用）。"""
+    for uid in user_ids:
+        try:
+            create_notification(
+                uid, f"新组会纪要：{meeting.title}",
+                f"{role_label} {by_name} 提交了「{meeting.title}」"
+                f"（{meeting.meeting_date.isoformat()}）的组会纪要，点击查看。",
+                category='camp', source_type='camp_meeting', source_id=meeting.id,
+                camp_session_id=camp_id)
+        except Exception:   # 通知失败不阻断主流程
+            pass
+
+
 # ─────────────────────────────────────────────
 # 培训组（导生组）域
 # ─────────────────────────────────────────────
@@ -244,6 +259,11 @@ def team_meeting_create(sid):
     if err:
         return err
     db.session.commit()
+    _notify_new_meeting(
+        [r.user_id for r in CampMember.query.filter_by(
+            camp_session_id=sid, role='student', team_mentor_id=m.mentor_id).all()
+         if r.user_id != user.id],
+        sid, m, user.username, "组长")
     names = _usernames({m.created_by})
     return jsonify({"code": 200, "message": "组会纪要已提交",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
@@ -302,6 +322,11 @@ def unit_meeting_create(uid):
     if err:
         return err
     db.session.commit()
+    _notify_new_meeting(
+        [r.user_id for r in CampUnitMember.query.filter_by(
+            unit_id=unit.id, status='active').all()
+         if r.user_id != user.id],
+        camp.id, m, user.username, "项目负责人")
     names = _usernames({m.created_by})
     return jsonify({"code": 200, "message": "组会纪要已提交",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
@@ -406,20 +431,8 @@ def meeting_attachment_delete(aid):
 
 # ─────────────────────────────────────────────
 # 附件代理下载（支持 HTTP Range——视频在线播放依赖 206）
+# 短签直连机制见 media_sign.py（三链共用：meeting / material / submission）
 # ─────────────────────────────────────────────
-
-# 媒体直连短签：`<a>/<video>` 带不了 Authorization 头（课程资源 Down_Code 同思路），
-# 但视频播放要发多次 Range 请求，一次性码不可用——改短时多次有效（2h，对齐 access token）。
-MEETING_MEDIA_TTL = 2 * 60 * 60
-
-
-def _sign_media(aid, uid, exp):
-    """附件直连签名：HMAC(JWT_SECRET, aid:uid:exp)，服务时重验并复查可见性。"""
-    from flask import current_app
-    msg = f"{aid}:{uid}:{exp}".encode()
-    return hmac.new(current_app.config["JWT_SECRET_KEY"].encode(),
-                    msg, hashlib.sha256).hexdigest()
-
 
 @bp.route("/meetings/attachments/<int:aid>/token")
 @jwt_required()
@@ -434,10 +447,7 @@ def meeting_attachment_token(aid):
     user = _current_user()
     if not _can_view(user, m):
         return jsonify({"code": 403, "message": "仅本组成员可访问组会附件"}), 403
-    exp = int(time.time()) + MEETING_MEDIA_TTL
-    st = _sign_media(aid, user.id, exp)
-    return jsonify({"code": 200, "expires_in": MEETING_MEDIA_TTL,
-                    "url": f"/camp/meetings/attachments/{aid}?u={user.id}&e={exp}&st={st}"})
+    return media_token_response('meeting', aid, user.id)
 
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
@@ -479,26 +489,9 @@ def meeting_attachment_download(aid):
     m, err = _meeting_or_404(a.meeting_id)
     if err:
         return err
-    if request.args.get("st") or request.args.get("u") or request.args.get("e"):
-        try:
-            uid, exp = int(request.args["u"]), int(request.args["e"])
-        except (KeyError, TypeError, ValueError):
-            return jsonify({"code": 403, "message": "附件签名无效"}), 403
-        if (exp < time.time()
-                or not hmac.compare_digest(_sign_media(aid, uid, exp),
-                                           request.args.get("st") or "")):
-            return jsonify({"code": 403, "message": "附件链接已过期，请刷新后重试"}), 403
-        user = UserModel.query.get(uid)
-        if not user or (user.status or 'active') == 'banned':
-            return jsonify({"code": 403, "message": "附件签名无效"}), 403
-    else:
-        try:
-            verify_jwt_in_request()
-        except Exception:
-            return jsonify({"code": 401, "message": "未提供访问令牌"}), 401
-        user = _current_user()
-        if not user:
-            return jsonify({"code": 401, "message": "用户未认证"}), 401
+    user, auth_err = resolve_media_request('meeting', aid)
+    if auth_err:
+        return auth_err
     if not _can_view(user, m):
         return jsonify({"code": 403, "message": "仅本组成员可下载组会附件"}), 403
     try:

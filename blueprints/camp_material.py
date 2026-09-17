@@ -21,6 +21,7 @@ from models import CampSession, CampMember, Chapter, CampChapterMaterial, CampCh
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team
 from .camp_project import _camp_or_404
+from .media_sign import media_token_response, resolve_media_request
 
 bp = Blueprint("camp_material", __name__, url_prefix="/camp")
 
@@ -167,10 +168,11 @@ def material_delete(mid):
     return jsonify({"code": 200, "message": "已删除"})
 
 
-@bp.route("/materials/attachments/<int:aid>")
+@bp.route("/materials/attachments/<int:aid>/token")
 @jwt_required()
-def material_attachment_download(aid):
-    """附件代理下载（存储对象不暴露直链；权限同删除：本人/本团队导生/admin）。"""
+def material_attachment_token(aid):
+    """换取附件短签直连（2026-09-17 修旧链裸链 401：`<a target=_blank>` 带不了
+    Authorization 头，前端点击下载时先来换签；权限同下载，2h 多次有效）。"""
     a = CampChapterMaterialAttachment.query.get(aid)
     if not a:
         return jsonify({"code": 404, "message": "附件不存在"}), 404
@@ -178,6 +180,24 @@ def material_attachment_download(aid):
     if not m:
         return jsonify({"code": 404, "message": "材料不存在"}), 404
     user = _current_user()
+    if not _can_manage(user, m):
+        return jsonify({"code": 403, "message": "仅材料本人、本团队导生或老师可下载"}), 403
+    return media_token_response('material', aid, user.id)
+
+
+@bp.route("/materials/attachments/<int:aid>")
+def material_attachment_download(aid):
+    """附件代理下载（存储对象不暴露直链；权限同删除：本人/本团队导生/admin）。
+    双通道鉴权：短签（/token 换取）或常规 JWT 均可，见 media_sign.py。"""
+    a = CampChapterMaterialAttachment.query.get(aid)
+    if not a:
+        return jsonify({"code": 404, "message": "附件不存在"}), 404
+    m = CampChapterMaterial.query.get(a.material_id)
+    if not m:
+        return jsonify({"code": 404, "message": "材料不存在"}), 404
+    user, auth_err = resolve_media_request('material', aid)
+    if auth_err:
+        return auth_err
     if not _can_manage(user, m):
         return jsonify({"code": 403, "message": "仅材料本人、本团队导生或老师可下载"}), 403
     try:
