@@ -1363,7 +1363,7 @@ class CampMentorMatch(db.Model):
 
 
 class CampMentorFavorite(db.Model):
-    """选导生·学员收藏（市集个人便签：不限数量、不参与配对，仅收集期可标记）。
+    """选导生·学员收藏（市集个人便签：不限数量、不参与配对；浏览期起即可标记）。
     与志愿（CampMentorPreference）解耦——收藏只服务浏览整理，导出/协调一律不读此表。"""
     __tablename__ = 'camp_mentor_favorite'
     id = db.Column(db.Integer, primary_key=True)

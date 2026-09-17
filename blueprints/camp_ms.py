@@ -367,7 +367,7 @@ def _send_phase_notifications(camp, phase):
             camp_session_id=camp.id, role='student').all()]
         for uid in students:
             create_notification(uid, "选导生开始",
-                                f"「{name}」选导生开始，请在 {_fmt_dt(camp.ms_preference_deadline)} 前浏览导生名片并提交 1-3 个志愿。",
+                                f"「{name}」志愿提交通道开启，请在 {_fmt_dt(camp.ms_preference_deadline)} 前提交 1-3 个志愿。",
                                 **common)
     elif phase == MS_DONE:
         # 截止提醒仅告知老师（Phase 1a 后全局「老师」即 super_admin；批量查询无法走
@@ -770,8 +770,8 @@ def favorite_add(sid, mentor_id):
         return err
     if student.team_mentor_id:
         return jsonify({"code": 403, "message": "你已有归属导生，无需再收藏"}), 403
-    if _ms_phase(camp) != MS_COLLECTING:
-        return jsonify({"code": 403, "message": "当前不在收藏窗口（志愿收集期内可标记）"}), 403
+    if _ms_phase(camp) not in (MS_UPCOMING, MS_COLLECTING):
+        return jsonify({"code": 403, "message": "当前不在收藏窗口（浏览期与收集期可标记）"}), 403
     if not _member_row(sid, mentor_id, role='mentor') or not CampMentorProfile.query.filter_by(
             camp_session_id=sid, user_id=mentor_id).first():
         return jsonify({"code": 400, "message": "所选导师不在本营或未发布名片"}), 400
