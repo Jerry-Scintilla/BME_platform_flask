@@ -399,7 +399,7 @@ def mentor_registration(sid):
         return jsonify({"code": 400, "message": "管理员无需申请加入营期"}), 400
     if camp.category == 'project':
         return jsonify({"code": 400, "message": "项目营无导生身份，请在开放报名后以成员身份申请"}), 400
-    if (user.level or 1) < 2:
+    if _capability_enabled(camp, 'mentor_level_gate') and (user.level or 1) < 2:
         return jsonify({"code": 403, "message": "导生报名需 LV2 及以上"}), 403
     if CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first():
         return jsonify({"code": 200, "message": "你已是本营成员，无需重复报名"}), 200
@@ -671,6 +671,16 @@ def session_update(sid):
             except (ValueError, TypeError):
                 caps = {}
             caps["attendance"] = bool(pd_["attendance_enabled"])
+            policy.capabilities = json.dumps(caps)
+        # 09-17 等级门槛开关（营期行可覆盖）：mentor_level_gate=培训营导生自助报名需 LV2+（类型默认开）/
+        # leader_level_gate=项目营负责人申报需 LV2+（类型默认关）；只覆写出现的位，其余位不动
+        gate_updates = {k: bool(pd_[k]) for k in ("mentor_level_gate", "leader_level_gate") if k in pd_}
+        if gate_updates:
+            try:
+                caps = json.loads(policy.capabilities) if policy.capabilities else {}
+            except (ValueError, TypeError):
+                caps = {}
+            caps.update(gate_updates)
             policy.capabilities = json.dumps(caps)
         db.session.flush()
         # 切离「每日承诺出勤」体系 → 清空本营承诺日（按周/不考勤不再用；切回 daily 手动重生成）

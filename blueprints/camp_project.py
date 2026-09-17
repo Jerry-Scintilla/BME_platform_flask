@@ -32,7 +32,7 @@ from models import (
 )
 
 from . import camp_role, audit_log, _current_user
-from .camp import _camp_writable
+from .camp import _camp_writable, _capability_enabled
 from .notification import create_notification
 
 bp = Blueprint("camp_project", __name__, url_prefix="/camp")
@@ -299,6 +299,10 @@ def application_submit(sid):
         return jsonify({"code": 400, "message": "申报期已结束（项目申报仅在「待开放」阶段开放）"}), 400
     if user.is_admin():
         return jsonify({"code": 400, "message": "管理员不作为项目负责人申报；如需代管请使用成员账号"}), 400
+    # 09-17 等级门槛可配置：leader_level_gate 类型默认关（=上线以来零门槛，旧营期行为不变），
+    # 管理端按营期打开后 LV1 不可自助申报；admin 代审/换负责人路径不受限（管理动作不查等级）
+    if _capability_enabled(camp, 'leader_level_gate') and (user.level or 1) < 2:
+        return jsonify({"code": 403, "message": "项目负责人申报需 LV2 及以上"}), 403
     d = request.json or {}
     name = (d.get("name") or "").strip()
     if not name or len(name) > 100:

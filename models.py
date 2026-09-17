@@ -1116,7 +1116,10 @@ CAMP_CATEGORY_DEFAULTS = {
         'project_limit': None,
         'course_policy': 'admin_managed',   # 阶段 5 生效：管理员负责课程，导生范围内共建
         # v1.3 能力开关（营期行可覆盖；后端按位门禁端点，前端按位渲染 tab）
-        'capabilities': {'attendance': True, 'leave': True, 'seat': True},
+        # mentor_level_gate（09-17）：导生自助报名需 LV2+——类型默认开=退役前硬编码行为的向前兼容；
+        # 旧行 capabilities JSON 无此位 → _policy_dict 合并时回退类型默认，旧营期行为不变
+        'capabilities': {'attendance': True, 'leave': True, 'seat': True,
+                         'mentor_level_gate': True},
     },
     'project': {
         'label': '项目营',
@@ -1125,7 +1128,10 @@ CAMP_CATEGORY_DEFAULTS = {
         'match_rule': 'multi_project',      # 每人最多参与 N 个项目（负责人自己的计入）
         'project_limit': 3,
         'course_policy': 'unit_creator',    # 阶段 5 生效：负责人在自己项目范围开课
-        'capabilities': {'attendance': False, 'leave': False, 'seat': False},  # 首期全关（09-12 拍板）
+        # leader_level_gate（09-17）：负责人申报需 LV2+——类型默认关=项目营上线以来零门槛的向前兼容，
+        # 管理端按营期打开；旧行无此位 → 回退类型默认 False，旧项目营行为不变
+        'capabilities': {'attendance': False, 'leave': False, 'seat': False,  # 首期全关（09-12 拍板）
+                         'leader_level_gate': False},
     },
 }
 
