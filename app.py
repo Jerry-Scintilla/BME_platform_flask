@@ -1,6 +1,7 @@
 import os
 
 from flask import Flask, redirect, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 import config
 from exts import db, mail, limiter, redis_client
 from storage import storage
@@ -22,6 +23,12 @@ from flask_redis import FlaskRedis
 app = Flask(__name__,
             static_folder=os.path.join(config.DATA_ROOT, 'avatars'),
             static_url_path='/data/avatars')
+
+# 反代后取真实客户端 IP（2026-09-17 修复）：nginx 已传 X-Forwarded-For，但 Flask
+# 不信任代理头 → request.remote_addr 恒为 127.0.0.1，flask-limiter 按它限流，
+# 全平台共享一个桶——验证码接口 1/minute 沦为"每分钟全站只发一封"（当晚 429 率
+# 94.8%）。x_for=1：仅信任本机 nginx 一跳，伪造 XFF 无法提权限流键。
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # 配置CORS（2026-09-16 安全加固）：来源白名单由 CORS_ORIGINS 指定（逗号分隔，
 # 含协议与端口，如 https://xxx.example.edu.cn,http://127.0.0.1:8081）。
