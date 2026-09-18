@@ -1,8 +1,13 @@
 """营期·组会留档蓝图（2026-09-17，migrate_34）：培训组（导生组）与项目组通用。
 
-组长（培训组=导生）/项目负责人提交组会纪要：标题+会议日期+文字纪要+附件（文件/视频），
-组员可查看下载；窗口=营期未归档即可提交（selecting 预备会 / running 例会都算，
-与组长活动考勤同口径），结营 _camp_writable 整体只读。
+组会生命周期（2026-09-18 调整为按开会的自然顺序）：
+发起（标题+日期，轻量创建）→ 布置（课内章节+课外任务，/assignments）→
+会后提交纪要（文字/文件/录像，经 PUT 编辑端点首次归档）。
+状态不落列，由「有纪要」（content 或附件存在）派生：无纪要=进行中、有纪要=已完结；
+迁移前的存量记录一律带纪要，天然全是已完结态。
+
+组长（培训组=导生）/项目负责人发起与归档，组员可查看下载；窗口=营期未归档即可操作
+（selecting 预备会 / running 例会都算，与组长活动考勤同口径），结营 _camp_writable 整体只读。
 
 双作用域（一张表桥接两套组长模型，方案 §3.7/§3.8）：
 - scope='team'：培训组。现役学习营不落 camp_unit（mentor_team 单元迁移窗口未到），
@@ -261,18 +266,32 @@ def _scope_write_denied(m, camp):
 
 
 def _notify_new_meeting(user_ids, camp_id, meeting, by_name, role_label):
-    """新纪要通知组员（调用方剔除创建人；失败不阻断主流程）。
+    """发起组会通知组员（调用方剔除创建人；失败不阻断主流程）。
     source_type='camp_meeting' → 通知中心点击深链 /camp?tab=meetings&sid=
     （项目营无营期层 tab，CampView 自动回落 ProjectHub，同链两用）。"""
     for uid in user_ids:
         try:
             create_notification(
-                uid, f"新组会纪要：{meeting.title}",
+                uid, f"新组会：{meeting.title}",
+                f"{role_label} {by_name} 发起了组会「{meeting.title}」"
+                f"（{meeting.meeting_date.isoformat()}），布置发布后会再次通知。",
+                category='camp', source_type='camp_meeting', source_id=meeting.id,
+                camp_session_id=camp_id)
+        except Exception:   # 通知失败不阻断主流程
+            pass
+
+
+def _notify_minutes_submitted(user_ids, camp_id, meeting, by_name, role_label):
+    """纪要归档通知组员（进行中→已完结的首次提交时一次性通知，失败不阻断主流程）。"""
+    for uid in user_ids:
+        try:
+            create_notification(
+                uid, f"组会纪要已归档：{meeting.title}",
                 f"{role_label} {by_name} 提交了「{meeting.title}」"
                 f"（{meeting.meeting_date.isoformat()}）的组会纪要，点击查看。",
                 category='camp', source_type='camp_meeting', source_id=meeting.id,
                 camp_session_id=camp_id)
-        except Exception:   # 通知失败不阻断主流程
+        except Exception:
             pass
 
 
@@ -307,10 +326,11 @@ def team_meeting_list(sid):
 
 @bp.route("/sessions/<int:sid>/team-meetings", methods=["POST"])
 @jwt_required()
-@audit_log(operation="提交组会纪要")
+@audit_log(operation="发起组会")
 def team_meeting_create(sid):
-    """组长（本营导生）提交培训组组会纪要（multipart：title/meeting_date 必填 +
-    content 选填 + Files[] 多文件；content/Files 至少其一）。"""
+    """组长（本营导生）发起培训组组会（multipart：title/meeting_date 必填；
+    content/Files 选填——补录已开完的会时可随创建一并归档纪要，正常流程会后经
+    「提交纪要」（PUT 编辑端点）补交，未归档前组会保持进行中态）。"""
     camp, err = _camp_or_404(sid)
     if err:
         return err
@@ -319,14 +339,12 @@ def team_meeting_create(sid):
     user = _current_user()
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
     if not member or member.role != 'mentor':
-        return jsonify({"code": 403, "message": "仅组长（导生）可提交组会纪要"}), 403
+        return jsonify({"code": 403, "message": "仅组长（导生）可发起组会"}), 403
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
     fields, files, err = _parse_meeting_form()
     if err:
         return err
-    if not fields["content"] and not files:
-        return jsonify({"code": 400, "message": "请填写纪要内容或上传附件"}), 400
     m = CampMeeting(camp_session_id=sid, scope='team', mentor_id=user.id,
                     created_by=user.id, **fields)
     db.session.add(m)
@@ -341,7 +359,7 @@ def team_meeting_create(sid):
          if r.user_id != user.id],
         sid, m, user.username, "组长")
     names = _usernames({m.created_by})
-    return jsonify({"code": 200, "message": "组会纪要已提交",
+    return jsonify({"code": 200, "message": "组会已创建",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
                         meeting_id=m.id).all(), names)})
 
@@ -376,15 +394,16 @@ def unit_meeting_list(uid):
 
 @bp.route("/units/<int:uid>/meetings", methods=["POST"])
 @jwt_required()
-@audit_log(operation="提交项目组会纪要")
+@audit_log(operation="发起项目组会")
 def unit_meeting_create(uid):
-    """项目负责人提交项目组组会纪要（表单同培训组链）。"""
+    """项目负责人发起项目组组会（表单同培训组链：title/meeting_date 必填，
+    纪要会后经「提交纪要」补归档）。"""
     unit, camp, err = _unit_or_404(uid)
     if err:
         return err
     user = _current_user()
     if not _is_unit_leader(unit, user):
-        return jsonify({"code": 403, "message": "仅项目负责人可提交组会纪要"}), 403
+        return jsonify({"code": 403, "message": "仅项目负责人可发起组会"}), 403
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
     if unit.status != 'active':
@@ -392,8 +411,6 @@ def unit_meeting_create(uid):
     fields, files, err = _parse_meeting_form()
     if err:
         return err
-    if not fields["content"] and not files:
-        return jsonify({"code": 400, "message": "请填写纪要内容或上传附件"}), 400
     m = CampMeeting(camp_session_id=camp.id, scope='unit', unit_id=unit.id,
                     created_by=user.id, **fields)
     db.session.add(m)
@@ -408,7 +425,7 @@ def unit_meeting_create(uid):
          if r.user_id != user.id],
         camp.id, m, user.username, "项目负责人")
     names = _usernames({m.created_by})
-    return jsonify({"code": 200, "message": "组会纪要已提交",
+    return jsonify({"code": 200, "message": "组会已创建",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
                         meeting_id=m.id).all(), names)})
 
@@ -426,17 +443,18 @@ def _meeting_or_404(mid):
 
 @bp.route("/meetings/<int:mid>", methods=["PUT"])
 @jwt_required()
-@audit_log(operation="编辑组会纪要")
+@audit_log(operation="提交组会纪要")
 def meeting_update(mid):
-    """编辑组会（创建人/现任组长/admin）：multipart，未提供的文字字段保持旧值，
-    Files[] 为追加附件（历史附件不覆盖；删单个附件走附件端点）。"""
+    """提交/编辑组会纪要（创建人/现任组长/admin）：multipart，未提供的文字字段保持旧值，
+    Files[] 为追加附件（历史附件不覆盖；删单个附件走附件端点）。
+    会后首次归档纪要（原本无文字且无附件）时通知组员，之后的安静编辑不再打扰。"""
     m, err = _meeting_or_404(mid)
     if err:
         return err
     camp = CampSession.query.get(m.camp_session_id)
     user = _current_user()
     if not _can_manage(user, m):
-        return jsonify({"code": 403, "message": "仅创建人或组长可编辑组会纪要"}), 403
+        return jsonify({"code": 403, "message": "仅创建人或组长可提交组会纪要"}), 403
     denied = _scope_write_denied(m, camp)
     if denied:
         return denied
@@ -446,6 +464,7 @@ def meeting_update(mid):
     keep_atts = CampMeetingAttachment.query.filter_by(meeting_id=m.id).count()
     if not fields["content"] and not files and not keep_atts:
         return jsonify({"code": 400, "message": "请填写纪要内容或上传附件"}), 400
+    had_minutes = bool(m.content) or keep_atts > 0    # 归档前态（进行中）
     m.title, m.meeting_date, m.content = (fields["title"], fields["meeting_date"],
                                           fields["content"])
     db.session.flush()
@@ -453,6 +472,11 @@ def meeting_update(mid):
     if err:
         return err
     db.session.commit()
+    if not had_minutes:                              # 进行中 → 已完结，一次性通知
+        _notify_minutes_submitted(
+            [u.id for u in _group_students(m) if u.id != user.id],
+            m.camp_session_id, m, user.username,
+            "组长" if m.scope == 'team' else "项目负责人")
     names = _usernames({m.created_by})
     return jsonify({"code": 200, "message": "组会纪要已更新",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
