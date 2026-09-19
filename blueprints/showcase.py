@@ -8,7 +8,10 @@
 红线（基本方案 §五）：① 展示不反向驱动营期流程；② community 条目不进营期组织约束；
 ③ 档案附件引用不复制。评论走 discussion 基建（scope_type='project'）。
 """
+import io
 import json
+import os
+import uuid
 
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
@@ -18,6 +21,9 @@ from models import (
     UserModel, ShowcaseProject, ShowcaseFavorite,
     CampUnit, ProjectProfile, CampMember,
 )
+from storage import storage
+import imaging
+from .media import media_url
 
 from . import audit_log, _current_user
 
@@ -26,6 +32,34 @@ bp = Blueprint("showcase", __name__, url_prefix="/showcase")
 PROJECT_STATUS = ('idea', 'ongoing', 'done')
 SOURCE_TEXT = {'camp': '营期项目', 'community': '自由分享'}
 STATUS_TEXT = {'idea': '构思中', 'ongoing': '进行中', 'done': '已完成'}
+GALLERY_MAX = 9          # 图集上限（单次+存量合计）
+IMG_EXTS = ("jpg", "jpeg", "png", "webp")
+IMG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _cover_thumb_url(p):
+    """封面缩略 URL：cover 存母版 '/media/showcase/{pid}/{uuid32}.webp'，
+    缩略 key = 母版 stem + '_thumb'（上传时成对写入）；无封面返回 None。"""
+    if not p.cover:
+        return None
+    stem, ext = p.cover.rsplit('.', 1)
+    return f"{stem}_thumb.{ext}"
+
+
+def _remove_cover_objects(p):
+    """删除封面母版 + 缩略两个对象（best-effort，对象缺失静默）。"""
+    if not p.cover:
+        return
+    stem, ext = p.cover.lstrip('/').rsplit('.', 1)
+    for key in (p.cover.lstrip('/'), f"{stem}_thumb.{ext}"):
+        try:
+            storage.remove_object(key)
+        except Exception:
+            pass
+
+
+def _gallery_list(p):
+    return json.loads(p.images_json) if p.images_json else []
 
 
 def _p_dict(p, user=None, favorited=None):
@@ -35,7 +69,9 @@ def _p_dict(p, user=None, favorited=None):
         "source_ref": p.source_ref, "owner_user_id": p.owner_user_id,
         "owner_name": owner.username if owner else '',
         "title": p.title, "summary": p.summary, "description": p.description,
-        "cover": p.cover, "tags": json.loads(p.tags) if p.tags else [],
+        "cover": p.cover, "cover_thumb": _cover_thumb_url(p),
+        "images": _gallery_list(p),
+        "tags": json.loads(p.tags) if p.tags else [],
         "project_status": p.project_status,
         "project_status_text": STATUS_TEXT.get(p.project_status, p.project_status),
         "status": p.status, "view_count": p.view_count,
@@ -258,6 +294,138 @@ def publish_from_camp():
     db.session.add(p)
     db.session.commit()
     return jsonify({"code": 200, "message": "已发布到项目广场", "project": _p_dict(p, user)})
+
+
+# ─────────────────────────────────────────────
+# 媒体：封面 + 图集（上传即保存，状态即所得；权限同编辑=_can_manage）
+# ─────────────────────────────────────────────
+
+@bp.route("/projects/<int:pid>/cover", methods=["POST"])
+@jwt_required()
+@audit_log(operation="上传广场项目封面")
+def project_cover_update(pid):
+    """上传/替换封面：multipart 字段 cover；转码 16:9 母版 <=1600x900 + 缩略 640x360 成对入
+    storage media/ 命名空间，替换时清旧对象（照 course_cover_update 样板）。"""
+    p = ShowcaseProject.query.get(pid)
+    user = _current_user()
+    if not p:
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+    if not _can_manage(p, user):
+        return jsonify({"code": 403, "message": "仅创建人/发布人和管理员可操作"}), 403
+    file = request.files.get("cover")
+    if not file or not file.filename:
+        return jsonify({"code": 400, "message": "缺少封面文件 cover"}), 400
+    ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
+    if ext not in IMG_EXTS:
+        return jsonify({"code": 400, "message": "封面仅支持 jpg/jpeg/png/webp"}), 400
+    if file.content_length and file.content_length > IMG_MAX_BYTES:
+        return jsonify({"code": 400, "message": "封面不能超过 10MB"}), 400
+
+    try:
+        master, thumb = imaging.showcase_cover_pair(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"封面图无效：{e}"}), 400
+
+    uid = uuid.uuid4().hex
+    master_key = f"media/showcase/{p.id}/{uid}.webp"
+    thumb_key = f"media/showcase/{p.id}/{uid}_thumb.webp"
+    try:
+        storage.put_object(master_key, io.BytesIO(master), len(master), "image/webp")
+        storage.put_object(thumb_key, io.BytesIO(thumb), len(thumb), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"封面存储失败：{e}"}), 500
+
+    _remove_cover_objects(p)                       # 替换：清旧对象（best-effort）
+    p.cover = media_url(master_key)                # 存母版完整相对 URL
+    db.session.commit()
+    return jsonify({"code": 200, "message": "封面上传成功",
+                    "cover": p.cover, "cover_thumb": _cover_thumb_url(p)})
+
+
+@bp.route("/projects/<int:pid>/cover/delete", methods=["POST"])
+@jwt_required()
+@audit_log(operation="删除广场项目封面")
+def project_cover_delete(pid):
+    """删除封面（回退首字色块兜底）。"""
+    p = ShowcaseProject.query.get(pid)
+    user = _current_user()
+    if not p:
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+    if not _can_manage(p, user):
+        return jsonify({"code": 403, "message": "仅创建人/发布人和管理员可操作"}), 403
+    _remove_cover_objects(p)
+    p.cover = None
+    db.session.commit()
+    return jsonify({"code": 200, "message": "封面已删除"})
+
+
+@bp.route("/projects/<int:pid>/images", methods=["POST"])
+@jwt_required()
+@audit_log(operation="上传广场项目图集")
+def project_images_upload(pid):
+    """追加图集：multipart 字段 images（可多文件）；单次+存量合计 <=GALLERY_MAX 张。
+    保比例缩最长边 1600（不裁切），key media/showcase/{pid}/gallery/{uuid32}.webp。"""
+    p = ShowcaseProject.query.get(pid)
+    user = _current_user()
+    if not p:
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+    if not _can_manage(p, user):
+        return jsonify({"code": 403, "message": "仅创建人/发布人和管理员可操作"}), 403
+    files = request.files.getlist("images")
+    files = [f for f in files if f and f.filename]
+    if not files:
+        return jsonify({"code": 400, "message": "缺少图片文件 images"}), 400
+    images = _gallery_list(p)
+    if len(images) + len(files) > GALLERY_MAX:
+        return jsonify({"code": 400,
+                        "message": f"图集最多 {GALLERY_MAX} 张（已有 {len(images)} 张，本次最多再传 {GALLERY_MAX - len(images)} 张）"}), 400
+    for f in files:
+        ext = os.path.splitext(f.filename)[1].lower().lstrip(".")
+        if ext not in IMG_EXTS:
+            return jsonify({"code": 400, "message": f"图片 {f.filename} 仅支持 jpg/jpeg/png/webp"}), 400
+        if f.content_length and f.content_length > IMG_MAX_BYTES:
+            return jsonify({"code": 400, "message": f"图片 {f.filename} 不能超过 10MB"}), 400
+
+    for f in files:
+        try:
+            data = imaging.showcase_gallery_bytes(f.stream)
+        except imaging.ImageError as e:
+            return jsonify({"code": 400, "message": f"图片 {f.filename} 无效：{e}"}), 400
+        key = f"media/showcase/{p.id}/gallery/{uuid.uuid4().hex}.webp"
+        try:
+            storage.put_object(key, io.BytesIO(data), len(data), "image/webp")
+        except Exception as e:
+            return jsonify({"code": 500, "message": f"图片存储失败：{e}"}), 500
+        images.append(media_url(key))
+
+    p.images_json = json.dumps(images, ensure_ascii=False) if images else None
+    db.session.commit()
+    return jsonify({"code": 200, "message": "图集已更新", "images": images})
+
+
+@bp.route("/projects/<int:pid>/images/delete", methods=["POST"])
+@jwt_required()
+@audit_log(operation="删除广场项目图集图片")
+def project_images_delete(pid):
+    """按 URL 删除图集中的单张（body {url}，URL 即上传回包里的相对路径）。"""
+    p = ShowcaseProject.query.get(pid)
+    user = _current_user()
+    if not p:
+        return jsonify({"code": 404, "message": "项目不存在"}), 404
+    if not _can_manage(p, user):
+        return jsonify({"code": 403, "message": "仅创建人/发布人和管理员可操作"}), 403
+    url = (request.json or {}).get("url")
+    images = _gallery_list(p)
+    if url not in images:
+        return jsonify({"code": 404, "message": "图集中没有这张图片"}), 404
+    images.remove(url)
+    try:                                            # 删对象 best-effort
+        storage.remove_object(url.lstrip('/'))
+    except Exception:
+        pass
+    p.images_json = json.dumps(images, ensure_ascii=False) if images else None
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已删除", "images": images})
 
 
 # ─────────────────────────────────────────────

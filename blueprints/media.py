@@ -22,6 +22,7 @@ PUBLIC_MEDIA_PREFIXES = (
     "media/medals/",
     "media/banners/",
     "media/course-covers/",
+    "media/showcase/",
 )
 
 EXT_CONTENT_TYPES = {

@@ -1881,7 +1881,8 @@ class ShowcaseProject(db.Model):
     title = db.Column(db.String(120), nullable=False)
     summary = db.Column(db.String(300))                          # 列表页简介
     description = db.Column(db.Text)                             # 详情正文
-    cover = db.Column(db.String(255))                            # 封面（可空，MVP 用色块兜底）
+    cover = db.Column(db.String(255))                            # 封面（可空，无图用色块兜底）
+    images_json = db.Column(db.Text)                             # JSON 图集相对 URL 数组（≤9，走 /projects/<id>/images 专端点）
     tags = db.Column(db.Text)                                    # JSON 字符串数组
     project_status = db.Column(db.String(20), nullable=False, default='ongoing')  # idea/ongoing/done
     status = db.Column(db.String(20), nullable=False, default='visible')          # visible/hidden（治理）

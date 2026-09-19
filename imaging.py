@@ -10,6 +10,8 @@
 - 勋章   medal_bytes         512x512 contain 到画布 q85（勋章墙大图位）
 - 轮播   banner_bytes        1600x800 cover 裁切，q80 起 ≤500KB 逐档降（运营规范）
 - 封面   course_cover_pair   3:4 中心裁切，母版 <=1200x1600 + 缩略 600x800 q82
+- 广场封面 showcase_cover_pair    16:9 中心裁切，母版 <=1600x900 + 缩略 640x360 q82
+- 广场图集 showcase_gallery_bytes 最长边 1600 保比例 q82（不裁切）
 """
 import io
 
@@ -29,6 +31,9 @@ MEDAL_SIZE = 512
 BANNER_SIZE = (1600, 800)
 COVER_MASTER_MAX = (1200, 1600)
 COVER_THUMB = (600, 800)
+SHOWCASE_COVER_MASTER_MAX = (1600, 900)
+SHOWCASE_COVER_THUMB = (640, 360)
+SHOWCASE_GALLERY_MAX_SIDE = 1600
 
 # 带透明通道的源（勋章多为 PNG）压 WebP 时保留 alpha；其余统一压到 RGB（省体积）
 def _has_alpha(img):
@@ -138,3 +143,25 @@ def course_cover_pair(stream) -> tuple[bytes, bytes]:
     if not _has_alpha(thumb):
         thumb = thumb.convert("RGB")
     return _to_webp(master), _to_webp(thumb)
+
+
+def showcase_cover_pair(stream) -> tuple[bytes, bytes]:
+    """XLAB 项目封面：16:9 中心裁切 -> (母版 <=1600x900, 缩略 640x360)，均 WebP q82。"""
+    img = _load(stream)
+    img = _center_crop(img, 16, 9)
+    master = _shrink_only(img.copy(), SHOWCASE_COVER_MASTER_MAX)
+    if not _has_alpha(master):
+        master = master.convert("RGB")
+    thumb = img.resize(SHOWCASE_COVER_THUMB, Image.LANCZOS)
+    if not _has_alpha(thumb):
+        thumb = thumb.convert("RGB")
+    return _to_webp(master), _to_webp(thumb)
+
+
+def showcase_gallery_bytes(stream) -> bytes:
+    """XLAB 项目图集：保比例缩到最长边 1600 WebP q82（不裁切，画廊原图语义）。"""
+    img = _load(stream)
+    img = _shrink_only(img, (SHOWCASE_GALLERY_MAX_SIDE, SHOWCASE_GALLERY_MAX_SIDE))
+    if not _has_alpha(img):
+        img = img.convert("RGB")
+    return _to_webp(img)

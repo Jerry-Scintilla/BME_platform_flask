@@ -249,19 +249,26 @@ def create_thread():
     scope_type = data.get('scope_type', 'global')
     scope_id = data.get('scope_id')  # global 时可为空
 
-    if not title or not content:
-        return jsonify({"code": 400, "message": "标题和内容不能为空"}), 400
-
-    # 长度校验（strip 后计字符），挡 1 字灌水
-    if len((title or '').strip()) < 4:
-        return jsonify({"code": 400, "message": "标题至少 4 个字"}), 400
-    if len((content or '').strip()) < 10:
-        return jsonify({"code": 400, "message": "正文至少 10 个字"}), 400
-
-    # 校验 scope_type
+    # 校验 scope_type（提前：title 校验按 scope 分支，project=留言式无标题）
     valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task', 'project']  # project=项目广场（功能扩展轮 §五）
     if scope_type not in valid_scopes:
         return jsonify({"code": 400, "message": f"scope_type 必须为: {', '.join(valid_scopes)}"}), 400
+
+    if not content:
+        return jsonify({"code": 400, "message": "内容不能为空"}), 400
+
+    if scope_type == 'project':
+        # 项目广场讨论区=留言式：无标题，缺省自动用正文前 20 字占位（DB title 不可空）
+        title = (title or '').strip() or (content or '').strip()[:20]
+    else:
+        if not title:
+            return jsonify({"code": 400, "message": "标题和内容不能为空"}), 400
+        # 长度校验（strip 后计字符），挡 1 字灌水
+        if len((title or '').strip()) < 4:
+            return jsonify({"code": 400, "message": "标题至少 4 个字"}), 400
+
+    if len((content or '').strip()) < 10:
+        return jsonify({"code": 400, "message": "正文至少 10 个字"}), 400
 
     # 非 global 类型需要 scope_id
     if scope_type != 'global' and not scope_id:
