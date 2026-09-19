@@ -5,7 +5,13 @@
 - 正文存 ArticleV2Model.content_md 字段，不写文件
 - _is_article_manager / _ensure_article_access 自 article.py 复制（自包含，不碰旧码）
 - ArticleV2Form 内联（不动 forms.py）
+- 社区重设计（09-19）：cover_image_key 封面 + is_official 官方推文（仅文章管理员可设）+
+  编辑器图床 /upload_image + 发布限流（同讨论帖规格）
 """
+import io
+import os
+import uuid
+
 from flask import Blueprint, request, jsonify
 import wtforms
 from wtforms.validators import length
@@ -13,11 +19,13 @@ from wtforms.validators import length
 from sqlalchemy import and_, or_
 from datetime import datetime
 
-from exts import db
+from exts import db, redis_client
 from models import (
     ArticleV2Model, UserModel, PermissionModel, UserPermissionModel,
     DiscussionThread, DiscussionReply, DiscussionReaction,
 )
+from storage import storage
+import imaging
 
 # 导入token验证模块
 from flask_jwt_extended import get_jwt_identity, jwt_required
@@ -27,10 +35,64 @@ from flasgger import swag_from
 
 # 导入审计 / 当前用户
 from . import audit_log, _current_user
-from .media import public_avatar_url
+from .media import public_avatar_url, media_url
 
 
 bp = Blueprint("article_v2", __name__, url_prefix="/v2/article")
+
+IMG_EXTS = ("jpg", "jpeg", "png", "webp")
+IMG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _publish_rate_guard(user):
+    """发文限流（同讨论帖规格：5 分钟 ≤3、小时 ≤10；redis 不可用降级不限流）。超限返回 429 响应。"""
+    uid = str(user.id)
+    try:
+        n5 = redis_client.incr(f"article_rate:{uid}:5m")
+        if n5 == 1:
+            redis_client.expire(f"article_rate:{uid}:5m", 300)
+        n1h = redis_client.incr(f"article_rate:{uid}:1h")
+        if n1h == 1:
+            redis_client.expire(f"article_rate:{uid}:1h", 3600)
+    except Exception:
+        return None
+    if n5 > 3:
+        return jsonify({"code": 429, "message": "发文太频繁，请 5 分钟后再试"}), 429
+    if n1h > 10:
+        return jsonify({"code": 429, "message": "发文太频繁，请稍后再试"}), 429
+    return None
+
+
+def _official_flag(data, user, article=None):
+    """从请求体解析 is_official：仅文章管理员可设（推文是运营动作）；其余请求一律不动该标记。
+    返回 (值或 None=不改, 错误响应或 None)。"""
+    if 'is_official' not in (data or {}):
+        return None, None
+    if not _is_article_manager(user):
+        return None, (jsonify({"code": 403, "message": "官方推文标记仅文章管理员可设置"}), 403)
+    val = data['is_official']
+    if not isinstance(val, bool):
+        return None, (jsonify({"code": 400, "message": "is_official 须为布尔值"}), 400)
+    return val, None
+
+
+def _remove_cover_objects(article):
+    """删除封面母版 + 缩略对象（best-effort）。"""
+    if not article.cover_image_key:
+        return
+    stem, ext = article.cover_image_key.lstrip('/').rsplit('.', 1)
+    for key in (article.cover_image_key.lstrip('/'), f"{stem}_thumb.{ext}"):
+        try:
+            storage.remove_object(key)
+        except Exception:
+            pass
+
+
+def _cover_thumb_url(article):
+    if not article.cover_image_key:
+        return None
+    stem, ext = article.cover_image_key.rsplit('.', 1)
+    return f"{stem}_thumb.{ext}"
 
 
 def _is_article_manager(user):
@@ -67,6 +129,9 @@ def _article_to_dict(a, with_author_avatar=False, summary=False):
         "title": a.title or '',
         "introduction": a.introduction or '',
         "status": a.status,
+        "cover": a.cover_image_key,
+        "cover_thumb": _cover_thumb_url(a),
+        "is_official": bool(a.is_official),
         "author_id": a.author_id,
         "author_name": a.author.username if a.author else '',
         "created_at": a.created_at.strftime('%Y-%m-%d %H:%M:%S') if a.created_at else '',
@@ -140,10 +205,19 @@ def article_v2_public():
     if user is None:
         return jsonify({"code": 401, "message": "用户不存在"}), 401
 
+    data = request.get_json(silent=True) or {}
+    official, err = _official_flag(data, user)
+    if err:
+        return err
+    limited = _publish_rate_guard(user)
+    if limited:
+        return limited
+
     article = ArticleV2Model(
         title=title, introduction=introduction,
         content_md=content_md, author_id=user.id,
         status=ArticleV2Model.STATUS_PUBLISHED, publish_time=datetime.now(),
+        is_official=bool(official),
     )
     db.session.add(article)
     db.session.commit()
@@ -154,6 +228,7 @@ def article_v2_public():
         "id": article.id,
         "title": article.title,
         "introduction": article.introduction,
+        "is_official": bool(article.is_official),
     }), 200
 
 
@@ -178,6 +253,10 @@ def article_v2_draft():
     if not title and not content_md.strip():
         return jsonify({"code": 400, "message": "写点标题或内容再保存草稿"}), 400
 
+    official, err = _official_flag(request.get_json(silent=True), user)
+    if err:
+        return err
+
     article_id = form.id.data
     if article_id:
         article = ArticleV2Model.query.filter_by(id=article_id).first()
@@ -191,10 +270,13 @@ def article_v2_draft():
         article.title = title
         article.introduction = introduction
         article.content_md = content_md
+        if official is not None:
+            article.is_official = official
     else:
         article = ArticleV2Model(
             title=title, introduction=introduction, content_md=content_md,
             author_id=user.id, status=ArticleV2Model.STATUS_DRAFT, publish_time=None,
+            is_official=bool(official),
         )
         db.session.add(article)
     db.session.commit()
@@ -223,6 +305,11 @@ def article_v2_publish(article_id):
         article.introduction = data['introduction']
     if 'content_md' in data:
         article.content_md = data['content_md']
+    official, err = _official_flag(data, _current_user())
+    if err:
+        return err
+    if official is not None:
+        article.is_official = official
     if article.status != ArticleV2Model.STATUS_PUBLISHED:
         # 发布前补校验：标题与正文不能空
         if not (article.title or '').strip() or not (article.content_md or '').strip():
@@ -285,6 +372,9 @@ def article_v2_get(article_id):
             "introduction": article.introduction,
             "content_md": article.content_md,
             "status": article.status,
+            "cover": article.cover_image_key,
+            "cover_thumb": _cover_thumb_url(article),
+            "is_official": bool(article.is_official),
             "publish_time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S') if article.publish_time else "",
             "author_id": article.author_id,
             "author_name": article.author.username if article.author else "",
@@ -319,8 +409,101 @@ def article_v2_edit(article_id):
         if len(content_md) > 500000:
             return jsonify({"code": 400, 'message': '正文内容过长（上限 50 万字符）'}), 400
         article.content_md = content_md
+    official, err = _official_flag(data, _current_user())
+    if err:
+        return err
+    if official is not None:
+        article.is_official = official
     db.session.commit()
     return jsonify({"code": 200, "message": "文章编辑成功"})
+
+
+# ─────────────────────────────────────────────
+# 媒体（社区重设计 09-19）：封面成对转码 + 编辑器图床
+# ─────────────────────────────────────────────
+
+# 封面上传/替换（16:9 母版+缩略成对入 storage；作者本人或文章管理员）
+@bp.route("/<int:article_id>/cover", methods=["POST"])
+@jwt_required()
+@audit_log(operation="上传文章封面")
+def article_v2_cover_update(article_id):
+    article = ArticleV2Model.query.filter_by(id=article_id).first()
+    if article is None:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+    check = _ensure_article_access(_current_user(), article)
+    if check:
+        return check
+    file = request.files.get("cover")
+    if not file or not file.filename:
+        return jsonify({"code": 400, "message": "缺少封面文件 cover"}), 400
+    ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
+    if ext not in IMG_EXTS:
+        return jsonify({"code": 400, "message": "封面仅支持 jpg/jpeg/png/webp"}), 400
+    if file.content_length and file.content_length > IMG_MAX_BYTES:
+        return jsonify({"code": 400, "message": "封面不能超过 10MB"}), 400
+
+    try:
+        master, thumb = imaging.article_cover_pair(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"封面图无效：{e}"}), 400
+
+    uid = uuid.uuid4().hex
+    master_key = f"media/articles/{article.id}/{uid}.webp"
+    thumb_key = f"media/articles/{article.id}/{uid}_thumb.webp"
+    try:
+        storage.put_object(master_key, io.BytesIO(master), len(master), "image/webp")
+        storage.put_object(thumb_key, io.BytesIO(thumb), len(thumb), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"封面存储失败：{e}"}), 500
+
+    _remove_cover_objects(article)                    # 替换：清旧对象（best-effort）
+    article.cover_image_key = media_url(master_key)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "封面上传成功",
+                    "cover": article.cover_image_key, "cover_thumb": _cover_thumb_url(article)})
+
+
+# 封面删除（回退无封面样式）
+@bp.route("/<int:article_id>/cover/delete", methods=["POST"])
+@jwt_required()
+@audit_log(operation="删除文章封面")
+def article_v2_cover_delete(article_id):
+    article = ArticleV2Model.query.filter_by(id=article_id).first()
+    if article is None:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+    check = _ensure_article_access(_current_user(), article)
+    if check:
+        return check
+    _remove_cover_objects(article)
+    article.cover_image_key = None
+    db.session.commit()
+    return jsonify({"code": 200, "message": "封面已删除"})
+
+
+# 编辑器图床（md-editor-v3 on-upload-image）：正文插图上传，保比例缩最长边 1600，
+# 返回 /media 相对 URL 供 markdown 引用。挂在作者名下（article 未建时按 uid 归档）
+@bp.route("/upload_image", methods=["POST"])
+@jwt_required()
+def article_v2_upload_image():
+    file = request.files.get("image")
+    if not file or not file.filename:
+        return jsonify({"code": 400, "message": "缺少图片文件 image"}), 400
+    ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
+    if ext not in IMG_EXTS:
+        return jsonify({"code": 400, "message": "插图仅支持 jpg/jpeg/png/webp"}), 400
+    if file.content_length and file.content_length > IMG_MAX_BYTES:
+        return jsonify({"code": 400, "message": "插图不能超过 10MB"}), 400
+    try:
+        data = imaging.showcase_gallery_bytes(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"图片无效：{e}"}), 400
+    uid = str(uuid.uuid4())
+    key = f"media/articles/inline/{uid[:8]}/{uid}.webp"
+    try:
+        storage.put_object(key, io.BytesIO(data), len(data), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"图片存储失败：{e}"}), 500
+    return jsonify({"code": 200, "url": media_url(key)})
 
 
 # 删除文章（连同其 discussion 互动数据：thread / replies / reactions，软关联需手工清）

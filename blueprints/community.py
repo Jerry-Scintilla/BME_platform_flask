@@ -40,14 +40,24 @@ def get_current_user():
 from .media import public_avatar_url as get_avatar_url   # 新链路 /media/，旧值兜底 /data/avatars/
 
 
+def _thread_images(t):
+    """帖子图集 URL 数组（json 列解析；旧帖无图为空数组）。"""
+    try:
+        return json.loads(t.images_json) if t.images_json else []
+    except (TypeError, ValueError):
+        return []
+
+
 # ==================== 热度排序 ====================
 
 # 半衰期（天）：内容每过这么多天，热度衰减一半。
 # 这是热度公式唯一的主调节旋钮——若好内容掉得太快，先调大这里（14→21→30）再动互动权重。
+# 社区重设计（09-19）分层：帖子 14 天（快节奏对话），文章 30 天（长内容慢衰减，P1 公式落地）。
 _HALF_LIFE_DAYS = 14
+_ARTICLE_HALF_LIFE_DAYS = 30
 
 
-def _hot_score(interaction, activity_dt, now):
+def _hot_score(interaction, activity_dt, now, half_life_days=_HALF_LIFE_DAYS):
     """半衰期热度分：HOT = (互动分 + 1) * 0.5 ^ (age_days / 半衰期)。
 
     - +1 给新内容基础分，零互动也有分（=1）不会沉底；
@@ -58,7 +68,7 @@ def _hot_score(interaction, activity_dt, now):
     if activity_dt is None:
         activity_dt = now
     age_days = max((now - activity_dt).total_seconds() / 86400.0, 0.0)
-    return (interaction + 1.0) * (0.5 ** (age_days / _HALF_LIFE_DAYS))
+    return (interaction + 1.0) * (0.5 ** (age_days / half_life_days))
 
 
 # ==================== 社区广场聚合信息流 ====================
@@ -139,6 +149,7 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             "id": t.id,
             "title": t.title,
             "summary": (t.content or '')[:200],
+            "images": _thread_images(t),
             "author_id": t.author_id,
             "author_name": t.author.username if t.author else "",
             "author_avatar": get_avatar_url(t.author.avatar_url) if t.author else "",
@@ -152,6 +163,7 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             # ── 排序用私有字段（返回前剔除，不下发客户端）──
             "_interaction": (t.like_count or 0) + 2 * (t.reply_count or 0),
             "_rank_dt": t.last_reply_at or t.created_at,
+            "_half_life": _HALF_LIFE_DAYS,
             # ── 回填 liked 用（调用方剔除）──
             "_like_tid": t.id,
         })
@@ -172,6 +184,8 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             "id": a.id,
             "title": a.title,
             "summary": (a.introduction or '')[:200],
+            "cover": None,                          # v1 文章无封面（前端兜底）
+            "images": [],
             "author_id": a.author_id,
             "author_name": a.author.username if a.author else "",
             "author_avatar": get_avatar_url(a.author.avatar_url) if a.author else "",
@@ -185,15 +199,19 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             # ── 排序用私有字段（返回前剔除，不下发客户端）──
             "_interaction": 2 * rc,
             "_rank_dt": rank_dt or now,
+            "_half_life": _ARTICLE_HALF_LIFE_DAYS,
             "_article_reply_count": rc,            # 确定性平局打破
             # v1 文章无点赞通道，无 _like_tid
         })
 
     # ── 3. V2 文章（Markdown，article_v2 表；与旧文章同格式并入信息流） ──
-    # 互动数取自上方预取的 v2_*_map（scope_type='article_v2' 的 thread）；无 thread 的文章显示 0
-    for a in ArticleV2Model.query.options(joinedload(ArticleV2Model.author)).filter_by(
-        status=ArticleV2Model.STATUS_PUBLISHED
-    ).all():
+    # 互动数取自上方预取的 v2_*_map（scope_type='article_v2' 的 thread）；无 thread 的文章显示 0。
+    # 社区重设计（09-19）：is_official 官方推文由顶部精选带（/community/spotlight）展示，feed 不重复。
+    v2_query = ArticleV2Model.query.options(joinedload(ArticleV2Model.author)).filter(
+        ArticleV2Model.status == ArticleV2Model.STATUS_PUBLISHED,
+        ArticleV2Model.is_official.is_(False),
+    )
+    for a in v2_query.all():
         if content_type == 'discussion':
             continue
         rc = v2_reply_map.get(a.id, 0)
@@ -204,11 +222,15 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
         last_rep = v2_last_reply_map.get(a.id)
         if last_rep is not None:
             rank_dt = last_rep if rank_dt is None else max(rank_dt, last_rep)
+        stem, ext = (a.cover_image_key.rsplit('.', 1) if a.cover_image_key else (None, None))
         items.append({
             "type": "article",
             "id": a.id,
             "title": a.title,
             "summary": (a.introduction or '')[:200],
+            "cover": a.cover_image_key,
+            "cover_thumb": f"{stem}_thumb.{ext}" if stem else None,
+            "images": [],
             "author_id": a.author_id,
             "author_name": a.author.username if a.author else "",
             "author_avatar": get_avatar_url(a.author.avatar_url) if a.author else "",
@@ -220,18 +242,21 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             "is_pinned": False,
             "article_id": a.id,
             "article_version": 2,                   # 前端据此跳 /article-v2
-            "_interaction": lc + 2 * rc,            # 与 v1 文章口径对齐：赞 + 2*评
+            # 文章热度 P1 公式（09-19 落地）：2*评 + 1*赞 + 0.3*浏览（浏览已被 view_batch 治理）
+            "_interaction": 2 * rc + 1 * lc + 0.3 * vc,
             "_rank_dt": rank_dt or now,
+            "_half_life": _ARTICLE_HALF_LIFE_DAYS,
             "_article_reply_count": rc,
             "_like_tid": tid,                       # 回填 v2 文章点赞（按其 thread id）；无 thread 时为 None
         })
 
     # 排序：置顶(is_pinned)绝对优先 → 热度分(hot)或活跃时间(latest) → 确定性平局打破
     # 用真实 datetime（_rank_dt）排序，勿用格式化字符串（空串会错误沉底）
+    # 半衰期分层（09-19）：帖子 14 天 / 文章 30 天（item._half_life）
     if sort == 'hot':
         items.sort(key=lambda x: (
             x['is_pinned'],
-            _hot_score(x['_interaction'], x['_rank_dt'], now),
+            _hot_score(x['_interaction'], x['_rank_dt'], now, x.get('_half_life', _HALF_LIFE_DAYS)),
             x.get('_article_reply_count', x['reply_count'] or 0),
             x['_rank_dt'],
         ), reverse=True)
@@ -375,3 +400,49 @@ def community_feed():
         "per_page": per_page,
         "pages": pages,
     })
+
+
+# GET /community/spotlight
+# 推文精选带（社区重设计 09-19）：最新 N 篇官方推文（is_official 且已发布），
+# 带 cover/introduction/作者；redis 60s 公共缓存（运营内容变化低频）。
+# 官方推文不进 /feed 正文流——精选带是它们的唯一展示位。
+@bp.route("/spotlight", methods=["GET"])
+@jwt_required()
+def community_spotlight():
+    limit = request.args.get('limit', 3, type=int)
+    limit = max(1, min(limit, 6))
+    cache_key = f"community:spotlight:{limit}"
+    cached = None
+    try:
+        cached = redis_client.get(cache_key)
+    except Exception:
+        cached = None
+    if cached:
+        try:
+            return jsonify(json.loads(cached))
+        except (ValueError, TypeError):
+            pass
+
+    rows = ArticleV2Model.query.options(joinedload(ArticleV2Model.author)).filter(
+        ArticleV2Model.status == ArticleV2Model.STATUS_PUBLISHED,
+        ArticleV2Model.is_official.is_(True),
+    ).order_by(ArticleV2Model.publish_time.desc()).limit(limit).all()
+    data = []
+    for a in rows:
+        stem, ext = (a.cover_image_key.rsplit('.', 1) if a.cover_image_key else (None, None))
+        data.append({
+            "id": a.id,
+            "title": a.title or '',
+            "summary": (a.introduction or '')[:120],
+            "cover": a.cover_image_key,
+            "cover_thumb": f"{stem}_thumb.{ext}" if stem else None,
+            "author_id": a.author_id,
+            "author_name": a.author.username if a.author else '',
+            "publish_time": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else '',
+        })
+    payload = {"code": 200, "data": data}
+    try:
+        redis_client.setex(cache_key, 60, json.dumps(payload))
+    except Exception:
+        pass
+    return jsonify(payload)

@@ -258,7 +258,8 @@ def _notify(article):
         uids,
         title="今日 AI 话题已更新",
         content=(article.introduction or article.title or "BME 资讯君更新了今日话题")[:200],
-        category="system",
+        # 社区重设计（09-19）：资讯是社区内容，不再占用 system 公告通道（system 留给真正的系统公告）
+        category="community",
         source_type="admin",
         source_id=article.id,
     )

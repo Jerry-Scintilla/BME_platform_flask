@@ -142,6 +142,8 @@ class ArticleV2Model(db.Model):
     introduction = db.Column(db.Text, nullable=True)        # 草稿允许空
     content_md = db.Column(db.Text, nullable=True)          # Markdown 正文，不写文件；草稿允许空
     status = db.Column(db.String(20), default=STATUS_PUBLISHED)
+    cover_image_key = db.Column(db.String(255), nullable=True)   # 封面 '/media/articles/...' 相对 URL（社区重设计 09-19）
+    is_official = db.Column(db.Boolean, nullable=False, default=False)  # 官方推文标记：仅文章管理员可设，社区精选带展示
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     publish_time = db.Column(db.DateTime, nullable=True)    # 仅已发布有；草稿为 None
@@ -955,6 +957,7 @@ class DiscussionThread(db.Model):
     scope_id = db.Column(db.Integer, nullable=True)  # 关联对象ID，global时为空
     title = db.Column(db.String(200), nullable=False)
     content = db.Column(db.Text, nullable=False)
+    images_json = db.Column(db.Text, nullable=True)  # 帖子图集 '/media/discussions/...' URL 数组 ≤4（社区重设计 09-19，global 帖用）
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
     is_pinned = db.Column(db.Boolean, default=False)

@@ -23,6 +23,8 @@ PUBLIC_MEDIA_PREFIXES = (
     "media/banners/",
     "media/course-covers/",
     "media/showcase/",
+    "media/articles/",
+    "media/discussions/",
 )
 
 EXT_CONTENT_TYPES = {

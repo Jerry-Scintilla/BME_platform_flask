@@ -2,10 +2,17 @@ from flask import Blueprint, request, jsonify
 from flask_cors import cross_origin
 from sqlalchemy import and_, or_
 from datetime import datetime
+import io
+import json
+import os
+import uuid
 
 from exts import db, redis_client
 from models import UserModel, DiscussionThread, DiscussionReply, DiscussionReaction, CourseGroup, CourseGroupMember
 from flask_jwt_extended import get_jwt_identity, jwt_required
+
+from storage import storage
+import imaging
 
 bp = Blueprint("discussion", __name__, url_prefix="/discussions")
 
@@ -25,6 +32,15 @@ def options_handler(path):
 
 
 from .media import public_avatar_url as get_avatar_url   # 新链路 /media/，旧值兜底 /data/avatars/
+from .media import media_url as _media_url
+
+
+def _thread_images(thread):
+    """帖子图集 URL 数组（json 列解析；旧帖无图为空数组）。"""
+    try:
+        return json.loads(thread.images_json) if thread.images_json else []
+    except (TypeError, ValueError):
+        return []
 
 
 # ==================== 权限辅助函数 ====================
@@ -297,12 +313,20 @@ def create_thread():
     if n1h > 10:
         return jsonify({"code": 429, "message": "发帖太频繁，请稍后再试"}), 429
 
+    # 帖子图集（社区重设计 09-19）：URL 数组 ≤4，只收 /media/discussions/ 上传回包（防外链）
+    images = data.get('images')
+    if images is not None:
+        if (not isinstance(images, list) or len(images) > 4
+                or any(not isinstance(u, str) or not u.startswith('/media/discussions/') for u in images)):
+            return jsonify({"code": 400, "message": "images 须为 ≤4 个 /media/discussions/ 上传返回的 URL"}), 400
+
     thread = DiscussionThread(
         title=title,
         content=content,
         scope_type=scope_type,
         scope_id=scope_id,
-        author_id=user.id
+        author_id=user.id,
+        images_json=json.dumps(images, ensure_ascii=False) if images else None,
     )
     db.session.add(thread)
     db.session.commit()
@@ -314,6 +338,7 @@ def create_thread():
             "id": thread.id,
             "title": thread.title,
             "content": thread.content,
+            "images": _thread_images(thread),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -399,6 +424,7 @@ def list_threads():
             "id": thread.id,
             "title": thread.title,
             "content": thread.content,
+            "images": _thread_images(thread),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -459,6 +485,7 @@ def get_thread(thread_id):
             "id": thread.id,
             "title": thread.title,
             "content": thread.content,
+            "images": _thread_images(thread),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -545,6 +572,13 @@ def update_thread(thread_id):
         thread.title = data['title']
     if 'content' in data:
         thread.content = data['content']
+    # 图集整体替换（同 create 的校验口径）
+    if 'images' in data:
+        images = data['images']
+        if images is not None and (not isinstance(images, list) or len(images) > 4
+                                    or any(not isinstance(u, str) or not u.startswith('/media/discussions/') for u in images)):
+            return jsonify({"code": 400, "message": "images 须为 ≤4 个 /media/discussions/ 上传返回的 URL"}), 400
+        thread.images_json = json.dumps(images, ensure_ascii=False) if images else None
 
     db.session.commit()
 
@@ -555,6 +589,7 @@ def update_thread(thread_id):
             "id": thread.id,
             "title": thread.title,
             "content": thread.content,
+            "images": _thread_images(thread),
             "updated_at": thread.updated_at.strftime('%Y-%m-%d %H:%M:%S')
         }
     })
@@ -1034,3 +1069,29 @@ def my_article_favorites():
         })
 
     return jsonify({"code": 200, "data": result, "total": len(result)}), 200
+
+
+# 帖子图床（社区重设计 09-19）：发帖/编辑帖的图片上传，保比例缩最长边 1600，
+# 返回 /media/discussions/ 相对 URL；create/update 以 URL 数组引用（防外链）。
+@bp.route("/upload_image", methods=["POST"])
+@jwt_required()
+def upload_image():
+    file = request.files.get("image")
+    if not file or not file.filename:
+        return jsonify({"code": 400, "message": "缺少图片文件 image"}), 400
+    ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        return jsonify({"code": 400, "message": "图片仅支持 jpg/jpeg/png/webp"}), 400
+    if file.content_length and file.content_length > 10 * 1024 * 1024:
+        return jsonify({"code": 400, "message": "图片不能超过 10MB"}), 400
+    try:
+        data = imaging.showcase_gallery_bytes(file.stream)
+    except imaging.ImageError as e:
+        return jsonify({"code": 400, "message": f"图片无效：{e}"}), 400
+    uid = uuid.uuid4()
+    key = f"media/discussions/{str(uid)[:8]}/{uid}.webp"
+    try:
+        storage.put_object(key, io.BytesIO(data), len(data), "image/webp")
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"图片存储失败：{e}"}), 500
+    return jsonify({"code": 200, "url": _media_url(key)})

@@ -12,6 +12,7 @@
 - 封面   course_cover_pair   3:4 中心裁切，母版 <=1200x1600 + 缩略 600x800 q82
 - 广场封面 showcase_cover_pair    16:9 中心裁切，母版 <=1600x900 + 缩略 640x360 q82
 - 广场图集 showcase_gallery_bytes 最长边 1600 保比例 q82（不裁切）
+- 文章封面 article_cover_pair     同 16:9 规格（与广场封面共用实现）
 """
 import io
 
@@ -145,17 +146,27 @@ def course_cover_pair(stream) -> tuple[bytes, bytes]:
     return _to_webp(master), _to_webp(thumb)
 
 
-def showcase_cover_pair(stream) -> tuple[bytes, bytes]:
-    """XLAB 项目封面：16:9 中心裁切 -> (母版 <=1600x900, 缩略 640x360)，均 WebP q82。"""
+def _cover_pair_169(stream, master_max, thumb_size) -> tuple[bytes, bytes]:
+    """16:9 封面成对转码的共用实现（广场封面/文章封面同规格）。"""
     img = _load(stream)
     img = _center_crop(img, 16, 9)
-    master = _shrink_only(img.copy(), SHOWCASE_COVER_MASTER_MAX)
+    master = _shrink_only(img.copy(), master_max)
     if not _has_alpha(master):
         master = master.convert("RGB")
-    thumb = img.resize(SHOWCASE_COVER_THUMB, Image.LANCZOS)
+    thumb = img.resize(thumb_size, Image.LANCZOS)
     if not _has_alpha(thumb):
         thumb = thumb.convert("RGB")
     return _to_webp(master), _to_webp(thumb)
+
+
+def showcase_cover_pair(stream) -> tuple[bytes, bytes]:
+    """XLAB 项目封面：16:9 中心裁切 -> (母版 <=1600x900, 缩略 640x360)，均 WebP q82。"""
+    return _cover_pair_169(stream, SHOWCASE_COVER_MASTER_MAX, SHOWCASE_COVER_THUMB)
+
+
+def article_cover_pair(stream) -> tuple[bytes, bytes]:
+    """文章 v2 封面：与广场封面同规格 16:9（母版 <=1600x900 + 缩略 640x360）WebP q82。"""
+    return _cover_pair_169(stream, SHOWCASE_COVER_MASTER_MAX, SHOWCASE_COVER_THUMB)
 
 
 def showcase_gallery_bytes(stream) -> bytes:
