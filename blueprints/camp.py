@@ -812,20 +812,95 @@ def member_assign_batch(sid):
 @bp.route("/sessions/<int:sid>/members")
 @jwt_required()
 def member_list(sid):
+    """营期成员列表。
+
+    不带查询参数时保持旧契约（返回全部 ``members``），供用户端等存量调用继续使用；
+    管理端可传 ``page/page_size/keyword/role`` 启用服务端分页。用户信息通过一次 JOIN
+    取齐，避免原实现按成员逐个 ``UserModel.query.get`` 形成 N+1 查询。
+    """
     user = _current_user()
-    visible = set(_visible_student_ids(sid, user))
     see_all = user.is_admin()
-    data = []
-    for m in CampMember.query.filter_by(camp_session_id=sid).all():
-        if m.role == 'student' and not see_all and m.user_id not in visible:
-            continue                        # 导生只看本团队
-        u = UserModel.query.get(m.user_id)
-        data.append({
-            "user_id": m.user_id, "username": u.username if u else "",
+    visible = set() if see_all else set(_visible_student_ids(sid, user))
+    base = (db.session.query(CampMember, UserModel)
+            .join(UserModel, UserModel.id == CampMember.user_id)
+            .filter(CampMember.camp_session_id == sid))
+    if not see_all:
+        base = base.filter(or_(CampMember.role != 'student',
+                               CampMember.user_id.in_(visible)))
+
+    paged = any(k in request.args for k in ("page", "page_size", "keyword", "role"))
+    query = base
+    keyword = (request.args.get("keyword") or "").strip()
+    if keyword:
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = query.filter(UserModel.username.like(f"%{escaped}%", escape="\\"))
+    roles = [r.strip() for r in (request.args.get("role") or "").split(",") if r.strip()]
+    if roles:
+        query = query.filter(CampMember.role.in_(roles))
+
+    total = query.count() if paged else None
+    if paged:
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+            page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+        except (ValueError, TypeError):
+            return jsonify({"code": 400, "message": "分页参数错误"}), 400
+        rows = (query.order_by(CampMember.id)
+                .offset((page - 1) * page_size).limit(page_size).all())
+    else:
+        page, page_size = 1, 0
+        rows = query.order_by(CampMember.id).all()
+
+    data = [{
+            "user_id": m.user_id, "username": u.username,
             "role": m.role, "team_mentor_id": m.team_mentor_id,
             "joined_at": m.joined_at.isoformat() if m.joined_at else None,
-        })
-    return jsonify({"code": 200, "members": data})
+        } for m, u in rows]
+    if not paged:
+        return jsonify({"code": 200, "members": data})
+
+    counts = {"student": 0, "mentor": 0, "member": 0}
+    for role, count in (base.with_entities(CampMember.role, db.func.count(CampMember.id))
+                        .group_by(CampMember.role).all()):
+        counts[role] = count
+    return jsonify({"code": 200, "members": data, "total": total,
+                    "page": page, "page_size": page_size, "counts": counts})
+
+
+@bp.route("/sessions/<int:sid>/member-candidates")
+@jwt_required()
+@camp_role()
+def member_candidates(sid):
+    """管理端“加成员”远程选人器：分页搜索未入营的普通用户。"""
+    if not CampSession.query.get(sid):
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        page_size = min(50, max(1, int(request.args.get("page_size", 20))))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "分页参数错误"}), 400
+
+    member_ids = db.session.query(CampMember.user_id).filter(
+        CampMember.camp_session_id == sid)
+    query = UserModel.query.filter(
+        UserModel.role != 'super_admin',
+        or_(UserModel.status.is_(None), UserModel.status != 'banned'),
+        ~UserModel.id.in_(member_ids),
+    )
+    keyword = (request.args.get("keyword") or "").strip()
+    if keyword:
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{escaped}%"
+        query = query.filter(or_(UserModel.username.like(like, escape="\\"),
+                                 UserModel.email.like(like, escape="\\")))
+    total = query.count()
+    users = (query.order_by(UserModel.id)
+             .offset((page - 1) * page_size).limit(page_size).all())
+    return jsonify({
+        "code": 200, "total": total, "page": page, "page_size": page_size,
+        "users": [{"User_Id": u.id, "User_Name": u.username,
+                   "User_Email": u.email, "role": u.role} for u in users],
+    })
 
 
 @bp.route("/sessions/<int:sid>/members/<int:uid>", methods=["DELETE"])

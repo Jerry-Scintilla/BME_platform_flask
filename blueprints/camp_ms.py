@@ -1053,7 +1053,34 @@ def overview(sid):
 
     phase = _ms_phase(camp)
     mentor_rows = CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()
-    student_rows = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
+    student_base = (db.session.query(CampMember, UserModel)
+                    .join(UserModel, UserModel.id == CampMember.user_id)
+                    .filter(CampMember.camp_session_id == sid,
+                            CampMember.role == 'student'))
+    student_count = student_base.count()
+    matched_n = student_base.filter(CampMember.team_mentor_id.isnot(None)).count()
+    paged = any(k in request.args for k in
+                ('student_page', 'student_page_size', 'student_keyword'))
+    student_query = student_base
+    keyword = (request.args.get('student_keyword') or '').strip()
+    if keyword:
+        escaped = keyword.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        student_query = student_query.filter(
+            UserModel.username.like(f'%{escaped}%', escape='\\'))
+    student_total = student_query.count() if paged else student_count
+    if paged:
+        try:
+            student_page = max(1, int(request.args.get('student_page', 1)))
+            student_page_size = min(100, max(1, int(request.args.get('student_page_size', 20))))
+        except (ValueError, TypeError):
+            return jsonify({"code": 400, "message": "分页参数错误"}), 400
+        student_pairs = (student_query.order_by(CampMember.id)
+                         .offset((student_page - 1) * student_page_size)
+                         .limit(student_page_size).all())
+    else:
+        student_page, student_page_size = 1, 0
+        student_pairs = student_query.order_by(CampMember.id).all()
+    student_rows = [row for row, _u in student_pairs]
     profiles = {p.user_id: p for p in CampMentorProfile.query.filter_by(
         camp_session_id=sid).all()}
     # 单轮化：志愿只看 round==1；chose_r2 / submitted_r2 / r2_enabled 键保留但恒定（前端兼容）
@@ -1062,17 +1089,29 @@ def overview(sid):
         .filter(CampMentorPreference.camp_session_id == sid,
                 CampMentorPreference.round == 1)
         .group_by(CampMentorPreference.mentor_user_id).all()}
-    submitted = {r[0] for r in db.session.query(CampMentorPreference.student_user_id)
-                 .filter(CampMentorPreference.camp_session_id == sid,
-                         CampMentorPreference.round == 1).all()}
+    student_ids = [m.user_id for m in student_rows]
+    submitted_q = db.session.query(CampMentorPreference.student_user_id).filter(
+        CampMentorPreference.camp_session_id == sid,
+        CampMentorPreference.round == 1)
+    if paged:
+        submitted_q = submitted_q.filter(
+            CampMentorPreference.student_user_id.in_(student_ids))
+    submitted = {r[0] for r in submitted_q.all()}
     users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(
-        [m.user_id for m in mentor_rows + student_rows])).all()}
+        [m.user_id for m in mentor_rows] + student_ids)).all()}
+
+    matched_by_mentor = {r[0]: r[1] for r in db.session.query(
+        CampMember.team_mentor_id, func.count(CampMember.id)).filter(
+            CampMember.camp_session_id == sid,
+            CampMember.role == 'student',
+            CampMember.team_mentor_id.isnot(None),
+        ).group_by(CampMember.team_mentor_id).all()}
 
     mentors = []
     for m in mentor_rows:
         u = users.get(m.user_id)
         p = profiles.get(m.user_id)
-        matched = _live_matched(sid, m.user_id)
+        matched = matched_by_mentor.get(m.user_id, 0)
         # 方向 = 名片 tags[0]（与 _inherit_direction_course 的继承口径一致；无名片/未选为 None）
         direction = None
         if p and p.tags:
@@ -1104,8 +1143,7 @@ def overview(sid):
             "submitted_r1": s.user_id in submitted,
             "submitted_r2": False,
         })
-    matched_n = sum(1 for s in student_rows if s.team_mentor_id)
-    return jsonify({"code": 200, "phase": phase,
+    payload = {"code": 200, "phase": phase,
                     "config_error": bool(not (camp.ms_preference_start
                                               and camp.ms_preference_deadline)),
                     "deadlines": {
@@ -1115,9 +1153,14 @@ def overview(sid):
                         "round2_deadline": _fmt_dt(camp.ms_round2_deadline),
                     },
                     "mentors": mentors, "students": students,
-                    "stats": {"students": len(student_rows), "matched": matched_n,
-                              "unmatched": len(student_rows) - matched_n,
-                              "r2_enabled": False}})
+                    "stats": {"students": student_count, "matched": matched_n,
+                              "unmatched": student_count - matched_n,
+                              "r2_enabled": False}}
+    if paged:
+        payload.update({"student_total": student_total,
+                        "student_page": student_page,
+                        "student_page_size": student_page_size})
+    return jsonify(payload)
 
 
 @bp.route("/<int:sid>/assign", methods=["POST"])
