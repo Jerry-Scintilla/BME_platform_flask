@@ -1946,39 +1946,48 @@ def _direction_of_mentor(camp, mentor_uid):
     return next((d for d in _ms_directions(camp) if d["name"] == str(tags[0])), None)
 
 
-def _chapters_payload(camp, course_id, student_uid):
+def _chapters_payload(camp, course_id, student_uid, ctx=None):
     """学习单元平铺 + 学员自学完成比 + 认证态（09-13 含按章评分 score，未打分为 null；
     09-14 含 material_count 材料数，学员卡与导生成员页的「材料 n」chip 数据源；
     09-14 层级过滤：只留学习单元章——历史课程两级设计（L1=分组大标题 0 课时、L2=挂课时
-    单元，parent_id 全空不可用），课程存在 L>=2 时 L1 是纯标题不下发，防「大标题被认证」）。"""
-    chs = (Chapter.query.filter_by(course_id=course_id)
-           .order_by(Chapter.order, Chapter.id).all())
-    if any(ch.level and ch.level >= 2 for ch in chs):
-        chs = [ch for ch in chs if not (ch.level and ch.level < 2)]
-    lesson_total = defaultdict(int)
-    lesson_ch = {}
-    for l in LessonModel.query.filter_by(course_id=course_id).all():
-        lesson_total[l.chapter_id] += 1
-        lesson_ch[l.id] = l.chapter_id
-    # 09-14 快照隔离：营内自学完成读营期快照表（从零，不看营外全局历史进度）；
-    # archived 营读历史仍走快照——营期口径正确保留。
-    # 注：进度行只有 lesson_id，须经 lesson→chapter 映射归章（原代码直接读 r.chapter_id
-    # 是存量 bug——模型无此列，此前全局表恰无 completed 行循环体未执行而未显形）
-    done_rows = CampLearningProgress.query.filter(
-        CampLearningProgress.camp_session_id == camp.id,
-        CampLearningProgress.user_id == student_uid,
-        CampLearningProgress.course_id == course_id,
-        CampLearningProgress.status == CampLearningProgress.STATUS_COMPLETED).all()
-    lesson_done = defaultdict(int)
-    for r in done_rows:
-        lesson_done[lesson_ch.get(r.lesson_id)] += 1
-    certs = {c.chapter_id: c for c in CampChapterCertification.query.filter_by(
-        camp_session_id=camp.id, student_user_id=student_uid).all()
-        if c.course_id == course_id}
-    material_count = defaultdict(int)
-    for m in CampChapterMaterial.query.filter_by(
-            camp_session_id=camp.id, student_user_id=student_uid, course_id=course_id).all():
-        material_count[m.chapter_id] += 1
+    单元，parent_id 全空不可用），课程存在 L>=2 时 L1 是纯标题不下发，防「大标题被认证」。
+    09-19 ctx：调用方（team_progress）可传入全组预取映射（_team_progress_ctx），免逐
+    （学员×课程）循环查询；不传则保持原逐行查询（progress_board / my-direction 不动）。"""
+    if ctx is not None:
+        chs = ctx["chapters"].get(course_id, [])
+        lesson_total = ctx["lesson_total"].get(course_id, {})
+        lesson_done = ctx["lesson_done"].get((student_uid, course_id), {})
+        certs = ctx["certs"].get(student_uid, {})
+        material_count = ctx["material_count"].get(student_uid, {})
+    else:
+        chs = (Chapter.query.filter_by(course_id=course_id)
+               .order_by(Chapter.order, Chapter.id).all())
+        if any(ch.level and ch.level >= 2 for ch in chs):
+            chs = [ch for ch in chs if not (ch.level and ch.level < 2)]
+        lesson_total = defaultdict(int)
+        lesson_ch = {}
+        for l in LessonModel.query.filter_by(course_id=course_id).all():
+            lesson_total[l.chapter_id] += 1
+            lesson_ch[l.id] = l.chapter_id
+        # 09-14 快照隔离：营内自学完成读营期快照表（从零，不看营外全局历史进度）；
+        # archived 营读历史仍走快照——营期口径正确保留。
+        # 注：进度行只有 lesson_id，须经 lesson→chapter 映射归章（原代码直接读 r.chapter_id
+        # 是存量 bug——模型无此列，此前全局表恰无 completed 行循环体未执行而未显形）
+        done_rows = CampLearningProgress.query.filter(
+            CampLearningProgress.camp_session_id == camp.id,
+            CampLearningProgress.user_id == student_uid,
+            CampLearningProgress.course_id == course_id,
+            CampLearningProgress.status == CampLearningProgress.STATUS_COMPLETED).all()
+        lesson_done = defaultdict(int)
+        for r in done_rows:
+            lesson_done[lesson_ch.get(r.lesson_id)] += 1
+        certs = {c.chapter_id: c for c in CampChapterCertification.query.filter_by(
+            camp_session_id=camp.id, student_user_id=student_uid).all()
+            if c.course_id == course_id}
+        material_count = defaultdict(int)
+        for m in CampChapterMaterial.query.filter_by(
+                camp_session_id=camp.id, student_user_id=student_uid, course_id=course_id).all():
+            material_count[m.chapter_id] += 1
     out = []
     for ch in chs:
         cert = certs.get(ch.id)
@@ -1995,15 +2004,20 @@ def _chapters_payload(camp, course_id, student_uid):
     return out
 
 
-def _course_block(camp, course_id, student_uid):
+def _course_block(camp, course_id, student_uid, ctx=None):
     """单门课程的进度块（team/progress 与 my-direction 共用）：
-    章节列表 + 认证计数 + 课程均分（已认证且已打分章节的算术平均，读时聚合不落库）。"""
-    course = CourseModel.query.get(course_id)
-    chapters = _chapters_payload(camp, course_id, student_uid)
+    章节列表 + 认证计数 + 课程均分（已认证且已打分章节的算术平均，读时聚合不落库）。
+    ctx 含课程行时一并免查（见 _chapters_payload 注释）。"""
+    course = (ctx["courses"].get(course_id) if ctx is not None
+              else CourseModel.query.get(course_id))
+    chapters = _chapters_payload(camp, course_id, student_uid, ctx)
     certified = sum(1 for c in chapters if c["certified"])
     scores = [c["score"] for c in chapters if c["certified"] and c["score"] is not None]
-    uc = UserCourseModel.query.filter_by(
-        user_id=student_uid, course_id=course_id).first()
+    if ctx is not None:
+        uc = ctx["user_course"].get((student_uid, course_id))
+    else:
+        uc = UserCourseModel.query.filter_by(
+            user_id=student_uid, course_id=course_id).first()
     return {
         "course_id": course_id,
         "course_title": course.title if course else "",
@@ -2013,6 +2027,64 @@ def _course_block(camp, course_id, student_uid):
         "total_chapters": len(chapters),
         "score_avg": round(sum(scores) / len(scores)) if scores else None,
         "course_status": uc.status if uc else None,
+    }
+
+
+def _team_progress_ctx(camp, uids, course_ids):
+    """team/progress 的全组预取（09-19 消 N+1）：一次取齐 学员×课程 的章节/课时/
+    快照完成/认证/材料数/课程行，组装成 _chapters_payload/_course_block 直接可查的
+    映射。查询数与团队规模无关（固定 ~7 条）。"""
+    uids = list(uids or [])
+    course_ids = list(course_ids or [])
+    chapters_by_course = {}
+    for ch in (Chapter.query.filter(Chapter.course_id.in_(course_ids))
+               .order_by(Chapter.order, Chapter.id).all()):
+        chapters_by_course.setdefault(ch.course_id, []).append(ch)
+    chapters = {}
+    lesson_total = {}
+    lesson_ch = {}
+    for cid, chs in chapters_by_course.items():
+        # 同款层级过滤：存在 L>=2 时 L1 纯标题不下发
+        if any(ch.level and ch.level >= 2 for ch in chs):
+            chs = [ch for ch in chs if not (ch.level and ch.level < 2)]
+        chapters[cid] = chs
+        lesson_total[cid] = defaultdict(int)
+        lesson_ch[cid] = {}
+    for l in LessonModel.query.filter(LessonModel.course_id.in_(course_ids)).all():
+        lesson_total[l.course_id][l.chapter_id] += 1
+        lesson_ch[l.course_id][l.id] = l.chapter_id
+    lesson_done = {}      # (uid, cid) → {chapter_id: 完成课时数}
+    for r in CampLearningProgress.query.filter(
+            CampLearningProgress.camp_session_id == camp.id,
+            CampLearningProgress.user_id.in_(uids),
+            CampLearningProgress.course_id.in_(course_ids),
+            CampLearningProgress.status == CampLearningProgress.STATUS_COMPLETED).all():
+        ch_id = lesson_ch.get(r.course_id, {}).get(r.lesson_id)
+        if ch_id is None:
+            continue
+        lesson_done.setdefault((r.user_id, r.course_id), defaultdict(int))[ch_id] += 1
+    certs = {}            # uid → {chapter_id: 认证行}
+    for c in CampChapterCertification.query.filter(
+            CampChapterCertification.camp_session_id == camp.id,
+            CampChapterCertification.student_user_id.in_(uids)).all():
+        certs.setdefault(c.student_user_id, {})[c.chapter_id] = c
+    material_count = {}   # uid → {chapter_id: 材料数}
+    for m in CampChapterMaterial.query.filter(
+            CampChapterMaterial.camp_session_id == camp.id,
+            CampChapterMaterial.student_user_id.in_(uids)).all():
+        material_count.setdefault(m.student_user_id, defaultdict(int))[m.chapter_id] += 1
+    return {
+        "chapters": chapters,
+        "lesson_total": lesson_total,
+        "lesson_done": lesson_done,
+        "certs": certs,
+        "material_count": material_count,
+        "courses": {c.id: c for c in CourseModel.query.filter(
+            CourseModel.id.in_(course_ids)).all()},
+        "user_course": {(uc.user_id, uc.course_id): uc for uc in
+                        UserCourseModel.query.filter(
+                            UserCourseModel.user_id.in_(uids),
+                            UserCourseModel.course_id.in_(course_ids)).all()},
     }
 
 
@@ -2048,7 +2120,8 @@ def merge_camp_learning_progress(camp):
 @camp_role('mentor')
 def team_progress(sid):
     """导生视角：本团队每学员 × 方向全部课程的章节进度 + 认证态（按章认证的读端点）。
-    09-13 多课制：direction.course_ids 逐课出进度块；顶层 courses 为课程摘要（表头用）。"""
+    09-13 多课制：direction.course_ids 逐课出进度块；顶层 courses 为课程摘要（表头用）。
+    09-19 消 N+1：全组数据一次预取（_team_progress_ctx，查询数与团队规模无关）。"""
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
@@ -2060,19 +2133,19 @@ def team_progress(sid):
                         "message": "尚未设置方向或方向未绑定课程"})
     students = (CampMember.query.filter_by(camp_session_id=sid, role='student')
                 .order_by(CampMember.user_id).all())
-    data = []
-    for s in students:
-        if not _in_my_team(sid, user, s.user_id) and not user.is_admin():
-            continue
-        u = UserModel.query.get(s.user_id)
-        data.append({
-            "student_user_id": s.user_id, "username": u.username if u else "",
-            "courses": [_course_block(camp, cid, s.user_id)
-                        for cid in direction["course_ids"]],
-        })
+    mine = [s for s in students
+            if user.is_admin() or _in_my_team(sid, user, s.user_id)]
+    ctx = _team_progress_ctx(camp, [s.user_id for s in mine], direction["course_ids"])
+    users = {u.id: u.username for u in UserModel.query.filter(
+        UserModel.id.in_([s.user_id for s in mine])).all()}
+    data = [{"student_user_id": s.user_id,
+             "username": users.get(s.user_id, ""),
+             "courses": [_course_block(camp, cid, s.user_id, ctx)
+                         for cid in direction["course_ids"]]}
+            for s in mine]
     courses_summary = [{"course_id": cid,
-                        "course_title": (CourseModel.query.get(cid).title
-                                         if CourseModel.query.get(cid) else "")}
+                        "course_title": ctx["courses"][cid].title
+                        if ctx["courses"].get(cid) else ""}
                        for cid in direction["course_ids"]]
     return jsonify({"code": 200, "direction": direction["name"],
                     "courses": courses_summary, "students": data})
