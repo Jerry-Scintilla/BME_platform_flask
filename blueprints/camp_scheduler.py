@@ -1,6 +1,6 @@
 """营期调度器 — 时间型通知不再依赖页面访问（通知方案 §5.7，2026-09-20）。
 
-两个任务（全部幂等，可安全补跑）：
+四个任务（全部幂等，可安全补跑）：
 1. camp_deadline_reminder（每 30 分钟）：选导生 collecting 阶段、志愿截止在未来 24h 内
    且尚未提醒过的营——未提交志愿的学员收提醒，责任人收「N 人未提交」摘要。
    幂等：Redis SETNX 游标 camp:ms_deadline_remind:{sid}:{deadline_ts}（7 天过期），
@@ -8,6 +8,9 @@
 2. camp_attendance_daily_digest（每天 08:30，汇总昨日）：running 且每日承诺考勤的营，
    昨日异常（缺勤/时长不足/迟到）按导生分组发团队摘要，责任人收全营汇总；
    全员无异常不发（降噪）。幂等：Redis 游标 camp:att_digest:{sid}:{date}。
+3. camp_task_deadline_scan（每 30 分钟）：组会课外任务 T-24h 催办 + 逾期通知（本人+组长）。
+4. camp_chapter_due_scan（每 30 分钟，migrate_49）：组会课内布置认证截止 T-24h 催办 +
+   逾期通知（本人催学习 + 组长汇总兼催认证）。游标带截止时刻，改期后重发。
 
 调度基础设施沿用 attendance_report 的模式：APScheduler + fcntl 文件锁（多 worker
 只启动一个），崩溃后内核回收锁由新 worker 接管。评估口径直接复用 camp._eval_day
@@ -332,6 +335,98 @@ def _task_deadline_scan(now=None):
 
 
 # ─────────────────────────────────────────────
+# 4. 课内布置认证截止提醒（T-24h）与逾期通知（migrate_49）
+# ─────────────────────────────────────────────
+
+def _job_chapter_due_scan(app):
+    with app.app_context():
+        try:
+            _chapter_due_scan()
+        except Exception as e:
+            app.logger.exception(f"[camp_scheduler] 课内截止扫描失败: {e}")
+
+
+def _chapter_due_scan(now=None):
+    """未结营营期里带 chapter_due_at 且有布置章的 team 组会：T-24h 提醒未认证的组员
+    （学员侧动作=学习+提交材料，是认证的前置）；刚逾期通知本人 + 组长（汇总，文案兼催
+    认证——双瓶颈都覆盖）。不锁认证（无 allow_late 语义，逾期纯提醒）。
+    幂等游标带截止时刻（改期后即新 key 重发，规避任务扫描改期后 7 天哑火的缺陷）：
+    due_soon 6h 过期（截止前持续催办），overdue 一次性 7 天游标。直接调用便于测试。"""
+    from models import (CampSession, CampMeeting, CampMeetingChapterPlan,
+                        CampChapterCertification, CampMember, UserModel)
+    from .camp_meeting import _leader_uid
+    from .notification import create_notification
+
+    now = now or datetime.now()
+    meets = (CampMeeting.query
+             .join(CampSession, CampSession.id == CampMeeting.camp_session_id)
+             .filter(CampMeeting.chapter_due_at.isnot(None),
+                     CampMeeting.scope == 'team',
+                     CampSession.status.notin_(('archived', 'deleted')))
+             .all())
+    sent = 0
+    for m in meets:
+        ch_ids = [p.chapter_id for p in CampMeetingChapterPlan.query.filter_by(
+            meeting_id=m.id).all()]
+        if not ch_ids:
+            continue
+        members = [r.user_id for r in CampMember.query.filter_by(
+            camp_session_id=m.camp_session_id, role='student',
+            team_mentor_id=m.mentor_id).all()]
+        if not members:
+            continue
+        certs = {(r.student_user_id, r.chapter_id) for r in CampChapterCertification.query.filter(
+            CampChapterCertification.camp_session_id == m.camp_session_id,
+            CampChapterCertification.chapter_id.in_(ch_ids),
+            CampChapterCertification.student_user_id.in_(members)).all()}
+        pending_by_user = {uid: [cid for cid in ch_ids if (uid, cid) not in certs]
+                           for uid in members}
+        pending_by_user = {uid: miss for uid, miss in pending_by_user.items() if miss}
+        if not pending_by_user:
+            continue
+        due_ts = int(m.chapter_due_at.timestamp())
+        due_text = m.chapter_due_at.strftime('%m-%d %H:%M')
+        if now < m.chapter_due_at and m.chapter_due_at <= now + timedelta(hours=24):
+            # T-24h 催办（6h 游标：截止前每 6 小时再催一次，最后一次在截止前）
+            if not _redis_guard(f"camp:chapter_due_soon:{m.id}:{due_ts}", ttl_seconds=6 * 3600):
+                continue
+            for uid, miss in pending_by_user.items():
+                create_notification(
+                    uid, "课内进度即将截止",
+                    f"组会「{m.title}」布置的章节需在 {due_text} 前完成认证，"
+                    f"你还有 {len(miss)} 章未认证，请尽快学习并提交材料。",
+                    category='camp', source_type='camp_meeting',
+                    source_id=m.id, camp_session_id=m.camp_session_id, is_important=True)
+            sent += 1
+        elif now > m.chapter_due_at:
+            # 逾期一次性通知：本人（催学习补材料）+ 组长（汇总，兼催认证）
+            if not _redis_guard(f"camp:chapter_overdue:{m.id}:{due_ts}", ttl_seconds=7 * 86400):
+                continue
+            for uid, miss in pending_by_user.items():
+                create_notification(
+                    uid, "课内进度已逾期",
+                    f"组会「{m.title}」布置的章节已于 {due_text} 截止，"
+                    f"你还有 {len(miss)} 章未认证，请尽快补上。",
+                    category='camp', source_type='camp_meeting',
+                    source_id=m.id, camp_session_id=m.camp_session_id, is_important=True)
+            leader = _leader_uid(m)
+            if leader and leader not in pending_by_user:
+                names = ", ".join((UserModel.query.get(uid).username if UserModel.query.get(uid)
+                                   else str(uid)) for uid in list(pending_by_user)[:10])
+                create_notification(
+                    leader, "课内进度逾期提醒",
+                    f"组会「{m.title}」布置的章节已于 {due_text} 截止，"
+                    f"{len(pending_by_user)} 名组员尚有未认证章节：{names}"
+                    f"{' 等' if len(pending_by_user) > 10 else ''}。请确认学习进度并完成认证。",
+                    category='camp', source_type='camp_meeting',
+                    source_id=m.id, camp_session_id=m.camp_session_id)
+            sent += 1
+        if sent:
+            db.session.commit()
+    return sent
+
+
+# ─────────────────────────────────────────────
 # 初始化（fcntl 多 worker 单例，同 attendance_report 模式）
 # ─────────────────────────────────────────────
 
@@ -356,11 +451,15 @@ def init_camp_scheduler(app):
         args=[app], id="camp_task_deadline_scan",
         coalesce=True, max_instances=1, misfire_grace_time=600, replace_existing=True)
     sched.add_job(
+        _job_chapter_due_scan, trigger=IntervalTrigger(minutes=30, timezone=tz_name),
+        args=[app], id="camp_chapter_due_scan",
+        coalesce=True, max_instances=1, misfire_grace_time=600, replace_existing=True)
+    sched.add_job(
         _job_attendance_digest,
         trigger=CronTrigger(hour=8, minute=30, timezone=tz_name),
         args=[app], id="camp_attendance_daily_digest",
         coalesce=True, max_instances=1, misfire_grace_time=7200, replace_existing=True)
     sched.start()
     _scheduler = sched
-    app.logger.info(f"[camp_scheduler] 已启动：志愿/任务截止提醒（30 分钟扫描）+ "
+    app.logger.info(f"[camp_scheduler] 已启动：志愿/任务/课内截止提醒（30 分钟扫描）+ "
                     f"考勤日摘要（每天 08:30，{tz_name}）")

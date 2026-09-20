@@ -52,6 +52,22 @@ MAX_FILE_MB = 100     # 普通文件单件上限（与章节材料/交付链同�
 MAX_VIDEO_MB = 500    # 视频单件上限（组会录像）
 MAX_TOTAL_MB = 1024   # 单次请求整包上限（多文件合计粗检，multipart 开销有余量）
 
+DUE_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
+
+
+def _parse_due_at(raw):
+    """截止时间宽松解析（课外任务与课内布置共用）：'YYYY-MM-DD HH:MM' 等 4 格式；
+    不匹配返回 None，由调用方带上下文报 400。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in DUE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
 
 # ─────────────────────────────────────────────
 # 辅助
@@ -118,6 +134,7 @@ def _meeting_dict(m, atts, names):
         "id": m.id, "scope": m.scope, "unit_id": m.unit_id, "mentor_id": m.mentor_id,
         "title": m.title, "meeting_date": m.meeting_date.isoformat(),
         "content": m.content,
+        "chapter_due_at": m.chapter_due_at.isoformat() if m.chapter_due_at else None,
         "created_by": m.created_by, "creator_name": names.get(m.created_by, str(m.created_by)),
         "created_at": m.created_at.isoformat() if m.created_at else None,
         "updated_at": m.updated_at.isoformat() if m.updated_at else None,
@@ -130,13 +147,15 @@ def _meeting_dict(m, atts, names):
 
 def _meetings_payload(sid, user, student_ids, leader_view, **filters):
     """按作用域过滤取组会列表并序列化（新会日期在前，同日新纪录在前）。
-    user/student_ids/leader_view 供列表卡片的布置摘要计数（导生=提交 x/期望；组员=我的待提交 n）。"""
+    user/student_ids/leader_view 供列表卡片的布置摘要计数（导生=提交/认证 x/期望；组员=我的待提交/待认证 n）。"""
     rows = (CampMeeting.query.filter_by(camp_session_id=sid, **filters)
             .order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc()).all())
     atts = _atts_by_meeting([m.id for m in rows])
     creator_ids = {m.created_by for m in rows}
     names = _usernames(creator_ids)
-    summaries = _meeting_summaries([m.id for m in rows], user, student_ids, leader_view)
+    summaries = _meeting_summaries(sid, [m.id for m in rows],
+                                   {m.id: m.chapter_due_at for m in rows},
+                                   user, student_ids, leader_view)
     return [{**_meeting_dict(m, atts[m.id], names), **summaries.get(m.id, {})}
             for m in rows]
 
@@ -151,18 +170,21 @@ def _task_overdue(task, sub_done):
     return bool(task.required and task.due_at and datetime.now() > task.due_at and not sub_done)
 
 
-def _meeting_summaries(meeting_ids, user, student_ids, leader_view):
-    """列表摘要：任务数/课内章数 + 提交计数（按 submit_type 判有效提交，退回不计完成）。
-    leader_view=True → 提交 x/期望（任务 × 组员）+ 逾期数；否则 → 我的待提交 n + 逾期 n。"""
+def _meeting_summaries(sid, meeting_ids, due_by_meeting, user, student_ids, leader_view):
+    """列表摘要：任务数/课内章数 + 完成计数。完成口径=课外任务有效提交（退回不计）
+    + 课内章节认证（2026-09-20 修正：纯课内布置不再误判「已交齐」；认证不区分
+    certified_at 与布置先后，「当前已认证」即完成）。leader_view=True → 提交/认证
+    x/期望 + 逾期数；否则 → 我的待提交/待认证 n + 逾期 n。"""
     out = {}
     if not meeting_ids:
         return out
     tasks = (CampMeetingTask.query
              .filter(CampMeetingTask.meeting_id.in_(meeting_ids)).all())
-    plans = dict(db.session.query(CampMeetingChapterPlan.meeting_id,
-                                  db.func.count(CampMeetingChapterPlan.id))
-                 .filter(CampMeetingChapterPlan.meeting_id.in_(meeting_ids))
-                 .group_by(CampMeetingChapterPlan.meeting_id).all())
+    plan_rows = (CampMeetingChapterPlan.query
+                 .filter(CampMeetingChapterPlan.meeting_id.in_(meeting_ids)).all())
+    plan_chapters = {}
+    for p in plan_rows:
+        plan_chapters.setdefault(p.meeting_id, []).append(p.chapter_id)
     tasks_by_meeting = {}
     for t in tasks:
         tasks_by_meeting.setdefault(t.meeting_id, []).append(t)
@@ -173,22 +195,34 @@ def _meeting_summaries(meeting_ids, user, student_ids, leader_view):
     task_by_id = {t.id: t for t in tasks}
     # 完成提交 (meeting_id, task_id, uid) 三元组（有效 + 未退回）
     done_pairs = set()
-    sub_by_key = {}
     for s in subs:
         t = task_by_id[s.task_id]
-        sub_by_key[(t.id, s.student_user_id)] = s
         if _submission_done(s, t, att_counts.get(s.id, 0)):
             done_pairs.add((t.meeting_id, t.id, s.student_user_id))
+    # 章节认证对 (uid, chapter_id)：营内布置章并集一次查齐（plans 仅 team 域存在）
+    cert_pairs = set()
+    all_plan_chs = {p.chapter_id for p in plan_rows}
+    if all_plan_chs:
+        cert_q = CampChapterCertification.query.filter(
+            CampChapterCertification.camp_session_id == sid,
+            CampChapterCertification.chapter_id.in_(all_plan_chs))
+        if leader_view:
+            cert_q = cert_q.filter(CampChapterCertification.student_user_id.in_(student_ids or []))
+        else:
+            cert_q = cert_q.filter(CampChapterCertification.student_user_id == user.id)
+        cert_pairs = {(r.student_user_id, r.chapter_id) for r in cert_q.all()}
     now = datetime.now()
     for mid in meeting_ids:
         m_tasks = tasks_by_meeting.get(mid, [])
+        m_chs = plan_chapters.get(mid, [])
         done_by_user = {}
         for (m_id, t_id, uid) in done_pairs:
             if m_id == mid:
                 done_by_user.setdefault(uid, set()).add(t_id)
         overdue_tasks = [t for t in m_tasks
                          if t.required and t.due_at and now > t.due_at]
-        summary = {"task_count": len(m_tasks), "chapter_count": int(plans.get(mid, 0))}
+        summary = {"task_count": len(m_tasks), "chapter_count": len(m_chs)}
+        past_ch_due = bool(due_by_meeting.get(mid) and now > due_by_meeting[mid])
         if leader_view:
             summary["expected_count"] = len(m_tasks) * len(student_ids or [])
             summary["submission_count"] = sum(len(v) for v in done_by_user.values())
@@ -196,10 +230,20 @@ def _meeting_summaries(meeting_ids, user, student_ids, leader_view):
                 1 for t in overdue_tasks
                 for u in (student_ids or [])
                 if t.id not in done_by_user.get(u, set()))
+            summary["chapter_expected"] = len(m_chs) * len(student_ids or [])
+            summary["chapter_certified"] = sum(
+                1 for ch_id in m_chs for u in (student_ids or [])
+                if (u, ch_id) in cert_pairs)
+            summary["chapter_overdue_count"] = (
+                summary["chapter_expected"] - summary["chapter_certified"]) if past_ch_due else 0
         else:
             mine = done_by_user.get(user.id, set())
             summary["my_pending"] = len([t for t in m_tasks if t.id not in mine])
             summary["my_overdue"] = len([t for t in overdue_tasks if t.id not in mine])
+            summary["my_chapter_pending"] = sum(
+                1 for ch_id in m_chs if (user.id, ch_id) not in cert_pairs)
+            summary["my_chapter_overdue"] = (
+                summary["my_chapter_pending"]) if past_ch_due else 0
         out[mid] = summary
     return out
 
@@ -371,6 +415,10 @@ def camp_meetings_all(sid):
                                         db.func.count(CampMeetingTask.id))
                        .filter(CampMeetingTask.meeting_id.in_([m.id for m in rows]))
                        .group_by(CampMeetingTask.meeting_id).all()) if rows else {}
+    chapter_counts = dict(db.session.query(CampMeetingChapterPlan.meeting_id,
+                                           db.func.count(CampMeetingChapterPlan.id))
+                          .filter(CampMeetingChapterPlan.meeting_id.in_([m.id for m in rows]))
+                          .group_by(CampMeetingChapterPlan.meeting_id).all()) if rows else {}
     mentor_ids = {m.mentor_id for m in rows if m.scope == 'team' and m.mentor_id}
     mentor_names = {u.id: u.username for u in UserModel.query.filter(
         UserModel.id.in_(mentor_ids))} if mentor_ids else {}
@@ -384,6 +432,7 @@ def camp_meetings_all(sid):
                               if m.scope == 'team'
                               else units.get(m.unit_id, f"项目组#{m.unit_id}"))
         item["task_count"] = int(task_counts.get(m.id, 0))
+        item["chapter_count"] = int(chapter_counts.get(m.id, 0))
         item["has_minutes"] = bool((m.content or '').strip()) or bool(atts[m.id])
         out.append(item)
     return jsonify({"code": 200, "meetings": out})
@@ -684,9 +733,11 @@ def _task_att_dict(a, viewer):
             "url": media_signed_url('meeting_task', a.id, viewer.id)}
 
 
-def _detail_payload(m, user, is_leader):
-    """组会详情（视角分流）：导生=审阅矩阵（任务提交明细 + 章节认证矩阵 + 章节目录）；
-    组员=我的任务与提交 + 我的章节认证态。"""
+def _detail_payload(m, user, role):
+    """组会详情（视角三分）：导生 leader=审阅矩阵（任务提交明细 + 章节认证矩阵 + 章节目录）；
+    组员 member=我的任务与提交 + 我的章节认证态；老师 staff（2026-09-20）=只读概览
+    （计数无明细、无私有态——修此前老师误入组员分支看到自己「未提交」的错位）。"""
+    is_leader = role == 'leader'
     camp = CampSession.query.get(m.camp_session_id)
     students = _group_students(m)
     tasks = (CampMeetingTask.query.filter_by(meeting_id=m.id)
@@ -732,6 +783,15 @@ def _detail_payload(m, user, is_leader):
                     item["pending_review"] += 1
             past_due = bool(t.required and t.due_at and datetime.now() > t.due_at)
             item["overdue_count"] = (len(students) - item["submission_count"]) if past_due else 0
+        elif role == 'staff':
+            done = 0
+            for u in students:
+                s = sub_by_key.get((t.id, u.id))
+                if s and _submission_done(s, t, len(atts.get(s.id, []))):
+                    done += 1
+            item["submission_count"] = done
+            past_due = bool(t.required and t.due_at and datetime.now() > t.due_at)
+            item["overdue_count"] = (len(students) - done) if past_due else 0
         else:
             s = sub_by_key.get((t.id, user.id))
             valid = (_submission_done(s, t, len(atts.get(s.id, []))) if s else False)
@@ -767,17 +827,22 @@ def _detail_payload(m, user, is_leader):
                                            else {"score": certs[(u.id, p.chapter_id)].score})
                                for u in students}
                 ch["certified_count"] = sum(1 for v in ch["certs"].values() if v)
+            elif role == 'staff':
+                ch["certified_count"] = sum(
+                    1 for u in students if (u.id, p.chapter_id) in certs)
             else:
                 r = certs.get((user.id, p.chapter_id))
                 ch["my_cert"] = None if r is None else {"score": r.score}
             chapters_out.append(ch)
 
-    out = {"code": 200, "is_leader": is_leader,
+    out = {"code": 200, "is_leader": is_leader, "viewer_role": role,
            "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
                meeting_id=m.id).all(), _usernames({m.created_by})),
-           "students": ([{"user_id": u.id, "username": u.username} for u in students]
-                        if is_leader else []),
            "tasks": tasks_out, "chapters": chapters_out}
+    if is_leader:
+        out["students"] = [{"user_id": u.id, "username": u.username} for u in students]
+    elif role == 'staff':
+        out["student_total"] = len(students)
     if is_leader and m.scope == 'team':
         out["chapter_catalog"] = _chapter_catalog(camp, m)
     return out
@@ -786,14 +851,19 @@ def _detail_payload(m, user, is_leader):
 @bp.route("/meetings/<int:mid>/detail")
 @jwt_required()
 def meeting_detail(mid):
-    """组会详情（视角分流：导生=审阅矩阵；组员=我的任务与认证态）。"""
+    """组会详情（视角三分：导生=审阅矩阵；组员=我的任务与认证态；老师 staff=只读概览）。"""
     m, err = _meeting_or_404(mid)
     if err:
         return err
     user = _current_user()
     if not _can_view(user, m):
         return jsonify({"code": 403, "message": "仅本组成员可查看组会"}), 403
-    return jsonify(_detail_payload(m, user, _can_manage(user, m)))
+    if _can_manage(user, m):
+        role = 'leader'
+    else:
+        from .camp_staff import camp_staff_row
+        role = 'staff' if (user.is_admin() or camp_staff_row(m.camp_session_id, user.id)) else 'member'
+    return jsonify(_detail_payload(m, user, role))
 
 
 @bp.route("/sessions/<int:sid>/team/task-summary")
@@ -836,11 +906,13 @@ def team_task_summary(sid):
 @jwt_required()
 @audit_log(operation="保存组会布置")
 def meeting_assignments_save(mid):
-    """保存组会布置（现任组长/admin）。body: {chapters: [chapter_id], tasks: [{id?, title, note?,
-    submit_type?, due_at?, required?, allow_late?}]}—— chapters 整组替换（仅 team 域，项目营无
-    按章认证）；tasks 带 id=更新、无 id=新增、缺席=删除（已有学生提交的任务拒删，防数据丢失）。
+    """保存组会布置（现任组长/admin）。body: {chapters: [chapter_id], chapter_due_at?,
+    tasks: [{id?, title, note?, submit_type?, due_at?, required?, allow_late?}]}——
+    chapters 整组替换（仅 team 域，项目营无按章认证）；tasks 带 id=更新、无 id=新增、
+    缺席=删除（已有学生提交的任务拒删，防数据丢失）。
     生命周期字段（migrate_44）：due_at 截止（'YYYY-MM-DD HH:MM'）、required 必交（默认 true）、
-    allow_late 允许迟交（默认 true）。"""
+    allow_late 允许迟交（默认 true）。chapter_due_at（migrate_49）=课内布置统一认证截止
+    （空=清除；无布置章或非 team 域强制 None，防调度器空转）。"""
     m, err = _meeting_or_404(mid)
     if err:
         return err
@@ -853,7 +925,7 @@ def meeting_assignments_save(mid):
         return denied
     d = request.json or {}
 
-    # ── 课内章节（整组替换，team 域）──
+    # ── 课内章节（整组替换，team 域）+ 统一认证截止（migrate_49）──
     chapter_ids, seen = [], set()
     for raw in (d.get("chapters") or []):
         try:
@@ -871,6 +943,12 @@ def meeting_assignments_save(mid):
             return jsonify({"code": 404, "message": "布置章节不存在"}), 404
     if m.scope != 'team':
         chapter_ids = []          # 项目营忽略章节布置
+    chapter_due_raw = (d.get("chapter_due_at") or "").strip() if d.get("chapter_due_at") else None
+    chapter_due_at = _parse_due_at(chapter_due_raw) if chapter_due_raw else None
+    if chapter_due_raw and chapter_due_at is None:
+        return jsonify({"code": 400, "message": "课内认证截止格式须为 YYYY-MM-DD HH:MM"}), 400
+    if not chapter_ids:
+        chapter_due_at = None     # 无布置章的截止无意义
 
     # ── 课外任务（upsert + 受保护删除）──
     raw_tasks = d.get("tasks") or []
@@ -885,17 +963,9 @@ def meeting_assignments_save(mid):
         if st not in VALID_SUBMIT_TYPES:
             return jsonify({"code": 400, "message": "submit_type 须为 file/text/any"}), 400
         note = (t.get("note") or "").strip()[:500] or None
-        due_raw = (t.get("due_at") or "").strip() or None
-        due_at = None
-        if due_raw:
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-                try:
-                    due_at = datetime.strptime(due_raw, fmt)
-                    break
-                except ValueError:
-                    continue
-            if due_at is None:
-                return jsonify({"code": 400, "message": f"任务「{title[:30]}」截止时间格式须为 YYYY-MM-DD HH:MM"}), 400
+        due_at = _parse_due_at(t.get("due_at"))
+        if (t.get("due_at") or "").strip() and due_at is None:
+            return jsonify({"code": 400, "message": f"任务「{title[:30]}」截止时间格式须为 YYYY-MM-DD HH:MM"}), 400
         tid = t.get("id")
         try:
             tid = int(tid) if tid else None
@@ -932,6 +1002,9 @@ def meeting_assignments_save(mid):
                     CampMeetingChapterPlan.query.filter_by(meeting_id=mid).all()}
     if old_plan_ids != set(chapter_ids):
         changed = True
+    if m.chapter_due_at != chapter_due_at:
+        changed = True
+        m.chapter_due_at = chapter_due_at
     CampMeetingChapterPlan.query.filter_by(meeting_id=mid).delete(synchronize_session=False)
     for cid in chapter_ids:
         db.session.add(CampMeetingChapterPlan(meeting_id=mid,
@@ -942,7 +1015,7 @@ def meeting_assignments_save(mid):
             f"组会布置更新：{m.title}",
             f"组会「{m.title}」（{m.meeting_date.isoformat()}）更新了任务与课内布置，点击查看。")
     db.session.commit()
-    return jsonify(_detail_payload(m, user, True))
+    return jsonify(_detail_payload(m, user, 'leader'))
 
 
 @bp.route("/meetings/tasks/<int:tid>/submission", methods=["POST"])

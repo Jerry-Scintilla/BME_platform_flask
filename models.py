@@ -1927,7 +1927,9 @@ class CampArchiveRevision(db.Model):
 
 class CampMeeting(db.Model):
     """组会纪要：标题+会议日期+文字纪要+附件（文件/视频）。窗口=营期未归档即可提交
-    （selecting 预备会 / running 例会都算，与组长活动考勤同口径）；结营 _camp_writable 只读。"""
+    （selecting 预备会 / running 例会都算，与组长活动考勤同口径）；结营 _camp_writable 只读。
+    chapter_due_at（migrate_49）：课内布置（chapter_plan）的统一认证截止——单值放本表
+    而非 plan 每行（plan 是纯投影联接表+整组替换，统一截止与 Task.due_at 同为实体级）。"""
     __tablename__ = 'camp_meeting'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -1937,6 +1939,7 @@ class CampMeeting(db.Model):
     title = db.Column(db.String(200), nullable=False)
     meeting_date = db.Column(db.Date, nullable=False)
     content = db.Column(db.Text)                                # 文字纪要（可空=纯附件/视频）
+    chapter_due_at = db.Column(db.DateTime)                     # 课内布置认证截止（migrate_49，team 域单值；调度器据此提醒）
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
