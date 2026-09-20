@@ -21,7 +21,7 @@ from exts import db, redis_client
 from models import (
     CampSession, CampCycle, CampPolicy, CampMember, CampCourse, CampAttendancePlan,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
-    MedalModel, MedalUserModel, UserModel, SeatModel,
+    MedalModel, MedalUserModel, UserModel, SeatModel, CampStaff,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
     CampChapterCertification, CampChapterMaterial, CampLearningProgress,
     Chapter, LessonModel, LearningProgressModel,
@@ -30,6 +30,8 @@ from models import (
 
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
+from .camp_staff import (camp_access, camp_staff_row, camp_responsible_ids,
+                         has_camp_access, staff_permissions)
 from .camp_ms import (_apply_ms_fields, _validate_ms, _ms_dict, _ms_phase, _ms_tags_list,
                       _ms_directions, _inherit_direction_course)
 
@@ -104,8 +106,8 @@ def _camp_writable(camp):
 
 
 def _visible_student_ids(camp_id, user):
-    """导生=本团队学员；老师/超管=全营学员。"""
-    if user.is_admin():
+    """导生=本团队学员；营期负责人（CampStaff）/超管=全营学员。"""
+    if user.is_admin() or camp_staff_row(camp_id, user.id):
         return [m.user_id for m in CampMember.query.filter_by(
             camp_session_id=camp_id, role='student').all()]
     return [m.user_id for m in CampMember.query.filter_by(
@@ -117,6 +119,18 @@ def _in_my_team(camp_id, mentor, student_id):
     return CampMember.query.filter_by(
         camp_session_id=camp_id, role='student',
         user_id=student_id, team_mentor_id=mentor.id).first() is not None
+
+
+def _staff_or_mentor_gate(sid, user):
+    """复合门禁（阶段 1）：本营负责人（CampStaff）/ 本营导生 / 超管 —— 用于原本只给导生的
+    读视图与操作（请假审批、考勤看板、进度看板、发奖励），老师接入后不破坏导生权限。
+    返回 None 通过，否则 (resp, code)。"""
+    if user.is_admin() or camp_staff_row(sid, user.id):
+        return None
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    if not member or member.role != 'mentor':
+        return jsonify({"code": 403, "message": "仅本营负责人或导生可访问"}), 403
+    return None
 
 
 def _eval_day(records, plan, on_leave, is_today=False):
@@ -607,21 +621,43 @@ def session_list():
     my_rows = CampMember.query.filter_by(user_id=user.id).all()
     member_ids = {m.camp_session_id for m in my_rows}
     my_roles = {m.camp_session_id: m.role for m in my_rows}
+    # 营期工作人员身份（阶段 1，方案 §5.5）：my_staff_role / available_perspectives /
+    # my_permissions；老师负责的 running/archived 营同样可见（工作台入口）
+    my_staff_rows = CampStaff.query.filter_by(user_id=user.id, status='active').all()
+    staff_roles = {r.camp_session_id: r.role for r in my_staff_rows}
     if not (user.is_admin()):
-        # 营期中心可见性（方案 §3.3，五态）：成员的营（含进行中与历史）
+        # 营期中心可见性（方案 §3.3，五态）：成员或工作人员的营（含进行中与历史）
         # + 全员可见的 upcoming（即将开始；导生报名窗口，LV≥2 可自助报名）/ selecting（可报名）。
-        # draft 永不可见；running/archived 仅成员可见。
+        # draft 永不可见；running/archived 仅成员/工作人员可见。
+        my_camps = member_ids | set(staff_roles)
         conds = [CampSession.status.in_(('upcoming', 'selecting'))]
-        if member_ids:
-            conds.append(CampSession.id.in_(member_ids))
+        if my_camps:
+            conds.append(CampSession.id.in_(my_camps))
         q = q.filter(or_(*conds), CampSession.status != 'draft')
     camps = q.order_by(CampSession.start_date.desc()).all()
-    # 附当前用户是否成员 + 营内任职（CampMember.role：student/mentor）。
-    # 身份解耦后导生/学员是营内身份而非全局角色，用户端工作台 tab 分流改读 my_role；
-    # 非成员（导生报名窗口内的 upcoming/selecting 营）my_role 为 null。
+
+    def _identity(c):
+        """营期身份契约（方案 §5.5）：my_role=CampMember 语义不变；my_staff_role=CampStaff；
+        available_perspectives 供界面分流（服务端不信任回传视角）；my_permissions 供按钮显隐。"""
+        staff_role = staff_roles.get(c.id)
+        perspectives = []
+        if staff_role:
+            perspectives.append('teacher')
+        if my_roles.get(c.id) == 'mentor':
+            perspectives.append('mentor')
+        elif my_roles.get(c.id) == 'student':
+            perspectives.append('student')
+        return {
+            "is_member": c.id in member_ids,
+            "my_role": my_roles.get(c.id),
+            "my_staff_role": staff_role,
+            "has_camp_access": bool(staff_role) or c.id in member_ids,
+            "available_perspectives": perspectives or None,
+            "my_permissions": sorted(staff_permissions(staff_role)) if staff_role else [],
+        }
+
     return jsonify({"code": 200,
-                    "sessions": [{**_session_dict(c), "is_member": c.id in member_ids,
-                                  "my_role": my_roles.get(c.id)} for c in camps]})
+                    "sessions": [{**_session_dict(c), **_identity(c)} for c in camps]})
 
 
 @bp.route("/sessions/<int:sid>")
@@ -630,7 +666,23 @@ def session_detail(sid):
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
-    return jsonify({"code": 200, "session": _session_dict(camp)})
+    user = _current_user()
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    staff = camp_staff_row(sid, user.id)
+    perspectives = []
+    if staff:
+        perspectives.append('teacher')
+    if member and member.role in ('mentor', 'student'):
+        perspectives.append(member.role)
+    return jsonify({"code": 200, "session": {
+        **_session_dict(camp),
+        "is_member": bool(member),
+        "my_role": member.role if member else None,
+        "my_staff_role": staff.role if staff else None,
+        "has_camp_access": bool(staff or member or user.is_admin()),
+        "available_perspectives": perspectives or None,
+        "my_permissions": sorted(staff_permissions(staff.role)) if staff else [],
+    }})
 
 
 @bp.route("/sessions/<int:sid>", methods=["PUT"])
@@ -791,7 +843,7 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
 
 @bp.route("/sessions/<int:sid>/members", methods=["POST"])
 @jwt_required()
-@camp_role()
+@camp_access('member.manage')
 @audit_log(operation="分配营期成员")
 def member_assign(sid):
     d = request.json or {}
@@ -833,7 +885,7 @@ def _notify_member_assigned(sid, m):
 
 @bp.route("/sessions/<int:sid>/members/batch", methods=["POST"])
 @jwt_required()
-@camp_role()
+@camp_access('member.manage')
 @audit_log(operation="批量分配营期成员")
 def member_assign_batch(sid):
     """事务批量加成员（v1.3 阶段3 收编 admin 前端逐人并发 POST）。逐项校验+逐项回报，
@@ -882,7 +934,7 @@ def member_list(sid):
     取齐，避免原实现按成员逐个 ``UserModel.query.get`` 形成 N+1 查询。
     """
     user = _current_user()
-    see_all = user.is_admin()
+    see_all = user.is_admin() or camp_staff_row(sid, user.id)
     visible = set() if see_all else set(_visible_student_ids(sid, user))
     base = (db.session.query(CampMember, UserModel)
             .join(UserModel, UserModel.id == CampMember.user_id)
@@ -932,7 +984,7 @@ def member_list(sid):
 
 @bp.route("/sessions/<int:sid>/member-candidates")
 @jwt_required()
-@camp_role()
+@camp_access('member.manage')
 def member_candidates(sid):
     """管理端“加成员”远程选人器：分页搜索未入营的普通用户。"""
     if not CampSession.query.get(sid):
@@ -968,7 +1020,7 @@ def member_candidates(sid):
 
 @bp.route("/sessions/<int:sid>/members/<int:uid>", methods=["DELETE"])
 @jwt_required()
-@camp_role()
+@camp_access('member.manage')
 @audit_log(operation="移除营期成员")
 def member_remove(sid, uid):
     camp = CampSession.query.get(sid)
@@ -1118,10 +1170,9 @@ def plan_regenerate(sid):
 
 @bp.route("/attendance/dashboard/<int:sid>")
 @jwt_required()
-@camp_role('mentor')
 def attendance_dashboard(sid):
     """学生×承诺日 状态矩阵 + 汇总。
-    导生=本团队；老师/超管=全营；学员被 @camp_role 拦截(403)。
+    导生=本团队；营期负责人/超管=全营；学员被门禁拦截(403)。
     ?from=&to= 缺省=营期起止；聚合 CheckRecord 按 (user_id,date)，不依赖 camp_session_id。"""
     camp = CampSession.query.get(sid)
     if not camp:
@@ -1129,6 +1180,9 @@ def attendance_dashboard(sid):
     if not _capability_enabled(camp, 'attendance'):
         return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     user = _current_user()
+    denied = _staff_or_mentor_gate(sid, user)
+    if denied:
+        return denied
 
     # 09-12 模式 C（学期校区·按周累计）：导生/老师看本团队学员的周分桶统计
     if _attendance_mode(camp) == 'weekly':
@@ -1503,14 +1557,14 @@ def leave_submit():
     db.session.add(lv)
     db.session.flush()
     # 通知审批人（2026-09-20 P0 修正，方案 §6.7）：只通知学员所属导生——其他团队导生
-    # 无权审批且不该看到请假隐私；未分组（或所属导生已不在营）才兜底通知超管。
+    # 无权审批且不该看到请假隐私；未分组（或所属导生已不在营）走责任链
+    # （owner+teachers → 无工作人员的营才兜底全部超管）。
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
     approvers = []
     if member and member.team_mentor_id:
         approvers = [member.team_mentor_id]
     if not approvers:
-        approvers = [u.id for u in UserModel.query.filter(
-            UserModel.role == 'super_admin').all()]
+        approvers = camp_responsible_ids(sid)
     for aid in approvers:
         create_notification(aid, "新的营期请假申请",
                             f"「{camp.name}」{user.username} 申请请假 {sd} 至 {ed}，请及时审批。",
@@ -1534,8 +1588,8 @@ def leave_approve(lid):
     _lv_camp = CampSession.query.get(lv.camp_session_id)
     if _lv_camp and not _capability_enabled(_lv_camp, 'leave'):
         return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
-    # 导生仅限本团队；老师/超管不限
-    if not (user.is_admin()):
+    # 导生仅限本团队；营期负责人（owner/teacher）/超管不限（阶段 1 责任链）
+    if not (user.is_admin() or camp_staff_row(lv.camp_session_id, user.id)):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
             return jsonify({"code": 403, "message": "无权审批（非本团队）"}), 403
     d = request.json or {}
@@ -1578,8 +1632,8 @@ def leave_revoke(lid):
         return jsonify({"code": 404, "message": "请假记录不存在"}), 404
     if lv.status != 'approved':
         return jsonify({"code": 400, "message": "仅已批准的请假可撤回"}), 400
-    # 与审批同权限：导生仅限本团队；老师/超管不限
-    if not (user.is_admin()):
+    # 与审批同权限：导生仅限本团队；营期负责人/超管不限
+    if not (user.is_admin() or camp_staff_row(lv.camp_session_id, user.id)):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
             return jsonify({"code": 403, "message": "无权撤回（非本团队）"}), 403
     lv.status = 'pending'
@@ -1598,9 +1652,11 @@ def leave_revoke(lid):
 
 @bp.route("/sessions/<int:sid>/leave")
 @jwt_required()
-@camp_role('mentor')
 def leave_list(sid):
     user = _current_user()
+    denied = _staff_or_mentor_gate(sid, user)
+    if denied:
+        return denied
     _camp_lv = CampSession.query.get(sid)
     if _camp_lv and not _capability_enabled(_camp_lv, 'leave'):
         return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
@@ -1666,8 +1722,8 @@ def leave_mine():
 
 @bp.route("/reward", methods=["POST"])
 @jwt_required()
-@camp_role('mentor')
 def reward_issue():
+    """发放营期奖励：导生限本团队；营期负责人（owner/teacher）全营；超管兜底。"""
     user = _current_user()
     d = request.json or {}
     sid, uid, medal_id = d.get("camp_session_id"), d.get("user_id"), d.get("medal_id")
@@ -1676,7 +1732,10 @@ def reward_issue():
     camp = CampSession.query.get(sid)
     if not camp or not _camp_writable(camp):
         return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
-    if not (user.is_admin()):
+    denied = _staff_or_mentor_gate(sid, user)
+    if denied:
+        return denied
+    if not (user.is_admin() or camp_staff_row(sid, user.id)):
         if not _in_my_team(sid, user, uid):
             return jsonify({"code": 403, "message": "无权给该学员发奖励"}), 403
     if not MedalModel.query.get(medal_id):
@@ -1777,25 +1836,17 @@ def _camp_mentors(sid):
     return out
 
 
-def _camp_admin_ids(sid):
-    """营期管理侧通知接收人（阶段 0 口径）：super_admin 兜底。
-    CampStaff（owner/teacher 责任模型）上线后此函数切换为
-    活跃工作人员 → super_admin 最终兜底（配套方案 §7.2）。"""
-    return [u.id for u in UserModel.query.filter(
-        UserModel.role == 'super_admin', UserModel.status.is_(None)
-        | (UserModel.status != 'banned')).all()]
-
-
 def _notify_camp_admins(sid, title, content, source_type, source_id=None,
                         include_pending_hint=False):
-    """向营期管理侧发通知；include_pending_hint 时附本营待审申请数（给经办人处理上下文）。
-    只 add 不 commit，随调用方事务。"""
+    """向营期管理侧发通知（2026-09-20 阶段 1 起走责任链）：本营 owner+teachers；
+    无任何活跃工作人员的营才兜底全部 super_admin（方案 §7.2/§11.1，委任完成后可关兜底）。
+    include_pending_hint 时附本营待审申请数（给经办人处理上下文）。只 add 不 commit。"""
     if include_pending_hint:
         pending = CampJoinRequest.query.filter_by(
             camp_session_id=sid, status='pending').count()
         if pending > 1:
             content += f"（本营现有 {pending} 条待审批申请）"
-    for aid in _camp_admin_ids(sid):
+    for aid in camp_responsible_ids(sid):
         create_notification(aid, title, content, category='camp',
                             source_type=source_type, source_id=source_id,
                             camp_session_id=sid)
@@ -1935,7 +1986,7 @@ def join_request_mine():
 
 @bp.route("/sessions/<int:sid>/join-requests")
 @jwt_required()
-@camp_role()
+@camp_access('application.review')
 def join_request_list(sid):
     """老师/超管看某营的加入申请（默认 pending，?status=all 看全部）。返回含本营导生列表供审批选。"""
     status = request.args.get("status", "pending")
@@ -2018,14 +2069,18 @@ def _apply_join_approval(req, join_mentor):
 
 @bp.route("/join-requests/<int:rid>/approve", methods=["POST"])
 @jwt_required()
-@camp_role()
 @audit_log(operation="批准营期申请")
 def join_request_approve(rid):
+    """按 rid 定位（路由无 sid 段，装饰器取不到营期参数）——权限在端点内显式判定：
+    超管或本营有 application.review 权限的负责人（owner/teacher）。"""
     req = CampJoinRequest.query.get(rid)
     if not req:
         return jsonify({"code": 404, "message": "申请不存在"}), 404
     if req.status != 'pending':
         return jsonify({"code": 400, "message": "该申请已处理"}), 400
+    user = _current_user()
+    if not has_camp_access(user, req.camp_session_id, 'application.review'):
+        return jsonify({"code": 403, "message": "需要本营负责人权限"}), 403
     m, err = _apply_join_approval(req, (request.json or {}).get("team_mentor_id"))
     if err:
         msg, code = err
@@ -2036,7 +2091,7 @@ def join_request_approve(rid):
 
 @bp.route("/sessions/<int:sid>/join-requests/batch-approve", methods=["POST"])
 @jwt_required()
-@camp_role()
+@camp_access('application.review')
 @audit_log(operation="批量批准营期申请")
 def join_request_batch_approve(sid):
     """批量批准加入申请（09-16 多选/一键通过，学员与导生申请通用）：
@@ -2078,14 +2133,16 @@ def join_request_batch_approve(sid):
 
 @bp.route("/join-requests/<int:rid>/reject", methods=["POST"])
 @jwt_required()
-@camp_role()
 @audit_log(operation="拒绝营期申请")
 def join_request_reject(rid):
+    """按 rid 定位（路由无 sid 段）——权限端点内判定，同 join_request_approve。"""
     req = CampJoinRequest.query.get(rid)
     if not req:
         return jsonify({"code": 404, "message": "申请不存在"}), 404
     if req.status != 'pending':
         return jsonify({"code": 400, "message": "该申请已处理"}), 400
+    if not has_camp_access(_current_user(), req.camp_session_id, 'application.review'):
+        return jsonify({"code": 403, "message": "需要本营负责人权限"}), 403
     req.status = 'rejected'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
@@ -2109,7 +2166,7 @@ def join_request_reject(rid):
 
 @bp.route("/sessions/<int:sid>/members/<int:uid>", methods=["PUT"])
 @jwt_required()
-@camp_role()
+@camp_access('member.manage')
 @audit_log(operation="改派营期成员导生")
 def member_update(sid, uid):
     """改成员归属导生（仅学员行可改；日常团队改派入口）。"""
@@ -2403,18 +2460,20 @@ def team_progress(sid):
 
 @bp.route("/sessions/<int:sid>/progress/board")
 @jwt_required()
-@camp_role('mentor')
 def progress_board(sid):
     """营期学习进度看板（管理端营详情「学习进度」tab 数据源，09-16）：
     按导生团队（CampMember.team_mentor_id）分桶，每组课程列 = 该组导生名片方向绑定的课程
     ——方向制下各组课程不同，故组=独立子矩阵而非全营单矩阵；学员行逐课进度块与
     team/progress / my-direction 同口径（_course_block）。导生调用仅返回本组
     （_visible_student_ids），与将来导生端看板化共用本端点；archived 营可读（结营复盘，
-    快照口径保留）。"""
+    快照口径保留）。阶段 1 起营期负责人（owner/teacher）也走本端点看全营。"""
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     user = _current_user()
+    denied = _staff_or_mentor_gate(sid, user)
+    if denied:
+        return denied
     visible = set(_visible_student_ids(sid, user))
     buckets = defaultdict(list)                     # team_mentor_id -> [CampMember]
     for s in CampMember.query.filter_by(camp_session_id=sid, role='student').all():

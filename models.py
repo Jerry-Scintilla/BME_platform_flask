@@ -1228,6 +1228,45 @@ class CampMember(db.Model):
     )
 
 
+class CampStaff(db.Model):
+    """营期工作人员（2026-09-20，migrate_42《培训营老师身份与营期负责人架构设计方案》）：
+    与 CampMember 平行的治理分支——owner=主负责人（原则上每营恰好一个活跃）/ teacher=协同老师。
+    解除职责改 status='ended' 不物理删除（审计链）；主负责人从活跃 owner 行单一读取，
+    不在 CampSession 上另存副本。允许同一人同时是本营 CampMember（如老师兼导生）。"""
+    __tablename__ = 'camp_staff'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False, default='teacher')          # owner / teacher
+    status = db.Column(db.String(20), nullable=False, default='active')         # active / ended
+    assigned_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    assigned_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    ended_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    ended_at = db.Column(db.DateTime, nullable=True)
+    end_reason = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'user_id', name='uq_camp_staff_camp_user'),
+        db.Index('ix_camp_staff_session_status_role', 'camp_session_id', 'status', 'role'),
+    )
+
+
+class CampStaffEvent(db.Model):
+    """营期工作人员职责变更事件（只追加，方案 §3.4）：谁在什么时候把这个营交给了谁。
+    通知表可被用户删除，不承担审计职责。action ∈ assign/promote/demote/transfer/end。"""
+    __tablename__ = 'camp_staff_event'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    action = db.Column(db.String(20), nullable=False)             # assign / promote / demote / transfer / end
+    before_role = db.Column(db.String(20), nullable=True)
+    after_role = db.Column(db.String(20), nullable=True)
+    operator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    reason = db.Column(db.String(500), nullable=True)
+    occurred_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+
+
 class CampCourse(db.Model):
     """营期可选课程目录"""
     __tablename__ = 'camp_course'

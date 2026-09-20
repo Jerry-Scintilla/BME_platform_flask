@@ -354,6 +354,7 @@ from .notification import bp as notification_bp
 from .seat import bp as seat_bp
 from .attendance_report import bp as attendance_report_bp
 from .camp import bp as camp_bp
+from .camp_staff import bp as camp_staff_bp
 from .camp_ms import bp as camp_ms_bp
 from .camp_project import bp as camp_project_bp
 from .camp_delivery import bp as camp_delivery_bp
@@ -390,6 +391,7 @@ __all__ = [
     'seat_bp',
     'attendance_report_bp',
     'camp_bp',
+    'camp_staff_bp',
     'camp_ms_bp',
     'camp_project_bp',
     'camp_delivery_bp',

@@ -370,11 +370,11 @@ def _send_phase_notifications(camp, phase):
                                 f"「{name}」志愿提交通道开启，请在 {_fmt_dt(camp.ms_preference_deadline)} 前提交 1-3 个志愿。",
                                 **common)
     elif phase == MS_DONE:
-        # 截止提醒仅告知老师（Phase 1a 后全局「老师」即 super_admin；批量查询无法走
-        # is_admin() 方法收口，按同口径过滤 role）
-        staffs = UserModel.query.filter(UserModel.role == 'super_admin').all()
-        for u in staffs:
-            create_notification(u.id, "选导生：志愿已截止",
+        # 截止提醒走责任链（阶段 1，方案 §7.2）：本营 owner+teachers；
+        # 无工作人员的营才兜底全部 super_admin
+        from .camp_staff import camp_responsible_ids
+        for uid in camp_responsible_ids(camp.id):
+            create_notification(uid, "选导生：志愿已截止",
                                 f"「{name}」学员志愿已截止，请导出志愿 CSV 完成线下协调，再批量指派导生。",
                                 **common)
 
