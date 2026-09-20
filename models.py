@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pygments.lexer import default
 from sqlalchemy import and_
-from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.dialects.mysql import LONGTEXT, MEDIUMTEXT
 from sqlalchemy.orm import foreign, remote
 
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -136,11 +136,19 @@ class ArticleV2Model(db.Model):
     __tablename__ = 'article_v2'
     STATUS_DRAFT = 'draft'
     STATUS_PUBLISHED = 'published'
+    # 官方富文本推文（2026-09-20 方案）：正文格式 markdown / html 二选一，与
+    # is_official（运营身份）、is_essence（精选）正交。html 仅文章管理员可写，
+    # 存清洗后片段（services/article_html.py），格式一经保存锁定。
+    CONTENT_TYPE_MD = 'markdown'
+    CONTENT_TYPE_HTML = 'html'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     title = db.Column(db.String(100), nullable=True)        # 草稿允许空
     introduction = db.Column(db.Text, nullable=True)        # 草稿允许空
     content_md = db.Column(db.Text, nullable=True)          # Markdown 正文，不写文件；草稿允许空
+    content_type = db.Column(db.String(16), nullable=False, default=CONTENT_TYPE_MD)   # 正文技术格式
+    content_html = db.Column(MEDIUMTEXT, nullable=True)     # 清洗后 HTML 正文（秀米/公众号排版，MEDIUMTEXT 防超 TEXT 容量）
+    content_version = db.Column(db.Integer, nullable=False, default=1)  # HTML 清洗规范版本，供未来重洗
     status = db.Column(db.String(20), default=STATUS_PUBLISHED)
     cover_image_key = db.Column(db.String(255), nullable=True)   # 封面 '/media/articles/...' 相对 URL（社区重设计 09-19）
     is_official = db.Column(db.Boolean, nullable=False, default=False)  # 官方推文标记：仅文章管理员可设，社区精选带展示

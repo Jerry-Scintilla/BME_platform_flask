@@ -1,0 +1,42 @@
+导入官方富文本（剪贴板 HTML 清洗 + 图片转存，仅文章管理员）
+---
+tags:
+  - 文章模块V2
+security:
+  - Bearer: []
+consumes:
+  - multipart/form-data
+parameters:
+  - name: article_id
+    in: formData
+    type: integer
+    required: true
+    description: 文章 id（先创建 HTML 草稿再导入，图片归属该草稿）
+  - name: html
+    in: formData
+    type: string
+    required: true
+    description: 剪贴板中的 text/html 原文（上限 3MB）
+  - name: source_hint
+    in: formData
+    type: string
+    required: false
+    description: 来源提示 xiumi / wechat / web / unknown
+  - name: files
+    in: formData
+    type: file
+    required: false
+    description: 剪贴板中的本地图片文件（可多个，单张上限 10MB）
+  - name: file_map
+    in: formData
+    type: string
+    required: false
+    description: JSON 对象，占位符文本 -> files 序号映射
+
+responses:
+  200:
+    description: 返回清洗后 HTML 与导入报告（data.html / data.report / data.files）
+  400:
+    description: 参数缺失或超过上限
+  403:
+    description: 需要文章管理权限

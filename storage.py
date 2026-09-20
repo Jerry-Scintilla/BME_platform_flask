@@ -100,6 +100,10 @@ class MinioStorage:
     def stat_object(self, key):
         return self._client.stat_object(self.bucket, key)
 
+    def list_objects(self, prefix=""):
+        """按前缀列对象 key（媒体目录清理用）。"""
+        return [o.object_name for o in self._client.list_objects(self.bucket, prefix=prefix, recursive=True)]
+
     def get_object(self, key, offset=None, length=None):
         """返回可读响应流（调用方负责关闭并 release_conn）。
         offset/length 用于 HTTP Range 分段读取（视频拖动进度条依赖 206）。"""
@@ -154,6 +158,16 @@ class LocalStorage:
         st = os.stat(self._path(key))    # 不存在抛 FileNotFoundError，对齐 minio 抛错语义
         return types.SimpleNamespace(size=st.st_size)
 
+    def list_objects(self, prefix=""):
+        root = os.path.join(self.root, prefix)
+        if not os.path.isdir(root):
+            return []
+        keys = []
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                keys.append(os.path.relpath(os.path.join(dirpath, name), self.root).replace(os.sep, "/"))
+        return keys
+
     def get_object(self, key, offset=None, length=None):
         fh = open(self._path(key), "rb")
         if offset is not None:
@@ -207,6 +221,10 @@ class Storage:
 
     def stat_object(self, key):
         return self._impl_or_fail().stat_object(key)
+
+    def list_objects(self, prefix=""):
+        """按前缀列对象 key（本地后端递归目录、minio 后端 list_objects，签名一致）。"""
+        return self._impl_or_fail().list_objects(prefix)
 
     def get_object(self, key, offset=None, length=None):
         """返回可读响应流（调用方负责关闭并 release_conn——local 后端两者皆可用）。

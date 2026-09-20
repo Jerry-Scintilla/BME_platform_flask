@@ -65,6 +65,14 @@ DATA_ROOT = os.getenv("DATA_ROOT", "./data")
 # 对象存储后端选择：minio（默认，向后兼容）| local（本地磁盘，无需 MinIO 服务）
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "minio")
 
+# 官方富文本推文（HTML 正文）总开关：关闭后 HTML 创建/导入接口一律拒绝（回滚用，
+# 不影响已发布 HTML 文章的阅读渲染）。独立于前端 VITE 开关，权限不靠前端控制。
+ARTICLE_HTML_ENABLED = os.getenv("ARTICLE_HTML_ENABLED", "true").lower() == "true"
+
+# 表单非文件字段上限：Werkzeug 3.1 默认 500KB，会拦掉官方富文本导入的 html 字段
+# （原始上限 3MB，见 services/article_html.py）。抬到 4MB 留余量（09-20 修复 413）。
+MAX_FORM_MEMORY_SIZE = 4 * 1024 * 1024
+
 # 对象存储（MinIO / 任意 S3 兼容服务）：课程资源等文件的本体存储，
 # 后端只做上传/下载代理，不在本地磁盘持久化文件（STORAGE_BACKEND=local 时本组配置不生效）
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")

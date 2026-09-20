@@ -7,6 +7,35 @@ from flask_jwt_extended import get_jwt_identity
 from exts import db
 from models import UserModel, PermissionModel, UserPermissionModel
 
+# 审计字段长度上限（09-20 官方富文本导入修复）：operation_data 列为 TEXT(64KB)，
+# 导入响应含整段清洗后 HTML（可达 2MB），全量入库触发 1406 把成功业务变 500
+# 且污染 session（PendingRollbackError 连坐后续请求）。
+AUDIT_DATA_MAX_CHARS = 16000          # 16k 字符，utf8mb4 最坏 4B/字符仍在 64KB 内
+AUDIT_URL_MAX_CHARS = 200             # 对齐 operation_url 列 String(200)
+
+
+def _audit_truncate(value, limit):
+    """审计字段截断：超长保留前段并标注截断量。"""
+    s = str(value)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"...(truncated {len(s) - limit} chars)"
+
+
+def _audit_write(log_entry):
+    """审计落库 best-effort：失败只回滚并打日志——绝不把成功的业务响应变成 500，
+    也不让失败的 flush 悬在 session 里污染后续请求。"""
+    try:
+        db.session.add(log_entry)
+        db.session.commit()
+    except Exception as e:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        print(f"[audit] 审计日志写入失败（已忽略，不影响业务响应）：{e}")
+
+
 # 安全审计装饰器
 def audit_log(operation=None, is_login=False):
     """
@@ -73,19 +102,17 @@ def audit_log(operation=None, is_login=False):
                     username = user.username if user else user_email
                     user_id = user.id if user else None
 
-                    log_entry = AuditLog(
+                    _audit_write(AuditLog(
                         user_id=user_id,
                         username=username,
                         ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
-                        operation_url=request.url,
-                        operation_data=str(operation_data),
+                        operation_url=_audit_truncate(request.url, AUDIT_URL_MAX_CHARS),
+                        operation_data=_audit_truncate(operation_data, AUDIT_DATA_MAX_CHARS),
                         result=result,
                         timestamp=start_time
-                    )
-                    db.session.add(log_entry)
-                    db.session.commit()
+                    ))
 
                 return response
             except Exception as e:
@@ -100,19 +127,17 @@ def audit_log(operation=None, is_login=False):
                         0].strip()
                     client_ip = real_ip or request.remote_addr
 
-                    log_entry = AuditLog(
+                    _audit_write(AuditLog(
                         user_id=user_id,
                         username=username,
                         ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
-                        operation_url=request.url,
-                        operation_data=str({'error': str(e)}),
+                        operation_url=_audit_truncate(request.url, AUDIT_URL_MAX_CHARS),
+                        operation_data=_audit_truncate({'error': str(e)}, AUDIT_DATA_MAX_CHARS),
                         result='失败',
                         timestamp=start_time
-                    )
-                    db.session.add(log_entry)
-                    db.session.commit()
+                    ))
                 raise
         return wrapper
     return decorator

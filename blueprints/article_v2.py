@@ -7,12 +7,15 @@
 - ArticleV2Form 内联（不动 forms.py）
 - 社区重设计（09-19）：cover_image_key 封面 + is_official 官方推文（仅文章管理员可设）+
   编辑器图床 /upload_image + 发布限流（同讨论帖规格）
+- 官方富文本推文（09-20 方案）：content_type=html 第二种正文格式，仅文章管理员可写，
+  服务端每写必洗（services/article_html.py），必须官方推文；/admin/html/import 导入。
 """
 import io
+import json
 import os
 import uuid
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 import wtforms
 from wtforms.validators import length
 
@@ -26,6 +29,7 @@ from models import (
 )
 from storage import storage
 import imaging
+from services import article_html
 
 # 导入token验证模块
 from flask_jwt_extended import get_jwt_identity, jwt_required
@@ -130,6 +134,78 @@ def _ensure_article_access(user, article):
     return jsonify({"code": 403, "message": "用户权限不足"}), 403
 
 
+# ─────────────────────────────────────────────
+# 官方富文本（content_type）集中校验（方案 §6.3）
+# 草稿/发布/草稿转发布/编辑全部走这里，权限与互斥规则不散落路由。
+# ─────────────────────────────────────────────
+
+def _html_enabled():
+    return bool(current_app.config.get("ARTICLE_HTML_ENABLED", True))
+
+
+def _content_fields(data, user, article=None):
+    """解析并校验 content_type / content_md / content_html。
+
+    返回 (content_type, content_md, content_html, 错误响应)；正文值为 None 表示本次请求未携带。
+    规则（方案 §5.2/§6）：
+    - 缺省 content_type 按存量 markdown 处理（向后兼容，老客户端不受影响）
+    - html 仅文章管理员可用；HTML 文章连作者本人（非管理员）也不放行
+    - 格式一经保存锁定：已有文章的 content_type 不可改
+    - markdown 与 content_html 互斥；html 与 content_md 互斥
+    """
+    data = data or {}
+    ctype = data.get('content_type')
+    if ctype is None:
+        ctype = article.content_type if article is not None else ArticleV2Model.CONTENT_TYPE_MD
+    if ctype not in (ArticleV2Model.CONTENT_TYPE_MD, ArticleV2Model.CONTENT_TYPE_HTML):
+        return None, None, None, (jsonify({"code": 400, "message": "content_type 仅支持 markdown/html"}), 400)
+
+    if ctype == ArticleV2Model.CONTENT_TYPE_HTML:
+        if not _html_enabled():
+            return None, None, None, (jsonify({"code": 403, "message": "官方富文本功能已关闭"}), 403)
+        if not _is_article_manager(user):
+            return None, None, None, (jsonify({"code": 403, "message": "HTML 正文仅文章管理员可用"}), 403)
+
+    if article is not None and ctype != article.content_type:
+        return None, None, None, (
+            jsonify({"code": 400, "message": f"正文格式已锁定为 {article.content_type}，如需另一种格式请复制为新文章"}), 400)
+
+    content_md = data.get('content_md')
+    content_html = data.get('content_html')
+    if ctype == ArticleV2Model.CONTENT_TYPE_MD:
+        if content_html:
+            return None, None, None, (jsonify({"code": 400, "message": "Markdown 文章不能提交 content_html"}), 400)
+        if content_md is not None and len(content_md) > 500000:
+            return None, None, None, (jsonify({"code": 400, "message": "正文内容过长（上限 50 万字符）"}), 400)
+    else:
+        if content_md:
+            return None, None, None, (jsonify({"code": 400, "message": "HTML 文章不能提交 content_md"}), 400)
+        if content_html is not None and len(content_html.encode("utf-8", errors="ignore")) > article_html.RAW_HTML_MAX_BYTES:
+            return None, None, None, (jsonify({"code": 400, "message": "正文超过 3MB 上限"}), 400)
+    return ctype, content_md, content_html, None
+
+
+def _official_for_html(official):
+    """HTML 文章的官方标记规则（方案 §6.2）：必须官方；显式 false 拒绝；缺省补 True。
+    返回 (生效值, 错误响应)。"""
+    if official is False:
+        return None, (jsonify({"code": 400, "message": "HTML 文章必须为官方推文，不能取消官方标记；如下线请直接下架文章"}), 400)
+    return True, None
+
+
+def _sanitize_and_set_html(article, content_html):
+    """写库前的服务端重洗（幂等），以清洗结果覆盖客户端正文。返回错误响应或 None。"""
+    if content_html is None:
+        return None
+    try:
+        cleaned, _report = article_html.clean_for_save(article.id, content_html)
+    except article_html.HtmlImportError as e:
+        return jsonify({"code": 400, "message": str(e)}), 400
+    article.content_html = cleaned or None
+    article.content_version = article.content_version or 1
+    return None
+
+
 def _article_to_dict(a, with_author_avatar=False, summary=False):
     """序列化文章为 dict（/list、/by_author、/my 共用，收敛重复）。
 
@@ -140,6 +216,7 @@ def _article_to_dict(a, with_author_avatar=False, summary=False):
         "id": a.id,
         "title": a.title or '',
         "introduction": a.introduction or '',
+        "content_type": a.content_type or ArticleV2Model.CONTENT_TYPE_MD,
         "status": a.status,
         "cover": a.cover_image_key,
         "cover_thumb": _cover_thumb_url(a),
@@ -177,7 +254,8 @@ class ArticleV2Form(wtforms.Form):
 
     title = wtforms.StringField(validators=[length(min=1, max=100, message='标题格式不对')])
     introduction = wtforms.StringField(validators=[length(min=1, max=300, message='简介格式不对')])
-    content_md = wtforms.StringField(validators=[length(min=1, max=500000, message='正文内容过长（上限 50 万字符）')])
+    # content_md 改为可选：HTML 官方推文发布不带 content_md（必填校验移到 _content_fields 按格式分流）
+    content_md = wtforms.StringField(validators=[length(max=500000, message='正文内容过长（上限 50 万字符）')])
 
 
 class ArticleV2DraftForm(wtforms.Form):
@@ -199,7 +277,7 @@ class ArticleV2DraftForm(wtforms.Form):
     content_md = wtforms.StringField(validators=[length(max=500000, message='正文内容过长（上限 50 万字符）')])
 
 
-# 发布文章（存 md，不写文件）
+# 发布文章（markdown 或 html 官方推文；html 仅文章管理员，服务端重洗后落库）
 @bp.route("/public", methods=["POST"])
 @jwt_required()
 @audit_log(operation="创建文章")
@@ -211,7 +289,6 @@ def article_v2_public():
 
     title = form.title.data
     introduction = form.introduction.data
-    content_md = form.content_md.data
 
     user_email = get_jwt_identity()
     user = UserModel.query.filter_by(email=user_email).first()
@@ -219,24 +296,45 @@ def article_v2_public():
         return jsonify({"code": 401, "message": "用户不存在"}), 401
 
     data = request.get_json(silent=True) or {}
+    ctype, content_md, content_html, err = _content_fields(data, user)
+    if err:
+        return err
+    # 发布必须有正文：markdown 看 content_md，html 看 content_html
+    if ctype == ArticleV2Model.CONTENT_TYPE_MD and not (content_md or '').strip():
+        return jsonify({"code": 400, "message": "正文内容不能为空"}), 400
+    if ctype == ArticleV2Model.CONTENT_TYPE_HTML and not (content_html or '').strip():
+        return jsonify({"code": 400, "message": "正文内容不能为空"}), 400
+
     official, err = _official_flag(data, user)
     if err:
         return err
     essence, err = _essence_flag(data, user)
     if err:
         return err
+    if ctype == ArticleV2Model.CONTENT_TYPE_HTML:
+        official, err = _official_for_html(official)
+        if err:
+            return err
     limited = _publish_rate_guard(user)
     if limited:
         return limited
 
     article = ArticleV2Model(
         title=title, introduction=introduction,
-        content_md=content_md, author_id=user.id,
+        content_md=content_md if ctype == ArticleV2Model.CONTENT_TYPE_MD else None,
+        content_type=ctype, content_version=1,
+        author_id=user.id,
         status=ArticleV2Model.STATUS_PUBLISHED, publish_time=datetime.now(),
         is_official=bool(official),
         is_essence=bool(essence),
     )
     db.session.add(article)
+    db.session.flush()                     # 先拿 id：HTML 转存路径要挂文章归属
+    if ctype == ArticleV2Model.CONTENT_TYPE_HTML:
+        err = _sanitize_and_set_html(article, content_html)
+        if err:
+            db.session.rollback()
+            return err
     db.session.commit()
 
     return jsonify({
@@ -249,7 +347,8 @@ def article_v2_public():
     }), 200
 
 
-# 保存草稿（无 id 新建草稿；带 id 更新现有草稿内容，仅限 status=draft）
+# 保存草稿（无 id 新建草稿；带 id 更新现有草稿内容，仅限 status=draft；
+# HTML 官方推文草稿允许全空——新建入口先建空草稿拿 id 再进编辑器，方案 §8.1）
 @bp.route("/draft", methods=["POST"])
 @jwt_required()
 @audit_log(operation="保存草稿")
@@ -263,43 +362,73 @@ def article_v2_draft():
     if user is None:
         return jsonify({"code": 401, "message": "用户不存在"}), 401
 
-    title = (form.title.data or '').strip()
-    introduction = form.introduction.data or ''
-    content_md = form.content_md.data or ''
-    # 草稿至少要有标题或正文，避免存全空记录
-    if not title and not content_md.strip():
-        return jsonify({"code": 400, "message": "写点标题或内容再保存草稿"}), 400
+    data = request.get_json(silent=True) or {}
+    article_id = form.id.data
+    existing = None
+    if article_id:
+        existing = ArticleV2Model.query.filter_by(id=article_id).first()
+        if existing is None:
+            return jsonify({"code": 404, "message": "文章不存在"}), 404
+        check = _ensure_article_access(user, existing)
+        if check:
+            return check
 
-    official, err = _official_flag(request.get_json(silent=True), user)
+    ctype, content_md, content_html, err = _content_fields(data, user, existing)
     if err:
         return err
 
-    article_id = form.id.data
-    if article_id:
-        article = ArticleV2Model.query.filter_by(id=article_id).first()
-        if article is None:
-            return jsonify({"code": 404, "message": "文章不存在"}), 404
-        check = _ensure_article_access(user, article)
-        if check:
-            return check
-        if article.status != ArticleV2Model.STATUS_DRAFT:
+    title = (form.title.data or '').strip()
+    introduction = form.introduction.data or ''
+    # 草稿至少要有标题或正文（HTML 空草稿例外：新建流程先占位）
+    if ctype == ArticleV2Model.CONTENT_TYPE_MD:
+        if not title and not (content_md or '').strip():
+            return jsonify({"code": 400, "message": "写点标题或内容再保存草稿"}), 400
+        content_html = None
+    else:
+        content_md = None
+
+    official, err = _official_flag(data, user)
+    if err:
+        return err
+    if ctype == ArticleV2Model.CONTENT_TYPE_HTML:
+        official, err = _official_for_html(official)
+        if err:
+            return err
+
+    if existing is not None:
+        if existing.status != ArticleV2Model.STATUS_DRAFT:
             return jsonify({"code": 400, "message": "该文章已发布，请使用编辑功能"}), 400
-        article.title = title
-        article.introduction = introduction
-        article.content_md = content_md
+        existing.title = title
+        existing.introduction = introduction
+        if ctype == ArticleV2Model.CONTENT_TYPE_MD:
+            existing.content_md = content_md or ''
+        else:
+            err = _sanitize_and_set_html(existing, content_html)
+            if err:
+                return err
         if official is not None:
-            article.is_official = official
+            existing.is_official = official
+        article = existing
     else:
         article = ArticleV2Model(
-            title=title, introduction=introduction, content_md=content_md,
+            title=title, introduction=introduction,
+            content_md=(content_md or '') if ctype == ArticleV2Model.CONTENT_TYPE_MD else None,
+            content_type=ctype, content_version=1,
             author_id=user.id, status=ArticleV2Model.STATUS_DRAFT, publish_time=None,
             is_official=bool(official),
         )
         db.session.add(article)
+        db.session.flush()                 # 先拿 id，HTML 正文转存挂文章归属
+        if ctype == ArticleV2Model.CONTENT_TYPE_HTML:
+            err = _sanitize_and_set_html(article, content_html)
+            if err:
+                db.session.rollback()
+                return err
     db.session.commit()
     return jsonify({
         "code": 200, "message": "草稿已保存",
         "id": article.id, "status": article.status,
+        "content_type": article.content_type,
     }), 200
 
 
@@ -308,34 +437,58 @@ def article_v2_draft():
 @jwt_required()
 @audit_log(operation="发布文章")
 def article_v2_publish(article_id):
+    user = _current_user()
     article = ArticleV2Model.query.filter_by(id=article_id).first()
     if article is None:
         return jsonify({"code": 404, "message": "文章不存在"}), 404
-    check = _ensure_article_access(_current_user(), article)
+    check = _ensure_article_access(user, article)
     if check:
         return check
+    # HTML 文章的发布属编辑动作：非文章管理员连作者本人也不放行（方案 §6.1）
+    if article.content_type == ArticleV2Model.CONTENT_TYPE_HTML and not _is_article_manager(user):
+        return jsonify({"code": 403, "message": "HTML 文章仅文章管理员可操作"}), 403
     # 可选：随发布一起更新内容（草稿发布时把当前编辑内容写入，避免改动丢失）
     data = request.get_json(silent=True) or {}
+    ctype, content_md, content_html, err = _content_fields(data, user, article)
+    if err:
+        return err
     if 'title' in data:
         article.title = data['title']
     if 'introduction' in data:
         article.introduction = data['introduction']
-    if 'content_md' in data:
-        article.content_md = data['content_md']
-    official, err = _official_flag(data, _current_user())
+    if ctype == ArticleV2Model.CONTENT_TYPE_MD:
+        if content_md is not None:
+            article.content_md = content_md
+    else:
+        err = _sanitize_and_set_html(article, content_html)
+        if err:
+            return err
+    official, err = _official_flag(data, user)
     if err:
         return err
+    if article.content_type == ArticleV2Model.CONTENT_TYPE_HTML:
+        official, err = _official_for_html(official)
+        if err:
+            return err
     if official is not None:
         article.is_official = official
-    essence, err = _essence_flag(data, _current_user())
+    essence, err = _essence_flag(data, user)
     if err:
         return err
     if essence is not None:
         article.is_essence = essence
     if article.status != ArticleV2Model.STATUS_PUBLISHED:
-        # 发布前补校验：标题与正文不能空
-        if not (article.title or '').strip() or not (article.content_md or '').strip():
-            return jsonify({"code": 400, "message": "标题和正文不能为空"}), 400
+        # 发布前补校验：标题与正文不能空（按格式分流；HTML 还须无转存失败占位块）
+        if not (article.title or '').strip():
+            return jsonify({"code": 400, "message": "标题不能为空"}), 400
+        if article.content_type == ArticleV2Model.CONTENT_TYPE_MD:
+            if not (article.content_md or '').strip():
+                return jsonify({"code": 400, "message": "正文不能为空"}), 400
+        else:
+            if not (article.content_html or '').strip():
+                return jsonify({"code": 400, "message": "正文不能为空"}), 400
+            if article_html.has_failed_images(article.content_html):
+                return jsonify({"code": 400, "message": "正文中仍有图片转存失败占位块，请处理后（删除或重传）再发布"}), 400
         article.status = ArticleV2Model.STATUS_PUBLISHED
         if not article.publish_time:
             article.publish_time = datetime.now()
@@ -392,7 +545,10 @@ def article_v2_get(article_id):
             "id": article.id,
             "title": article.title,
             "introduction": article.introduction,
-            "content_md": article.content_md,
+            "content_type": article.content_type or ArticleV2Model.CONTENT_TYPE_MD,
+            "content_version": article.content_version or 1,
+            "content_md": article.content_md if article.content_type != ArticleV2Model.CONTENT_TYPE_HTML else None,
+            "content_html": article.content_html if article.content_type == ArticleV2Model.CONTENT_TYPE_HTML else None,
             "status": article.status,
             "cover": article.cover_image_key,
             "cover_thumb": _cover_thumb_url(article),
@@ -409,35 +565,51 @@ def article_v2_get(article_id):
     })
 
 
-# 编辑文章（改 title/introduction/content_md）
+# 编辑文章（改 title/introduction/正文；正文按 content_type 分流且每次写库前重洗）
 @bp.route("/<int:article_id>/edit", methods=["POST"])
 @jwt_required()
 @audit_log(operation="编辑文章")
 @swag_from('../apidocs/article_v2/edit.yaml')
 def article_v2_edit(article_id):
+    user = _current_user()
     data = request.get_json(silent=True) or {}
     article = ArticleV2Model.query.filter_by(id=article_id).first()
     if article is None:
         return jsonify({"code": 404, "message": "文章不存在"}), 404
-    check = _ensure_article_access(_current_user(), article)
+    check = _ensure_article_access(user, article)
     if check:
         return check
+    # HTML 文章编辑：非文章管理员连作者本人也不放行（方案 §6.1）
+    if article.content_type == ArticleV2Model.CONTENT_TYPE_HTML and not _is_article_manager(user):
+        return jsonify({"code": 403, "message": "HTML 文章仅文章管理员可编辑"}), 403
+
+    ctype, content_md, content_html, err = _content_fields(data, user, article)
+    if err:
+        return err
 
     if 'title' in data:
         article.title = data['title']
     if 'introduction' in data:
         article.introduction = data['introduction']
-    content_md = data.get('content_md')
-    if content_md is not None:
-        if len(content_md) > 500000:
-            return jsonify({"code": 400, 'message': '正文内容过长（上限 50 万字符）'}), 400
-        article.content_md = content_md
-    official, err = _official_flag(data, _current_user())
+    if ctype == ArticleV2Model.CONTENT_TYPE_MD:
+        if content_md is not None:
+            if len(content_md) > 500000:
+                return jsonify({"code": 400, 'message': '正文内容过长（上限 50 万字符）'}), 400
+            article.content_md = content_md
+    else:
+        err = _sanitize_and_set_html(article, content_html)
+        if err:
+            return err
+    official, err = _official_flag(data, user)
     if err:
         return err
+    if article.content_type == ArticleV2Model.CONTENT_TYPE_HTML:
+        official, err = _official_for_html(official)
+        if err:
+            return err
     if official is not None:
         article.is_official = official
-    essence, err = _essence_flag(data, _current_user())
+    essence, err = _essence_flag(data, user)
     if err:
         return err
     if essence is not None:
@@ -534,7 +706,72 @@ def article_v2_upload_image():
     return jsonify({"code": 200, "url": media_url(key)})
 
 
-# 删除文章（连同其 discussion 互动数据：thread / replies / reactions，软关联需手工清）
+# ─────────────────────────────────────────────
+# 官方富文本导入（方案 §7.2）：剪贴板 HTML -> 归一化/转存/清洗 -> 干净 HTML + 报告
+# ─────────────────────────────────────────────
+
+# 官方富文本导入（multipart/form-data：article_id 必填先建草稿、html 剪贴板内容、
+# source_hint 可选、files[] 剪贴板本地图片、file_map 占位符->files 序号映射）
+@bp.route("/admin/html/import", methods=["POST"])
+@jwt_required()
+@audit_log(operation="导入官方富文本")
+@swag_from('../apidocs/article_v2/admin_html_import.yaml')
+def article_v2_admin_html_import():
+    user = _current_user()
+    if not _is_article_manager(user):
+        return jsonify({"code": 403, "message": "需要文章管理权限"}), 403
+    if not _html_enabled():
+        return jsonify({"code": 403, "message": "官方富文本功能已关闭"}), 403
+
+    article_id = request.form.get('article_id', type=int)
+    if not article_id:
+        return jsonify({"code": 400, "message": "缺少 article_id（请先创建草稿再导入）"}), 400
+    article = ArticleV2Model.query.filter_by(id=article_id).first()
+    if article is None:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+    check = _ensure_article_access(user, article)
+    if check:
+        return check
+    if article.content_type != ArticleV2Model.CONTENT_TYPE_HTML:
+        return jsonify({"code": 400, "message": "仅 HTML 官方推文可导入富文本"}), 400
+
+    raw_html = request.form.get('html')
+    if not raw_html or not raw_html.strip():
+        return jsonify({"code": 400, "message": "缺少 html 字段（剪贴板 text/html）"}), 400
+    source_hint = request.form.get('source_hint') or 'unknown'
+    files = request.files.getlist('files')
+    file_map_raw = request.form.get('file_map')
+    file_map = {}
+    if file_map_raw:
+        try:
+            file_map = json.loads(file_map_raw)
+            if not isinstance(file_map, dict):
+                file_map = {}
+        except (ValueError, TypeError):
+            return jsonify({"code": 400, "message": "file_map 须为 JSON 对象"}), 400
+
+    try:
+        cleaned, report, file_urls = article_html.import_html(article.id, raw_html, source_hint, files)
+    except article_html.HtmlImportError as e:
+        return jsonify({"code": 400, "message": str(e)}), 400
+
+    # 占位符替换（剪贴板图片文件与 HTML 内占位文本的映射，按 files 序号）
+    for placeholder, idx in file_map.items():
+        try:
+            url = file_urls[int(idx)]
+            cleaned = cleaned.replace(str(placeholder), url)
+        except (ValueError, IndexError, KeyError):
+            pass
+
+    return jsonify({
+        "code": 200,
+        "message": "导入完成",
+        "data": {"html": cleaned, "report": report, "files": file_urls},
+    }), 200
+
+
+# 删除文章（连同其 discussion 互动数据：thread / replies / reactions，软关联需手工清；
+# HTML 文章额外清理其媒体目录 media/articles/html/<id>/，方案 §12.5）
 @bp.route("/<int:article_id>/delete", methods=["POST"])
 @jwt_required()
 @audit_log(operation="删除文章")
@@ -546,6 +783,8 @@ def article_v2_delete(article_id):
     check = _ensure_article_access(_current_user(), article)
     if check:
         return check
+    if article.content_type == ArticleV2Model.CONTENT_TYPE_HTML:
+        article_html.remove_article_html_media(article.id)   # best-effort，失败不阻塞删除
 
     # 清理该 v2 文章的 discussion 互动（scope_type/target_type 均为软关联，无 DB FK 级联）
     v2_threads = DiscussionThread.query.filter_by(
