@@ -41,6 +41,7 @@ STAFF_PERMISSIONS = {
         'application.review',      # 审批学员/导生报名
         'member.manage',           # 成员直接添加、移除、改派
         'mentor_selection.manage', # 选导生配置
+        'mentor_selection.operate',# 选导生运营（指派/批量回填/导出；manage ⊃ operate）
         'learning.read_all',       # 全营学习进度
         'attendance.read_all',     # 全营考勤
         'leave.override',          # 全营请假兜底审批

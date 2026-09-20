@@ -37,6 +37,7 @@ from models import (
 
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
+from .camp_staff import camp_access
 from .forms import AvatarForm
 from .media import public_avatar_url
 from storage import storage
@@ -1165,7 +1166,7 @@ def overview(sid):
 
 @bp.route("/<int:sid>/assign", methods=["POST"])
 @jwt_required()
-@camp_role()
+@camp_access('mentor_selection.operate')
 @audit_log(operation="手动指派导生")
 def assign(sid):
     camp, err = _camp_or_404(sid)
@@ -1221,7 +1222,7 @@ def assign(sid):
 
 @bp.route("/<int:sid>/export")
 @jwt_required()
-@camp_role()
+@camp_access('mentor_selection.operate')
 @audit_log(operation="导出选导生志愿")
 def export_preferences(sid):
     """导出学员志愿 CSV（utf-8-sig 带 BOM，Excel 可直接打开）：老师线下协调用。
@@ -1269,9 +1270,78 @@ def export_preferences(sid):
     return resp
 
 
+@bp.route("/<int:sid>/assign/roster")
+@jwt_required()
+@camp_access('mentor_selection.operate')
+def assign_roster(sid):
+    """指派名册（老师工作台·选导生收官页数据源）：学员行（志愿摘要 + 当前归属）×
+    导生列（方向/名额/已带人数/是否发布名片）+ 统计。交互式批量指派用（管理端粘贴
+    回填之外的用户端路径，共用 assign/batch 落库）。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if not camp.mentor_selection_enabled:
+        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    students = CampMember.query.filter_by(camp_session_id=sid, role='student') \
+        .order_by(CampMember.id).all()
+    mentors = CampMember.query.filter_by(camp_session_id=sid, role='mentor') \
+        .order_by(CampMember.id).all()
+    prefs = {}
+    for r in (CampMentorPreference.query
+              .filter_by(camp_session_id=sid, round=1)
+              .order_by(CampMentorPreference.rank).all()):
+        prefs.setdefault(r.student_user_id, []).append(r)
+    profiles = {p.user_id: p for p in CampMentorProfile.query
+                .filter_by(camp_session_id=sid).all()}
+    uids = {s.user_id for s in students} | {m.user_id for m in mentors}
+    uids |= {r.mentor_user_id for plist in prefs.values() for r in plist}
+    users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(uids)).all()} if uids else {}
+    tags_by_uid = {}
+    for m in mentors:
+        p = profiles.get(m.user_id)
+        if p and p.tags:
+            try:
+                tl = json.loads(p.tags)
+                tags_by_uid[m.user_id] = tl[0] if isinstance(tl, list) and tl else None
+            except (ValueError, TypeError):
+                pass
+
+    def _name(uid):
+        u = users.get(uid)
+        return u.username if u else str(uid)
+
+    # 已带人数按 live 链接（含老师预分配的插班生，与名额口径一致）
+    matched = {}
+    for s in students:
+        if s.team_mentor_id:
+            matched[s.team_mentor_id] = matched.get(s.team_mentor_id, 0) + 1
+    assigned = sum(matched.values())
+    submitted = len(prefs)
+    return jsonify({"code": 200, "roster": {
+        "students": [{
+            "user_id": s.user_id, "username": _name(s.user_id),
+            "team_mentor_id": s.team_mentor_id,
+            "team_mentor_name": _name(s.team_mentor_id) if s.team_mentor_id else None,
+            "preferences": [{
+                "rank": r.rank, "mentor_user_id": r.mentor_user_id,
+                "mentor_name": _name(r.mentor_user_id), "note": r.note,
+            } for r in prefs.get(s.user_id, [])],
+        } for s in students],
+        "mentors": [{
+            "user_id": m.user_id, "username": _name(m.user_id),
+            "tag": tags_by_uid.get(m.user_id),
+            "capacity": profiles[m.user_id].capacity if m.user_id in profiles else None,
+            "matched": matched.get(m.user_id, 0),
+            "has_profile": m.user_id in profiles,
+        } for m in mentors],
+        "stats": {"students": len(students), "assigned": assigned,
+                  "unassigned": len(students) - assigned, "submitted": submitted},
+    }})
+
+
 @bp.route("/<int:sid>/assign/batch", methods=["POST"])
 @jwt_required()
-@camp_role()
+@camp_access('mentor_selection.operate')
 @audit_log(operation="批量指派导生")
 def assign_batch(sid):
     """线下协调结果批量回填：body {pairs:[{student_user_id, mentor_user_id},...]}。
