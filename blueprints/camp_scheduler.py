@@ -229,6 +229,109 @@ def _attendance_digest_scan(day, *, force=False):
 
 
 # ─────────────────────────────────────────────
+# 3. 组会任务截止提醒（T-24h）与逾期通知
+# ─────────────────────────────────────────────
+
+def _job_task_deadline_scan(app):
+    with app.app_context():
+        try:
+            _task_deadline_scan()
+        except Exception as e:
+            app.logger.exception(f"[camp_scheduler] 任务截止扫描失败: {e}")
+
+
+def _task_deadline_scan(now=None):
+    """未结营营期里带截止的必交任务：T-24h 内到期提醒未完成的组员；刚逾期通知本人+组长。
+    幂等游标按 (task, 类型) 一轮：due_soon 每 6h 重发一次（游标 6h 过期，截止前持续催办），
+    overdue 一次性（7 天游标）。直接调用便于测试。"""
+    from models import (CampSession, CampMeeting, CampMeetingTask,
+                        CampMeetingTaskSubmission, CampMeetingTaskAttachment)
+    from .camp_meeting import _submission_done, _leader_uid
+    from .notification import create_notification
+
+    now = now or datetime.now()
+    tasks = (CampMeetingTask.query
+             .join(CampMeeting, CampMeeting.id == CampMeetingTask.meeting_id)
+             .join(CampSession, CampSession.id == CampMeeting.camp_session_id)
+             .filter(CampMeetingTask.due_at.isnot(None),
+                     CampMeetingTask.required.is_(True),
+                     CampSession.status.notin_(('archived', 'deleted')))
+             .all())
+    if not tasks:
+        return 0
+    subs = CampMeetingTaskSubmission.query.filter(
+        CampMeetingTaskSubmission.task_id.in_([t.id for t in tasks])).all()
+    att_counts = dict(db.session.query(
+        CampMeetingTaskAttachment.submission_id,
+        db.func.count(CampMeetingTaskAttachment.id))
+        .filter(CampMeetingTaskAttachment.submission_id.in_([s.id for s in subs]))
+        .group_by(CampMeetingTaskAttachment.submission_id).all()) if subs else {}
+    done_by_task = {}
+    for s in subs:
+        t = next(x for x in tasks if x.id == s.task_id)
+        if _submission_done(s, t, att_counts.get(s.id, 0)):
+            done_by_task.setdefault(t.id, set()).add(s.student_user_id)
+    sent_tasks = 0
+    for t in tasks:
+        done = done_by_task.get(t.id, set())
+        m = CampMeeting.query.get(t.meeting_id)
+        if not m:
+            continue
+        # 本任务的组员（team=该导生组学员；unit=active 成员减 leader）
+        from models import CampMember, CampUnitMember
+        if m.scope == 'team':
+            members = [r.user_id for r in CampMember.query.filter_by(
+                camp_session_id=m.camp_session_id, role='student',
+                team_mentor_id=m.mentor_id).all()]
+        else:
+            members = [r.user_id for r in CampUnitMember.query.filter_by(
+                unit_id=m.unit_id, status='active').all() if r.role != 'leader']
+        pending = [uid for uid in members if uid not in done]
+        if not pending:
+            continue
+        if now < t.due_at and t.due_at <= now + timedelta(hours=24):
+            # T-24h 催办（6h 游标：截止前每 6 小时再催一次，最后一次在截止前）
+            if not _redis_guard(f"camp:task_due_soon:{t.id}", ttl_seconds=6 * 3600):
+                continue
+            from models import UserModel
+            for uid in pending:
+                create_notification(
+                    uid, "任务即将截止",
+                    f"组会「{m.title}」的任务「{t.title}」将于 "
+                    f"{t.due_at.strftime('%m-%d %H:%M')} 截止，你尚未提交。",
+                    category='camp', source_type='camp_meeting',
+                    source_id=m.id, camp_session_id=m.camp_session_id, is_important=True)
+            sent_tasks += 1
+        elif now > t.due_at:
+            # 逾期一次性通知：本人 + 组长（组长收汇总一条）
+            if not _redis_guard(f"camp:task_overdue:{t.id}", ttl_seconds=7 * 86400):
+                continue
+            from models import UserModel
+            for uid in pending:
+                create_notification(
+                    uid, "任务已逾期",
+                    f"组会「{m.title}」的任务「{t.title}」已于 "
+                    f"{t.due_at.strftime('%m-%d %H:%M')} 截止，你尚未提交"
+                    f"{'，请尽快补交' if t.allow_late else '，已停止接收提交'}。",
+                    category='camp', source_type='camp_meeting',
+                    source_id=m.id, camp_session_id=m.camp_session_id, is_important=True)
+            leader = _leader_uid(m)
+            if leader and leader not in pending:
+                names = ", ".join((UserModel.query.get(uid).username if UserModel.query.get(uid)
+                                   else str(uid)) for uid in pending[:10])
+                create_notification(
+                    leader, "任务逾期提醒",
+                    f"组会「{m.title}」的任务「{t.title}」已逾期，"
+                    f"{len(pending)} 名组员未提交：{names}{' 等' if len(pending) > 10 else ''}。",
+                    category='camp', source_type='camp_meeting',
+                    source_id=m.id, camp_session_id=m.camp_session_id)
+            sent_tasks += 1
+        if sent_tasks:
+            db.session.commit()
+    return sent_tasks
+
+
+# ─────────────────────────────────────────────
 # 初始化（fcntl 多 worker 单例，同 attendance_report 模式）
 # ─────────────────────────────────────────────
 
@@ -249,11 +352,15 @@ def init_camp_scheduler(app):
         args=[app], id="camp_deadline_reminder",
         coalesce=True, max_instances=1, misfire_grace_time=600, replace_existing=True)
     sched.add_job(
+        _job_task_deadline_scan, trigger=IntervalTrigger(minutes=30, timezone=tz_name),
+        args=[app], id="camp_task_deadline_scan",
+        coalesce=True, max_instances=1, misfire_grace_time=600, replace_existing=True)
+    sched.add_job(
         _job_attendance_digest,
         trigger=CronTrigger(hour=8, minute=30, timezone=tz_name),
         args=[app], id="camp_attendance_daily_digest",
         coalesce=True, max_instances=1, misfire_grace_time=7200, replace_existing=True)
     sched.start()
     _scheduler = sched
-    app.logger.info(f"[camp_scheduler] 已启动：志愿截止提醒（30 分钟扫描）+ "
+    app.logger.info(f"[camp_scheduler] 已启动：志愿/任务截止提醒（30 分钟扫描）+ "
                     f"考勤日摘要（每天 08:30，{tz_name}）")

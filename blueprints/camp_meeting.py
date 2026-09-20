@@ -137,9 +137,19 @@ def _meetings_payload(sid, user, student_ids, leader_view, **filters):
             for m in rows]
 
 
+def _submission_done(sub, task, att_count):
+    """完成口径（migrate_44）：有效提交且未被退回——退回的提交须重交后才算完成。"""
+    return _submission_valid(sub, task, att_count) and sub.status != 'returned'
+
+
+def _task_overdue(task, sub_done):
+    """逾期态（读时派生）：必交 + 已过截止 + 未完成。allow_late 只影响能否继续交。"""
+    return bool(task.required and task.due_at and datetime.now() > task.due_at and not sub_done)
+
+
 def _meeting_summaries(meeting_ids, user, student_ids, leader_view):
-    """列表摘要：任务数/课内章数 + 提交计数（按 submit_type 判有效提交）。
-    leader_view=True → 提交 x/期望（任务 × 组员）；否则 → 我的待提交 n。"""
+    """列表摘要：任务数/课内章数 + 提交计数（按 submit_type 判有效提交，退回不计完成）。
+    leader_view=True → 提交 x/期望（任务 × 组员）+ 逾期数；否则 → 我的待提交 n + 逾期 n。"""
     out = {}
     if not meeting_ids:
         return out
@@ -157,25 +167,35 @@ def _meeting_summaries(meeting_ids, user, student_ids, leader_view):
             if tasks else [])
     att_counts = (_att_counts_of([s.id for s in subs]) if subs else {})
     task_by_id = {t.id: t for t in tasks}
-    # 有效提交 (meeting_id, task_id, uid) 三元组
-    valid_pairs = set()
+    # 完成提交 (meeting_id, task_id, uid) 三元组（有效 + 未退回）
+    done_pairs = set()
+    sub_by_key = {}
     for s in subs:
         t = task_by_id[s.task_id]
-        if _submission_valid(s, t, att_counts.get(s.id, 0)):
-            valid_pairs.add((t.meeting_id, t.id, s.student_user_id))
+        sub_by_key[(t.id, s.student_user_id)] = s
+        if _submission_done(s, t, att_counts.get(s.id, 0)):
+            done_pairs.add((t.meeting_id, t.id, s.student_user_id))
+    now = datetime.now()
     for mid in meeting_ids:
         m_tasks = tasks_by_meeting.get(mid, [])
         done_by_user = {}
-        for (m_id, t_id, uid) in valid_pairs:
+        for (m_id, t_id, uid) in done_pairs:
             if m_id == mid:
                 done_by_user.setdefault(uid, set()).add(t_id)
+        overdue_tasks = [t for t in m_tasks
+                         if t.required and t.due_at and now > t.due_at]
         summary = {"task_count": len(m_tasks), "chapter_count": int(plans.get(mid, 0))}
         if leader_view:
             summary["expected_count"] = len(m_tasks) * len(student_ids or [])
             summary["submission_count"] = sum(len(v) for v in done_by_user.values())
+            summary["overdue_count"] = sum(
+                1 for t in overdue_tasks
+                for u in (student_ids or [])
+                if t.id not in done_by_user.get(u, set()))
         else:
             mine = done_by_user.get(user.id, set())
             summary["my_pending"] = len([t for t in m_tasks if t.id not in mine])
+            summary["my_overdue"] = len([t for t in overdue_tasks if t.id not in mine])
         out[mid] = summary
     return out
 
@@ -642,28 +662,44 @@ def _detail_payload(m, user, is_leader):
     for t in tasks:
         item = {"id": t.id, "title": t.title, "note": t.note,
                 "submit_type": t.submit_type,
-                "submit_type_text": SUBMIT_TYPE_TEXT.get(t.submit_type, t.submit_type)}
+                "submit_type_text": SUBMIT_TYPE_TEXT.get(t.submit_type, t.submit_type),
+                "due_at": t.due_at.isoformat() if t.due_at else None,
+                "required": bool(t.required), "allow_late": bool(t.allow_late)}
         if is_leader:
             item["submissions"] = {}
             item["submission_count"] = 0
+            item["pending_review"] = 0
             for u in students:
                 s = sub_by_key.get((t.id, u.id))
                 if not s:
                     continue
-                valid = _submission_valid(s, t, len(atts.get(s.id, [])))
+                valid = _submission_done(s, t, len(atts.get(s.id, [])))
                 item["submissions"][str(u.id)] = {
                     "valid": valid, "content": s.content,
+                    "status": s.status,
+                    "review_comment": s.review_comment,
+                    "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
                     "updated_at": s.updated_at.isoformat() if s.updated_at else None,
                     "attachments": [_task_att_dict(a, user) for a in atts.get(s.id, [])]}
                 if valid:
                     item["submission_count"] += 1
+                if s.status == 'submitted' and _submission_valid(s, t, len(atts.get(s.id, []))):
+                    item["pending_review"] += 1
+            past_due = bool(t.required and t.due_at and datetime.now() > t.due_at)
+            item["overdue_count"] = (len(students) - item["submission_count"]) if past_due else 0
         else:
             s = sub_by_key.get((t.id, user.id))
+            valid = (_submission_done(s, t, len(atts.get(s.id, []))) if s else False)
             item["my_submission"] = (None if s is None else {
-                "valid": _submission_valid(s, t, len(atts.get(s.id, []))),
+                "valid": valid,
+                "status": s.status,
+                "review_comment": s.review_comment,
                 "content": s.content,
                 "updated_at": s.updated_at.isoformat() if s.updated_at else None,
                 "attachments": [_task_att_dict(a, user) for a in atts.get(s.id, [])]})
+            item["my_overdue"] = _task_overdue(t, valid)
+            item["late_locked"] = bool(t.due_at and t.required and not t.allow_late
+                                       and datetime.now() > t.due_at and not valid)
         tasks_out.append(item)
 
     chapters_out = []
@@ -741,10 +777,10 @@ def team_task_summary(sid):
             if tasks else [])
     att_counts = _att_counts_of([s.id for s in subs])
     task_by_id = {t.id: t for t in tasks}
-    done = set()   # (task_id, student_id) 有效提交对
+    done = set()   # (task_id, student_id) 有效提交对（退回不计，重交后恢复）
     for s in subs:
         t = task_by_id[s.task_id]
-        if s.student_user_id in student_ids and _submission_valid(s, t, att_counts.get(s.id, 0)):
+        if s.student_user_id in student_ids and _submission_done(s, t, att_counts.get(s.id, 0)):
             done.add((t.id, s.student_user_id))
     return jsonify({"code": 200, "meeting_count": len(meeting_ids), "task_total": len(tasks),
                     "summary": [{"user_id": uid, "submitted": sum(
@@ -755,9 +791,11 @@ def team_task_summary(sid):
 @jwt_required()
 @audit_log(operation="保存组会布置")
 def meeting_assignments_save(mid):
-    """保存组会布置（现任组长/admin）。body: {chapters: [chapter_id], tasks: [{id?, title, note?, submit_type?}]}
-    —— chapters 整组替换（仅 team 域，项目营无按章认证）；tasks 带 id=更新、无 id=新增、
-    缺席=删除（已有学生提交的任务拒删，防数据丢失）。"""
+    """保存组会布置（现任组长/admin）。body: {chapters: [chapter_id], tasks: [{id?, title, note?,
+    submit_type?, due_at?, required?, allow_late?}]}—— chapters 整组替换（仅 team 域，项目营无
+    按章认证）；tasks 带 id=更新、无 id=新增、缺席=删除（已有学生提交的任务拒删，防数据丢失）。
+    生命周期字段（migrate_44）：due_at 截止（'YYYY-MM-DD HH:MM'）、required 必交（默认 true）、
+    allow_late 允许迟交（默认 true）。"""
     m, err = _meeting_or_404(mid)
     if err:
         return err
@@ -802,15 +840,27 @@ def meeting_assignments_save(mid):
         if st not in VALID_SUBMIT_TYPES:
             return jsonify({"code": 400, "message": "submit_type 须为 file/text/any"}), 400
         note = (t.get("note") or "").strip()[:500] or None
+        due_raw = (t.get("due_at") or "").strip() or None
+        due_at = None
+        if due_raw:
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    due_at = datetime.strptime(due_raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            if due_at is None:
+                return jsonify({"code": 400, "message": f"任务「{title[:30]}」截止时间格式须为 YYYY-MM-DD HH:MM"}), 400
         tid = t.get("id")
         try:
             tid = int(tid) if tid else None
         except (TypeError, ValueError):
             return jsonify({"code": 400, "message": "任务 id 非法"}), 400
-        norm.append((tid, title[:200], note, st))
+        norm.append((tid, title[:200], note, st, due_at,
+                     bool(t.get("required", True)), bool(t.get("allow_late", True))))
 
     existing = {t.id: t for t in CampMeetingTask.query.filter_by(meeting_id=mid).all()}
-    keep_ids = {tid for tid, *_ in norm if tid}
+    keep_ids = {n[0] for n in norm if n[0]}
     for tid, t in existing.items():
         if tid in keep_ids:
             continue
@@ -819,15 +869,18 @@ def meeting_assignments_save(mid):
                             "message": f"任务「{t.title}」已有学生提交，不能删除（可清空标题旁的说明代替）"}), 400
         db.session.delete(t)
     changed = False
-    for tid, title, note, st in norm:
+    for tid, title, note, st, due_at, required, allow_late in norm:
         if tid and tid in existing:
             t = existing[tid]
-            if (t.title, t.note, t.submit_type) != (title, note, st):
+            if (t.title, t.note, t.submit_type, t.due_at, t.required, t.allow_late) \
+                    != (title, note, st, due_at, required, allow_late):
                 t.title, t.note, t.submit_type = title, note, st
+                t.due_at, t.required, t.allow_late = due_at, required, allow_late
                 changed = True
         else:
             db.session.add(CampMeetingTask(meeting_id=mid, title=title, note=note,
-                                           submit_type=st, created_by=user.id))
+                                           submit_type=st, due_at=due_at, required=required,
+                                           allow_late=allow_late, created_by=user.id))
             changed = True
 
     old_plan_ids = {p.chapter_id for p in
@@ -870,6 +923,11 @@ def meeting_task_submit(tid):
 
     sub = CampMeetingTaskSubmission.query.filter_by(
         task_id=t.id, student_user_id=user.id).first()
+    # 截止锁定（migrate_44）：必交且已过截止且不允许迟交 → 拒收（已通过的更新不受限）
+    if t.due_at and t.required and not t.allow_late and datetime.now() > t.due_at \
+            and not (sub and sub.status == 'accepted'):
+        return jsonify({"code": 400,
+                        "message": f"任务「{t.title}」已于 {t.due_at.strftime('%m-%d %H:%M')} 截止，不再接收提交"}), 400
     content_raw = request.form.get("content")
     content = (content_raw.strip() or None) if content_raw is not None else (sub.content if sub else None)
     files = [f for f in request.files.getlist("Files") if f.filename]
@@ -903,13 +961,20 @@ def meeting_task_submit(tid):
         need = {'file': '至少上传 1 个文件', 'text': '请填写文字内容'}.get(
             t.submit_type, '请填写文字或上传文件')
         return jsonify({"code": 400, "message": f"按任务要求（{SUBMIT_TYPE_TEXT.get(t.submit_type)}），{need}"}), 400
+    # 审阅流（migrate_44）：提交/重交置 submitted 态并清审阅留痕（退回后的重交重新待审）
+    sub.status = 'submitted'
+    sub.submitted_at = datetime.now()
+    sub.reviewed_by = None
+    sub.reviewed_at = None
+    sub.review_comment = None
     leader = _leader_uid(m)
     if leader and leader != user.id:                 # 提交通知与业务同事务（P0 修复）
         _notify_meeting_users(m, [leader], f"任务提交：{t.title}",
                               f"{user.username} 提交了组会「{m.title}」的任务「{t.title}」，点击查看。")
     db.session.commit()
     return jsonify({"code": 200, "message": "已提交", "my_submission": {
-        "valid": True, "content": sub.content,
+        "valid": True, "content": sub.content, "status": sub.status,
+        "review_comment": None,
         "updated_at": sub.updated_at.isoformat() if sub.updated_at else None,
         "attachments": [_task_att_dict(a, user) for a in att_rows]}})
 
@@ -924,6 +989,65 @@ def _task_attachment_ctx(aid):
     if err:
         return None, None, None, err
     return a, sub, m, None
+
+
+@bp.route("/meetings/tasks/<int:tid>/review", methods=["POST"])
+@jwt_required()
+@audit_log(operation="审阅组会任务")
+def meeting_task_review(tid):
+    """组长审阅学员提交（migrate_44 生命周期）：body {student_user_id, accept, comment?}。
+    accept=true → status=accepted；false → returned（学员重交后回 submitted 重新待审）。
+    「已交」口径不变（有效提交即计），审阅态是叠加层——退回会让待办重新出现。"""
+    t = CampMeetingTask.query.get(tid)
+    if not t:
+        return jsonify({"code": 404, "message": "任务不存在"}), 404
+    m, err = _meeting_or_404(t.meeting_id)
+    if err:
+        return err
+    camp = CampSession.query.get(m.camp_session_id)
+    user = _current_user()
+    if not _can_manage(user, m):
+        return jsonify({"code": 403, "message": "仅组长可审阅任务"}), 403
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
+    d = request.json or {}
+    uid = d.get("student_user_id")
+    accept = bool(d.get("accept", True))
+    comment = (d.get("comment") or "").strip()[:500] or None
+    if not uid:
+        return jsonify({"code": 400, "message": "缺少 student_user_id"}), 400
+    sub = CampMeetingTaskSubmission.query.filter_by(
+        task_id=t.id, student_user_id=uid).first()
+    att_count = CampMeetingTaskAttachment.query.filter_by(submission_id=sub.id).count() \
+        if sub else 0
+    if not sub or not _submission_valid(sub, t, att_count):
+        return jsonify({"code": 404, "message": "该学员尚未有效提交本任务"}), 404
+    sub.status = 'accepted' if accept else 'returned'
+    sub.reviewed_by = user.id
+    sub.reviewed_at = datetime.now()
+    sub.review_comment = comment
+    stu = UserModel.query.get(uid)
+    stu_name = stu.username if stu else str(uid)
+    if accept:
+        title = f"任务已通过：{t.title}"
+        content = (f"你在组会「{m.title}」的任务「{t.title}」已由 {user.username} 审阅通过。")
+        if comment:
+            content += f"评语：{comment}。"
+    else:
+        title = f"任务被退回：{t.title}"
+        content = (f"你在组会「{m.title}」的任务「{t.title}」被 {user.username} 退回，"
+                   f"请修改后重新提交。")
+        if comment:
+            content += f"退回原因：{comment}。"
+        elif t.due_at:
+            content += f"截止时间 {t.due_at.strftime('%m-%d %H:%M')}。"
+    create_notification(uid, title, content, category='camp',
+                        source_type='camp_meeting', source_id=m.id,
+                        camp_session_id=m.camp_session_id,
+                        is_important=not accept)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已通过" if accept else "已退回",
+                    "status": sub.status})
 
 
 @bp.route("/meetings/task-attachments/<int:aid>", methods=["DELETE"])

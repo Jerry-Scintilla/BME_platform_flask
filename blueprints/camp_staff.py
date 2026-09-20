@@ -9,7 +9,7 @@
 
 权限策略层（方案 §5.2）：中央权限表 STAFF_PERMISSIONS，@camp_access(permission) 收口判定；
 现有 @camp_role() 端点按方案逐个迁移（不一次性放开，防静默扩权）。本轮迁移：报名审批、
-成员管理、请假/考勤全营视图；营期状态迁移暂留 super_admin（方案 P-01 待产品拍板）。
+成员管理、请假/考勤全营视图；营期状态迁移恒留 super_admin（2026-09-20 拍板 P-01）。
 
 主负责人唯一性（方案 §3.3）：owner 变更（委任/转交）在同一事务内先 FOR UPDATE 锁营期行，
 再结束旧 owner、落新行；owner 只从活跃 CampStaff 行读取，不在 CampSession 上存副本。
@@ -35,7 +35,9 @@ bp = Blueprint("camp_staff", __name__, url_prefix="/camp")
 # ─────────────────────────────────────────────
 
 # 中央权限表（方案 §5.2）。owner 比 teacher 多：委任老师、选导生管理、请假兜底、
-# 营期配置；session.transition 本期不放开（P-01 待拍板），列在表里供拍板后启用。
+# 营期配置。
+# 2026-09-20 产品拍板（P-01/P-04）：owner 只负责营期日常管理——开营/结营（session
+# transition）与主负责人转交恒为 super_admin 权限，不进入本表。
 STAFF_PERMISSIONS = {
     'owner': {
         'application.review',      # 审批学员/导生报名
@@ -50,7 +52,6 @@ STAFF_PERMISSIONS = {
         'announcement.publish',    # 发布营期公告
         'session.configure',       # 编辑营期基本信息
         'staff.manage',            # 委任/解除协同老师
-        'session.transition',      # 营期状态迁移（P-01 拍板前不挂到端点）
     },
     'teacher': {
         'application.review',

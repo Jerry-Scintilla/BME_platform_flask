@@ -1898,7 +1898,9 @@ class CampMeetingChapterPlan(db.Model):
 
 class CampMeetingTask(db.Model):
     """组会·课外任务：导生布置、组员提交。一次组会=一个教学单元（纪要+课内布置+课外任务），
-    submit_type 约束学生交什么：file=需交文件 / text=需交文字 / any=任一（缺省）。"""
+    submit_type 约束学生交什么：file=需交文件 / text=需交文字 / any=任一（缺省）。
+    生命周期字段（2026-09-20，migrate_44《通知方案》§3.7）：due_at 截止时间、required 必交、
+    allow_late 允许迟交——逾期态读时派生（required 且过 due 且无有效提交且不允许迟交）。"""
     __tablename__ = 'camp_meeting_task'
     id = db.Column(db.Integer, primary_key=True)
     meeting_id = db.Column(db.Integer, db.ForeignKey('camp_meeting.id', ondelete='CASCADE'),
@@ -1906,19 +1908,29 @@ class CampMeetingTask(db.Model):
     title = db.Column(db.String(200), nullable=False)
     note = db.Column(db.String(500))                      # 任务说明（导生口述内容的书面化）
     submit_type = db.Column(db.String(10), nullable=False, default='any')
+    due_at = db.Column(db.DateTime, nullable=True)        # 截止时间（调度器据此发 T-24h/逾期提醒）
+    required = db.Column(db.Boolean, default=True)        # 必交（逾期判定与提醒只看必交任务）
+    allow_late = db.Column(db.Boolean, default=True)      # 允许迟交（关=逾期后拒收）
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
 class CampMeetingTaskSubmission(db.Model):
     """组会任务提交：每人每任务一条 upsert（改文字/补删附件），审阅以最新态为准；
-    有效性按 submit_type 判（file=有附件 / text=有文字 / any=任一）。"""
+    有效性按 submit_type 判（file=有附件 / text=有文字 / any=任一）。
+    审阅流（2026-09-20，migrate_44）：status submitted=已提交待审 / returned=已退回
+    （重交后回 submitted）/ accepted=已通过；「已交」口径=有效提交（兼容存量），审阅态叠加。"""
     __tablename__ = 'camp_meeting_task_submission'
     id = db.Column(db.Integer, primary_key=True)
     task_id = db.Column(db.Integer, db.ForeignKey('camp_meeting_task.id', ondelete='CASCADE'),
                         nullable=False, index=True)
     student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     content = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='submitted')  # submitted/returned/accepted
+    submitted_at = db.Column(db.DateTime, nullable=True)  # 最近一次有效提交时间
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    review_comment = db.Column(db.String(500), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     __table_args__ = (
