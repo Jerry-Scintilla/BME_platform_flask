@@ -76,6 +76,18 @@ def _official_flag(data, user, article=None):
     return val, None
 
 
+def _essence_flag(data, user):
+    """is_essence 解析（仅文章管理员可设，与 is_official 同门禁；Phase 3 精华标记）。"""
+    if 'is_essence' not in (data or {}):
+        return None, None
+    if not _is_article_manager(user):
+        return None, (jsonify({"code": 403, "message": "精华标记仅文章管理员可设置"}), 403)
+    val = data['is_essence']
+    if not isinstance(val, bool):
+        return None, (jsonify({"code": 400, "message": "is_essence 须为布尔值"}), 400)
+    return val, None
+
+
 def _remove_cover_objects(article):
     """删除封面母版 + 缩略对象（best-effort）。"""
     if not article.cover_image_key:
@@ -132,6 +144,7 @@ def _article_to_dict(a, with_author_avatar=False, summary=False):
         "cover": a.cover_image_key,
         "cover_thumb": _cover_thumb_url(a),
         "is_official": bool(a.is_official),
+        "is_essence": bool(a.is_essence),
         "author_id": a.author_id,
         "author_name": a.author.username if a.author else '',
         "created_at": a.created_at.strftime('%Y-%m-%d %H:%M:%S') if a.created_at else '',
@@ -209,6 +222,9 @@ def article_v2_public():
     official, err = _official_flag(data, user)
     if err:
         return err
+    essence, err = _essence_flag(data, user)
+    if err:
+        return err
     limited = _publish_rate_guard(user)
     if limited:
         return limited
@@ -218,6 +234,7 @@ def article_v2_public():
         content_md=content_md, author_id=user.id,
         status=ArticleV2Model.STATUS_PUBLISHED, publish_time=datetime.now(),
         is_official=bool(official),
+        is_essence=bool(essence),
     )
     db.session.add(article)
     db.session.commit()
@@ -310,6 +327,11 @@ def article_v2_publish(article_id):
         return err
     if official is not None:
         article.is_official = official
+    essence, err = _essence_flag(data, _current_user())
+    if err:
+        return err
+    if essence is not None:
+        article.is_essence = essence
     if article.status != ArticleV2Model.STATUS_PUBLISHED:
         # 发布前补校验：标题与正文不能空
         if not (article.title or '').strip() or not (article.content_md or '').strip():
@@ -375,6 +397,7 @@ def article_v2_get(article_id):
             "cover": article.cover_image_key,
             "cover_thumb": _cover_thumb_url(article),
             "is_official": bool(article.is_official),
+            "is_essence": bool(article.is_essence),
             "publish_time": article.publish_time.strftime('%Y-%m-%d %H:%M:%S') if article.publish_time else "",
             "author_id": article.author_id,
             "author_name": article.author.username if article.author else "",
@@ -414,6 +437,11 @@ def article_v2_edit(article_id):
         return err
     if official is not None:
         article.is_official = official
+    essence, err = _essence_flag(data, _current_user())
+    if err:
+        return err
+    if essence is not None:
+        article.is_essence = essence
     db.session.commit()
     return jsonify({"code": 200, "message": "文章编辑成功"})
 

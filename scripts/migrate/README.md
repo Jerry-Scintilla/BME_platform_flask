@@ -44,3 +44,4 @@ python scripts/migrate/migrate_09_mentor_selection.py     # camp_session 加选�
 | 36_showcase_media | `ALTER showcase_project ADD images_json TEXT NULL`（XLAB 图集列；cover 列 22 建表已有） |
 | 37_community_redesign | article_v2 加 cover_image_key/is_official；discussion_thread 加 images_json（社区重设计：推文封面标记 + 帖子图集） |
 | 38_community_governance | discussion_thread 加 category/project_id/pinned_until（话题标签、关联 XLAB 项目、置顶过期） |
+| 39_essence | discussion_thread/article_v2 加 is_essence（精华标记，热度 ×2） |

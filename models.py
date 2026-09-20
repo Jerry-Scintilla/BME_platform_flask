@@ -144,6 +144,7 @@ class ArticleV2Model(db.Model):
     status = db.Column(db.String(20), default=STATUS_PUBLISHED)
     cover_image_key = db.Column(db.String(255), nullable=True)   # 封面 '/media/articles/...' 相对 URL（社区重设计 09-19）
     is_official = db.Column(db.Boolean, nullable=False, default=False)  # 官方推文标记：仅文章管理员可设，社区精选带展示
+    is_essence = db.Column(db.Boolean, nullable=False, default=False)   # 精华文章（热度 ×2，Phase 3 质量分层）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     publish_time = db.Column(db.DateTime, nullable=True)    # 仅已发布有；草稿为 None
@@ -961,6 +962,7 @@ class DiscussionThread(db.Model):
     category = db.Column(db.String(20), nullable=True)   # 话题标签（闲聊/提问/分享/招人；global 帖用，Phase 2 09-20）
     project_id = db.Column(db.Integer, nullable=True, index=True)  # 关联 XLAB 项目（帖子导流项目详情）
     pinned_until = db.Column(db.DateTime, nullable=True)  # 置顶过期（到点自动失效；空=不过期）
+    is_essence = db.Column(db.Boolean, nullable=False, default=False)  # 精华帖（热度 ×2，Phase 3 质量分层）
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
     is_pinned = db.Column(db.Boolean, default=False)

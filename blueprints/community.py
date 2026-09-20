@@ -90,208 +90,144 @@ def _serialize_reply(r):
 
 
 def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
-    """构建 feed 的公共分页（不含任何用户特定状态），结果可被多用户共享缓存。
+    """构建 feed 的公共分页（Phase 3 09-20：SQL UNION 真分页，替代全量加载内存排序）。
 
-    返回 (page_items, total, pages)。每项保留 `_like_tid` 供调用方回填 liked 后剔除；
-    讨论帖项额外挂 `replies`（前 2 条顶级回复预览）。
+    三类内容（global 帖 / v1 文章 / v2 文章）各出统一列的子查询 UNION ALL，
+    热度公式 SQL 化（半衰期 POW 表达式），DB 层 ORDER BY + LIMIT/OFFSET——
+    不再全量实体化 ORM 对象；页行返回后由调用方做 enrichment（徽章/回复预览/liked）。
 
-    语义说明：非管理员视角只展示 STATUS_NORMAL 的讨论帖（管理员视角仍含 hidden/deleted）。
-    这是为了让公共缓存不依赖具体 user.id——"作者在主 feed 看到自己隐藏帖"的旧边缘行为随之取消，
-    作者管理自己的隐藏帖请在详情/个人页进行。
+    质量分层（P1 落地）：作者为 super_admin ×1.5 权重、精华 ×2、发布 48h 内 +3 曝光保护。
+    帖子半衰期 14 天 / 文章 30 天；官方推文（is_official）不进 feed（精选带展示）。
+    is_pinned 用生效态（pinned_until 到点自动失效）。
     """
-    # ── 预取文章互动数（v1 + v2），避免正文循环内查库 ──
-    # article_last_reply_map 让有新评论的文章也能 bump 浮起，否则文章活跃时间永远停在 publish_time
-    article_reply_map = {}
-    article_last_reply_map = {}
-    for t in DiscussionThread.query.filter_by(
-        scope_type='article', status=DiscussionThread.STATUS_NORMAL
-    ).all():
-        sid = t.scope_id
-        article_reply_map[sid] = article_reply_map.get(sid, 0) + (t.reply_count or 0)
-        if t.last_reply_at is not None:
-            cur = article_last_reply_map.get(sid)
-            article_last_reply_map[sid] = t.last_reply_at if cur is None else max(cur, t.last_reply_at)
+    from sqlalchemy import text as _text
 
-    # V2 文章互动数（reply/like/view）+ thread_id 映射；只读，绝不在此为 v2 文章新建 thread
-    v2_reply_map = {}
-    v2_like_map = {}
-    v2_view_map = {}
-    v2_thread_id_map = {}
-    v2_last_reply_map = {}
-    for t in DiscussionThread.query.filter_by(
-        scope_type='article_v2', status=DiscussionThread.STATUS_NORMAL
-    ).all():
-        sid = t.scope_id
-        v2_reply_map[sid] = v2_reply_map.get(sid, 0) + (t.reply_count or 0)
-        v2_like_map[sid] = v2_like_map.get(sid, 0) + (t.like_count or 0)
-        v2_view_map[sid] = v2_view_map.get(sid, 0) + (t.view_count or 0)
-        v2_thread_id_map[sid] = t.id
-        if t.last_reply_at is not None:
-            cur = v2_last_reply_map.get(sid)
-            v2_last_reply_map[sid] = t.last_reply_at if cur is None else max(cur, t.last_reply_at)
+    # 统一热度表达式：HOT = (互动分+1+新内容保护) * 衰减 * 作者权重 * 精华倍率
+    hot = ("(interaction + 1 + IF(rank_dt > NOW() - INTERVAL 48 HOUR, 3, 0)) "
+           "* POW(0.5, TIMESTAMPDIFF(SECOND, rank_dt, NOW()) / 86400.0 / half_life) "
+           "* author_weight * IF(is_essence, 2.0, 1.0)")
 
-    items = []
+    subsqls = []
 
-    # ── 1. global 讨论帖（管理员见全部状态，非管理员只见 normal） ──
-    # 话题筛选（Phase 2 09-20）：category 参数只作用于讨论帖（文章无话题概念）
-    category = request.args.get('category') if request else None
-    thread_query = DiscussionThread.query.filter(
-        DiscussionThread.scope_type == 'global'
-    ).options(joinedload(DiscussionThread.author))
-    if is_admin:
-        pass  # 管理员可见所有状态
-    else:
-        thread_query = thread_query.filter(DiscussionThread.status == DiscussionThread.STATUS_NORMAL)
-    if category:
-        thread_query = thread_query.filter(DiscussionThread.category == category)
-    thread_rows = thread_query.all()
-    # 关联项目标题批量预取（免逐帖 N+1）
-    from .discussion import _pin_active, _project_title_map, CATEGORY_TEXT
-    ptitle_map = _project_title_map(thread_rows)
-    for t in thread_rows:
-        # 类型筛选：当前只要文章时跳过讨论帖（数据量小，循环内过滤开销可忽略）
-        if content_type == 'article':
-            continue
-        items.append({
-            "type": "discussion",
-            "id": t.id,
-            "title": t.title,
-            "summary": (t.content or '')[:200],
-            "images": _thread_images(t),
-            "category": t.category,
-            "category_text": CATEGORY_TEXT.get(t.category) if t.category else None,
-            "project_id": t.project_id,
-            "project_title": ptitle_map.get(t.project_id),
-            "author_id": t.author_id,
-            "author_name": t.author.username if t.author else "",
-            "author_avatar": get_avatar_url(t.author.avatar_url) if t.author else "",
-            "created_at": t.created_at.strftime('%Y-%m-%d %H:%M:%S') if t.created_at else "",
-            "like_count": t.like_count or 0,
-            "reply_count": t.reply_count or 0,
-            "view_count": t.view_count or 0,
-            "liked": False,
-            # 置顶=生效中的置顶（pinned_until 到点自动失效，Phase 2）
-            "is_pinned": _pin_active(t),
-            "article_id": None,
-            # ── 排序用私有字段（返回前剔除，不下发客户端）──
-            "_interaction": (t.like_count or 0) + 2 * (t.reply_count or 0),
-            "_rank_dt": t.last_reply_at or t.created_at,
-            "_half_life": _HALF_LIFE_DAYS,
-            # ── 回填 liked 用（调用方剔除）──
-            "_like_tid": t.id,
-        })
+    # ── 1. global 讨论帖 ──
+    category = request.args.get('category')
+    from .discussion import THREAD_CATEGORIES
+    category_on = category in THREAD_CATEGORIES     # 白名单：枚举外的值一律忽略（防注入）
+    if content_type != 'article':
+        cond = "t.status = 'normal'"
+        if is_admin:
+            cond = "t.status != 'deleted'"
+        cat = f" AND t.category = '{category}'" if category_on else ""
+        subsqls.append(f"""
+            SELECT 'discussion' AS type, t.id, t.title, LEFT(t.content, 200) AS summary,
+                   t.images_json AS images_raw, t.category, t.project_id,
+                   sp.title AS project_title,
+                   t.author_id, u.username AS author_name, u.avatar_url AS author_avatar_raw,
+                   COALESCE(t.last_reply_at, t.created_at) AS rank_dt,
+                   t.created_at AS created_dt,
+                   (t.like_count + 2 * t.reply_count) AS interaction,
+                   t.reply_count, t.like_count AS like_count, t.view_count,
+                   (t.is_pinned AND (t.pinned_until IS NULL OR t.pinned_until > NOW())) AS is_pinned,
+                   t.is_essence, 14 AS half_life,
+                   IF(u.role = 'super_admin', 1.5, 1.0) AS author_weight,
+                   NULL AS article_id, NULL AS article_version,
+                   NULL AS cover, NULL AS cover_thumb, t.id AS like_tid
+            FROM discussion_thread t
+            JOIN user u ON u.id = t.author_id
+            LEFT JOIN showcase_project sp ON sp.id = t.project_id AND sp.status = 'visible'
+            WHERE t.scope_type = 'global' AND {cond}{cat}
+        """)
 
-    # ── 2. 文章 v1（沿用 article_list 无可见性过滤，全部可见） ──
-    for a in ArticleModel.query.options(joinedload(ArticleModel.author)).all():
-        # 类型筛选：当前只要讨论时跳过文章
-        if content_type == 'discussion':
-            continue
-        rc = article_reply_map.get(a.id, 0)
-        # 活跃时间 T = max(发布时间, 最近评论时间)；都为空回退 now（age=0，仅基础分）
-        rank_dt = a.publish_time
-        last_rep = article_last_reply_map.get(a.id)
-        if last_rep is not None:
-            rank_dt = last_rep if rank_dt is None else max(rank_dt, last_rep)
-        items.append({
-            "type": "article",
-            "id": a.id,
-            "title": a.title,
-            "summary": (a.introduction or '')[:200],
-            "cover": None,                          # v1 文章无封面（前端兜底）
-            "images": [],
-            "author_id": a.author_id,
-            "author_name": a.author.username if a.author else "",
-            "author_avatar": get_avatar_url(a.author.avatar_url) if a.author else "",
-            "created_at": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else "",
-            "like_count": 0,                       # 文章卡不展示点赞
-            "reply_count": rc,                     # = 文章评论数
-            "view_count": 0,
-            "liked": False,
-            "is_pinned": False,                    # ArticleModel 无 is_pinned，文章暂不可置顶
-            "article_id": a.id,                    # 供前端跳转文章详情
-            # ── 排序用私有字段（返回前剔除，不下发客户端）──
-            "_interaction": 2 * rc,
-            "_rank_dt": rank_dt or now,
-            "_half_life": _ARTICLE_HALF_LIFE_DAYS,
-            "_article_reply_count": rc,            # 确定性平局打破
-            # v1 文章无点赞通道，无 _like_tid
-        })
+    # ── 2. v1 文章（无 status/点赞通道；互动=评论聚合） ──
+    # 话题筛选开启时只看该话题的帖子（文章无话题概念，不混入）
+    if content_type != 'discussion' and not category_on:
+        subsqls.append("""
+            SELECT 'article' AS type, a.id, a.title, LEFT(a.introduction, 200) AS summary,
+                   NULL AS images_raw, NULL AS category, NULL AS project_id,
+                   NULL AS project_title,
+                   a.author_id, u.username AS author_name, u.avatar_url AS author_avatar_raw,
+                   COALESCE(agg.last_reply_at, a.publish_time) AS rank_dt,
+                   a.publish_time AS created_dt,
+                   2 * IFNULL(agg.rc, 0) AS interaction,
+                   IFNULL(agg.rc, 0) AS reply_count, 0 AS like_count, 0 AS view_count,
+                   0 AS is_pinned, 0 AS is_essence, 30 AS half_life,
+                   IF(u.role = 'super_admin', 1.5, 1.0) AS author_weight,
+                   a.id AS article_id, NULL AS article_version,
+                   NULL AS cover, NULL AS cover_thumb, NULL AS like_tid
+            FROM article a
+            JOIN user u ON u.id = a.author_id
+            LEFT JOIN (SELECT scope_id, SUM(reply_count) AS rc, MAX(last_reply_at) AS last_reply_at
+                       FROM discussion_thread WHERE scope_type = 'article' AND status = 'normal'
+                       GROUP BY scope_id) agg ON agg.scope_id = a.id
+        """)
+        # ── 3. v2 文章（排除官方推文；互动=赞+2评+0.3浏览） ──
+        subsqls.append("""
+            SELECT 'article' AS type, a.id, a.title, LEFT(a.introduction, 200) AS summary,
+                   NULL AS images_raw, NULL AS category, NULL AS project_id,
+                   NULL AS project_title,
+                   a.author_id, u.username AS author_name, u.avatar_url AS author_avatar_raw,
+                   COALESCE(agg.last_reply_at, a.publish_time) AS rank_dt,
+                   a.publish_time AS created_dt,
+                   (IFNULL(agg.lc, 0) + 2 * IFNULL(agg.rc, 0) + 0.3 * IFNULL(agg.vc, 0)) AS interaction,
+                   IFNULL(agg.rc, 0) AS reply_count, IFNULL(agg.lc, 0) AS like_count,
+                   IFNULL(agg.vc, 0) AS view_count,
+                   0 AS is_pinned, a.is_essence, 30 AS half_life,
+                   IF(u.role = 'super_admin', 1.5, 1.0) AS author_weight,
+                   a.id AS article_id, 2 AS article_version,
+                   a.cover_image_key AS cover,
+                   CONCAT(SUBSTRING_INDEX(a.cover_image_key, '.', 1), '_thumb.',
+                          SUBSTRING_INDEX(a.cover_image_key, '.', -1)) AS cover_thumb,
+                   agg.thread_id AS like_tid
+            FROM article_v2 a
+            JOIN user u ON u.id = a.author_id
+            LEFT JOIN (SELECT scope_id, SUM(reply_count) AS rc, SUM(like_count) AS lc,
+                              SUM(view_count) AS vc, MAX(last_reply_at) AS last_reply_at,
+                              MAX(id) AS thread_id
+                       FROM discussion_thread WHERE scope_type = 'article_v2' AND status = 'normal'
+                       GROUP BY scope_id) agg ON agg.scope_id = a.id
+            WHERE a.status = 'published' AND NOT a.is_official
+        """)
 
-    # ── 3. V2 文章（Markdown，article_v2 表；与旧文章同格式并入信息流） ──
-    # 互动数取自上方预取的 v2_*_map（scope_type='article_v2' 的 thread）；无 thread 的文章显示 0。
-    # 社区重设计（09-19）：is_official 官方推文由顶部精选带（/community/spotlight）展示，feed 不重复。
-    v2_query = ArticleV2Model.query.options(joinedload(ArticleV2Model.author)).filter(
-        ArticleV2Model.status == ArticleV2Model.STATUS_PUBLISHED,
-        ArticleV2Model.is_official.is_(False),
-    )
-    for a in v2_query.all():
-        if content_type == 'discussion':
-            continue
-        rc = v2_reply_map.get(a.id, 0)
-        lc = v2_like_map.get(a.id, 0)
-        tid = v2_thread_id_map.get(a.id)
-        vc = v2_view_map.get(a.id, 0)
-        rank_dt = a.publish_time
-        last_rep = v2_last_reply_map.get(a.id)
-        if last_rep is not None:
-            rank_dt = last_rep if rank_dt is None else max(rank_dt, last_rep)
-        stem, ext = (a.cover_image_key.rsplit('.', 1) if a.cover_image_key else (None, None))
-        items.append({
-            "type": "article",
-            "id": a.id,
-            "title": a.title,
-            "summary": (a.introduction or '')[:200],
-            "cover": a.cover_image_key,
-            "cover_thumb": f"{stem}_thumb.{ext}" if stem else None,
-            "images": [],
-            "author_id": a.author_id,
-            "author_name": a.author.username if a.author else "",
-            "author_avatar": get_avatar_url(a.author.avatar_url) if a.author else "",
-            "created_at": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else "",
-            "like_count": lc,
-            "reply_count": rc,
-            "view_count": vc,
-            "liked": False,
-            "is_pinned": False,
-            "article_id": a.id,
-            "article_version": 2,                   # 前端据此跳 /article-v2
-            # 文章热度 P1 公式（09-19 落地）：2*评 + 1*赞 + 0.3*浏览（浏览已被 view_batch 治理）
-            "_interaction": 2 * rc + 1 * lc + 0.3 * vc,
-            "_rank_dt": rank_dt or now,
-            "_half_life": _ARTICLE_HALF_LIFE_DAYS,
-            "_article_reply_count": rc,
-            "_like_tid": tid,                       # 回填 v2 文章点赞（按其 thread id）；无 thread 时为 None
-        })
-
-    # 排序：置顶(is_pinned)绝对优先 → 热度分(hot)或活跃时间(latest) → 确定性平局打破
-    # 用真实 datetime（_rank_dt）排序，勿用格式化字符串（空串会错误沉底）
-    # 半衰期分层（09-19）：帖子 14 天 / 文章 30 天（item._half_life）
+    union = " UNION ALL ".join(f"({s})" for s in subsqls)
+    offset = (page - 1) * per_page
     if sort == 'hot':
-        items.sort(key=lambda x: (
-            x['is_pinned'],
-            _hot_score(x['_interaction'], x['_rank_dt'], now, x.get('_half_life', _HALF_LIFE_DAYS)),
-            x.get('_article_reply_count', x['reply_count'] or 0),
-            x['_rank_dt'],
-        ), reverse=True)
-    else:  # latest：按活跃时间倒序
-        items.sort(key=lambda x: (
-            x['is_pinned'],
-            x['_rank_dt'],
-            x.get('_article_reply_count', x['reply_count'] or 0),
-        ), reverse=True)
+        order = (f" ORDER BY is_pinned DESC, {hot} DESC, reply_count DESC, rank_dt DESC")
+    else:
+        order = " ORDER BY is_pinned DESC, rank_dt DESC, reply_count DESC"
 
-    # 内存分页
-    total = len(items)
+    total = db.session.execute(_text(f"SELECT COUNT(*) FROM ({union}) x")).scalar() or 0
     pages = (total + per_page - 1) // per_page if per_page > 0 else 0
-    start = (page - 1) * per_page
-    page_items = items[start:start + per_page]
-    # 下发前剔除 _ 前缀私有排序字段；保留 _like_tid 供调用方回填 liked 后再剔除
-    page_items = [
-        {k: v for k, v in it.items() if not k.startswith('_') or k == '_like_tid'}
-        for it in page_items
-    ]
+    rows = db.session.execute(_text(
+        f"SELECT * FROM ({union}) x{order} LIMIT {int(per_page)} OFFSET {int(offset)}"
+    )).mappings().all()
 
-    # ── 社团徽章：按页收集作者一次 IN 查询（干事=职位[·组]，普通成员=主要组组名；tier 供样式分层）──
+    page_items = []
+    from .discussion import CATEGORY_TEXT, _thread_images
+    for r in rows:
+        item = {
+            "type": r["type"], "id": r["id"], "title": r["title"],
+            "summary": r["summary"] or '',
+            "images": _thread_images_from_raw(r["images_raw"]),
+            "category": r["category"],
+            "category_text": CATEGORY_TEXT.get(r["category"]) if r["category"] else None,
+            "project_id": r["project_id"], "project_title": r["project_title"],
+            "author_id": r["author_id"], "author_name": r["author_name"] or "",
+            "author_avatar": get_avatar_url(r["author_avatar_raw"]),
+            "created_at": r["created_dt"].strftime('%Y-%m-%d %H:%M:%S') if r["created_dt"] else "",
+            "like_count": r["like_count"] or 0, "reply_count": r["reply_count"] or 0,
+            "view_count": r["view_count"] or 0, "liked": False,
+            "is_pinned": bool(r["is_pinned"]),
+            "is_essence": bool(r["is_essence"]),
+            "article_id": r["article_id"],
+            "_like_tid": r["like_tid"],
+        }
+        if r["type"] == 'article':
+            item["article_version"] = r["article_version"]
+            item["cover"] = r["cover"]
+            item["cover_thumb"] = r["cover_thumb"]
+        page_items.append(item)
+
+    # ── 社团徽章：按页收集作者一次 IN 查询 ──
     from .officers import badge_map as officer_badge_map
     page_author_ids = list({it.get('author_id') for it in page_items if it.get('author_id')})
     if page_author_ids:
@@ -309,14 +245,13 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             DiscussionReply.query
             .filter(
                 DiscussionReply.thread_id.in_(feed_thread_ids),
-                DiscussionReply.parent_reply_id.is_(None),       # 与 list_replies 口径一致，只取顶级
+                DiscussionReply.parent_reply_id.is_(None),
                 DiscussionReply.status == DiscussionReply.STATUS_NORMAL,
             )
             .order_by(DiscussionReply.thread_id, DiscussionReply.created_at.desc())
             .options(joinedload(DiscussionReply.author))
             .all()
         )
-        # 已按 (thread_id, created_at desc) 排序：groupby 后每组取最新 2 条，再反转为正序展示
         preview_map = {}
         for tid, group in itertools.groupby(reply_rows, key=lambda r: r.thread_id):
             latest_two = list(group)[:2]
@@ -327,6 +262,14 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
                 it['replies'] = [_serialize_reply(r) for r in preview_map.get(it['id'], [])]
 
     return page_items, total, pages
+
+
+def _thread_images_from_raw(raw):
+    """feed SQL 行的 images_json 原始串 -> URL 数组（与 discussion._thread_images 同口径）。"""
+    try:
+        return json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
 
 
 # GET /community/feed

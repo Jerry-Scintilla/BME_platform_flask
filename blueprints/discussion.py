@@ -427,6 +427,7 @@ def create_thread():
             "content": thread.content,
             "images": _thread_images(thread),
             **_thread_extra(thread),
+            "is_essence": bool(thread.is_essence),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -521,6 +522,7 @@ def list_threads():
             "images": _thread_images(thread),
             **_thread_extra(thread, ptitle_map),
             "pinned_effective": _pin_active(thread),
+            "is_essence": bool(thread.is_essence),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -585,6 +587,7 @@ def get_thread(thread_id):
             "images": _thread_images(thread),
             **_thread_extra(thread),
             "pinned_effective": _pin_active(thread),
+            "is_essence": bool(thread.is_essence),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -798,6 +801,28 @@ def hide_thread(thread_id):
     })
 
 
+# 精华标记 POST /discussions/threads/{thread_id}/essence（治理：切换，热度 ×2，Phase 3 质量分层）
+@bp.route("/threads/<int:thread_id>/essence", methods=["POST"])
+@jwt_required()
+def essence_thread(thread_id):
+    """精华帖标记切换（can_moderate_thread 门禁；feed 热度 ×2）。"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户不存在"}), 401
+    thread = DiscussionThread.query.get(thread_id)
+    if not thread:
+        return jsonify({"code": 404, "message": "帖子不存在"}), 404
+    if not can_moderate_thread(thread, user):
+        return jsonify({"code": 403, "message": "无权限操作"}), 403
+    thread.is_essence = not thread.is_essence
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": "essence" if thread.is_essence else "un-essence",
+        "data": {"is_essence": thread.is_essence},
+    })
+
+
 # 锁帖/解锁 POST /discussions/threads/{thread_id}/lock
 @bp.route("/threads/<int:thread_id>/lock", methods=["POST"])
 @jwt_required()
@@ -888,6 +913,38 @@ def create_reply(thread_id):
     thread.last_reply_at = datetime.now()
 
     db.session.commit()
+
+    # 互动通知（Phase 3 09-20）：回复产生 community 通知——
+    # 普通帖通知楼主；文章评论（scope=article/article_v2）通知文章作者；
+    # 楼中楼额外通知父回复作者。自己回自己/通知对象=操作人时跳过。
+    try:
+        from .notification import create_notification
+        from models import ArticleModel, ArticleV2Model
+        targets = set()
+        if thread.scope_type in ('article', 'article_v2'):
+            model = ArticleV2Model if thread.scope_type == 'article_v2' else ArticleModel
+            art = model.query.get(thread.scope_id)
+            if art:
+                targets.add(art.author_id)
+        else:
+            targets.add(thread.author_id)
+        if parent_reply_id:
+            pr = DiscussionReply.query.get(parent_reply_id)
+            if pr:
+                targets.add(pr.author_id)
+        targets.discard(user.id)
+        for uid in targets:
+            create_notification(
+                uid,
+                title='你的内容有新回复',
+                content=f"{user.username or '有人'} 回复了你：{content.strip()[:80]}",
+                category='community',
+                source_type='discussion_reply',
+                source_id=reply.id,
+            )
+        db.session.commit()
+    except Exception:
+        db.session.rollback()   # 通知失败不影响回复本身
 
     return jsonify({
         "code": 201,
@@ -1128,6 +1185,31 @@ def toggle_reaction():
             target.like_count += 1
         db.session.commit()
         liked = True
+
+        # 互动通知（Phase 3）：点赞产生 community 通知（thread→楼主；reply→回复作者；
+        # 文章评论 thread 点赞→文章作者）。取消赞不撤回通知；自己赞自己跳过。
+        if reaction_type == 'like':
+            try:
+                from .notification import create_notification
+                from models import ArticleModel, ArticleV2Model
+                if target_type == 'thread' and target.scope_type in ('article', 'article_v2'):
+                    model = ArticleV2Model if target.scope_type == 'article_v2' else ArticleModel
+                    art = model.query.get(target.scope_id)
+                    notify_uid = art.author_id if art else target.author_id
+                else:
+                    notify_uid = target.author_id
+                if notify_uid and notify_uid != user.id:
+                    create_notification(
+                        notify_uid,
+                        title='你的内容获赞',
+                        content=f"{user.username or '有人'} 赞了你的{'回复' if target_type == 'reply' else '内容'}",
+                        category='community',
+                        source_type='discussion_like',
+                        source_id=target_id,
+                    )
+                    db.session.commit()
+            except Exception:
+                db.session.rollback()
 
     return jsonify({
         "code": 200,
