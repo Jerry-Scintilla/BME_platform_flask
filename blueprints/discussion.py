@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_cors import cross_origin
 from sqlalchemy import and_, or_
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import json
 import os
@@ -34,6 +34,10 @@ def options_handler(path):
 from .media import public_avatar_url as get_avatar_url   # 新链路 /media/，旧值兜底 /data/avatars/
 from .media import media_url as _media_url
 
+# 话题标签（Phase 2 09-20）：global 帖轻量分类——招人类内容引导关联 XLAB 项目
+THREAD_CATEGORIES = ('chat', 'ask', 'share', 'recruit')
+CATEGORY_TEXT = {'chat': '闲聊', 'ask': '提问', 'share': '分享', 'recruit': '招人'}
+
 
 def _thread_images(thread):
     """帖子图集 URL 数组（json 列解析；旧帖无图为空数组）。"""
@@ -41,6 +45,73 @@ def _thread_images(thread):
         return json.loads(thread.images_json) if thread.images_json else []
     except (TypeError, ValueError):
         return []
+
+
+def _validate_category_project(data):
+    """create/update 共用：校验 category（枚举内/None）与 project_id（存在且上架）。
+    返回 (category, project_id, 错误响应)。字段缺省时返回 None 哨兵表示"不改"。"""
+    from models import ShowcaseProject
+    category = data.get('category') if 'category' in data else False
+    if category is False:
+        cat_out = False
+    elif category is None or category == '':
+        cat_out = None
+    elif category not in THREAD_CATEGORIES:
+        return None, None, (jsonify({"code": 400, "message": f"category 须为 {'/'.join(THREAD_CATEGORIES)} 或空"}), 400)
+    else:
+        cat_out = category
+    project_id = data.get('project_id') if 'project_id' in data else False
+    if project_id is False:
+        pid_out = False
+    elif project_id in (None, ''):
+        pid_out = None
+    else:
+        if not isinstance(project_id, int):
+            return None, None, (jsonify({"code": 400, "message": "project_id 须为整数或空"}), 400)
+        if not ShowcaseProject.query.filter_by(id=project_id, status='visible').first():
+            return None, None, (jsonify({"code": 404, "message": "关联的项目不存在或已下架"}), 404)
+        pid_out = project_id
+    return cat_out, pid_out, None
+
+
+def _pin_active(thread, now=None):
+    """置顶是否生效（pinned_until 到点自动失效）。"""
+    if not thread.is_pinned:
+        return False
+    until = thread.pinned_until
+    if until is None:
+        return True
+    return until > (now or datetime.now())
+
+
+def _thread_extra(t, project_titles=None):
+    """话题/关联项目序列化块。project_titles 为 {id: title} 预查映射（列表批量场景免 N+1）。"""
+    title = None
+    if t.project_id:
+        if project_titles is not None:
+            title = project_titles.get(t.project_id)
+        else:
+            from models import ShowcaseProject
+            p = ShowcaseProject.query.get(t.project_id)
+            title = p.title if p and p.status == 'visible' else None
+    return {
+        "category": t.category,
+        "category_text": CATEGORY_TEXT.get(t.category) if t.category else None,
+        "project_id": t.project_id,
+        "project_title": title,
+    }
+
+
+def _project_title_map(threads):
+    """批量取 {project_id: title}（仅上架项目；一次 IN 查询）。"""
+    from models import ShowcaseProject
+    pids = list({t.project_id for t in threads if t.project_id})
+    if not pids:
+        return {}
+    rows = ShowcaseProject.query.filter(
+        ShowcaseProject.id.in_(pids), ShowcaseProject.status == 'visible'
+    ).with_entities(ShowcaseProject.id, ShowcaseProject.title).all()
+    return dict(rows)
 
 
 # ==================== 权限辅助函数 ====================
@@ -152,14 +223,23 @@ def can_post_thread(scope_type, scope_id, user):
 
 
 def can_moderate_thread(thread, user):
-    """检查用户是否可以管理主题帖（置顶/锁帖等）。
+    """检查用户是否可以管理主题帖（置顶/锁帖/隐藏等治理动作）。
 
-    仅管理员可置顶/锁帖——作者不再能管理自己的帖子（旧逻辑让作者可 pin/lock 自己的帖，
-    属自助置顶越权）。作者的删帖/编辑权限走各自端点的独立内联检查，不受此函数影响。
+    super_admin 直通；Phase 2（09-20）激活 discussion_management 权限点——持有者可治理
+    （原空转种子权限，社区治理页上线启用）。作者不再能管理自己的帖子（自助置顶越权
+    已修）；作者的删帖/编辑权限走各自端点的独立内联检查，不受此函数影响。
     """
     if not user:
         return False
-    return user.is_admin()
+    if user.is_admin():
+        return True
+    from models import PermissionModel, UserPermissionModel
+    perm = PermissionModel.query.filter_by(name='discussion_management').first()
+    if not perm:
+        return False
+    return UserPermissionModel.query.filter_by(
+        user_id=user.id, permission_id=perm.id
+    ).first() is not None
 
 
 # ==================== 主题帖 CRUD ====================
@@ -320,6 +400,11 @@ def create_thread():
                 or any(not isinstance(u, str) or not u.startswith('/media/discussions/') for u in images)):
             return jsonify({"code": 400, "message": "images 须为 ≤4 个 /media/discussions/ 上传返回的 URL"}), 400
 
+    # 话题标签 + 关联 XLAB 项目（Phase 2 09-20；仅 global 帖有意义，其他 scope 忽略）
+    category, project_id, cp_err = _validate_category_project(data if scope_type == 'global' else {})
+    if cp_err:
+        return cp_err
+
     thread = DiscussionThread(
         title=title,
         content=content,
@@ -327,6 +412,8 @@ def create_thread():
         scope_id=scope_id,
         author_id=user.id,
         images_json=json.dumps(images, ensure_ascii=False) if images else None,
+        category=category if scope_type == 'global' else None,
+        project_id=project_id if scope_type == 'global' else None,
     )
     db.session.add(thread)
     db.session.commit()
@@ -339,6 +426,7 @@ def create_thread():
             "title": thread.title,
             "content": thread.content,
             "images": _thread_images(thread),
+            **_thread_extra(thread),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -369,6 +457,9 @@ def list_threads():
     scope_type = request.args.get('scope_type')
     scope_id = request.args.get('scope_id', type=int)
     status = request.args.get('status', DiscussionThread.STATUS_NORMAL)
+    if status == 'all':
+        status = None    # 治理视角：列全部状态（Phase 2 09-20）
+    category = request.args.get('category')    # 话题筛选（global 帖，Phase 2）
     sort = request.args.get('sort', 'latest')  # latest/pinned
 
     query = DiscussionThread.query
@@ -403,6 +494,8 @@ def list_threads():
         query = query.filter(DiscussionThread.scope_id == scope_id)
     if status:
         query = query.filter(DiscussionThread.status == status)
+    if category:
+        query = query.filter(DiscussionThread.category == category)
 
     # 排序
     if sort == 'pinned':
@@ -414,17 +507,20 @@ def list_threads():
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
 
     result = []
+    ptitle_map = _project_title_map(pagination.items)
     for thread in pagination.items:
         # 检查用户是否有权限查看（用于隐藏状态帖子）
         if thread.status in [DiscussionThread.STATUS_HIDDEN, DiscussionThread.STATUS_DELETED]:
             if thread.author_id != user.id and not user.is_admin():
                 continue
 
-        result.append({
+        item = {
             "id": thread.id,
             "title": thread.title,
             "content": thread.content,
             "images": _thread_images(thread),
+            **_thread_extra(thread, ptitle_map),
+            "pinned_effective": _pin_active(thread),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -437,7 +533,8 @@ def list_threads():
             "view_count": thread.view_count,
             "last_reply_at": thread.last_reply_at.strftime('%Y-%m-%d %H:%M:%S') if thread.last_reply_at else None,
             "created_at": thread.created_at.strftime('%Y-%m-%d %H:%M:%S')
-        })
+        }
+        result.append(item)
 
     return jsonify({
         "code": 200,
@@ -486,6 +583,8 @@ def get_thread(thread_id):
             "title": thread.title,
             "content": thread.content,
             "images": _thread_images(thread),
+            **_thread_extra(thread),
+            "pinned_effective": _pin_active(thread),
             "scope_type": thread.scope_type,
             "scope_id": thread.scope_id,
             "author_id": thread.author_id,
@@ -579,6 +678,15 @@ def update_thread(thread_id):
                                     or any(not isinstance(u, str) or not u.startswith('/media/discussions/') for u in images)):
             return jsonify({"code": 400, "message": "images 须为 ≤4 个 /media/discussions/ 上传返回的 URL"}), 400
         thread.images_json = json.dumps(images, ensure_ascii=False) if images else None
+    # 话题/关联项目（Phase 2；仅 global 帖）
+    if thread.scope_type == 'global':
+        category, project_id, cp_err = _validate_category_project(data)
+        if cp_err:
+            return cp_err
+        if category is not False:
+            thread.category = category
+        if project_id is not False:
+            thread.project_id = project_id
 
     db.session.commit()
 
@@ -626,7 +734,7 @@ def delete_thread(thread_id):
 @bp.route("/threads/<int:thread_id>/pin", methods=["POST"])
 @jwt_required()
 def pin_thread(thread_id):
-    """置顶/取消置顶主题帖"""
+    """置顶/取消置顶主题帖。body 可选 expires_days（≤30）：置顶 N 天后自动失效；取消置顶清空。"""
     user = get_current_user()
     if not user:
         return jsonify({"code": 401, "message": "用户不存在"}), 401
@@ -639,16 +747,54 @@ def pin_thread(thread_id):
     if not can_moderate_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
 
-    # 切换置顶状态
-    thread.is_pinned = not thread.is_pinned
+    if thread.is_pinned and _pin_active(thread):
+        # 已置顶 → 取消
+        thread.is_pinned = False
+        thread.pinned_until = None
+    else:
+        days = (request.get_json(silent=True) or {}).get('expires_days')
+        thread.is_pinned = True
+        if isinstance(days, int) and 1 <= days <= 30:
+            thread.pinned_until = datetime.now() + timedelta(days=days)
+        else:
+            thread.pinned_until = None
     db.session.commit()
 
     return jsonify({
         "code": 200,
         "message": "pinned" if thread.is_pinned else "unpinned",
         "data": {
-            "is_pinned": thread.is_pinned
+            "is_pinned": thread.is_pinned,
+            "pinned_until": thread.pinned_until.strftime('%Y-%m-%d %H:%M:%S') if thread.pinned_until else None,
         }
+    })
+
+
+# 隐藏/恢复 POST /discussions/threads/{thread_id}/hide（治理：hidden<->normal）
+@bp.route("/threads/<int:thread_id>/hide", methods=["POST"])
+@jwt_required()
+def hide_thread(thread_id):
+    """隐藏/恢复主题帖（hidden<->normal 切换）。隐藏帖仅作者/admin 在详情可见，不进公共 feed。"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"code": 401, "message": "用户不存在"}), 401
+
+    thread = DiscussionThread.query.get(thread_id)
+    if not thread:
+        return jsonify({"code": 404, "message": "帖子不存在"}), 404
+
+    if not can_moderate_thread(thread, user):
+        return jsonify({"code": 403, "message": "无权限操作"}), 403
+
+    if thread.status == DiscussionThread.STATUS_HIDDEN:
+        thread.status = DiscussionThread.STATUS_NORMAL
+    else:
+        thread.status = DiscussionThread.STATUS_HIDDEN
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": "hidden" if thread.status == DiscussionThread.STATUS_HIDDEN else "restored",
+        "data": {"status": thread.status}
     })
 
 

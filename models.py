@@ -958,6 +958,9 @@ class DiscussionThread(db.Model):
     title = db.Column(db.String(200), nullable=False)
     content = db.Column(db.Text, nullable=False)
     images_json = db.Column(db.Text, nullable=True)  # 帖子图集 '/media/discussions/...' URL 数组 ≤4（社区重设计 09-19，global 帖用）
+    category = db.Column(db.String(20), nullable=True)   # 话题标签（闲聊/提问/分享/招人；global 帖用，Phase 2 09-20）
+    project_id = db.Column(db.Integer, nullable=True, index=True)  # 关联 XLAB 项目（帖子导流项目详情）
+    pinned_until = db.Column(db.DateTime, nullable=True)  # 置顶过期（到点自动失效；空=不过期）
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
     is_pinned = db.Column(db.Boolean, default=False)

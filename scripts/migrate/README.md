@@ -43,3 +43,4 @@ python scripts/migrate/migrate_09_mentor_selection.py     # camp_session 加选�
 | 09_mentor_selection | camp_session 加 6 列（enabled + 4 时间点 + ms_tags）；create_all 建 camp_mentor_profile / preference / match 3 表；建 ./data/mentor_photos/ |
 | 36_showcase_media | `ALTER showcase_project ADD images_json TEXT NULL`（XLAB 图集列；cover 列 22 建表已有） |
 | 37_community_redesign | article_v2 加 cover_image_key/is_official；discussion_thread 加 images_json（社区重设计：推文封面标记 + 帖子图集） |
+| 38_community_governance | discussion_thread 加 category/project_id/pinned_until（话题标签、关联 XLAB 项目、置顶过期） |

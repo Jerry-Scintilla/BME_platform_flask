@@ -133,6 +133,8 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
     items = []
 
     # ── 1. global 讨论帖（管理员见全部状态，非管理员只见 normal） ──
+    # 话题筛选（Phase 2 09-20）：category 参数只作用于讨论帖（文章无话题概念）
+    category = request.args.get('category') if request else None
     thread_query = DiscussionThread.query.filter(
         DiscussionThread.scope_type == 'global'
     ).options(joinedload(DiscussionThread.author))
@@ -140,7 +142,13 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
         pass  # 管理员可见所有状态
     else:
         thread_query = thread_query.filter(DiscussionThread.status == DiscussionThread.STATUS_NORMAL)
-    for t in thread_query.all():
+    if category:
+        thread_query = thread_query.filter(DiscussionThread.category == category)
+    thread_rows = thread_query.all()
+    # 关联项目标题批量预取（免逐帖 N+1）
+    from .discussion import _pin_active, _project_title_map, CATEGORY_TEXT
+    ptitle_map = _project_title_map(thread_rows)
+    for t in thread_rows:
         # 类型筛选：当前只要文章时跳过讨论帖（数据量小，循环内过滤开销可忽略）
         if content_type == 'article':
             continue
@@ -150,6 +158,10 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             "title": t.title,
             "summary": (t.content or '')[:200],
             "images": _thread_images(t),
+            "category": t.category,
+            "category_text": CATEGORY_TEXT.get(t.category) if t.category else None,
+            "project_id": t.project_id,
+            "project_title": ptitle_map.get(t.project_id),
             "author_id": t.author_id,
             "author_name": t.author.username if t.author else "",
             "author_avatar": get_avatar_url(t.author.avatar_url) if t.author else "",
@@ -158,7 +170,8 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             "reply_count": t.reply_count or 0,
             "view_count": t.view_count or 0,
             "liked": False,
-            "is_pinned": bool(t.is_pinned),
+            # 置顶=生效中的置顶（pinned_until 到点自动失效，Phase 2）
+            "is_pinned": _pin_active(t),
             "article_id": None,
             # ── 排序用私有字段（返回前剔除，不下发客户端）──
             "_interaction": (t.like_count or 0) + 2 * (t.reply_count or 0),
@@ -344,7 +357,7 @@ def community_feed():
 
     # ── 公共缓存（不含用户特定 liked）：按管理员/普通视角分桶，TTL 8s ──
     view = 'admin' if is_admin else 'public'
-    cache_key = f"community:feed:{content_type}:{sort}:{page}:{per_page}:{view}"
+    cache_key = f"community:feed:{content_type}:{sort}:{page}:{per_page}:{view}:{request.args.get('category') or ''}"
 
     page_items = None
     total = pages = 0

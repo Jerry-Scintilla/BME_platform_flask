@@ -580,7 +580,7 @@ def article_v2_my():
     return jsonify({"code": 200, "data": data}), 200
 
 
-# admin 列全部 v2 文章（全部作者 + 含草稿；?status=all|draft|published &q= &author_id=）
+# admin 列全部 v2 文章（全部作者 + 含草稿；?status=all|draft|published &q= &author_id= &official=true|false）
 @bp.route("/admin/list", methods=["GET"])
 @jwt_required()
 def article_v2_admin_list():
@@ -589,11 +589,14 @@ def article_v2_admin_list():
     status = request.args.get('status', 'all')
     author_id = request.args.get('author_id', type=int)
     kw = request.args.get('q', '', type=str).strip()
+    official = request.args.get('official')
     query = ArticleV2Model.query
     if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PUBLISHED):
         query = query.filter_by(status=status)
     if author_id:
         query = query.filter_by(author_id=author_id)
+    if official is not None and official != '':
+        query = query.filter(ArticleV2Model.is_official.is_(official.lower() == 'true'))
     if kw:
         like = f'%{kw}%'
         query = query.filter(or_(ArticleV2Model.title.like(like),
