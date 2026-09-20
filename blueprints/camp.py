@@ -21,7 +21,7 @@ from exts import db, redis_client
 from models import (
     CampSession, CampCycle, CampPolicy, CampMember, CampCourse, CampAttendancePlan,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
-    MedalModel, MedalUserModel, UserModel, SeatModel, CampStaff,
+    MedalModel, MedalUserModel, UserModel, SeatModel, CampStaff, CampMemberEvent,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
     CampChapterCertification, CampChapterMaterial, CampLearningProgress,
     Chapter, LessonModel, LearningProgressModel,
@@ -803,10 +803,22 @@ def session_update(sid):
 # 成员
 # ─────────────────────────────────────────────
 
-def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="student"):
+def _member_event(sid, uid, action, before, after, operator_id, reason=None):
+    """成员变更账本（只追加，migrate_45）：before/after 为 {role, status, team_mentor_id} 快照。"""
+    db.session.add(CampMemberEvent(
+        camp_session_id=sid, user_id=uid, action=action,
+        before=json.dumps(before, ensure_ascii=False) if before else None,
+        after=json.dumps(after, ensure_ascii=False) if after else None,
+        operator_id=operator_id, reason=(reason or None) or None))
+
+
+def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="student",
+                   action="assign", operator_id=None):
     """营期成员分配核心：role 由调用方显式指定 + team_mentor 校验。
     auto_plan=True 学员按工作日自动生成承诺日（member_assign 直接加成员兜底）；
     approve 端点传 False，改由调用方用学生手选日期建 plan。
+    软删除（migrate_45）：历史移除行存在时走复职（status 回 active + 记 reactivate 事件），
+    不再插入新行（UQ(camp,user) 兜底防重）。
     返回 (CampMember, None) 成功（未 commit）；或 (None, (message, code)) 失败。"""
     camp = CampSession.query.get(sid)
     if not camp:
@@ -823,7 +835,10 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
         return None, ("教师/超管通过营期管理入口操作，不作为营期成员加入", 400)
     if role not in ('student', 'mentor', 'member'):
         return None, ("营内角色仅支持 student/mentor/member", 400)
-    if CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first():
+    from models import member_history_scope
+    with member_history_scope():          # 复职判定须看到历史行
+        existing = CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first()
+    if existing and existing.status == 'active':
         return None, ("该用户已在营期中", 402)
     # 归属导生仅学员可设，且必须是本营导生
     if role == 'student' and team_mentor_id:
@@ -831,10 +846,29 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
             return None, ("指定的导生不在本营", 400)
     else:
         team_mentor_id = None
-    m = CampMember(camp_session_id=sid, user_id=user_id, role=role, team_mentor_id=team_mentor_id)
-    db.session.add(m)
+    if existing:
+        before = {"role": existing.role, "status": existing.status,
+                  "team_mentor_id": existing.team_mentor_id}
+        existing.role = role
+        existing.team_mentor_id = team_mentor_id
+        existing.status = 'active'
+        existing.joined_at = datetime.now()
+        existing.ended_at = None
+        existing.ended_by = None
+        existing.end_reason = None
+        m = existing
+        _member_event(sid, user_id, 'reactivate', before,
+                      {"role": role, "status": 'active', "team_mentor_id": team_mentor_id},
+                      operator_id or (existing.ended_by or user_id))
+    else:
+        m = CampMember(camp_session_id=sid, user_id=user_id, role=role,
+                       team_mentor_id=team_mentor_id)
+        db.session.add(m)
+        _member_event(sid, user_id, action, None,
+                      {"role": role, "status": 'active', "team_mentor_id": team_mentor_id},
+                      operator_id or user_id)
     if auto_plan and role == 'student' and _pledge_daily(camp):
-        _gen_plan(camp, user_id)          # 直接加成员：按工作日生成（兜底；按周/不考勤模式无承诺日）
+        _gen_plan(camp, user_id)          # 直接加成员：零 plan 学员按工作日生成（兜底）
     # 方向制继承（09-12）：学员归属导生 → 自动入读该方向绑定的课程（不 commit，随调用方事务）
     if role == 'student' and team_mentor_id:
         _inherit_direction_course(camp, user_id, team_mentor_id)
@@ -944,32 +978,51 @@ def member_list(sid):
                                CampMember.user_id.in_(visible)))
 
     paged = any(k in request.args for k in ("page", "page_size", "keyword", "role"))
-    query = base
-    keyword = (request.args.get("keyword") or "").strip()
-    if keyword:
-        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        query = query.filter(UserModel.username.like(f"%{escaped}%", escape="\\"))
-    roles = [r.strip() for r in (request.args.get("role") or "").split(",") if r.strip()]
-    if roles:
-        query = query.filter(CampMember.role.in_(roles))
+    # 历史视图（软删除后）：管理端/负责人 include_ended=1 时含已移除成员（带移除留痕，
+    # 方案 §3.3「历史页面明确查看结束关系」）。执行段整体包在逃生口内。
+    include_ended = request.args.get("include_ended") == "1" and see_all
 
-    total = query.count() if paged else None
-    if paged:
-        try:
-            page = max(1, int(request.args.get("page", 1)))
-            page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-        except (ValueError, TypeError):
-            return jsonify({"code": 400, "message": "分页参数错误"}), 400
-        rows = (query.order_by(CampMember.id)
-                .offset((page - 1) * page_size).limit(page_size).all())
+    def _run():
+        query = base
+        keyword = (request.args.get("keyword") or "").strip()
+        if keyword:
+            escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            query = query.filter(UserModel.username.like(f"%{escaped}%", escape="\\"))
+        roles = [r.strip() for r in (request.args.get("role") or "").split(",") if r.strip()]
+        if roles:
+            query = query.filter(CampMember.role.in_(roles))
+        total = query.count() if paged else None
+        if paged:
+            try:
+                page = max(1, int(request.args.get("page", 1)))
+                page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+            except (ValueError, TypeError):
+                return None, (jsonify({"code": 400, "message": "分页参数错误"}), 400)
+            rows = (query.order_by(CampMember.id)
+                    .offset((page - 1) * page_size).limit(page_size).all())
+        else:
+            rows = query.order_by(CampMember.id).all()
+        return (total, rows, None)
+
+    if include_ended:
+        from models import member_history_scope
+        with member_history_scope():
+            result = _run()
     else:
-        page, page_size = 1, 0
-        rows = query.order_by(CampMember.id).all()
+        result = _run()
+    if result[2]:
+        return result[2]
+    total, rows = result[0], result[1]
+    page = max(1, int(request.args.get("page", 1))) if paged else 1
+    page_size = min(100, max(1, int(request.args.get("page_size", 20)))) if paged else 0
 
     data = [{
             "user_id": m.user_id, "username": u.username,
             "role": m.role, "team_mentor_id": m.team_mentor_id,
             "joined_at": m.joined_at.isoformat() if m.joined_at else None,
+            "status": m.status,
+            "ended_at": m.ended_at.isoformat() if m.ended_at else None,
+            "end_reason": m.end_reason,
         } for m, u in rows]
     if not paged:
         return jsonify({"code": 200, "members": data})
@@ -1023,6 +1076,10 @@ def member_candidates(sid):
 @camp_access('member.manage')
 @audit_log(operation="移除营期成员")
 def member_remove(sid, uid):
+    """移除成员（2026-09-20 起软删除，migrate_45《通知方案》§3.3）：status=removed 不物理
+    删除——「谁曾经参加、何时被谁移除」可追溯；成员列表/权限判定默认只见 active。
+    连带清理保持原语义：座位解绑、未处理申请关闭、选导生名片/志愿/账本释放、
+    移除导生时其学员归属置空（其原归属记入事件 before 快照）。"""
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
@@ -1031,8 +1088,13 @@ def member_remove(sid, uid):
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
     if not m:
         return jsonify({"code": 404, "message": "成员不存在"}), 404
-    db.session.delete(m)
-    CampAttendancePlan.query.filter_by(camp_session_id=sid, user_id=uid).delete()
+    user = _current_user()
+    reason = ((request.json or {}).get("reason") or "").strip()[:500] or None
+    before = {"role": m.role, "status": m.status, "team_mentor_id": m.team_mentor_id}
+    m.status = 'removed'
+    m.ended_at = datetime.now()
+    m.ended_by = user.id
+    m.end_reason = reason
     # 连带清理：座位解绑（座位保留，人员清空）+ 未处理的加入申请（避免再批入已移除的人）
     for st in CampSeat.query.filter_by(camp_session_id=sid, user_id=uid).all():
         st.user_id = None
@@ -1051,13 +1113,19 @@ def member_remove(sid, uid):
     CampMember.query.filter(
         CampMember.camp_session_id == sid, CampMember.team_mentor_id == uid
     ).update({CampMember.team_mentor_id: None}, synchronize_session=False)
+    _member_event(sid, uid, 'remove', before,
+                  {"role": m.role, "status": 'removed', "team_mentor_id": None},
+                  user.id, reason)
     # 被移除者感知（同事务，is_important——资格类变更不静默，方案 §6.3 camp.member.removed）
-    create_notification(uid, "你已被移出营期",
-                        f"你已被移出「{camp.name}」。如有疑问请联系老师。",
+    content = f"你已被移出「{camp.name}」。"
+    if reason:
+        content += f"原因：{reason}。"
+    content += "如有疑问请联系老师。"
+    create_notification(uid, "你已被移出营期", content,
                         category='camp', source_type='camp_session', source_id=sid,
                         camp_session_id=sid, is_important=True)
     db.session.commit()
-    return jsonify({"code": 200, "message": "已移除"})
+    return jsonify({"code": 200, "message": "已移除（记录保留，可追溯）"})
 
 
 # ─────────────────────────────────────────────
@@ -2018,7 +2086,7 @@ def _apply_join_approval(req, join_mentor):
     _camp = CampSession.query.get(req.camp_session_id)
     mentor = None if (_camp and _camp.mentor_selection_enabled) else join_mentor
     m, err = _assign_member(req.camp_session_id, req.user_id, mentor, auto_plan=False,
-                            role=(req.apply_role or "student"))
+                            role=(req.apply_role or "student"), action="approve_join")
     if err:
         return None, err
     # 用学员申请时手选的承诺日建 CampAttendancePlan（替代 _gen_plan 自动工作日）
@@ -2205,6 +2273,10 @@ def member_update(sid, uid):
         _inherit_direction_course(camp, uid, team_mentor_id)
     # 改派三方通知（2026-09-20 补齐，方案 §6.3 camp.member.reassigned）：学员 + 新导生 + 旧导生
     if team_mentor_id != old_mentor_id:
+        _member_event(sid, uid, 'reassign',
+                      {"role": m.role, "status": m.status, "team_mentor_id": old_mentor_id},
+                      {"role": m.role, "status": m.status, "team_mentor_id": team_mentor_id},
+                      user.id)
         student = UserModel.query.get(uid)
         s_name = student.username if student else str(uid)
         new_mentor = UserModel.query.get(team_mentor_id) if team_mentor_id else None

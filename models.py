@@ -1215,7 +1215,11 @@ class CampSession(db.Model):
 
 class CampMember(db.Model):
     """营期成员（独立于 CourseGroup，隔离安全）。
-    role=student/mentor；team_mentor_id 仅 student 行填，指向其导生。"""
+    role=student/mentor；team_mentor_id 仅 student 行填，指向其导生。
+    状态化（2026-09-20，migrate_45《通知方案》§3.3）：移除改 status=removed 不物理删除
+    ——「谁曾经参加、何时退出、谁操作」可追溯；全部业务查询默认只见 active
+    （do_orm_execute 全局过滤，见文末 _camp_member_default_filter；历史视图走
+    member_history_scope 逃生口）。"""
     __tablename__ = 'camp_member'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -1223,9 +1227,31 @@ class CampMember(db.Model):
     role = db.Column(db.String(20), nullable=False, default='student')          # student / mentor
     team_mentor_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
     joined_at = db.Column(db.DateTime, default=datetime.now)
+    status = db.Column(db.String(20), nullable=False, default='active')         # active / removed / exited
+    ended_at = db.Column(db.DateTime, nullable=True)
+    ended_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    end_reason = db.Column(db.String(500), nullable=True)
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'user_id', name='uq_camp_member_camp_user'),
+        db.Index('ix_camp_member_session_status', 'camp_session_id', 'status'),
     )
+
+
+class CampMemberEvent(db.Model):
+    """营期成员变更账本（只追加，2026-09-20 migrate_45《通知方案》§3.3）：成员关系的状态
+    迁移全程留痕——移除/退出不再物理删除后，通知表可被用户删除，不承担审计职责。
+    action ∈ assign（直接分配）/ approve_join（报名通过入营）/ reactivate（复职）/
+    reassign（改派归属导生）/ remove（管理员移除）/ exit（本人退出）。"""
+    __tablename__ = 'camp_member_event'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    action = db.Column(db.String(20), nullable=False)
+    before = db.Column(db.Text)             # JSON：变更前 {role, status, team_mentor_id}
+    after = db.Column(db.Text)              # JSON：变更后
+    operator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    reason = db.Column(db.String(500), nullable=True)
+    occurred_at = db.Column(db.DateTime, default=datetime.now)
 
 
 class CampStaff(db.Model):
@@ -2135,3 +2161,39 @@ class StandaloneResourceModel(db.Model):
             'uploader': self.uploader.username if self.uploader else None,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None
         }
+
+
+# ─────────────────────────────────────────────
+# CampMember 默认过滤（2026-09-20，migrate_45 成员软删除）
+# ─────────────────────────────────────────────
+# 全部 ORM 查询默认只见 status='active' 的成员（含关系加载）；移除/退出的成员只在
+# member_history_scope 逃生口内可见（复职判定、历史视图）。写入路径（insert/update/
+# delete）不受影响。多 worker 各自注册，进程内单次。
+import threading as _threading
+
+from sqlalchemy import event as _sa_event
+from sqlalchemy.orm import with_loader_criteria as _with_loader_criteria
+
+_member_history_local = _threading.local()
+
+
+def member_history_scope():
+    """逃生口上下文：with member_history_scope(): ... 内的 CampMember 查询可见全部状态。"""
+    class _Scope:
+        def __enter__(self):
+            _member_history_local.on = getattr(_member_history_local, 'on', 0) + 1
+            return self
+        def __exit__(self, *exc):
+            _member_history_local.on -= 1
+            return False
+    return _Scope()
+
+
+@_sa_event.listens_for(db.Session, "do_orm_execute")
+def _camp_member_default_filter(execute_state):
+    if not execute_state.is_select:
+        return                                   # 写路径不加条件（移除=UPDATE 状态）
+    if getattr(_member_history_local, 'on', 0):
+        return                                   # 逃生口：历史/复职判定查询
+    execute_state.statement = execute_state.statement.options(
+        _with_loader_criteria(CampMember, lambda cls: cls.status == 'active'))
