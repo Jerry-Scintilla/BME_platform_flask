@@ -697,7 +697,12 @@ def chapter_delete():
         if chapter:
             db.session.delete(chapter)
 
+    course_id = chapter.course_id
     delete_chapter_recursive(chapter_id)
+    # 顶级章节数缓存同步（导入/添加/编辑端点都会重算，删除此前漏了——course 4/37 已各漂 15/1）
+    course = CourseModel.query.get(course_id)
+    if course:
+        course.chapters = Chapter.query.filter_by(course_id=course_id, level=1).count()
     db.session.commit()
 
     return jsonify({
