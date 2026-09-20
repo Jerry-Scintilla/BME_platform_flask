@@ -352,12 +352,13 @@ def team_meeting_create(sid):
     err = _save_attachments(files, m, sid)
     if err:
         return err
-    db.session.commit()
+    # 通知与业务同事务落库（2026-09-20 P0：原 commit 后 add 不再提交，通知从未持久化）
     _notify_new_meeting(
         [r.user_id for r in CampMember.query.filter_by(
             camp_session_id=sid, role='student', team_mentor_id=m.mentor_id).all()
          if r.user_id != user.id],
         sid, m, user.username, "组长")
+    db.session.commit()
     names = _usernames({m.created_by})
     return jsonify({"code": 200, "message": "组会已创建",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
@@ -418,12 +419,13 @@ def unit_meeting_create(uid):
     err = _save_attachments(files, m, camp.id)
     if err:
         return err
-    db.session.commit()
+    # 通知与业务同事务落库（同 team_meeting_create 的 P0 修复）
     _notify_new_meeting(
         [r.user_id for r in CampUnitMember.query.filter_by(
             unit_id=unit.id, status='active').all()
          if r.user_id != user.id],
         camp.id, m, user.username, "项目负责人")
+    db.session.commit()
     names = _usernames({m.created_by})
     return jsonify({"code": 200, "message": "组会已创建",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
@@ -471,12 +473,12 @@ def meeting_update(mid):
     err = _save_attachments(files, m, m.camp_session_id)
     if err:
         return err
-    db.session.commit()
-    if not had_minutes:                              # 进行中 → 已完结，一次性通知
+    if not had_minutes:                              # 进行中 → 已完结，一次性通知（同事务）
         _notify_minutes_submitted(
             [u.id for u in _group_students(m) if u.id != user.id],
             m.camp_session_id, m, user.username,
             "组长" if m.scope == 'team' else "项目负责人")
+    db.session.commit()
     names = _usernames({m.created_by})
     return jsonify({"code": 200, "message": "组会纪要已更新",
                     "meeting": _meeting_dict(m, CampMeetingAttachment.query.filter_by(
@@ -836,13 +838,12 @@ def meeting_assignments_save(mid):
     for cid in chapter_ids:
         db.session.add(CampMeetingChapterPlan(meeting_id=mid,
                                               course_id=ch_course[cid], chapter_id=cid))
-    db.session.commit()
-
     if changed and (chapter_ids or norm):
         _notify_meeting_users(
             m, [u.id for u in _group_students(m)],
             f"组会布置更新：{m.title}",
             f"组会「{m.title}」（{m.meeting_date.isoformat()}）更新了任务与课内布置，点击查看。")
+    db.session.commit()
     return jsonify(_detail_payload(m, user, True))
 
 
@@ -902,11 +903,11 @@ def meeting_task_submit(tid):
         need = {'file': '至少上传 1 个文件', 'text': '请填写文字内容'}.get(
             t.submit_type, '请填写文字或上传文件')
         return jsonify({"code": 400, "message": f"按任务要求（{SUBMIT_TYPE_TEXT.get(t.submit_type)}），{need}"}), 400
-    db.session.commit()
     leader = _leader_uid(m)
-    if leader and leader != user.id:
+    if leader and leader != user.id:                 # 提交通知与业务同事务（P0 修复）
         _notify_meeting_users(m, [leader], f"任务提交：{t.title}",
                               f"{user.username} 提交了组会「{m.title}」的任务「{t.title}」，点击查看。")
+    db.session.commit()
     return jsonify({"code": 200, "message": "已提交", "my_submission": {
         "valid": True, "content": sub.content,
         "updated_at": sub.updated_at.isoformat() if sub.updated_at else None,

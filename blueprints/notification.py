@@ -274,18 +274,22 @@ def notification_list():
 @bp.route("/unread_count", methods=["GET"])
 @jwt_required()
 def notification_unread_count():
-    """获取未读通知数量（轻量接口，供铃铛轮询）"""
+    """获取未读通知数量（轻量接口，供铃铛轮询）。
+    返回 total（=unread_count，兼容旧形状）+ by_category 分类明细（收件箱 tab 徽标用）。"""
     user = _get_current_user()
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
 
-    count = NotificationModel.query.filter_by(
-        user_id=user.id, is_read=False
-    ).count()
-
+    rows = (db.session.query(NotificationModel.category, db.func.count(NotificationModel.id))
+            .filter(NotificationModel.user_id == user.id,
+                    NotificationModel.is_read == False)  # noqa: E712
+            .group_by(NotificationModel.category).all())
+    by_category = {cat: cnt for cat, cnt in rows}
     return jsonify({
         "code": 200,
-        "data": {"unread_count": count},
+        "data": {"unread_count": sum(by_category.values()),
+                 "total": sum(by_category.values()),
+                 "by_category": by_category},
     })
 
 

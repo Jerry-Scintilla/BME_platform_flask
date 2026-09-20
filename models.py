@@ -1241,7 +1241,10 @@ class CampCourse(db.Model):
 
 
 class CampAttendancePlan(db.Model):
-    """承诺出勤日期（营期范围 × 工作日展开；阈值冗余自 CampSession，便于按日判定）"""
+    """承诺出勤日期（营期范围 × 工作日展开；阈值冗余自 CampSession，便于按日判定）。
+    source（2026-09-20，migrate_41）：self_selected=学员报名手选 / admin=管理员兜底展开
+    （直接加成员、零 plan 学员重生成）/ legacy=迁移存量（不猜来源）。重生成只清理范围外
+    与零 plan 兜底，不再给 self_selected 学员自动补全（方案 §3.2 承诺语义保护）。"""
     __tablename__ = 'camp_attendance_plan'
     id = db.Column(db.Integer, primary_key=True)
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
@@ -1249,6 +1252,7 @@ class CampAttendancePlan(db.Model):
     date = db.Column(db.Date, nullable=False)
     expected_check_in = db.Column(db.Time)    # 冗余：判迟到
     min_daily_hours = db.Column(db.Float)     # 冗余：判达标
+    source = db.Column(db.String(20), default='legacy')   # self_selected / admin / legacy
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'user_id', 'date', name='uq_camp_plan_user_date'),
     )
@@ -1278,6 +1282,7 @@ class CampLeave(db.Model):
     status = db.Column(db.String(20), default='pending')   # pending / approved / rejected
     approver_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     approved_at = db.Column(db.DateTime, nullable=True)
+    decision_note = db.Column(db.Text, nullable=True)      # 审批意见/拒绝原因（业务真相，2026-09-20 migrate_41）
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
@@ -1292,9 +1297,10 @@ class CampJoinRequest(db.Model):
     reason = db.Column(db.Text, nullable=True)
     preferred_tag = db.Column(db.String(50), nullable=True)   # 【已退役 2026-09-12】报名时选的意向大组（组别改随归属导生继承）；列保留存历史行，新申请不写
     selected_days = db.Column(db.Text, nullable=True)   # 学员手选承诺出勤日（JSON 数组字符串，approve 后展开为 CampAttendancePlan）
-    status = db.Column(db.String(20), default='pending', index=True)   # pending / approved / rejected
+    status = db.Column(db.String(20), default='pending', index=True)   # pending / approved / rejected / cancelled
     reviewed_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     reviewed_at = db.Column(db.DateTime, nullable=True)
+    review_note = db.Column(db.Text, nullable=True)         # 拒绝原因等评审意见（业务真相，2026-09-20 migrate_41）
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
@@ -1392,7 +1398,8 @@ class CampMentorFavorite(db.Model):
 
 class CampChapterCertification(db.Model):
     """方向制学习·导生按章认证（2026-09-12，migrate_24）：学员随导生继承方向课程后，
-    导生逐章认证其学习进度；全章认证齐 → user_course.status 自动置 completed（汇总态，撤销不回滚）。
+    导生逐章认证其学习进度；全章认证齐 → user_course.status 置 completed，撤销致课程
+    不再满足全章认证时回退在读（2026-09-20 起完成态由有效认证派生）。
     认证人留痕（改派后新导师可继续认证/撤销自己名下的行）。
     2026-09-13 多课制+按章评分（migrate_28）：方向可绑多门课程（course_id 标识所属课）；
     score=该章评分 0-100（可空=认证未打分；课程均分读时聚合不落库）。"""

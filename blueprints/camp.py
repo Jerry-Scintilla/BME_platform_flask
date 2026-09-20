@@ -50,24 +50,31 @@ def _weekdays(start, end):
 
 
 def _gen_plan(camp, user_id):
-    """为某学员按营期范围(×工作日)生成/补齐承诺出勤日。幂等。"""
+    """为学员按营期范围(×工作日)生成整段承诺出勤日（管理员兜底口径，source='admin'）。
+    幂等；2026-09-20 语义收紧（方案 §3.2）：只服务「本营尚无任何 plan」的学员——
+    报名手选日（self_selected）的学员不会被自动补全，其承诺日只能显式修改。"""
+    exist = CampAttendancePlan.query.filter_by(
+        camp_session_id=camp.id, user_id=user_id).count()
+    if exist:
+        return
     days = _weekdays(camp.start_date, camp.end_date)
     if camp.weekdays_only:
         days = [d for d in days if d.weekday() < 5]   # 周一~周五
-    exist = {p.date for p in CampAttendancePlan.query.filter_by(
-        camp_session_id=camp.id, user_id=user_id).all()}
     for d in days:
-        if d not in exist:
-            db.session.add(CampAttendancePlan(
-                camp_session_id=camp.id, user_id=user_id, date=d,
-                expected_check_in=camp.expected_check_in,
-                min_daily_hours=camp.min_daily_hours,
-            ))
+        db.session.add(CampAttendancePlan(
+            camp_session_id=camp.id, user_id=user_id, date=d,
+            expected_check_in=camp.expected_check_in,
+            min_daily_hours=camp.min_daily_hours,
+            source='admin',
+        ))
 
 
 def _sync_plans(camp):
-    """营期日期/weekdays/成员变更后同步全部学员的 plan：删范围外（及工作日营的周末日）+ 补范围内缺的。幂等。
-    返回同步后 plan 总数。（旧 plan_regenerate 只补不删，缩短营期后范围外脏 plan 残留继续判缺勤）
+    """营期日期/weekdays/成员变更后同步学员 plan。幂等，返回同步后 plan 总数。
+    - 删范围外（及工作日营的周末日）——缩短营期后脏 plan 不残留判缺勤；
+    - 只给「本营零 plan」的学员兜底展开整段工作日（source='admin'）；
+    - 不再给已有承诺日的学员补全范围内缺的日（2026-09-20 P0：学员手选 N 天，
+      重生成后仍是 N 天，方案 §3.2）。
     09-12 三模式：非 daily（按周累计/不考勤）无承诺日体系，不同步只返回现存计数。"""
     if not _pledge_daily(camp):
         return CampAttendancePlan.query.filter_by(camp_session_id=camp.id).count()
@@ -85,6 +92,7 @@ def _sync_plans(camp):
             CampAttendancePlan.query.filter(CampAttendancePlan.id.in_(weekend_ids)).delete(
                 synchronize_session=False)
     out_q.delete(synchronize_session=False)
+    db.session.flush()      # 让上面 delete 的行即时可见，零 plan 判定不受本事务脏读影响
     for m in CampMember.query.filter_by(camp_session_id=camp.id, role='student').all():
         _gen_plan(camp, m.user_id)
     return CampAttendancePlan.query.filter_by(camp_session_id=camp.id).count()
@@ -407,9 +415,17 @@ def mentor_registration(sid):
         return jsonify({"code": 400, "message": "导生报名已截止（仅待开放/选择阶段开放）"}), 400
     if CampJoinRequest.query.filter_by(camp_session_id=sid, user_id=user.id, status='pending').first():
         return jsonify({"code": 200, "message": "已提交报名申请，等待管理员审核"}), 200
-    db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
-                                   reason="导生报名", selected_days="[]",
-                                   apply_role="mentor"))
+    req = CampJoinRequest(camp_session_id=sid, user_id=user.id,
+                          reason="导生报名", selected_days="[]",
+                          apply_role="mentor")
+    db.session.add(req)
+    db.session.flush()
+    # 管理侧感知：导生报名即通知经办人（附待审总数上下文）
+    _notify_camp_admins(sid, "新的导生报名",
+                        f"「{camp.name}」{user.username}（LV{user.level or 1}）申请担任导生，"
+                        f"请到营期管理审批。",
+                        source_type='camp_admin', source_id=req.id,
+                        include_pending_hint=True)
     db.session.commit()
     return jsonify({"code": 200, "message": "报名已提交，管理员审核通过后即可布置导生名片"})
 
@@ -447,6 +463,27 @@ def session_transition(sid):
         if not camp:
             return jsonify({"code": 404, "message": "营期不存在"}), 404
         return jsonify({"code": 409, "message": f"迁移失败：当前状态为 {camp.status}，{action} 要求 {src_status}"}), 409
+    # 生命周期通知（2026-09-20 补齐，方案 §6.2）：开营/结营对全营成员不再静默变更——
+    # 与状态翻转同事务落库；发布/撤回/开放报名阶段成员尚未成形（招募靠 is_featured 指针），不发。
+    camp = CampSession.query.get(sid)
+    if dst_status in ('running', 'archived'):
+        is_learning = camp.category != 'project'
+        if dst_status == 'running':
+            title = "营期已开营"
+            body = (f"「{camp.name}」已正式开营：学习方向、组会任务、考勤与请假已全部开放，"
+                    f"点击进入你的营期工作台。" if is_learning else
+                    f"「{camp.name}」已正式开营：项目工作台已开放，点击进入你的营期。")
+        else:
+            title = "营期已结营"
+            body = (f"「{camp.name}」已结营，营期转为只读：可在营期中心查看学习档案与历史记录，"
+                    f"感谢参与。" if is_learning else
+                    f"「{camp.name}」已结营，营期转为只读：可在营期中心查看项目档案与历史记录，"
+                    f"感谢参与。")
+        for m in CampMember.query.filter_by(camp_session_id=sid).all():
+            create_notification(m.user_id, title, body, category='camp',
+                                source_type='camp_session', source_id=sid,
+                                camp_session_id=sid,
+                                is_important=(dst_status == 'running'))
     db.session.commit()
     camp = CampSession.query.get(sid)
     # v1.3 阶段4：结营自动冻结档案（幂等；项目营快照含项目/里程碑/成果+资产回流打标）。
@@ -765,8 +802,33 @@ def member_assign(sid):
     if err:
         msg, code = err
         return jsonify({"code": code, "message": msg}), code
+    _notify_member_assigned(sid, m)
     db.session.commit()
     return jsonify({"code": 200, "message": "已加入", "member_id": m.id})
+
+
+def _notify_member_assigned(sid, m):
+    """直接分配入营的成员感知通知（同事务；报名审批通过者走 _apply_join_approval 自己的通知）。
+    学员带归属导生时一并通知导生（方案 §6.3 camp.member.assigned）。"""
+    camp = CampSession.query.get(sid)
+    u = UserModel.query.get(m.user_id)
+    if not camp or not u:
+        return
+    role_label = {'student': '学员', 'mentor': '导生', 'member': '成员'}.get(m.role, m.role)
+    content = f"你已被加入「{camp.name}」，当前身份：{role_label}。点击进入营期工作台。"
+    if m.role == 'student' and m.team_mentor_id:
+        mentor = UserModel.query.get(m.team_mentor_id)
+        if mentor:
+            content += f"你的导生是 {mentor.username}。"
+    create_notification(m.user_id, "已加入营期", content, category='camp',
+                        source_type='camp_session', source_id=sid, camp_session_id=sid)
+    if m.role == 'student' and m.team_mentor_id:
+        mentor = UserModel.query.get(m.team_mentor_id)
+        if mentor:
+            create_notification(mentor.id, "新学员加入你的团队",
+                                f"学员 {u.username} 已被分配到你在「{camp.name}」的团队。",
+                                category='camp', source_type='camp_session',
+                                source_id=sid, camp_session_id=sid)
 
 
 @bp.route("/sessions/<int:sid>/members/batch", methods=["POST"])
@@ -801,6 +863,7 @@ def member_assign_batch(sid):
             msg, _code = err
             results.append({"user_id": uid, "status": "failed", "message": msg})
         else:
+            _notify_member_assigned(sid, m)
             results.append({"user_id": uid, "status": "added", "member_id": m.id})
             ok += 1
     if ok:
@@ -936,6 +999,11 @@ def member_remove(sid, uid):
     CampMember.query.filter(
         CampMember.camp_session_id == sid, CampMember.team_mentor_id == uid
     ).update({CampMember.team_mentor_id: None}, synchronize_session=False)
+    # 被移除者感知（同事务，is_important——资格类变更不静默，方案 §6.3 camp.member.removed）
+    create_notification(uid, "你已被移出营期",
+                        f"你已被移出「{camp.name}」。如有疑问请联系老师。",
+                        category='camp', source_type='camp_session', source_id=sid,
+                        camp_session_id=sid, is_important=True)
     db.session.commit()
     return jsonify({"code": 200, "message": "已移除"})
 
@@ -1040,7 +1108,8 @@ def plan_regenerate(sid):
         return jsonify({"code": 400, "message": "本营考勤模式为按周累计，无承诺出勤日"}), 400
     cnt = _sync_plans(camp)
     db.session.commit()
-    return jsonify({"code": 200, "message": "已重生成", "plan_count": cnt})
+    return jsonify({"code": 200, "message": "已同步（清理范围外承诺日；学员已选日期保持不变，"
+                    "零承诺日学员已按工作日补齐）", "plan_count": cnt})
 
 
 # ─────────────────────────────────────────────
@@ -1433,13 +1502,18 @@ def leave_submit():
                    reason=d.get("reason", ""))
     db.session.add(lv)
     db.session.flush()
-    # 通知审批人：优先本营导生；营里没有导生则通知老师/超管（否则请假提交后无人知晓）
-    approvers = [m.user_id for m in CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()]
+    # 通知审批人（2026-09-20 P0 修正，方案 §6.7）：只通知学员所属导生——其他团队导生
+    # 无权审批且不该看到请假隐私；未分组（或所属导生已不在营）才兜底通知超管。
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    approvers = []
+    if member and member.team_mentor_id:
+        approvers = [member.team_mentor_id]
     if not approvers:
         approvers = [u.id for u in UserModel.query.filter(
-            UserModel.role.in_(['teacher', 'super_admin'])).all()]
+            UserModel.role == 'super_admin').all()]
     for aid in approvers:
-        create_notification(aid, "新的营期请假申请", f"{user.username} 申请请假 {sd}~{ed}",
+        create_notification(aid, "新的营期请假申请",
+                            f"「{camp.name}」{user.username} 申请请假 {sd} 至 {ed}，请及时审批。",
                             category='camp', source_type='leave', source_id=lv.id, camp_session_id=sid)
     db.session.commit()
     return jsonify({"code": 200, "message": "已提交", "leave_id": lv.id})
@@ -1447,8 +1521,10 @@ def leave_submit():
 
 @bp.route("/leave/<int:lid>/approve", methods=["POST"])
 @jwt_required()
-@camp_role('mentor')
 def leave_approve(lid):
+    """请假审批。不用 @camp_role('mentor')：路由按 lid 定位、无 sid 段，装饰器取不到
+    营期参数会 500（7517c32 的 query/body 回落也覆盖不到本端点 body）；
+    权限在端点内自查——admin 通过、导生限本团队（_in_my_team），语义与装饰器一致。"""
     user = _current_user()
     lv = CampLeave.query.get(lid)
     if not lv:
@@ -1463,26 +1539,34 @@ def leave_approve(lid):
         if not _in_my_team(lv.camp_session_id, user, lv.user_id):
             return jsonify({"code": 403, "message": "无权审批（非本团队）"}), 403
     d = request.json or {}
-    lv.status = 'approved' if d.get("approve", True) else 'rejected'
+    approved = bool(d.get("approve", True))
+    note = (d.get("note") or "").strip() or None      # 审批意见/拒绝原因（业务真相，migrate_41）
+    lv.status = 'approved' if approved else 'rejected'
     lv.approver_id = user.id
     lv.approved_at = datetime.now()
-    db.session.commit()
-    create_notification(lv.user_id, "请假审批结果",
-                        f"你的请假申请已{'批准' if lv.status == 'approved' else '拒绝'}",
+    lv.decision_note = note
+    # 通知内容按方案 §6.7 全要素：营名 + 日期 + 结果 + 审批人 + 拒绝原因（同事务落库）
+    camp_name = _lv_camp.name if _lv_camp else '营期'
+    content = (f"「{camp_name}」{lv.start_date.isoformat()} 至 {lv.end_date.isoformat()} "
+               f"的请假申请已由 {user.username} {'批准' if approved else '拒绝'}。")
+    if note:
+        content += f"{'拒绝' if not approved else '审批'}原因：{note}。"
+    create_notification(lv.user_id, "请假审批结果", content,
                         category='camp', source_type='leave', source_id=lv.id,
-                        camp_session_id=lv.camp_session_id)
+                        camp_session_id=lv.camp_session_id,
+                        is_important=not approved)
     db.session.commit()
     return jsonify({"code": 200, "message": "已审批", "status": lv.status})
 
 
 @bp.route("/leave/<int:lid>/revoke", methods=["POST"])
 @jwt_required()
-@camp_role('mentor')
 @audit_log(operation="撤回请假审批")
 def leave_revoke(lid):
     """撤回已批准的请假（如误批）：status 回 pending、清空审批人字段，重新进入待审批，
     之后可再次批准或拒绝。考勤按 status='approved' 实时聚合（_approved_leave_dates），
-    撤回即生效，看板/我的考勤中该段自动回算，无需迁移历史。"""
+    撤回即生效，看板/我的考勤中该段自动回算，无需迁移历史。
+    权限同审批：admin 通过、导生限本团队（不用 @camp_role，原因见 leave_approve）。"""
     user = _current_user()
     _rk_lv = CampLeave.query.get(lid)
     if _rk_lv:
@@ -1501,9 +1585,11 @@ def leave_revoke(lid):
     lv.status = 'pending'
     lv.approver_id = None
     lv.approved_at = None
+    lv.decision_note = None
     db.session.flush()
     create_notification(lv.user_id, "请假审批已撤回",
-                        f"你 {lv.start_date.isoformat()}~{lv.end_date.isoformat()} 的请假批准已被撤回，将重新审核",
+                        f"{user.username} 撤回了对 {lv.start_date.isoformat()} 至 "
+                        f"{lv.end_date.isoformat()} 请假的批准，该请假将重新审核。",
                         category='camp', source_type='leave', source_id=lv.id,
                         camp_session_id=lv.camp_session_id)
     db.session.commit()
@@ -1522,6 +1608,9 @@ def leave_list(sid):
     visible = set(_visible_student_ids(sid, user))
     see_all = user.is_admin()
     data = []
+    approver_ids = {lv.approver_id for lv in q.all() if lv.approver_id}
+    approver_names = {u.id: u.username for u in UserModel.query.filter(
+        UserModel.id.in_(approver_ids))} if approver_ids else {}
     for lv in q.order_by(CampLeave.created_at.desc()).all():
         if not see_all and lv.user_id not in visible:
             continue
@@ -1529,7 +1618,10 @@ def leave_list(sid):
         data.append({
             "id": lv.id, "user_id": lv.user_id, "username": u.username if u else "",
             "start_date": lv.start_date.isoformat(), "end_date": lv.end_date.isoformat(),
-            "reason": lv.reason, "status": lv.status, "created_at": lv.created_at.isoformat() if lv.created_at else None,
+            "reason": lv.reason, "status": lv.status,
+            "decision_note": lv.decision_note,
+            "approver_name": approver_names.get(lv.approver_id),
+            "created_at": lv.created_at.isoformat() if lv.created_at else None,
         })
     return jsonify({"code": 200, "leaves": data})
 
@@ -1545,11 +1637,24 @@ def leave_mine():
     if sid:
         q = q.filter_by(camp_session_id=sid)
     data = []
-    for lv in q.order_by(CampLeave.created_at.desc()).all():
+    approver_ids, camp_ids = set(), set()
+    rows = q.order_by(CampLeave.created_at.desc()).all()
+    for lv in rows:
+        if lv.approver_id:
+            approver_ids.add(lv.approver_id)
+        camp_ids.add(lv.camp_session_id)
+    approver_names = {u.id: u.username for u in UserModel.query.filter(
+        UserModel.id.in_(approver_ids))} if approver_ids else {}
+    camp_names = {c.id: c.name for c in CampSession.query.filter(
+        CampSession.id.in_(camp_ids))} if camp_ids else {}
+    for lv in rows:
         data.append({
             "id": lv.id, "camp_session_id": lv.camp_session_id,
+            "camp_name": camp_names.get(lv.camp_session_id),
             "start_date": lv.start_date.isoformat(), "end_date": lv.end_date.isoformat(),
             "reason": lv.reason, "status": lv.status,
+            "decision_note": lv.decision_note,
+            "approver_name": approver_names.get(lv.approver_id),
             "created_at": lv.created_at.isoformat() if lv.created_at else None,
         })
     return jsonify({"code": 200, "leaves": data})
@@ -1580,7 +1685,14 @@ def reward_issue():
                         issued_by=user.id, description=d.get("description", ""))
     db.session.add(mu)
     db.session.flush()
-    create_notification(uid, "获得营期奖励", "导生/老师给你发了一枚勋章",
+    # 奖励通知全要素（方案 §6.9）：营名 + 勋章名 + 发放人 + 说明
+    medal = MedalModel.query.get(medal_id)
+    medal_name = medal.medal_name if medal else '勋章'
+    content = f"你在「{camp.name}」获得 {user.username} 颁发的勋章「{medal_name}」。"
+    desc = (d.get("description") or "").strip()
+    if desc:
+        content += f"颁发说明：{desc}。"
+    create_notification(uid, "获得营期奖励", content,
                         category='camp', source_type='reward', source_id=mu.id, camp_session_id=sid)
     db.session.commit()
     return jsonify({"code": 200, "message": "已发放"})
@@ -1665,6 +1777,30 @@ def _camp_mentors(sid):
     return out
 
 
+def _camp_admin_ids(sid):
+    """营期管理侧通知接收人（阶段 0 口径）：super_admin 兜底。
+    CampStaff（owner/teacher 责任模型）上线后此函数切换为
+    活跃工作人员 → super_admin 最终兜底（配套方案 §7.2）。"""
+    return [u.id for u in UserModel.query.filter(
+        UserModel.role == 'super_admin', UserModel.status.is_(None)
+        | (UserModel.status != 'banned')).all()]
+
+
+def _notify_camp_admins(sid, title, content, source_type, source_id=None,
+                        include_pending_hint=False):
+    """向营期管理侧发通知；include_pending_hint 时附本营待审申请数（给经办人处理上下文）。
+    只 add 不 commit，随调用方事务。"""
+    if include_pending_hint:
+        pending = CampJoinRequest.query.filter_by(
+            camp_session_id=sid, status='pending').count()
+        if pending > 1:
+            content += f"（本营现有 {pending} 条待审批申请）"
+    for aid in _camp_admin_ids(sid):
+        create_notification(aid, title, content, category='camp',
+                            source_type=source_type, source_id=source_id,
+                            camp_session_id=sid)
+
+
 @bp.route("/featured")
 @jwt_required()
 def camp_featured():
@@ -1746,10 +1882,18 @@ def join_request_submit(sid):
         return jsonify({"code": 400, "message": "请至少选择一个有效的承诺出勤日（未来、营期范围内" +
                         ("、工作日" if camp.weekdays_only else "") + "）"}), 400
     # 个别无效日静默剔除（前端日期格已限可选范围，此处兜底）；去重排序后落库
-    db.session.add(CampJoinRequest(camp_session_id=sid, user_id=user.id,
-                                   reason=d.get("reason"),
-                                   apply_role=apply_role,
-                                   selected_days=json.dumps(sorted(set(valid)))))
+    req = CampJoinRequest(camp_session_id=sid, user_id=user.id,
+                          reason=d.get("reason"),
+                          apply_role=apply_role,
+                          selected_days=json.dumps(sorted(set(valid))))
+    db.session.add(req)
+    db.session.flush()
+    # 管理侧感知（2026-09-20 补齐，方案 §6.3）：申请提交即通知经办人，附待审总数上下文
+    _notify_camp_admins(sid, "新的营期报名申请",
+                        f"「{camp.name}」{user.username} 提交了学员报名申请"
+                        f"（承诺出勤 {len(valid)} 天），请到营期管理审批。",
+                        source_type='camp_admin', source_id=req.id,
+                        include_pending_hint=True)
     db.session.commit()
     return jsonify({"code": 200, "message": "申请已提交，等待审批"})
 
@@ -1782,6 +1926,7 @@ def join_request_mine():
         data.append({
             "id": r.id, "camp_session_id": r.camp_session_id, "camp_name": c.name if c else None,
             "reason": r.reason,
+            "review_note": r.review_note,
             "status": r.status, "apply_role": r.apply_role or "student",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
@@ -1804,7 +1949,7 @@ def join_request_list(sid):
         data.append({
             "id": r.id, "user_id": r.user_id, "username": u.username if u else None,
             "email": u.email if u else None, "role": u.role if u else None,
-            "reason": r.reason,
+            "reason": r.reason, "review_note": r.review_note,
             "status": r.status, "apply_role": r.apply_role or "student",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
@@ -1846,7 +1991,8 @@ def _apply_join_approval(req, join_mentor):
                     continue
                 db.session.add(CampAttendancePlan(
                     camp_session_id=req.camp_session_id, user_id=req.user_id, date=dv,
-                    expected_check_in=plan_camp.expected_check_in, min_daily_hours=plan_camp.min_daily_hours))
+                    expected_check_in=plan_camp.expected_check_in, min_daily_hours=plan_camp.min_daily_hours,
+                    source='self_selected'))   # 手选承诺日：重生成/同步不得自动扩大
         else:
             _gen_plan(plan_camp, req.user_id)   # 兜底：申请没带手选日则按工作日
     req.status = 'approved'
@@ -1943,9 +2089,10 @@ def join_request_reject(rid):
     req.status = 'rejected'
     req.reviewed_by = _current_user().id
     req.reviewed_at = datetime.now()
-    # 通知学生：入营申请未通过（同事务，commit 之前；拒绝原因从 body 读，不入库）
+    # 拒绝原因入业务真相（review_note，migrate_41），通知从业务记录渲染（方案 §3.8）
     d = request.json or {}
     reason = (d.get("reason") or "").strip()
+    req.review_note = reason or None
     camp = CampSession.query.get(req.camp_session_id)
     camp_name = camp.name if camp else '该营期'
     content = f"很遗憾，你对「{camp_name}」的入营申请未通过。"
@@ -1981,6 +2128,7 @@ def member_update(sid, uid):
     if team_mentor_id:
         if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
             return jsonify({"code": 400, "message": "指定的导生不在本营"}), 400
+    old_mentor_id = m.team_mentor_id
     m.team_mentor_id = team_mentor_id
     # 启用选导生的营期：改派同步回写配对账本（结果页/看板与 live 链接保持一致）；清空归属则删账本行
     if camp.mentor_selection_enabled:
@@ -1998,6 +2146,33 @@ def member_update(sid, uid):
     # 方向制继承（09-12）：改派到新导生 → 继承其方向课程（旧课程行保留为学习历史）
     if team_mentor_id:
         _inherit_direction_course(camp, uid, team_mentor_id)
+    # 改派三方通知（2026-09-20 补齐，方案 §6.3 camp.member.reassigned）：学员 + 新导生 + 旧导生
+    if team_mentor_id != old_mentor_id:
+        student = UserModel.query.get(uid)
+        s_name = student.username if student else str(uid)
+        new_mentor = UserModel.query.get(team_mentor_id) if team_mentor_id else None
+        old_mentor = UserModel.query.get(old_mentor_id) if old_mentor_id else None
+        if team_mentor_id and new_mentor:
+            create_notification(uid, "你的导生已变更",
+                                f"你在「{camp.name}」的导生已改派为 {new_mentor.username}，"
+                                f"学习方向将随新导生继承，请联系新导生开展学习。",
+                                category='camp', source_type='camp_session', source_id=sid,
+                                camp_session_id=sid, is_important=True)
+            create_notification(team_mentor_id, "改派通知：新学员加入你的团队",
+                                f"学员 {s_name} 已改派到你在「{camp.name}」的团队。",
+                                category='camp', source_type='camp_session', source_id=sid,
+                                camp_session_id=sid)
+        else:
+            create_notification(uid, "你的导生归属已解除",
+                                f"你在「{camp.name}」的导生归属已被解除，请留意后续分配。",
+                                category='camp', source_type='camp_session', source_id=sid,
+                                camp_session_id=sid, is_important=True)
+        if old_mentor:
+            create_notification(old_mentor_id, "改派通知：学员已调离你的团队",
+                                f"学员 {s_name} 已从你在「{camp.name}」的团队改派"
+                                f"（新导生：{new_mentor.username if new_mentor else '未分配'}）。",
+                                category='camp', source_type='camp_session', source_id=sid,
+                                camp_session_id=sid)
     db.session.commit()
     return jsonify({"code": 200, "message": "已更新"})
 
@@ -2308,7 +2483,8 @@ def progress_board(sid):
 def team_progress_certify(sid):
     """导生按章认证（幂等）/撤销。body: {student_user_id, chapter_id, score?}。
     score=0-100 按章评分（可空=认证不打分）；已认证行重复 POST 带 score 仅改分（免撤销改分）。
-    全章认证齐 → 该课 user_course.status 自动置 completed（汇总态，撤销不回滚）。"""
+    全章认证齐 → 该课 user_course.status 置 completed；撤销使课程不再满足全章认证时回退在读
+    （2026-09-20 起完成态由有效认证派生，方案 §3.5），认证/改分/撤销均通知学员。"""
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
@@ -2337,19 +2513,49 @@ def team_progress_certify(sid):
         return jsonify({"code": 404, "message": "章节不在你的方向课程内"}), 404
     row = CampChapterCertification.query.filter_by(
         camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id).first()
+    course = CourseModel.query.get(ch.course_id)
+    course_title = course.title if course else ''
     if request.method == "DELETE":
         if not row:
             return jsonify({"code": 404, "message": "该章节尚未认证"}), 404
         db.session.delete(row)
+        # 完成态回算（2026-09-20，方案 §3.5）：撤销后不再满足全章认证 → 课程从 completed
+        # 退回在读并告知学员；认证反馈是资格相关变更，不静默。
+        chapters = _chapters_payload(camp, ch.course_id, student_uid)
+        certified = sum(1 for c in chapters if c["certified"])
+        uc = UserCourseModel.query.filter_by(
+            user_id=student_uid, course_id=ch.course_id).first()
+        demoted = False
+        if chapters and certified < len(chapters) and uc \
+                and uc.status == UserCourseModel.STATUS_COMPLETED:
+            uc.status = UserCourseModel.STATUS_ACTIVE
+            demoted = True
+        create_notification(student_uid, "章节认证已撤销",
+                            f"「{camp.name}」课程「{course_title}」章节「{ch.name}」的认证已被 "
+                            f"{user.username} 撤销，请与导生确认后继续学习。"
+                            + (f"该课程此前已完成，现退回在读状态。" if demoted else ""),
+                            category='camp', source_type='camp_course',
+                            source_id=ch.course_id, camp_session_id=sid, is_important=True)
         db.session.commit()
         return jsonify({"code": 200, "message": "已撤销认证"})
     if not row:
         db.session.add(CampChapterCertification(
             camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id,
             course_id=ch.course_id, mentor_user_id=user.id, score=score))
+        # 章节认证反馈（2026-09-20 补齐，方案 §6.5）：学员第一时间知道导生认证结果
+        create_notification(student_uid, "章节学习已认证",
+                            f"「{camp.name}」课程「{course_title}」章节「{ch.name}」"
+                            + (f"已认证（{score} 分）。" if score is not None else "已认证。"),
+                            category='camp', source_type='camp_course',
+                            source_id=ch.course_id, camp_session_id=sid)
     elif score is not None:
         row.score = score        # 已认证行重复 POST 带 score = 改分（认证人/时间留痕不变）
-    # 全章认证齐 → 该课课程级 completed（死常量启用；撤销不回滚）
+        create_notification(student_uid, "章节认证评分已更新",
+                            f"「{camp.name}」课程「{course_title}」章节「{ch.name}」"
+                            f"评分已更新为 {score} 分。",
+                            category='camp', source_type='camp_course',
+                            source_id=ch.course_id, camp_session_id=sid)
+    # 全章认证齐 → 该课课程级 completed；撤销走 DELETE 分支回算（方案 §3.5 派生一致性）
     chapters = _chapters_payload(camp, ch.course_id, student_uid)
     certified = sum(1 for c in chapters if c["certified"])
     if chapters and certified >= len(chapters):
@@ -2357,11 +2563,10 @@ def team_progress_certify(sid):
             user_id=student_uid, course_id=ch.course_id).first()
         if uc and uc.status == UserCourseModel.STATUS_ACTIVE:
             uc.status = UserCourseModel.STATUS_COMPLETED
-            course = CourseModel.query.get(ch.course_id)
             create_notification(student_uid, "学习进度已认证",
-                                f"「{camp.name}」课程「{course.title if course else ''}」"
+                                f"「{camp.name}」课程「{course_title}」"
                                 f"全部章节已由导生认证，课程学习完成。",
-                                category='camp', source_type='mentor_selection',
+                                category='camp', source_type='camp_course',
                                 source_id=camp.id, camp_session_id=sid, is_important=True)
     db.session.commit()
     msg = "已认证" if score is None else f"已认证（{score} 分）"
