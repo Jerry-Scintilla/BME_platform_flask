@@ -1,0 +1,33 @@
+课程整体手动排序（Course_Ids 按目标顺序传全量数组）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: 需 course_management 权限
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      properties:
+        Course_Ids:
+          type: array
+          items:
+            type: integer
+          description: 按目标顺序排列的课程id（全量）
+
+responses:
+  200:
+    description: 排序成功
+  401:
+    description: 用户未认证
+  402:
+    description: 参数错误
+  403:
+    description: 权限不足

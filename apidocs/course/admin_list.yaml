@@ -1,0 +1,17 @@
+管理端课程列表（含下架课程，Course_Status 标注；与 /course/list 同序）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: 登录 token
+
+responses:
+  200:
+    description: 课程数组（裸数组，含 normal 与 off_shelf，不含 deleted）
+  401:
+    description: 用户未认证

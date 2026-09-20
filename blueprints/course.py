@@ -452,6 +452,10 @@ def course_edit():
 def course_list():
     a_list = CourseModel.query.filter(
         (CourseModel.status == None) | (CourseModel.status == CourseModel.STATUS_NORMAL)
+    ).order_by(
+        CourseModel.sort_order.asc(),
+        CourseModel.publish_time.desc(),
+        CourseModel.id.desc()
     ).all()
     data = []
     for course in a_list:
@@ -473,6 +477,45 @@ def course_list():
                   'Course_Difficulty': course.difficulty,
                   'Course_Other_Tags': other_tags_list,
                   'Course_Cover_Thumb': _cover_thumb_url(course),
+                  }
+        data.append(b_list)
+
+    return jsonify(data)
+
+
+# 管理端课程列表：含下架课程（Course_Status 标注），供课程管理页与各选择器使用。
+# 仅 @jwt_required 与 /course/resources 等读端点同口径——选择器页面使用者未必持 course_management ACL。
+@bp.route("/course/admin_list", methods=["GET"])
+@jwt_required()
+@swag_from('../apidocs/course/admin_list.yaml')
+def course_admin_list():
+    a_list = CourseModel.query.filter(
+        (CourseModel.status == None) | (CourseModel.status != CourseModel.STATUS_DELETED)
+    ).order_by(
+        CourseModel.sort_order.asc(),
+        CourseModel.publish_time.desc(),
+        CourseModel.id.desc()
+    ).all()
+    data = []
+    for course in a_list:
+        # 处理other_tags，将逗号分隔的字符串转为数组
+        # 同时兼容中文逗号和英文逗号
+        other_tags_list = []
+        if course.other_tags:
+            normalized_tags = course.other_tags.replace('，', ',')
+            other_tags_list = [tag.strip() for tag in normalized_tags.split(',') if tag.strip()]
+
+        b_list = {'Course_title': course.title,
+                  'Course_Introduction': course.introduction,
+                  'Course_Chapters': course.chapters,
+                  'Course_Time': course.publish_time.strftime('%Y-%m-%d %H:%M:%S'),
+                  'Course_Id': str(course.id),
+                  'Course_Tags': course.tags,
+                  'Course_Class_Hour': course.class_hour or 0,
+                  'Course_Difficulty': course.difficulty,
+                  'Course_Other_Tags': other_tags_list,
+                  'Course_Cover_Thumb': _cover_thumb_url(course),
+                  'Course_Status': 'off_shelf' if course.status == CourseModel.STATUS_OFF_SHELF else 'normal',
                   }
         data.append(b_list)
 
@@ -723,9 +766,18 @@ def course_delete():
 @swag_from('../apidocs/course/search_courses.yaml')
 def search_courses():
     normal_filter = (CourseModel.status == None) | (CourseModel.status == CourseModel.STATUS_NORMAL)
+    # 下架课程仅从列表隐藏，详情页（Course_Id 直查）仍可访问：只排除已删除。
+    # 必须补 == None 分支，裸 != 会因 SQL 三值逻辑丢掉 NULL 状态的存量行。
+    not_deleted = (CourseModel.status == None) | (CourseModel.status != CourseModel.STATUS_DELETED)
     search_query = request.args.get('Query')
     if search_query:
-        courses = CourseModel.query.filter(CourseModel.title.like(f'%{search_query}%'), normal_filter).all()
+        courses = CourseModel.query.filter(
+            CourseModel.title.like(f'%{search_query}%'), normal_filter
+        ).order_by(
+            CourseModel.sort_order.asc(),
+            CourseModel.publish_time.desc(),
+            CourseModel.id.desc()
+        ).all()
         if not courses:
             return jsonify({
                 "code": 402,
@@ -762,7 +814,7 @@ def search_courses():
     course_id = request.args.get('Course_Id')
     if course_id:
         course = CourseModel.query.filter(
-            CourseModel.id == course_id, normal_filter
+            CourseModel.id == course_id, not_deleted
         ).first()
         if course is None:
             return jsonify({
@@ -1236,6 +1288,62 @@ def resource_sort():
     db.session.commit()
 
     return jsonify({"code": 200, 'message': "排序成功"})
+
+
+@bp.route("/course/sort", methods=["POST"])
+@jwt_required()
+@check_permission('course_management')
+@audit_log(operation="课程手动排序")
+@swag_from('../apidocs/course/course_sort.yaml')
+def course_sort():
+    """课程整体排序，Course_Ids 按目标顺序传全量数组（同 resource_sort 语义）"""
+    data = request.get_json(silent=True) or {}
+    ids = data.get('Course_Ids')
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"code": 402, 'message': "参数错误"}), 402
+
+    # 建在非删除课程上（含下架）：客户端提交的是 admin_list 全量顺序，
+    # 排除下架课程会留下脏 sort_order，重新上架时错位。
+    courses = CourseModel.query.filter(
+        (CourseModel.status == None) | (CourseModel.status != CourseModel.STATUS_DELETED)
+    ).all()
+    by_id = {c.id: c for c in courses}
+    for idx, cid in enumerate(ids):
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            continue
+        if cid in by_id:
+            by_id[cid].sort_order = idx
+    db.session.commit()
+
+    return jsonify({"code": 200, 'message': "排序成功"})
+
+
+@bp.route("/course/shelf", methods=["POST"])
+@jwt_required()
+@check_permission('course_management')
+@audit_log(operation="课程上下架")
+@swag_from('../apidocs/course/course_shelf.yaml')
+def course_shelf():
+    """课程上下架：下架仅从学生端列表隐藏，详情页与已选课学员不受影响"""
+    data = request.get_json(silent=True) or {}
+    course_id = data.get('Course_Id')
+    status = data.get('Status')
+    if not course_id or status not in (CourseModel.STATUS_NORMAL, CourseModel.STATUS_OFF_SHELF):
+        return jsonify({"code": 402, 'message': "参数错误"}), 402
+
+    course = CourseModel.query.filter_by(id=course_id).first()
+    if course is None:
+        return jsonify({"code": 402, 'message': "课程不存在"}), 402
+    if course.status == CourseModel.STATUS_DELETED:
+        return jsonify({"code": 402, 'message': "课程已删除，不能上下架"}), 402
+
+    course.status = status
+    db.session.commit()
+
+    message = "已下架" if status == CourseModel.STATUS_OFF_SHELF else "已上架"
+    return jsonify({"code": 200, "Course_Id": str(course.id), 'message': message})
 
 
 # ==================== 课时管理 API ====================
