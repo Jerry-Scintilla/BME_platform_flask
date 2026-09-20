@@ -1267,6 +1267,25 @@ class CampStaffEvent(db.Model):
     occurred_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
 
 
+class CampAnnouncement(db.Model):
+    """营期公告（2026-09-20，migrate_43《通知方案》§7.3）：营期内需持续展示的公共内容——
+    与一次性送达的 Notification 是两种对象（公告可反复查看、可置顶/过期，不共表）。
+    发布时可选择同时向受众发一条通知（扇出在发布事务内完成）。"""
+    __tablename__ = 'camp_announcement'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    title = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    audience = db.Column(db.String(20), nullable=False, default='all')   # all / mentors / students（staff 恒可见）
+    is_pinned = db.Column(db.Boolean, default=False)
+    status = db.Column(db.String(20), default='active')          # active / ended（撤下不物理删除）
+    published_at = db.Column(db.DateTime, default=datetime.now)
+    expires_at = db.Column(db.DateTime, nullable=True)           # 过期不再展示（列表读时过滤）
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class CampCourse(db.Model):
     """营期可选课程目录"""
     __tablename__ = 'camp_course'
