@@ -726,6 +726,8 @@ def session_update(sid):
     ms_touched = any(k in d for k in (
         "mentor_selection_enabled", "ms_preference_start", "ms_preference_deadline",
         "ms_round1_deadline", "ms_round2_deadline", "ms_tags"))
+    old_ms_tags = camp.ms_tags                    # 方向课程变更传播的前值快照（B5）
+    propagated = 0
     if ms_touched:
         try:
             _apply_ms_fields(camp, d)
@@ -736,6 +738,13 @@ def session_update(sid):
         if err:
             db.session.rollback()
             return jsonify({"code": 400, "message": err}), 400
+        # 方向新增课程 → 自动下发给已归属该方向导生的学员（只加不减，§3.6）
+        from .camp_ms import _propagate_direction_courses
+        try:
+            propagated = _propagate_direction_courses(camp, old_ms_tags)
+        except Exception:
+            db.session.rollback()
+            propagated = 0                        # 传播失败不阻断配置保存，可重存触发
     # 营期策略覆盖（部分更新；category 不可改——策略行随类型生成，改类型=换营，建新营）
     if isinstance(d.get("policy"), dict):
         policy = camp.policy or CampPolicy(
@@ -797,7 +806,9 @@ def session_update(sid):
             redis_client.delete(f"ms:phase_last:{camp.id}")
         except Exception:
             pass   # Redis 不可用不阻断营期编辑（通知触发层自身有降级）
-    return jsonify({"code": 200, "message": "已更新" + plan_note, "session": _session_dict(camp)})
+    prop_note = f"；方向新增课程已同步给 {propagated} 名学员" if propagated else ""
+    return jsonify({"code": 200, "message": "已更新" + plan_note + prop_note,
+                    "session": _session_dict(camp)})
 
 
 # ─────────────────────────────────────────────

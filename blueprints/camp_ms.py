@@ -311,6 +311,68 @@ def _avatar_url(u):
     return public_avatar_url(u.avatar_url) if u and u.avatar_url else None
 
 
+def _propagate_direction_courses(camp, old_tags_raw):
+    """方向课程变更传播（2026-09-20 B5，方案 §3.6）：老师给方向新增课程绑定时，
+    已归属该方向导生的学员自动入读新增课程（只加不减——移除绑定不动已修课程，
+    学习历史保留原则，与 release 不回收同口径）；每个受影响学员聚一条通知。
+    返回受影响学员数（0=无变化）。不 commit（随调用方事务）。"""
+    old_map = {}
+    try:
+        old = json.loads(old_tags_raw) if old_tags_raw else []
+    except (ValueError, TypeError):
+        old = []
+    if isinstance(old, list):
+        for t in old:
+            if isinstance(t, dict) and str(t.get("name") or "").strip():
+                cids = t.get("course_ids")
+                if not isinstance(cids, list):
+                    cids = [t.get("course_id")] if t.get("course_id") is not None else []
+                old_map[str(t["name"]).strip()] = {
+                    int(c) for c in cids if str(c).lstrip("-").isdigit()}
+    new_map = {d["name"]: set(d["course_ids"]) for d in _ms_directions(camp)}
+    added_by_dir = {}
+    for name, cids in new_map.items():
+        added = cids - old_map.get(name, set())
+        if added:
+            added_by_dir[name] = added
+    if not added_by_dir:
+        return 0
+    from models import CourseModel
+    affected = 0
+    for profile in CampMentorProfile.query.filter_by(camp_session_id=camp.id).all():
+        try:
+            tags = json.loads(profile.tags) if profile.tags else []
+        except (ValueError, TypeError):
+            continue
+        dname = str(tags[0]).strip() if isinstance(tags, list) and tags else None
+        new_cids = added_by_dir.get(dname)
+        if not new_cids:
+            continue
+        students = CampMember.query.filter_by(
+            camp_session_id=camp.id, role='student',
+            team_mentor_id=profile.user_id).all()
+        for s in students:
+            added_titles = []
+            for cid in sorted(new_cids):
+                if UserCourseModel.query.filter_by(
+                        user_id=s.user_id, course_id=cid).first():
+                    continue                     # 已在修（含跨营行）：不动
+                db.session.add(UserCourseModel(
+                    user_id=s.user_id, course_id=cid,
+                    camp_session_id=camp.id, status=UserCourseModel.STATUS_ACTIVE))
+                c = CourseModel.query.get(cid)
+                added_titles.append(c.title if c else str(cid))
+            if added_titles:
+                affected += 1
+                create_notification(
+                    s.user_id, "学习方向新增课程",
+                    f"「{camp.name}」你的方向新增了课程：{'、'.join(added_titles)}，"
+                    f"已自动加入你的学习方向，请开始学习。",
+                    category='camp', source_type='camp_course',
+                    source_id=camp.id, camp_session_id=camp.id)
+    return affected
+
+
 def _photo_url(p):
     """新值 '/media/...' 原样；旧裸文件名回退旧路由（过渡一版，migrate_32 后只剩新值）。"""
     if not (p and p.photo):
