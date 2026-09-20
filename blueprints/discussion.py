@@ -461,6 +461,9 @@ def list_threads():
     if status == 'all':
         status = None    # 治理视角：列全部状态（Phase 2 09-20）
     category = request.args.get('category')    # 话题筛选（global 帖，Phase 2）
+    author_id = request.args.get('author_id', type=int)   # 按作者筛（本人或 admin；我的帖子 09-20）
+    if author_id and author_id != user.id and not user.is_admin():
+        return jsonify({"code": 403, "message": "只能查看自己的帖子"}), 403
     sort = request.args.get('sort', 'latest')  # latest/pinned
 
     query = DiscussionThread.query
@@ -497,6 +500,8 @@ def list_threads():
         query = query.filter(DiscussionThread.status == status)
     if category:
         query = query.filter(DiscussionThread.category == category)
+    if author_id:
+        query = query.filter(DiscussionThread.author_id == author_id)
 
     # 排序
     if sort == 'pinned':
