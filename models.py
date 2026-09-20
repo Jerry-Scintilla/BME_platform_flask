@@ -1194,7 +1194,7 @@ class CampSession(db.Model):
     policy_id = db.Column(db.Integer, db.ForeignKey('camp_policy.id'))               # 营期策略（CampPolicy，建营时按类型默认值生成）
     start_date = db.Column(db.Date, nullable=False)
     end_date = db.Column(db.Date, nullable=False)
-    status = db.Column(db.String(20), default='draft')           # draft / active / archived
+    status = db.Column(db.String(20), default='draft')           # 五态+删除：draft/upcoming/selecting/running/archived/deleted（CAMP_TRANSITIONS 状态机，camp.py）
     # 弹性考勤规则
     expected_check_in = db.Column(db.Time)                       # 期望到岗时间（判迟到基准）
     min_daily_hours = db.Column(db.Float)                        # 每日最低有效时长（判达标）
@@ -1340,6 +1340,21 @@ class CampAttendancePlan(db.Model):
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'user_id', 'date', name='uq_camp_plan_user_date'),
     )
+
+
+class CampAttendanceChange(db.Model):
+    """承诺出勤日变更账本（只追加，2026-09-20 migrate_46《通知方案》§3.2/§6.8）：
+    管理员/负责人对学员承诺日的显式调整（全量替换）留痕——before/after 日期集合快照，
+    配合通知（camp.attendance.commitment_changed）避免争议。"""
+    __tablename__ = 'camp_attendance_change'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    before_dates = db.Column(db.Text)          # JSON 数组
+    after_dates = db.Column(db.Text)           # JSON 数组
+    operator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    reason = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
 
 
 class CampSeat(db.Model):

@@ -22,6 +22,7 @@ from models import (
     CampSession, CampCycle, CampPolicy, CampMember, CampCourse, CampAttendancePlan,
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel, CampStaff, CampMemberEvent,
+    CampAttendanceChange,
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
     CampChapterCertification, CampChapterMaterial, CampLearningProgress,
     Chapter, LessonModel, LearningProgressModel,
@@ -1214,7 +1215,7 @@ def course_list(sid):
 
 @bp.route("/attendance/plan/<int:sid>", methods=["POST"])
 @jwt_required()
-@camp_role()
+@camp_access('member.manage')
 @audit_log(operation="重生成营期出勤计划")
 def plan_regenerate(sid):
     camp = CampSession.query.get(sid)
@@ -1230,6 +1231,111 @@ def plan_regenerate(sid):
     db.session.commit()
     return jsonify({"code": 200, "message": "已同步（清理范围外承诺日；学员已选日期保持不变，"
                     "零承诺日学员已按工作日补齐）", "plan_count": cnt})
+
+
+@bp.route("/attendance/plan/<int:sid>/<int:uid>", methods=["PUT"])
+@jwt_required()
+@camp_access('member.manage')
+@audit_log(operation="调整学员承诺出勤日")
+def plan_adjust(sid, uid):
+    """显式调整某学员的承诺出勤日（全量替换，migrate_46）：body {dates: [...], reason?}。
+    「同步/重生成」永不触碰个人承诺日（P0 语义），加日/减日走本端点——账本留痕
+    （before/after 快照）并通知学员本人（§6.8 commitment_changed）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
+    if not _pledge_daily(camp):
+        return jsonify({"code": 400, "message": "本营考勤模式为按周累计，无承诺出勤日"}), 400
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=uid, role='student').first()
+    if not member:
+        return jsonify({"code": 404, "message": "学员不在本营"}), 404
+    d = request.json or {}
+    reason = (d.get("reason") or "").strip()[:500] or None
+    dates = []
+    try:
+        for s in (d.get("dates") or []):
+            dates.append(date.fromisoformat(str(s)))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "日期格式须为 YYYY-MM-DD"}), 400
+    dates = sorted(set(dates))
+    for dv in dates:
+        if not (camp.start_date <= dv <= camp.end_date):
+            return jsonify({"code": 400, "message":
+                            f"日期 {dv.isoformat()} 超出营期范围（{camp.start_date} ~ {camp.end_date}）"}), 400
+        if camp.weekdays_only and dv.weekday() >= 5:
+            return jsonify({"code": 400, "message":
+                            f"本营仅工作日考勤，{dv.isoformat()} 是周末"}), 400
+    before_rows = CampAttendancePlan.query.filter_by(
+        camp_session_id=sid, user_id=uid).order_by(CampAttendancePlan.date).all()
+    before = [p.date.isoformat() for p in before_rows]
+    after = [dv.isoformat() for dv in dates]
+    if before == after:
+        return jsonify({"code": 200, "message": "承诺日无变化", "dates": after})
+    # 全量替换（删除旧行 + 写新行 source='admin'）；考勤判定按当前行实时聚合
+    CampAttendancePlan.query.filter_by(camp_session_id=sid, user_id=uid)\
+        .delete(synchronize_session=False)
+    for dv in dates:
+        db.session.add(CampAttendancePlan(
+            camp_session_id=sid, user_id=uid, date=dv,
+            expected_check_in=camp.expected_check_in,
+            min_daily_hours=camp.min_daily_hours, source='admin'))
+    db.session.add(CampAttendanceChange(
+        camp_session_id=sid, user_id=uid,
+        before_dates=json.dumps(before), after_dates=json.dumps(after),
+        operator_id=_current_user().id, reason=reason))
+    # 通知学员（§6.8：被本人之外的人修改时立即通知，附增删明细）
+    operator = _current_user()
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    parts = []
+    if added:
+        parts.append("新增 " + "、".join(x[5:] for x in added))
+    if removed:
+        parts.append("取消 " + "、".join(x[5:] for x in removed))
+    content = (f"你在「{camp.name}」的承诺出勤日已被 {operator.username} 调整："
+               + "；".join(parts) + "。")
+    if reason:
+        content += f"原因：{reason}。"
+    content += f"现共 {len(after)} 天。"
+    create_notification(uid, "承诺出勤日已调整", content,
+                        category='camp', source_type='camp_session',
+                        source_id=sid, camp_session_id=sid, is_important=True)
+    db.session.commit()
+    return jsonify({"code": 200, "message": f"已调整（{len(after)} 天，原 {len(before)} 天）",
+                    "dates": after})
+
+
+@bp.route("/attendance/plan/<int:sid>/<int:uid>", methods=["GET"])
+@jwt_required()
+@camp_access('member.manage')
+def plan_of_student(sid, uid):
+    """某学员当前承诺日 + 最近变更记录（调整弹窗数据源）。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    rows = CampAttendancePlan.query.filter_by(camp_session_id=sid, user_id=uid)\
+        .order_by(CampAttendancePlan.date).all()
+    change_rows = CampAttendanceChange.query.filter_by(
+        camp_session_id=sid, user_id=uid).order_by(
+        CampAttendanceChange.id.desc()).limit(10).all()
+    operators = {c.operator_id for c in change_rows}
+    names = {u.id: u.username for u in UserModel.query.filter(
+        UserModel.id.in_(operators))} if operators else {}
+    changes = [{
+        "before": json.loads(c.before_dates) if c.before_dates else [],
+        "after": json.loads(c.after_dates) if c.after_dates else [],
+        "operator_name": names.get(c.operator_id),
+        "reason": c.reason,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    } for c in change_rows]
+    return jsonify({"code": 200,
+                    "dates": [p.date.isoformat() for p in rows],
+                    "range": {"start": camp.start_date.isoformat(),
+                              "end": camp.end_date.isoformat(),
+                              "weekdays_only": bool(camp.weekdays_only)},
+                    "changes": changes})
 
 
 # ─────────────────────────────────────────────
