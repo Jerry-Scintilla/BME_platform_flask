@@ -820,13 +820,16 @@ def _detail_payload(m, user, role):
                 [p.chapter_id for p in plans])).all()
         certs = {(r.student_user_id, r.chapter_id): r for r in cert_rows}
         # 课内材料数（2026-09-20 修「导生看不到」：导生审阅矩阵格子带材料角标，
-        # 弹层查看下载——此前材料只在学员进度页可见，组会页无处可看）
+        # 弹层查看下载——此前材料只在学员进度页可见，组会页无处可看）。
+        # member 同步下发自己的份数：组员视图「未认证」与「已认证」之间补「已提交」
+        # 态（材料已交、待导生认证），学员交完不再对着"未认证"干等
+        mat_uids = [u.id for u in students] if is_leader else ([user.id] if role == 'member' else [])
         mat_counts = {}
-        if is_leader and students:
+        if plans and mat_uids:
             for r in CampChapterMaterial.query.filter(
                     CampChapterMaterial.camp_session_id == m.camp_session_id,
                     CampChapterMaterial.chapter_id.in_([p.chapter_id for p in plans]),
-                    CampChapterMaterial.student_user_id.in_([u.id for u in students])).all():
+                    CampChapterMaterial.student_user_id.in_(mat_uids)).all():
                 mat_counts[(r.student_user_id, r.chapter_id)] = \
                     mat_counts.get((r.student_user_id, r.chapter_id), 0) + 1
         for p in plans:
@@ -846,6 +849,7 @@ def _detail_payload(m, user, role):
             else:
                 r = certs.get((user.id, p.chapter_id))
                 ch["my_cert"] = None if r is None else {"score": r.score}
+                ch["my_material_count"] = mat_counts.get((user.id, p.chapter_id), 0)
             chapters_out.append(ch)
 
     out = {"code": 200, "is_leader": is_leader, "viewer_role": role,
