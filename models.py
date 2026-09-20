@@ -1324,6 +1324,33 @@ class CampCourse(db.Model):
     )
 
 
+class CampCourseAssignment(db.Model):
+    """营期课程分配（2026-09-20 B2，migrate_47《通知方案》§3.4）：某营期因某方向/导生
+    给某学员分配了某课程——营期维度的入课事实表。与 UserCourse（用户×课程全局唯一的
+    学习关系）解耦：同课跨营不再覆盖 UserCourse.camp_session_id（legacy 戳停写，读端
+    一律 assignment 优先、仅无 assignment 行时回退戳）。
+    source_type: direction=方向继承（归属/改派/传播）/ manual=手动入读 / migrated=迁移回填
+                 （无法确定历史来源的行 ref 置 NULL，不伪造历史，方案 §13.3）；
+    source_ref_id: direction→导生 user_id、manual→操作人 user_id、migrated→NULL；
+    status: active / ended（成员移除即 ended，学习历史行不回收——与 release 不回收同口径）。"""
+    __tablename__ = 'camp_course_assignment'
+    STATUS_ACTIVE = 'active'
+    STATUS_ENDED = 'ended'
+    id = db.Column(db.Integer, primary_key=True)
+    camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    student_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
+    source_type = db.Column(db.String(20), default='direction')
+    source_ref_id = db.Column(db.Integer)          # 见类注释；无稳定引用时 NULL
+    status = db.Column(db.String(20), default=STATUS_ACTIVE)
+    assigned_at = db.Column(db.DateTime, default=datetime.now)
+    ended_at = db.Column(db.DateTime)
+    __table_args__ = (
+        db.UniqueConstraint('camp_session_id', 'student_user_id', 'course_id',
+                            name='uq_camp_course_assignment'),
+    )
+
+
 class CampAttendancePlan(db.Model):
     """承诺出勤日期（营期范围 × 工作日展开；阈值冗余自 CampSession，便于按日判定）。
     source（2026-09-20，migrate_41）：self_selected=学员报名手选 / admin=管理员兜底展开

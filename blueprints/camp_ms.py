@@ -38,6 +38,7 @@ from models import (
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
 from .camp_staff import camp_access
+from .camp_course_assign import upsert_assignment
 from .forms import AvatarForm
 from .media import public_avatar_url
 from storage import storage
@@ -270,7 +271,9 @@ def _live_matched(camp_id, mentor_id):
 def _inherit_direction_course(camp, student_uid, mentor_uid):
     """方向制继承（09-12；09-13 多课制）：学员归属导生 → 自动入读该导生方向绑定的全部课程。
     - 方向取导生名片 tags[0] → _ms_directions 的 course_ids；无名片/legacy 无课程 → 静默跳过
-    - UserCourse UQ(user, course)：已有行（同课跨营）复用并重打 camp_session_id 戳（同旧 /camp/selection 口径）
+    - UserCourse UQ(user, course)：已有行（同课跨营）复用不再重打 camp_session_id 戳
+      （2026-09-20 B2，migrate_47：营期归属落 camp_course_assignment，方案 §3.4）；
+      新行也不带戳（营期口径读端 assignment 优先）
     - 不 commit（由调用方事务一并提交）；release/移除导生不回收旧课行（学习历史保留）
     """
     profile = CampMentorProfile.query.filter_by(
@@ -292,18 +295,18 @@ def _inherit_direction_course(camp, student_uid, mentor_uid):
         uc = UserCourseModel.query.filter_by(
             user_id=student_uid, course_id=cid).first()
         if uc:
-            uc.camp_session_id = camp.id
             # 复用旧选课行：曾退课（dropped）拉回在读——否则进营后「在学习」列表看不到该课
             # （退课只标状态不删行，UQ 保证复用）；completed 不降级（学完就是学完）
             if uc.status == UserCourseModel.STATUS_DROPPED:
                 uc.status = UserCourseModel.STATUS_ACTIVE
             last = uc
-            continue
-        uc = UserCourseModel(user_id=student_uid, course_id=cid,
-                             camp_session_id=camp.id,
-                             status=UserCourseModel.STATUS_ACTIVE)
-        db.session.add(uc)
-        last = uc
+        else:
+            uc = UserCourseModel(user_id=student_uid, course_id=cid,
+                                 status=UserCourseModel.STATUS_ACTIVE)
+            db.session.add(uc)
+            last = uc
+        upsert_assignment(camp, student_uid, cid,
+                          source_type='direction', source_ref_id=mentor_uid)
     return last
 
 
@@ -356,12 +359,18 @@ def _propagate_direction_courses(camp, old_tags_raw):
             for cid in sorted(new_cids):
                 if UserCourseModel.query.filter_by(
                         user_id=s.user_id, course_id=cid).first():
-                    continue                     # 已在修（含跨营行）：不动
+                    continue                     # 已在修（含跨营行）：全局行不动
                 db.session.add(UserCourseModel(
                     user_id=s.user_id, course_id=cid,
-                    camp_session_id=camp.id, status=UserCourseModel.STATUS_ACTIVE))
+                    status=UserCourseModel.STATUS_ACTIVE))
                 c = CourseModel.query.get(cid)
                 added_titles.append(c.title if c else str(cid))
+            # 已在修的课也要落本营分配行（同课跨营各营各一行，B2 方案 §3.4）；
+            # 上面的 continue 只挡全局行，不挡 assignment
+            for cid in sorted(new_cids):
+                upsert_assignment(camp, s.user_id, cid,
+                                  source_type='direction',
+                                  source_ref_id=profile.user_id)
             if added_titles:
                 affected += 1
                 create_notification(

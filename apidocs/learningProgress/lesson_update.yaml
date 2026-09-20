@@ -37,6 +37,11 @@ parameters:
         Detail:
           type: object
           description: 详情JSON对象，不同类型课时有不同字段
+        camp_session_id:
+          type: integer
+          description: 营期ID（可选，2026-09-20 B2）。营内入口学习时由前端显式携带——
+            同课跨营多活营时打点精确落该营快照；后端校验须存在该营的有效课程分配行，
+            无效则回落最新分配推导。非营内路径不带，走全局进度表。
 
 responses:
   200:

@@ -35,6 +35,7 @@ from .camp_staff import (camp_access, camp_staff_row, camp_responsible_ids,
                          has_camp_access, staff_permissions)
 from .camp_ms import (_apply_ms_fields, _validate_ms, _ms_dict, _ms_phase, _ms_tags_list,
                       _ms_directions, _inherit_direction_course)
+from .camp_course_assign import end_member_assignments
 
 bp = Blueprint("camp", __name__, url_prefix="/camp")
 
@@ -1125,6 +1126,9 @@ def member_remove(sid, uid):
     CampMember.query.filter(
         CampMember.camp_session_id == sid, CampMember.team_mentor_id == uid
     ).update({CampMember.team_mentor_id: None}, synchronize_session=False)
+    # 课程分配收尾（2026-09-20 B2）：该营分配行置 ended；UserCourse/进度/认证不回收
+    # （学习历史保留——移除后课程口径自动回全局/其它营，active_scope_camp 不再命中本营）
+    end_member_assignments(sid, uid)
     _member_event(sid, uid, 'remove', before,
                   {"role": m.role, "status": 'removed', "team_mentor_id": None},
                   user.id, reason)
@@ -2500,6 +2504,23 @@ def _chapters_payload(camp, course_id, student_uid, ctx=None):
     return out
 
 
+def _course_completed_in_any_camp(student_uid, course_id):
+    """(student, course) 的全营认证完备性（2026-09-20 B2 跨营守卫）：任一营的有效认证
+    覆盖该课全部学习单元章（层级过滤同 _chapters_payload）→ True。撤销回算时用它防
+    「A 营已完成的课，被 B 营撤销认证拖回在读」——全局完成态取各营认证的并集语义。"""
+    chs = Chapter.query.filter_by(course_id=course_id).all()
+    if any(ch.level and ch.level >= 2 for ch in chs):
+        chs = [ch for ch in chs if not (ch.level and ch.level < 2)]
+    need = {ch.id for ch in chs}
+    if not need:
+        return False
+    by_camp = {}
+    for c in CampChapterCertification.query.filter_by(
+            student_user_id=student_uid, course_id=course_id).all():
+        by_camp.setdefault(c.camp_session_id, set()).add(c.chapter_id)
+    return any(need <= got for got in by_camp.values())
+
+
 def _course_block(camp, course_id, student_uid, ctx=None):
     """单门课程的进度块（team/progress 与 my-direction 共用）：
     章节列表 + 认证计数 + 课程均分（已认证且已打分章节的算术平均，读时聚合不落库）。
@@ -2767,15 +2788,17 @@ def team_progress_certify(sid):
         if not row:
             return jsonify({"code": 404, "message": "该章节尚未认证"}), 404
         db.session.delete(row)
-        # 完成态回算（2026-09-20，方案 §3.5）：撤销后不再满足全章认证 → 课程从 completed
-        # 退回在读并告知学员；认证反馈是资格相关变更，不静默。
+        # 完成态回算（2026-09-20，方案 §3.5；B2 跨营守卫）：本营撤销后不再满足全章认证
+        # → 课程从 completed 退回在读并告知学员；但其它营认证仍完备时不降级（同课跨营，
+        # 全局完成态=各营认证并集）。认证反馈是资格相关变更，不静默。
         chapters = _chapters_payload(camp, ch.course_id, student_uid)
         certified = sum(1 for c in chapters if c["certified"])
         uc = UserCourseModel.query.filter_by(
             user_id=student_uid, course_id=ch.course_id).first()
         demoted = False
         if chapters and certified < len(chapters) and uc \
-                and uc.status == UserCourseModel.STATUS_COMPLETED:
+                and uc.status == UserCourseModel.STATUS_COMPLETED \
+                and not _course_completed_in_any_camp(student_uid, ch.course_id):
             uc.status = UserCourseModel.STATUS_ACTIVE
             demoted = True
         create_notification(student_uid, "章节认证已撤销",

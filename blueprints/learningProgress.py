@@ -8,7 +8,7 @@ from exts import db, redis_client
 
 # 导入数据库表
 from models import (UserModel, CourseModel, LearningProgressModel, GroupModel,
-                    LessonModel, UserCourseModel, CampSession, CampLearningProgress)
+                    LessonModel, UserCourseModel, CampLearningProgress)
 
 # 导入表单验证
 from .forms import LearningProgressForm
@@ -478,16 +478,13 @@ def group_through_courseid():
 
 # ==================== 课时进度管理 API ====================
 
-def _camp_scope(user_id, course_id):
-    """营期快照分流判定（09-14）：user_course 营戳指向非 archived 营 → 返回 camp；
-    无戳/营不存在/已 archived → None（走全局表）。就地判定 status 避免循环 import。"""
-    uc = UserCourseModel.query.filter_by(user_id=user_id, course_id=course_id).first()
-    if not uc or not uc.camp_session_id:
-        return None
-    camp = CampSession.query.get(uc.camp_session_id)
-    if camp and camp.status != 'archived':
-        return camp
-    return None
+def _camp_scope(user_id, course_id, prefer_sid=None):
+    """营期快照分流判定（09-14；2026-09-20 B2 改 assignment 口径，migrate_47）：
+    camp_course_assignment active 行 → 非 archived 营（同课跨营多活营时最新分配优先；
+    prefer_sid=前端营内入口带参显式指定）。仅 (user, course) 完全无分配行时回退旧
+    user_course 营戳（回填漏网兜底）。无有效营 → None（走全局表）。"""
+    from .camp_course_assign import active_scope_camp
+    return active_scope_camp(user_id, course_id, prefer_sid=prefer_sid)
 
 
 @bp.route("/learningProgress/lesson/update", methods=["POST"])
@@ -539,8 +536,14 @@ def update_lesson_progress():
 
     now = datetime.now()
 
-    # 营期快照分流（09-14）：营戳指向非 archived 营 → 写快照表（营期维度从零），不碰全局
-    camp = _camp_scope(user.id, course_id)
+    # 营期快照分流（09-14；B2 起 assignment 口径 + 显式 sid）：body 带 camp_session_id
+    # （前端从营内入口进来）优先按该营分配行分流——同课跨营多活营时打点落营准确；
+    # 无该营分配行则回落最新分配推导。非 archived 营 → 写快照表（营期维度从零），不碰全局
+    try:
+        prefer_sid = int(data.get('camp_session_id'))
+    except (TypeError, ValueError):
+        prefer_sid = None                   # 非法值静默忽略，回落推导口径
+    camp = _camp_scope(user.id, course_id, prefer_sid=prefer_sid)
     if camp is not None:
         snap = CampLearningProgress.query.filter_by(
             camp_session_id=camp.id, user_id=user.id, lesson_id=lesson_id).first()
@@ -858,13 +861,13 @@ def check_course():
         course_id=course_id
     ).first()
 
-    # 营期戳透出（09-14）：仅戳指向非 archived 营时返回——结营后全局才是有效口径；
-    # 前端用它做进度口径分流（effectiveSid），保证从任意路径进详情页口径一致
+    # 营期戳透出（09-14；B2 起 assignment 口径）：当前有效分配营（非 archived）才返回
+    # ——结营后全局才是有效口径；前端用它做进度口径分流（effectiveSid），保证从任意
+    # 路径进详情页口径一致。同课跨营多活营时返回最新分配营（与打点分流一致）。
     camp_sid = None
-    if user_course and user_course.camp_session_id:
-        cs = CampSession.query.get(user_course.camp_session_id)
-        if cs and cs.status != 'archived':
-            camp_sid = cs.id
+    scope = _camp_scope(user.id, course_id)
+    if scope is not None:
+        camp_sid = scope.id
 
     if user_course and user_course.status == UserCourseModel.STATUS_ACTIVE:
         return jsonify({
