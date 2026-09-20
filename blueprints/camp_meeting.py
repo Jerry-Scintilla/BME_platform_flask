@@ -77,8 +77,12 @@ def _team_context(sid, user):
 
 
 def _can_view(user, m):
-    """组会可见性：本组成员（team=组长及其学员；unit=active 单元成员）或 admin。"""
+    """组会可见性：本组成员（team=组长及其学员；unit=active 单元成员）或 admin；
+    营期负责人（CampStaff，meeting.read_all）可看全营组会（2026-09-20 A3）。"""
     if user.is_admin():
+        return True
+    from .camp_staff import camp_staff_row
+    if camp_staff_row(m.camp_session_id, user.id):
         return True
     if m.scope == 'team':
         if m.mentor_id == user.id:
@@ -342,6 +346,47 @@ def team_meeting_list(sid):
         "meetings": _meetings_payload(sid, user, student_ids, is_leader,
                                       scope='team', mentor_id=mentor.id),
     })
+
+
+@bp.route("/sessions/<int:sid>/meetings/all")
+@jwt_required()
+def camp_meetings_all(sid):
+    """全营组会总览（老师工作台·只读，A3 2026-09-20）：营期负责人按团队分组看全部组会——
+    行=组会（组长/日期/任务数/纪要态），详情点击走 /meetings/<mid>/detail（_can_view 已放行
+    staff，但 _can_manage 不放行——老师只读，管理与审阅仍是组长职责，方案 §4.2 矩阵）。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    user = _current_user()
+    if not user.is_admin():
+        from .camp_staff import camp_staff_row
+        if not camp_staff_row(sid, user.id):
+            return jsonify({"code": 403, "message": "仅本营负责人可查看全营组会"}), 403
+    rows = (CampMeeting.query.filter_by(camp_session_id=sid)
+            .order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc()).all())
+    atts = _atts_by_meeting([m.id for m in rows])
+    creator_ids = {m.created_by for m in rows}
+    names = _usernames(creator_ids)
+    task_counts = dict(db.session.query(CampMeetingTask.meeting_id,
+                                        db.func.count(CampMeetingTask.id))
+                       .filter(CampMeetingTask.meeting_id.in_([m.id for m in rows]))
+                       .group_by(CampMeetingTask.meeting_id).all()) if rows else {}
+    mentor_ids = {m.mentor_id for m in rows if m.scope == 'team' and m.mentor_id}
+    mentor_names = {u.id: u.username for u in UserModel.query.filter(
+        UserModel.id.in_(mentor_ids))} if mentor_ids else {}
+    unit_ids = {m.unit_id for m in rows if m.scope == 'unit' and m.unit_id}
+    units = {u.id: u.name for u in CampUnit.query.filter(
+        CampUnit.id.in_(unit_ids))} if unit_ids else {}
+    out = []
+    for m in rows:
+        item = _meeting_dict(m, atts[m.id], names)
+        item["team_label"] = (mentor_names.get(m.mentor_id, str(m.mentor_id))
+                              if m.scope == 'team'
+                              else units.get(m.unit_id, f"项目组#{m.unit_id}"))
+        item["task_count"] = int(task_counts.get(m.id, 0))
+        item["has_minutes"] = bool((m.content or '').strip()) or bool(atts[m.id])
+        out.append(item)
+    return jsonify({"code": 200, "meetings": out})
 
 
 @bp.route("/sessions/<int:sid>/team-meetings", methods=["POST"])
