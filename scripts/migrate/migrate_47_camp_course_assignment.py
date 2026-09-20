@@ -41,7 +41,7 @@ TABLES = {
             INDEX ix_cca_session (camp_session_id),
             CONSTRAINT fk_cca_session FOREIGN KEY (camp_session_id) REFERENCES camp_session(id),
             CONSTRAINT fk_cca_student FOREIGN KEY (student_user_id) REFERENCES user(id),
-            CONSTRAINT fk_cca_course FOREIGN KEY (course_id) REFERENCES course.id)
+            CONSTRAINT fk_cca_course FOREIGN KEY (course_id) REFERENCES course(id))
         ) CHARSET=utf8mb4
     """,
 }
