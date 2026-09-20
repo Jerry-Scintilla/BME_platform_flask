@@ -368,6 +368,7 @@ from .organization import bp as organization_bp
 from .club_admin import bp as club_admin_bp
 from .media import bp as media_bp
 from .banner import bp as banner_bp
+from .resource_center import bp as resource_center_bp
 
 __all__ = [
     'auth_bp',
@@ -402,5 +403,6 @@ __all__ = [
     'organization_bp',
     'club_admin_bp',
     'media_bp',
-    'banner_bp'
+    'banner_bp',
+    'resource_center_bp'
 ]

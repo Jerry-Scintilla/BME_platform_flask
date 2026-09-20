@@ -25,6 +25,7 @@ MEDIA_PATHS = {
     'meeting_task': '/camp/meetings/task-attachments',   # 组会任务附件（详情回包内嵌直链）
     # meeting_zip：组会提交打包（路径含后缀，调 media_signed_url 时显式传 path）
     'meeting_zip': '/camp/meetings',
+    'resource': '/resources/standalone',                  # 学习资源中心·平台资料
 }
 
 

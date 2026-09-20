@@ -2022,3 +2022,39 @@ class BannerModel(db.Model):
     image_focus_y = db.Column(db.Integer, nullable=False, server_default='50')   # 显示条纵向焦点 0-100（首页展示为全宽x160px 横带，50=中带）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class StandaloneResourceModel(db.Model):
+    """学习资源中心·平台资料（2026-09-20，migrate_40）：管理员上传的独立资料，
+    不挂课程（课程资料走 CourseResourceModel 按课程归组，两来源互不打散）。
+    文件本体走 storage 层（STORAGE_BACKEND=minio|local），object_key 形如
+    resources/{category}/{uuid}{ext}；下载走 media_sign 短签代理端点
+    （短时多次有效，为第二期在线预览/PDF 视频流式铺路），object_key 不外露。
+    category 为应用层枚举（见 resource_center.py CATEGORIES），不建字典表。"""
+    __tablename__ = 'standalone_resource'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(200), nullable=False)          # 展示名（含扩展名）
+    description = db.Column(db.String(500))                    # 一句话说明（选填）
+    category = db.Column(db.String(50), nullable=False, default='other', index=True)
+    object_key = db.Column(db.String(300), nullable=False)     # 对象存储 key
+    size = db.Column(db.Integer, nullable=False, default=0)    # 字节数
+    content_type = db.Column(db.String(100))
+    sort_order = db.Column(db.Integer, nullable=False, default=0)
+    uploader_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    uploader = db.relationship('UserModel', foreign_keys=[uploader_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'size': self.size,
+            'category': self.category,
+            'content_type': self.content_type,
+            'sort_order': self.sort_order,
+            'uploader': self.uploader.username if self.uploader else None,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None
+        }
