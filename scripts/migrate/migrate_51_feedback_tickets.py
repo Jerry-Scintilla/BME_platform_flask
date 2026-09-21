@@ -1,4 +1,4 @@
-"""迁移 50：用户反馈工单（2026-09-21 管理端 IA 重构 · 设计方案阶段 6A，幂等）。
+"""迁移 51：用户反馈工单（2026-09-21 管理端 IA 重构 · 设计方案阶段 6A，幂等）。
 
 步骤：
 1. 建四张工单表（feedback_ticket / feedback_ticket_attachment /
@@ -8,7 +8,7 @@
    ERROR_IMAGE_DIR 转存 storage（双后端）并登记 Attachment
 3. 旧 /information/error/* 端点此后内部转调新服务（代码层兼容，不动旧表）
 
-用法（项目根）：.venv/bin/python scripts/migrate/migrate_50_feedback_tickets.py
+用法（项目根）：.venv/bin/python scripts/migrate/migrate_51_feedback_tickets.py
 回滚：DROP TABLE feedback_ticket_event, feedback_ticket_message,
       feedback_ticket_attachment, feedback_ticket;（升级前先 mysqldump；
       旧 InformationModel.type=4 行不删除，映射可反查）
