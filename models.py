@@ -166,6 +166,10 @@ class CourseModel(db.Model):
     STATUS_NORMAL = 'normal'
     STATUS_DELETED = 'deleted'
     STATUS_OFF_SHELF = 'off_shelf'  # 下架：仅从学生端列表隐藏，详情页/已选课不受影响
+    # 学习方式（migrate_52）：open=自主学（登录即学，完成自评，全课时完成自动课成）
+    # / camp=营期学（仅营期选课可学，完成判定=导生按章认证）
+    LEARNING_MODE_OPEN = 'open'
+    LEARNING_MODE_CAMP = 'camp'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     title = db.Column(db.String(100), nullable=False)
@@ -179,6 +183,8 @@ class CourseModel(db.Model):
     difficulty = db.Column(db.Integer, nullable=True)
     other_tags = db.Column(db.String(100))
     status = db.Column(db.String(20), default=STATUS_NORMAL)
+    # 学习方式：open=自主学 / camp=营期学（存量默认 camp，保持入课=营期选课语义）
+    learning_mode = db.Column(db.String(20), nullable=False, default=LEARNING_MODE_CAMP)
     # 手动排序，小者在前；0=未手动排序（回退发布时间倒序）
     sort_order = db.Column(db.Integer, nullable=False, default=0)
 
@@ -348,6 +354,30 @@ class UserCourseModel(db.Model):
             'enroll_time': self.enroll_time.strftime('%Y-%m-%d %H:%M:%S') if self.enroll_time else None,
             'status': self.status
         }
+
+
+class CourseShelfModel(db.Model):
+    """课程书架 - 用户收藏课程的独立关系（migrate_53）。
+
+    与 user_course 选课完全解耦：加入/移出书架不建立选课关系，
+    不参与 can_learn 门禁、营期归属、学习进度与课成判定。
+    下架课（off_shelf）不删书架行——详情页按既定规则对已关联用户仍可直访。
+    """
+    __tablename__ = 'course_shelf'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    user = db.relationship('UserModel', backref=db.backref('course_shelf', lazy=True))
+    course = db.relationship('CourseModel', backref=db.backref('shelf_entries', lazy=True))
+
+    # 联合唯一约束：一人一门课只有一条书架记录（幂等加入/移出的基础）
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'course_id'),
+        db.Index('ix_course_shelf_user_created', 'user_id', 'created_at'),
+    )
 
 
 class Chapter(db.Model):

@@ -8,7 +8,7 @@ from exts import db, redis_client
 
 # 导入数据库表
 from models import (UserModel, CourseModel, LearningProgressModel, GroupModel,
-                    LessonModel, UserCourseModel, CampLearningProgress)
+                    LessonModel, UserCourseModel, CampLearningProgress, CourseShelfModel)
 
 # 导入表单验证
 from .forms import LearningProgressForm
@@ -487,6 +487,54 @@ def _camp_scope(user_id, course_id, prefer_sid=None):
     return active_scope_camp(user_id, course_id, prefer_sid=prefer_sid)
 
 
+def can_learn_course(user, course):
+    """学习权限门禁（migrate_52 学习方式）：
+    open=自主学 → 任何登录用户可学（首次打点自动建选课关系）；
+    camp=营期学 → 需有「营期选课行」（user_course 带营戳，含已结营——复习走全局口径）
+    或 B2 口径的 active 营内分配。A14 之前的全局自助选课行（营戳为空）不再放行。
+    打点写入（lesson/update）、学习页进入、详情页入口三处共用此口径。"""
+    if course.learning_mode == CourseModel.LEARNING_MODE_OPEN:
+        return True
+    row = UserCourseModel.query.filter_by(user_id=user.id, course_id=course.id).first()
+    if row and row.status != UserCourseModel.STATUS_DROPPED and row.camp_session_id:
+        return True
+    return _camp_scope(user.id, course.id) is not None
+
+
+def _ensure_open_course_enrollment(user, course):
+    """自主学课首次打点：补建全局选课行（camp_session_id=None）。
+    已有行（含营期选课行）不覆盖——营戳行是结营合并回全局的依据。"""
+    row = UserCourseModel.query.filter_by(user_id=user.id, course_id=course.id).first()
+    if row is None:
+        row = UserCourseModel(user_id=user.id, course_id=course.id,
+                              camp_session_id=None, status=UserCourseModel.STATUS_ACTIVE)
+        db.session.add(row)
+    return row
+
+
+def _maybe_complete_open_course(user, course):
+    """自主学课成判定（用户拍板：全部课时自评完成=课成）：全局表该课全部课时
+    completed 且选课行 active → 置 STATUS_COMPLETED。仅在全局打点后调用；
+    营期快照口径不触发（营内课成=导生按章认证）。"""
+    if course.learning_mode != CourseModel.LEARNING_MODE_OPEN:
+        return
+    row = UserCourseModel.query.filter_by(user_id=user.id, course_id=course.id).first()
+    if not row or row.status != UserCourseModel.STATUS_ACTIVE:
+        return
+    lesson_ids = [lid for (lid,) in db.session.query(LessonModel.id)
+                  .filter_by(course_id=course.id).all()]
+    if not lesson_ids:
+        return
+    done = LearningProgressModel.query.filter(
+        LearningProgressModel.user_id == user.id,
+        LearningProgressModel.course_id == course.id,
+        LearningProgressModel.lesson_id.in_(lesson_ids),
+        LearningProgressModel.status == 'completed'
+    ).count()
+    if done >= len(lesson_ids):
+        row.status = UserCourseModel.STATUS_COMPLETED
+
+
 @bp.route("/learningProgress/lesson/update", methods=["POST"])
 @jwt_required()
 @swag_from('../apidocs/learningProgress/lesson_update.yaml')
@@ -533,6 +581,11 @@ def update_lesson_progress():
     valid_status = ['not_started', 'learning', 'completed']
     if status not in valid_status:
         return jsonify({"code": 400, "message": f"状态必须为: {', '.join(valid_status)}"}), 400
+
+    # 学习方式门禁（migrate_52）：营期学未选课拒打点。
+    # 注意不能用 401——前端拦截器把任何 401 当登录失效清 token。
+    if not can_learn_course(user, course):
+        return jsonify({"code": 403, "message": "该课程为营期学习，请先经营期选课"}), 403
 
     now = datetime.now()
 
@@ -602,6 +655,12 @@ def update_lesson_progress():
         db.session.add(progress)
 
     db.session.commit()
+
+    # 自主学课全局口径收尾（migrate_52）：首次打点补建选课行；全部课时完成 → 自动课成
+    if course.learning_mode == CourseModel.LEARNING_MODE_OPEN:
+        _ensure_open_course_enrollment(user, course)
+        _maybe_complete_open_course(user, course)
+        db.session.commit()
 
     return jsonify({
         "code": 200,
@@ -752,9 +811,10 @@ def get_lesson_progress():
 
 # ==================== 用户选课 API ====================
 
-# 「自主加入学习」已移除（阶段 1，A14）：课程独立但学习进度只走营期，
-# 唯一入课途径 = 营期选课 /camp/selection（带 camp_session_id 戳）。
-# 历史无营戳的 user_course 行保留只读，进度照常展示。
+# 不提供「自主加入学习」接口（A14 起）：入课唯一途径 = 营期选课 /camp/selection
+# （带 camp_session_id 戳）。自主学课（learning_mode=open）登录即学，无需显式选课；
+# 首次产生真实学习进度时由 _ensure_open_course_enrollment 自动补建内部选课行
+# （仅供进度与课成判定，不是用户动作）。历史无营戳的 user_course 行保留只读。
 
 
 @bp.route("/userCourse/drop", methods=["POST"])
@@ -855,6 +915,10 @@ def check_course():
     if not course_id:
         return jsonify({"code": 400, "message": "课程ID不能为空"}), 400
 
+    course = CourseModel.query.get(course_id)
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+
     # 检查选课记录
     user_course = UserCourseModel.query.filter_by(
         user_id=user.id,
@@ -869,7 +933,15 @@ def check_course():
     if scope is not None:
         camp_sid = scope.id
 
-    if user_course and user_course.status == UserCourseModel.STATUS_ACTIVE:
+    # active 与 completed 都算已选课（completed=已学完，仍可复习进入）；
+    # dropped 不算。此前只认 active，自主学课自动课成（migrate_52）后会丢入口。
+    # can_learn（migrate_52 学习方式门禁）：open 恒真；camp 需营期选课行/营内分配。
+    # 前端详情页入口与学习页门禁都认它——enrolled 只表达选课关系，
+    # A14 前的全局自助行 enrolled=true 但 can_learn=false（营期课不放行）。
+    can_learn = can_learn_course(user, course)
+
+    if user_course and user_course.status in (
+            UserCourseModel.STATUS_ACTIVE, UserCourseModel.STATUS_COMPLETED):
         return jsonify({
             "code": 200,
             "message": "已选课",
@@ -877,7 +949,9 @@ def check_course():
                 "enrolled": True,
                 "status": user_course.status,
                 "enroll_time": user_course.enroll_time.strftime('%Y-%m-%d %H:%M:%S') if user_course.enroll_time else None,
-                "camp_session_id": camp_sid
+                "camp_session_id": camp_sid,
+                "learning_mode": course.learning_mode,
+                "can_learn": can_learn
             }
         })
     else:
@@ -887,7 +961,9 @@ def check_course():
             "data": {
                 "enrolled": False,
                 "status": user_course.status if user_course else None,
-                "camp_session_id": camp_sid
+                "camp_session_id": camp_sid,
+                "learning_mode": course.learning_mode,
+                "can_learn": can_learn
             }
         })
 
@@ -944,4 +1020,129 @@ def list_course_students():
             "students": result,
             "total": len(result)
         }
+    })
+
+
+# ==================== 课程书架 API（migrate_53） ====================
+# 书架 = 用户收藏课程的独立关系（course_shelf 表），与 user_course 选课完全
+# 解耦：不建立选课关系、不影响 can_learn/营期归属/学习进度/课成判定。
+# 加入与移出均幂等；下架课（off_shelf）不删书架行（详情页对已关联用户仍可直访，
+# 与 course/search 的 not_deleted 口径一致）。
+
+def _shelf_course_payload(course, created_at):
+    """书架列表行：课程摘要 + 收藏时间。删除课也照常返回（记录不擅自清理），
+    前端按 course_status 自行决定展示形态。"""
+    from .course import _cover_thumb_url
+    return {
+        'course_id': course.id,
+        'course_title': course.title,
+        'course_introduction': course.introduction,
+        'course_cover': course.cover,
+        'course_cover_thumb': _cover_thumb_url(course),
+        'course_chapters': course.chapters,
+        'learning_mode': course.learning_mode,
+        'course_status': course.status or CourseModel.STATUS_NORMAL,
+        'created_at': created_at.strftime('%Y-%m-%d %H:%M:%S') if created_at else None,
+    }
+
+
+@bp.route("/courseShelf/check", methods=["GET"])
+@jwt_required()
+def check_course_shelf():
+    """查询某课程是否已在当前用户书架
+    参数: Course_Id"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    course_id = request.args.get('Course_Id')
+    if not course_id:
+        return jsonify({"code": 400, "message": "课程ID不能为空"}), 400
+
+    row = CourseShelfModel.query.filter_by(user_id=user.id, course_id=course_id).first()
+    return jsonify({
+        "code": 200,
+        "message": "查询成功",
+        "data": {"in_shelf": row is not None}
+    })
+
+
+@bp.route("/courseShelf/add", methods=["POST"])
+@jwt_required()
+def add_course_to_shelf():
+    """加入书架（幂等；重复加入返回既有记录）
+    请求参数: { "Course_Id": 1 }"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    data = request.get_json(silent=True) or {}
+    course_id = data.get('Course_Id')
+    course = CourseModel.query.get(course_id) if course_id else None
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+
+    row = CourseShelfModel.query.filter_by(user_id=user.id, course_id=course.id).first()
+    if row is None:
+        row = CourseShelfModel(user_id=user.id, course_id=course.id)
+        db.session.add(row)
+        db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "已加入书架",
+        "data": {"course_id": course.id, "in_shelf": True,
+                 "created_at": row.created_at.strftime('%Y-%m-%d %H:%M:%S') if row.created_at else None}
+    })
+
+
+@bp.route("/courseShelf/remove", methods=["POST"])
+@jwt_required()
+def remove_course_from_shelf():
+    """移出书架（幂等；未在书架时同样返回成功）
+    请求参数: { "Course_Id": 1 }"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    data = request.get_json(silent=True) or {}
+    course_id = data.get('Course_Id')
+    if not course_id:
+        return jsonify({"code": 400, "message": "课程ID不能为空"}), 400
+
+    CourseShelfModel.query.filter_by(user_id=user.id, course_id=course_id).delete()
+    db.session.commit()
+
+    return jsonify({
+        "code": 200,
+        "message": "已移出书架",
+        "data": {"course_id": int(course_id), "in_shelf": False}
+    })
+
+
+@bp.route("/courseShelf/list", methods=["GET"])
+@jwt_required()
+def list_course_shelf():
+    """获取当前用户的书架列表（按收藏时间倒序）"""
+    user_email = get_jwt_identity()
+    user = UserModel.query.filter_by(email=user_email).first()
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    rows = CourseShelfModel.query.filter_by(user_id=user.id) \
+        .order_by(CourseShelfModel.created_at.desc()).all()
+
+    result = []
+    for row in rows:
+        course = CourseModel.query.get(row.course_id)
+        if course:
+            result.append(_shelf_course_payload(course, row.created_at))
+
+    return jsonify({
+        "code": 200,
+        "message": "获取书架列表成功",
+        "data": result
     })

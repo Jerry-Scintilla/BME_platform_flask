@@ -320,6 +320,7 @@ def public():
         # 添加对新字段的支持（课时数自动计算，初始为0）
         difficulty = form.Course_Difficulty.data if hasattr(form, 'Course_Difficulty') else None
         other_tags = form.Course_Other_Tags.data if hasattr(form, 'Course_Other_Tags') else None
+        learning_mode = form.Course_Learning_Mode.data or CourseModel.LEARNING_MODE_CAMP
 
         # 从 JWT 获取当前用户
         user_email = get_jwt_identity()
@@ -329,6 +330,7 @@ def public():
         # 初始课时数为0（后续通过添加课时自动更新）
         course = CourseModel(title=title, introduction=introduction, chapters=chapters,
                              class_hour=0, difficulty=difficulty, other_tags=other_tags,
+                             learning_mode=learning_mode,
                              creator_id=user.id if user else None)
 
         db.session.add(course)
@@ -371,6 +373,7 @@ def course_edit():
         tag = None
         difficulty = None
         other_tags = None
+        learning_mode = None
 
         if form.Course_title.data:
             title = form.Course_title.data
@@ -384,6 +387,8 @@ def course_edit():
             difficulty = form.Course_Difficulty.data
         if form.Course_Other_Tags.data:
             other_tags = form.Course_Other_Tags.data
+        if form.Course_Learning_Mode.data:
+            learning_mode = form.Course_Learning_Mode.data
 
         if title is not None:
             course.title = title
@@ -397,6 +402,8 @@ def course_edit():
             course.difficulty = difficulty
         if other_tags is not None:
             course.other_tags = other_tags
+        if learning_mode is not None:
+            course.learning_mode = learning_mode
 
         # 重新统计课时数（自动计算，不允许手动编辑）
         total_duration = db.session.query(db.func.sum(LessonModel.duration)).filter(
@@ -477,6 +484,7 @@ def course_list():
                   'Course_Difficulty': course.difficulty,
                   'Course_Other_Tags': other_tags_list,
                   'Course_Cover_Thumb': _cover_thumb_url(course),
+                  'Course_Learning_Mode': course.learning_mode,
                   }
         data.append(b_list)
 
@@ -516,6 +524,7 @@ def course_admin_list():
                   'Course_Other_Tags': other_tags_list,
                   'Course_Cover_Thumb': _cover_thumb_url(course),
                   'Course_Status': 'off_shelf' if course.status == CourseModel.STATUS_OFF_SHELF else 'normal',
+                  'Course_Learning_Mode': course.learning_mode,
                   }
         data.append(b_list)
 
@@ -809,6 +818,7 @@ def search_courses():
                 'Course_Other_Tags': other_tags_list,
                 'Cover': course.cover,
                 'Cover_Thumb': _cover_thumb_url(course),
+                'Learning_Mode': course.learning_mode,
             }
             course_list.append(course_info)
         return jsonify({
@@ -847,6 +857,7 @@ def search_courses():
             'Course_Other_Tags': other_tags_list,
             'Cover': course.cover,
             'Cover_Thumb': _cover_thumb_url(course),
+            'Learning_Mode': course.learning_mode,
         })
     return jsonify({
         "code": 402,

@@ -1,6 +1,6 @@
 import wtforms
 from flask_wtf.file import FileAllowed, FileSize, FileField
-from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional, DataRequired, ValidationError
+from wtforms.validators import Email, length, EqualTo, input_required, NumberRange, Optional, DataRequired, ValidationError, AnyOf
 from models import UserModel
 from flask import request
 from exts import db
@@ -114,6 +114,8 @@ class CourseForm(wtforms.Form):
     Course_Class_Hour = wtforms.IntegerField('Course_Class_Hour',validators=[Optional(),NumberRange(min=1, max=1000, message='课时数格式不对')])
     Course_Difficulty = wtforms.IntegerField('Course_Difficulty',validators=[Optional(),NumberRange(min=1, max=5, message='难度需要在1-5之间')])
     Course_Other_Tags = wtforms.StringField('Course_Other_Tags',validators=[Optional(),length(min=1, max=500, message='其他标签格式不对')])
+    # 学习方式（migrate_52）：open=自主学 / camp=营期学，不传不动
+    Course_Learning_Mode = wtforms.StringField('Course_Learning_Mode',validators=[Optional(),AnyOf(['open', 'camp'], message='学习方式必须为 open/camp')])
     # Cover = FileField('Cover',validators=[FileAllowed(['jpg', 'jpeg', 'png']), FileSize(5 * 1024 * 1024)])
 
 
