@@ -221,10 +221,11 @@ def notification_list():
     查询通知列表
 
     Query params:
-      category  — 可选，按分类过滤: 'system' | 'group'
-      is_read   — 可选，按已读状态过滤: 'true' | 'false'
-      page      — 页码，默认 1
-      per_page  — 每页条数，默认 20
+      category     — 可选，按分类过滤: 'system' | 'group'
+      is_read      — 可选，按已读状态过滤: 'true' | 'false'
+      is_important — 可选，按重要标记过滤: 'true' | 'false'（社区广场公告条精确取最近重要公告）
+      page         — 页码，默认 1
+      per_page     — 每页条数，默认 20
     """
     user = _get_current_user()
     if not user:
@@ -232,6 +233,7 @@ def notification_list():
 
     category = request.args.get("category")
     is_read = request.args.get("is_read")
+    is_important = request.args.get("is_important")
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 20, type=int)
     show_all = request.args.get("all", "false").lower() == "true"
@@ -250,6 +252,8 @@ def notification_list():
         query = query.filter_by(category=category)
     if is_read is not None:
         query = query.filter_by(is_read=(is_read.lower() == 'true'))
+    if is_important is not None:
+        query = query.filter_by(is_important=(is_important.lower() == 'true'))
 
     query = query.order_by(NotificationModel.created_at.desc())
 

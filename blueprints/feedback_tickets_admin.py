@@ -25,7 +25,7 @@ from .feedback_tickets import (VALID_TRANSITIONS, CATEGORIES, PRIORITIES,
 bp = Blueprint("feedback_tickets_admin", __name__, url_prefix="/admin/feedback-tickets")
 
 # 待处理优先排序：活跃态（new/reopened/triaged/in_progress/waiting_user）在前，
-# resolved/closed/rejected 在后；同组内最早提交优先（饿死最老的工单最不该）
+# resolved/closed/rejected 在后；同组内最新提交在前（09-22 用户定调倒序渲染）
 _STATUS_SORT = case(
     (FeedbackTicket.status == 'new', 0),
     (FeedbackTicket.status == 'reopened', 1),
@@ -66,7 +66,7 @@ def list_tickets():
                                  FeedbackTicket.description.like(like)))
 
     total = query.count()
-    rows = (query.order_by(_STATUS_SORT, FeedbackTicket.created_at)
+    rows = (query.order_by(_STATUS_SORT, FeedbackTicket.created_at.desc())
             .offset((page - 1) * page_size).limit(page_size).all())
 
     # 名单/计数一次 IN 查询（不逐行 N+1）
