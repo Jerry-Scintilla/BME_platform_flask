@@ -10,6 +10,9 @@ live 链接/账本写入路径，账本 source=mentor_pick）。旧两轮互选�
     camp_mentor_match 只是配对账本（round/来源），写入时同步设置链接。
   - 阶段不落库、读时计算（_ms_phase）：upcoming → collecting → done；
     「提前截止」= 老师把 ms_preference_deadline 改成 now（复用 session_update）。
+  - 营期阶段 × 选导生（2026-09-21 收缩）：收官写接口（assign/batch/pick）仅
+    camp.status == 'selecting' 开放（ms_stage_guard 统一守卫，running/archived 409）；
+    开营后的补分组/改派走成员管理，复盘走只读 /results。
   - 导生名片仅 upcoming/collecting 可改（防协调期改容量/换照片）。
   - 名额口径一律按 live 链接计（teacher 经 member_assign 预分配的插班生也占名额）。
   - 一轮/二轮截止字段（ms_round1_deadline / ms_round2_deadline）已随单轮化废弃：
@@ -69,6 +72,47 @@ MS_SOURCE_TYPE = 'mentor_selection'   # 通知 source_type（String(20) 放得�
 def _camp_writable(camp):
     """archived 营只读（与 camp.py 同义，本地复刻避免反向依赖）。"""
     return camp.status != 'archived'
+
+
+# ─────────────────────────────────────────────
+# 阶段守卫（2026-09-21 阶段权限收缩）
+# ─────────────────────────────────────────────
+
+# 营期状态中文标签（camp_staff.teacher_overview 同款，守卫报错文案用）
+CAMP_STATUS_LABELS = {
+    'draft': '草稿', 'upcoming': '待开放', 'selecting': '报名与选导生',
+    'running': '进行中', 'archived': '已结营',
+}
+
+
+def ms_stage_guard(camp, require_preference_done=False):
+    """选导生收官接口的统一阶段守卫：@camp_access 已判角色权限，这里再判营期阶段——
+    角色权限不能代替阶段权限（2026-09-21 拍板：「选导生收官」是开营前 selecting 阶段的
+    临时运营能力，不是负责人在整个营期内永久拥有的能力）。
+
+    判定顺序（先角色后阶段由装饰器/调用序保证，阶段内部按语义排）：
+      - 未启用选导生 → 400；
+      - camp.status != 'selecting'（含 running/archived/draft/upcoming）→ 409 阶段冲突，
+        明确不用 401/403，防前端把阶段问题误判成登录失效或权限不足；
+      - require_preference_done=True（指派类写操作）且志愿未截止 → 400，
+        收集期内志愿仍在变，不可提前批量配对。
+    开营后的补分组/改派统一走成员管理（member_assign/member_update 的既有审计与通知），
+    不得借本模块绕过；archived 复盘用只读端点（/results、/matched），不进本守卫。
+    返回 None 通过，否则 (resp, code)。"""
+    if not camp.mentor_selection_enabled:
+        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    if camp.status != 'selecting':
+        if camp.status == 'archived':
+            detail = "营期已结营，选导生流程已结束（配对结果可在只读端点复盘）"
+        else:
+            detail = (f"营期当前为「{CAMP_STATUS_LABELS.get(camp.status, camp.status)}」，"
+                      "选导生流程已结束；开营后的补分组或改派请走「成员管理」")
+        return jsonify({"code": 409,
+                        "message": f"选导生收官仅限开营前（selecting 阶段）操作：{detail}"}), 409
+    if require_preference_done and _ms_phase(camp) != MS_DONE:
+        return jsonify({"code": 400,
+                        "message": "志愿仍在提交（或未开始），截止后才能指派配对；可先导出志愿线下协调"}), 400
+    return None
 
 
 def _ms_directions_raw(camp):
@@ -959,9 +1003,10 @@ def matched_list(sid):
 # ─────────────────────────────────────────────
 
 def _pick_writable(camp):
-    """勾选窗口 = 志愿截止后（done）。收集期内志愿仍在变，不开放；
-    归档营只读由 _camp_writable 另行拦截。"""
-    return _ms_phase(camp) == MS_DONE and _camp_writable(camp)
+    """勾选窗口 = selecting 阶段且志愿截止后（done）。收集期内志愿仍在变，不开放；
+    开营（running）后选导生流程结束、归档营只读（2026-09-21 阶段收缩）。"""
+    return (camp.status == 'selecting'
+            and _ms_phase(camp) == MS_DONE and _camp_writable(camp))
 
 
 @bp.route("/<int:sid>/pick/roster")
@@ -1036,10 +1081,11 @@ def pick(sid):
         return err
     if not camp.mentor_selection_enabled:
         return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
-    if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
-    if not _pick_writable(camp):
-        return jsonify({"code": 400, "message": "志愿收集期内不可勾选，截止后开放"}), 400
+    # 阶段守卫（2026-09-21）：selecting 且志愿已截止才开放——开营/归档后导生勾选
+    # 同样收口（409），收集期内不可提前勾选（400）；补分组走成员管理
+    stage_err = ms_stage_guard(camp, require_preference_done=True)
+    if stage_err:
+        return stage_err
     user = _current_user()
     if not _member_row(sid, user.id, role='mentor'):
         return jsonify({"code": 403, "message": "仅本营导生可操作"}), 403
@@ -1243,10 +1289,10 @@ def assign(sid):
     camp, err = _camp_or_404(sid)
     if err:
         return err
-    if not camp.mentor_selection_enabled:
-        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
-    if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    # 阶段守卫（2026-09-21）：仅 selecting 且志愿已截止可指派；running/archived 409
+    stage_err = ms_stage_guard(camp, require_preference_done=True)
+    if stage_err:
+        return stage_err
     d = request.json or {}
     student_id, mentor_id = d.get("student_id"), d.get("mentor_id")
     if not student_id or not mentor_id:
@@ -1302,8 +1348,10 @@ def export_preferences(sid):
     camp, err = _camp_or_404(sid)
     if err:
         return err
-    if not camp.mentor_selection_enabled:
-        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    # 阶段守卫（2026-09-21）：导出是收官页配套操作，仅 selecting 阶段可用
+    stage_err = ms_stage_guard(camp)
+    if stage_err:
+        return stage_err
     students = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
     rows = (CampMentorPreference.query
             .filter_by(camp_session_id=sid, round=1)
@@ -1351,8 +1399,11 @@ def assign_roster(sid):
     camp, err = _camp_or_404(sid)
     if err:
         return err
-    if not camp.mentor_selection_enabled:
-        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
+    # 阶段守卫（2026-09-21）：名册是收官页数据源，仅 selecting 阶段可读；
+    # running/archived 复盘走只读的 /results 端点（与可写收官面分开）
+    stage_err = ms_stage_guard(camp)
+    if stage_err:
+        return stage_err
     students = CampMember.query.filter_by(camp_session_id=sid, role='student') \
         .order_by(CampMember.id).all()
     mentors = CampMember.query.filter_by(camp_session_id=sid, role='mentor') \
@@ -1422,10 +1473,10 @@ def assign_batch(sid):
     camp, err = _camp_or_404(sid)
     if err:
         return err
-    if not camp.mentor_selection_enabled:
-        return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
-    if not _camp_writable(camp):
-        return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
+    # 阶段守卫（2026-09-21）：仅 selecting 且志愿已截止可回填；running/archived 409
+    stage_err = ms_stage_guard(camp, require_preference_done=True)
+    if stage_err:
+        return stage_err
     pairs = (request.json or {}).get("pairs")
     if not isinstance(pairs, list):
         return jsonify({"code": 400, "message": "缺少 pairs 数组"}), 400
@@ -1496,7 +1547,10 @@ def results(sid):
         return jsonify({"code": 400, "message": "该营期未启用选导生"}), 400
     user = _current_user()
     member = _member_row(sid, user.id)
-    if not member and not _is_staff(user):
+    # 2026-09-21：营期负责人（CampStaff）也可读——running/archived 复盘最终配对结果的
+    # 只读通道（写操作已由 ms_stage_guard 收口，本端点纯读）
+    from .camp_staff import camp_staff_row
+    if not member and not _is_staff(user) and not camp_staff_row(sid, user.id):
         return jsonify({"code": 403, "message": "仅营期成员可查看"}), 403
     if _ms_phase(camp) != MS_DONE:
         return jsonify({"code": 400, "message": "选导生尚未结束"}), 400

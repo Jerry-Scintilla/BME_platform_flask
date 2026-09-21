@@ -384,9 +384,10 @@ def teacher_overview(sid):
     student_team = {m.user_id: m.team_mentor_id for m in students}
     unassigned_leaves = sum(1 for lv in pending_leaves if not student_team.get(lv.user_id))
 
-    # 选导生就绪（仅启用时）：未发布名片的导生 + 未提交志愿的学员
+    # 选导生就绪（2026-09-21 阶段收缩）：仅 selecting 阶段投影——开营后选导生流程
+    # 已结束，不再出现「未发布名片/未交志愿」等选导生阶段待办
     ms_stats = None
-    if camp.mentor_selection_enabled and camp.status != 'archived':
+    if camp.mentor_selection_enabled and camp.status == 'selecting':
         profile_uids = {p.user_id for p in CampMentorProfile.query
                         .filter_by(camp_session_id=sid).all()}
         submitted = {p.student_user_id for p in CampMentorPreference.query
@@ -401,23 +402,35 @@ def teacher_overview(sid):
     def _item(key, count, label, extra=None):
         return {"key": key, "count": count, "label": label, **(extra or {})}
 
+    # 待办按阶段投影（section=前端导航目标，契约见 TeacherOverview.goTodo）：
+    # archived 全量只读复盘——不生成任何待处理事项；未分组学员在 selecting 是选导生
+    # 收官待办（跳 ms），running 起转为运营风险项走「成员管理」处理
+    archived = camp.status == 'archived'
     work_items = []
-    if app_students:
-        work_items.append(_item("camp.application.pending", len(app_students), "待审学员报名"))
-    if app_mentors:
-        work_items.append(_item("camp.mentor_application.pending", len(app_mentors), "待审导生报名"))
-    if unmatched:
-        work_items.append(_item("camp.student.unmatched", len(unmatched), "未分配导生的学员"))
-    if pending_leaves:
+    if not archived and app_students:
+        work_items.append(_item("camp.application.pending", len(app_students), "待审学员报名",
+                                {"section": "admissions"}))
+    if not archived and app_mentors:
+        work_items.append(_item("camp.mentor_application.pending", len(app_mentors), "待审导生报名",
+                                {"section": "admissions"}))
+    if unmatched and camp.status == 'selecting':
+        work_items.append(_item("camp.student.unmatched", len(unmatched), "未分配导生的学员",
+                                {"section": "ms"}))
+    elif unmatched and camp.status == 'running':
+        work_items.append(_item("camp.student.ungrouped", len(unmatched), "未分组学员",
+                                {"section": "members"}))
+    if not archived and pending_leaves:
         work_items.append(_item("camp.leave.pending", len(pending_leaves), "待审批请假",
-                                {"unassigned": unassigned_leaves}))
+                                {"unassigned": unassigned_leaves, "section": "leaves"}))
     if ms_stats:
         if ms_stats["mentors_without_profile"]:
             work_items.append(_item("camp.mentor.no_profile",
-                                    ms_stats["mentors_without_profile"], "未发布名片的导生"))
+                                    ms_stats["mentors_without_profile"], "未发布名片的导生",
+                                    {"section": "ms"}))
         if ms_stats["students_without_preference"]:
             work_items.append(_item("camp.student.no_preference",
-                                    ms_stats["students_without_preference"], "未提交志愿的学员"))
+                                    ms_stats["students_without_preference"], "未提交志愿的学员",
+                                    {"section": "ms"}))
 
     return jsonify({"code": 200, "overview": {
         "stage": camp.status,

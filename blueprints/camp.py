@@ -873,6 +873,13 @@ def session_update(sid):
     ms_touched = any(k in d for k in (
         "mentor_selection_enabled", "ms_preference_start", "ms_preference_deadline",
         "ms_round1_deadline", "ms_round2_deadline", "ms_tags"))
+    # 阶段守卫（2026-09-21 收缩）：选导生配置只能开营前改——running 起流程已结束、
+    # archived 只读；阶段冲突给 409（非 401/403，防前端误判登录失效）
+    if ms_touched and camp.status in ('running', 'archived'):
+        db.session.rollback()
+        return jsonify({"code": 409, "message": (
+            f"选导生配置仅限开营前修改：营期当前为「"
+            f"{'进行中' if camp.status == 'running' else '已结营'}」，选导生流程已结束")}), 409
     old_ms_tags = camp.ms_tags                    # 方向课程变更传播的前值快照（B5）
     propagated = 0
     if ms_touched:
@@ -2818,12 +2825,19 @@ def team_progress(sid):
 @bp.route("/sessions/<int:sid>/progress/board")
 @jwt_required()
 def progress_board(sid):
-    """营期学习进度看板（管理端营详情「学习进度」tab 数据源，09-16）：
-    按导生团队（CampMember.team_mentor_id）分桶，每组课程列 = 该组导生名片方向绑定的课程
-    ——方向制下各组课程不同，故组=独立子矩阵而非全营单矩阵；学员行逐课进度块与
-    team/progress / my-direction 同口径（_course_block）。导生调用仅返回本组
-    （_visible_student_ids），与将来导生端看板化共用本端点；archived 营可读（结营复盘，
-    快照口径保留）。阶段 1 起营期负责人（owner/teacher）也走本端点看全营。"""
+    """营期学习进度看板（负责人工作台 + 管理端营详情「学习进度」tab 数据源，09-16；
+    2026-09-21 服务端分页 + 消 N+1）：
+    按导生团队（CampMember.team_mentor_id）分桶，分页单位=团队桶（未分组为特殊桶、
+    恒排末位）；参数 page（默认 1）/ page_size（默认 5，1-20）/ mentor_id（可选：
+    本营导生 id 或 'unassigned'=未分组桶；非法/跨营值 400，不静默兜底）。
+    每组课程列 = 该组导生名片方向绑定的课程（方向制下各组课程不同，组=独立子矩阵）；
+    学员行逐课进度块与 team/progress / my-direction 同口径（_course_block + 批量 ctx）。
+    性能口径：筛选范围内全部学员的课程/章节/认证/完成态经 _team_progress_ctx 一次批量
+    预取（查询数固定，与学员数×课程数无关，不再逐格查询）；序列化只输出当前页桶。
+    summary = 筛选范围整体汇总（scope/scope_label 区分全营/单团队/未分组口径），
+    独立于翻页；total = 符合筛选的团队桶总数（非学员数）。导生调用仅返回本组
+    （_visible_student_ids）；archived 营可读（结营复盘，快照口径保留）。
+    排序稳定（方向名→导生名→mentor id 兜底），翻页不重不漏。"""
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
@@ -2831,23 +2845,98 @@ def progress_board(sid):
     denied = _staff_or_mentor_gate(sid, user)
     if denied:
         return denied
-    visible = set(_visible_student_ids(sid, user))
-    buckets = defaultdict(list)                     # team_mentor_id -> [CampMember]
-    for s in CampMember.query.filter_by(camp_session_id=sid, role='student').all():
-        if s.user_id in visible:
-            buckets[s.team_mentor_id].append(s)
 
-    groups, sum_cert, sum_total, sum_done = [], 0, 0, 0
-    for mentor_id, rows in buckets.items():
-        if mentor_id is None:
+    # 分页参数：非法值 400（不静默取奇怪默认值）
+    try:
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 5))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "page/page_size 需为整数"}), 400
+    if page < 1:
+        return jsonify({"code": 400, "message": "page 需 ≥ 1"}), 400
+    if not 1 <= page_size <= 20:
+        return jsonify({"code": 400, "message": "page_size 需在 1-20 之间"}), 400
+
+    # mentor_id 筛选：'unassigned'=未分组桶；数字=本营导生（跨营/非本营导生 400）
+    mentor_filter = request.args.get('mentor_id')
+    if mentor_filter in (None, ''):
+        mentor_filter = None
+    elif mentor_filter != 'unassigned':
+        try:
+            mentor_filter = int(mentor_filter)
+        except (ValueError, TypeError):
+            return jsonify({"code": 400,
+                            "message": "mentor_id 需为本营导生 ID 或 unassigned"}), 400
+
+    visible = set(_visible_student_ids(sid, user))
+    students = [s for s in CampMember.query.filter_by(
+        camp_session_id=sid, role='student').all() if s.user_id in visible]
+    buckets = defaultdict(list)                     # team_mentor_id -> [CampMember]
+    for s in students:
+        buckets[s.team_mentor_id].append(s)
+
+    # 导生元数据一次批量：姓名 + 方向（名片 tags[0] 匹配方向定义，与 _direction_of_mentor 同口径）
+    mentor_rows = CampMember.query.filter_by(camp_session_id=sid, role='mentor') \
+        .order_by(CampMember.user_id).all()
+    if mentor_filter is not None and mentor_filter != 'unassigned' \
+            and mentor_filter not in {m.user_id for m in mentor_rows}:
+        return jsonify({"code": 400, "message": "该导生不在本营"}), 400
+    profiles = {p.user_id: p for p in CampMentorProfile.query
+                .filter_by(camp_session_id=sid).all()}
+    directions = _ms_directions(camp)
+
+    def _dir_of(m_uid):
+        p = profiles.get(m_uid)
+        if not p or not p.tags:
+            return None
+        try:
+            tags = json.loads(p.tags)
+        except (ValueError, TypeError):
+            return None
+        if not (isinstance(tags, list) and tags):
+            return None
+        return next((d for d in directions if d["name"] == str(tags[0])), None)
+
+    uids = [m.user_id for m in mentor_rows] + [s.user_id for s in students]
+    users = {u.id: u for u in UserModel.query.filter(
+        UserModel.id.in_(uids)).all()} if uids else {}
+
+    # 桶排序（稳定键，mentor id 兜底防翻页漂移）：有方向组按方向名→导生名，无方向组随后，未分组殿后
+    def _bucket_key(mid):
+        direction = _dir_of(mid)
+        u = users.get(mid)
+        return (1 if mid is None else 0,
+                0 if (mid is not None and direction) else 1,
+                direction["name"] if direction else "zz",
+                (u.username or "") if (mid is not None and u) else "",
+                mid or 0)
+    ordered = sorted(buckets.keys(), key=_bucket_key)
+
+    # 导生筛选（未分组=只留未分组桶；某导生=只留该桶——无学员的导生自然为空结果）
+    if mentor_filter == 'unassigned':
+        ordered = [mid for mid in ordered if mid is None]
+    elif mentor_filter is not None:
+        ordered = [mid for mid in ordered if mid == mentor_filter]
+    scope_mids = ordered
+    total = len(ordered)
+
+    # 筛选范围一次批量预取（含 summary 用的全范围数据；查询数与团队/学员规模无关）
+    scope_students = [s for mid in scope_mids for s in buckets[mid]]
+    course_ids = sorted({cid for mid in scope_mids
+                         for cid in ((_dir_of(mid) or {}).get("course_ids") or [])})
+    ctx = _team_progress_ctx(camp, [s.user_id for s in scope_students], course_ids)
+
+    def _group_payload(mid):
+        rows = buckets[mid]
+        direction = _dir_of(mid)
+        if mid is None:
             g = {"mentor_user_id": None, "mentor_name": None, "direction": None,
                  "hint": "尚未归属导生（开放报名后随导生继承方向）",
                  "courses": [], "students": []}
         else:
-            m_user = UserModel.query.get(mentor_id)
-            direction = _direction_of_mentor(camp, mentor_id)
-            g = {"mentor_user_id": mentor_id,
-                 "mentor_name": m_user.username if m_user else "",
+            u = users.get(mid)
+            g = {"mentor_user_id": mid,
+                 "mentor_name": u.username if u else "",
                  "direction": direction["name"] if direction else None,
                  "hint": (None if direction and direction["course_ids"]
                           else "导生尚未设置方向（或方向未绑定课程）"),
@@ -2855,18 +2944,15 @@ def progress_board(sid):
             if direction and direction["course_ids"]:
                 g["courses"] = [
                     {"course_id": cid,
-                     "course_title": (CourseModel.query.get(cid).title
-                                      if CourseModel.query.get(cid) else "")}
+                     "course_title": ctx["courses"][cid].title if ctx["courses"].get(cid) else ""}
                     for cid in direction["course_ids"]]
         g_cert = g_total = 0
         for s in rows:
-            u = UserModel.query.get(s.user_id)
-            blocks = [_course_block(camp, c["course_id"], s.user_id)
+            u = users.get(s.user_id)
+            blocks = [_course_block(camp, c["course_id"], s.user_id, ctx)
                       for c in g["courses"]]
             s_cert = sum(b["certified_chapters"] for b in blocks)
             s_total = sum(b["total_chapters"] for b in blocks)
-            sum_done += sum(1 for b in blocks
-                            if b["course_status"] == UserCourseModel.STATUS_COMPLETED)
             g_cert, g_total = g_cert + s_cert, g_total + s_total
             g["students"].append({
                 "student_user_id": s.user_id, "username": u.username if u else "",
@@ -2876,20 +2962,60 @@ def progress_board(sid):
         g["students"].sort(key=lambda x: (-(x["certified_rate"] if x["certified_rate"] is not None else -1),
                                           x["username"]))
         g["certified_rate"] = round(100 * g_cert / g_total) if g_total else None
-        sum_cert, sum_total = sum_cert + g_cert, sum_total + g_total
-        groups.append(g)
-    # 有方向组按方向名→导生名排前，无方向组次之，未分组殿后
-    groups.sort(key=lambda g: (g["mentor_user_id"] is None,
-                               g["direction"] is None,
-                               g["direction"] or "zz", g["mentor_name"] or ""))
+        return g
+
+    def _bucket_stats(mid):
+        """summary 用的轻量聚合（与 _group_payload 同 ctx 同口径，免建整份 payload）：
+        返回 (已认证章数, 总章数, 已完成课程数)。"""
+        cids = (_dir_of(mid) or {}).get("course_ids") or []
+        cert_n = total_n = done_n = 0
+        for s in buckets[mid]:
+            certs = ctx["certs"].get(s.user_id, {})
+            for cid in cids:
+                chs = ctx["chapters"].get(cid, [])
+                cert_n += sum(1 for ch in chs if ch.id in certs)
+                total_n += len(chs)
+                uc = ctx["user_course"].get((s.user_id, cid))
+                if uc is not None and uc.status == UserCourseModel.STATUS_COMPLETED:
+                    done_n += 1
+        return cert_n, total_n, done_n
+
+    # 当前页桶（page 超出总页数自然切出空列表，不 500）
+    page_mids = ordered[(page - 1) * page_size: page * page_size]
+    groups = [_group_payload(mid) for mid in page_mids]
+
+    # summary = 筛选范围整体汇总（与翻页无关）；scope/scope_label 让前端口径明确
+    sum_cert = sum_total = sum_done = scope_students_n = 0
+    for mid in scope_mids:
+        c, t, dn = _bucket_stats(mid)
+        sum_cert, sum_total, sum_done = sum_cert + c, sum_total + t, sum_done + dn
+        scope_students_n += len(buckets[mid])
+    if mentor_filter == 'unassigned':
+        scope_kind, scope_label = 'unassigned', '未分组学员'
+    elif mentor_filter is not None:
+        mu = users.get(mentor_filter)
+        scope_kind, scope_label = 'mentor', f'{mu.username} 团队' if mu else '所选导生团队'
+    else:
+        scope_kind, scope_label = 'all', '全营'
     summary = {
-        "group_count": sum(1 for g in groups if g["mentor_user_id"] is not None),
-        "student_count": sum(len(g["students"]) for g in groups),
+        "scope": scope_kind, "scope_label": scope_label,
+        "group_count": sum(1 for mid in scope_mids if mid is not None),
+        "student_count": scope_students_n,
         "certified_chapters": sum_cert, "total_chapters": sum_total,
         "completed_courses": sum_done,
         "certified_rate": round(100 * sum_cert / sum_total) if sum_total else None,
     }
-    return jsonify({"code": 200, "summary": summary, "groups": groups})
+
+    # mentors 筛选选项：本营全部导生（全量，不随页变化；direction 供前端展示）
+    mentors = [{
+        "mentor_user_id": m.user_id,
+        "mentor_name": users[m.user_id].username if users.get(m.user_id) else "",
+        "direction": (_dir_of(m.user_id) or {}).get("name"),
+    } for m in mentor_rows]
+
+    return jsonify({"code": 200, "summary": summary, "groups": groups,
+                    "mentors": mentors, "total": total,
+                    "page": page, "page_size": page_size})
 
 
 @bp.route("/sessions/<int:sid>/team/progress/certify", methods=["POST", "DELETE"])

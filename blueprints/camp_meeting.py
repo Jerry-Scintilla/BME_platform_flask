@@ -20,6 +20,7 @@ camp/{sid}/meeting/{meeting_id}/{uuid}{ext}；下载走鉴权代理端点
 /camp/meetings/attachments/<aid>，视频 inline 直播并支持 HTTP Range（206）。
 """
 import os
+import json
 import re
 import shutil
 import tempfile
@@ -30,6 +31,7 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify, Response, send_file
 from flask_jwt_extended import jwt_required
 from urllib.parse import quote
+from sqlalchemy import or_
 
 from exts import db
 from storage import storage
@@ -38,7 +40,8 @@ from models import (CampSession, CampMember, CampUnit, CampUnitMember,
                     CourseModel, Chapter, CampChapterCertification,
                     CampMeetingChapterPlan, CampMeetingTask,
                     CampMeetingTaskSubmission, CampMeetingTaskAttachment,
-                    CampChapterMaterial, CampChapterMaterialAttachment)
+                    CampChapterMaterial, CampChapterMaterialAttachment,
+                    CampMentorProfile)
 
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team, _direction_of_mentor
@@ -396,9 +399,17 @@ def team_meeting_list(sid):
 @bp.route("/sessions/<int:sid>/meetings/all")
 @jwt_required()
 def camp_meetings_all(sid):
-    """全营组会总览（老师工作台·只读，A3 2026-09-20）：营期负责人按团队分组看全部组会——
-    行=组会（组长/日期/任务数/纪要态），详情点击走 /meetings/<mid>/detail（_can_view 已放行
-    staff，但 _can_manage 不放行——老师只读，管理与审阅仍是组长职责，方案 §4.2 矩阵）。"""
+    """全营组会总览（老师工作台·只读，A3 2026-09-20；2026-09-21 服务端分页 + 导生筛选）：
+    营期负责人按团队看组会——行=组会（团队/发起人/日期/任务数/纪要态），详情点击走
+    /meetings/<mid>/detail（_can_view 已放行 staff，_can_manage 不放行——老师只读，
+    管理与审阅仍是组长职责，方案 §4.2 矩阵）。
+    参数：page（默认 1）/ page_size（默认 10，1-50，非法 400）/ mentor_id（可选，本营
+    导生 id，只看该导生组 scope='team' 的组会；跨营/非本营导生 400，不越营查询）/
+    status（可选 all/ongoing/archived，按「有纪要」派生态过滤）。
+    查询层先应用筛选再 count→order(meeting_date desc, id desc 稳定)→offset/limit，
+    附件/任务数/章节数只对当前页 meeting ids 聚合；mentors = 本营全部导生的筛选选项
+    （全量下发，不从当前页推导——翻页后筛选项不抖动）。项目营复用时 mentor 筛选
+    语义=培训组，前端项目营不展示「导生筛选」。"""
     camp, err = _camp_or_404(sid)
     if err:
         return err
@@ -407,19 +418,60 @@ def camp_meetings_all(sid):
         from .camp_staff import camp_staff_row
         if not camp_staff_row(sid, user.id):
             return jsonify({"code": 403, "message": "仅本营负责人可查看全营组会"}), 403
-    rows = (CampMeeting.query.filter_by(camp_session_id=sid)
-            .order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc()).all())
-    atts = _atts_by_meeting([m.id for m in rows])
-    creator_ids = {m.created_by for m in rows}
-    names = _usernames(creator_ids)
+
+    try:
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 10))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "page/page_size 需为整数"}), 400
+    if page < 1:
+        return jsonify({"code": 400, "message": "page 需 ≥ 1"}), 400
+    if not 1 <= page_size <= 50:
+        return jsonify({"code": 400, "message": "page_size 需在 1-50 之间"}), 400
+
+    q = CampMeeting.query.filter_by(camp_session_id=sid)
+
+    # mentor_id 筛选：须为本营导生（跨营 400）；语义=培训组（scope='team'）
+    mentor_id = request.args.get('mentor_id')
+    if mentor_id in (None, ''):
+        mentor_id = None
+    else:
+        try:
+            mentor_id = int(mentor_id)
+        except (ValueError, TypeError):
+            return jsonify({"code": 400, "message": "mentor_id 需为本营导生 ID"}), 400
+        if not CampMember.query.filter_by(
+                camp_session_id=sid, user_id=mentor_id, role='mentor').first():
+            return jsonify({"code": 400, "message": "该导生不在本营"}), 400
+        q = q.filter(CampMeeting.scope == 'team', CampMeeting.mentor_id == mentor_id)
+
+    # 状态筛选（可选）：archived=有纪要（content 非空白或含附件，与 has_minutes 同口径）；ongoing=反义
+    status = request.args.get('status') or 'all'
+    if status not in ('all', 'ongoing', 'archived'):
+        return jsonify({"code": 400, "message": "status 仅支持 all/ongoing/archived"}), 400
+    if status != 'all':
+        has_minutes = or_(
+            db.func.length(db.func.trim(db.func.coalesce(CampMeeting.content, ''))) > 0,
+            CampMeetingAttachment.query.filter(
+                CampMeetingAttachment.meeting_id == CampMeeting.id).exists())
+        q = q.filter(has_minutes if status == 'archived' else ~has_minutes)
+
+    total = q.count()
+    rows = (q.order_by(CampMeeting.meeting_date.desc(), CampMeeting.id.desc())
+            .offset((page - 1) * page_size).limit(page_size).all())
+
+    # 聚合只打当前页 ids（附件/任务数/章节数；total 与页内容无关）
+    mids = [m.id for m in rows]
+    atts = _atts_by_meeting(mids)
+    names = _usernames({m.created_by for m in rows})
     task_counts = dict(db.session.query(CampMeetingTask.meeting_id,
                                         db.func.count(CampMeetingTask.id))
-                       .filter(CampMeetingTask.meeting_id.in_([m.id for m in rows]))
-                       .group_by(CampMeetingTask.meeting_id).all()) if rows else {}
+                       .filter(CampMeetingTask.meeting_id.in_(mids))
+                       .group_by(CampMeetingTask.meeting_id).all()) if mids else {}
     chapter_counts = dict(db.session.query(CampMeetingChapterPlan.meeting_id,
                                            db.func.count(CampMeetingChapterPlan.id))
-                          .filter(CampMeetingChapterPlan.meeting_id.in_([m.id for m in rows]))
-                          .group_by(CampMeetingChapterPlan.meeting_id).all()) if rows else {}
+                          .filter(CampMeetingChapterPlan.meeting_id.in_(mids))
+                          .group_by(CampMeetingChapterPlan.meeting_id).all()) if mids else {}
     mentor_ids = {m.mentor_id for m in rows if m.scope == 'team' and m.mentor_id}
     mentor_names = {u.id: u.username for u in UserModel.query.filter(
         UserModel.id.in_(mentor_ids))} if mentor_ids else {}
@@ -436,7 +488,32 @@ def camp_meetings_all(sid):
         item["chapter_count"] = int(chapter_counts.get(m.id, 0))
         item["has_minutes"] = bool((m.content or '').strip()) or bool(atts[m.id])
         out.append(item)
-    return jsonify({"code": 200, "meetings": out})
+
+    # mentors 筛选选项：本营全部导生（全量、稳定；direction 供前端展示）
+    mentor_rows = CampMember.query.filter_by(
+        camp_session_id=sid, role='mentor').order_by(CampMember.user_id).all()
+    m_uids = [m.user_id for m in mentor_rows]
+    m_users = {u.id: u.username for u in UserModel.query.filter(
+        UserModel.id.in_(m_uids))} if m_uids else {}
+    profiles = {p.user_id: p for p in CampMentorProfile.query
+                .filter_by(camp_session_id=sid).all()}
+    mentors = []
+    for m in mentor_rows:
+        direction = None
+        p = profiles.get(m.user_id)
+        if p and p.tags:
+            try:
+                tl = json.loads(p.tags)
+                if isinstance(tl, list) and tl and str(tl[0]).strip():
+                    direction = str(tl[0]).strip()
+            except (ValueError, TypeError):
+                pass
+        mentors.append({"user_id": m.user_id,
+                        "username": m_users.get(m.user_id, str(m.user_id)),
+                        "direction": direction})
+
+    return jsonify({"code": 200, "meetings": out, "mentors": mentors,
+                    "total": total, "page": page, "page_size": page_size})
 
 
 @bp.route("/sessions/<int:sid>/team-meetings", methods=["POST"])
