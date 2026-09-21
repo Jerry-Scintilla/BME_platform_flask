@@ -165,6 +165,7 @@ class CourseModel(db.Model):
     __tablename__ = 'course'
     STATUS_NORMAL = 'normal'
     STATUS_DELETED = 'deleted'
+    STATUS_OFF_SHELF = 'off_shelf'  # 下架：仅从学生端列表隐藏，详情页/已选课不受影响
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     title = db.Column(db.String(100), nullable=False)
@@ -178,6 +179,8 @@ class CourseModel(db.Model):
     difficulty = db.Column(db.Integer, nullable=True)
     other_tags = db.Column(db.String(100))
     status = db.Column(db.String(20), default=STATUS_NORMAL)
+    # 手动排序，小者在前；0=未手动排序（回退发布时间倒序）
+    sort_order = db.Column(db.Integer, nullable=False, default=0)
 
     # 课程创建者，用于权限管理
     creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)

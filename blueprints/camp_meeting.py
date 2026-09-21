@@ -37,7 +37,8 @@ from models import (CampSession, CampMember, CampUnit, CampUnitMember,
                     CampMeeting, CampMeetingAttachment, UserModel,
                     CourseModel, Chapter, CampChapterCertification,
                     CampMeetingChapterPlan, CampMeetingTask,
-                    CampMeetingTaskSubmission, CampMeetingTaskAttachment)
+                    CampMeetingTaskSubmission, CampMeetingTaskAttachment,
+                    CampChapterMaterial, CampChapterMaterialAttachment)
 
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team, _direction_of_mentor
@@ -818,6 +819,19 @@ def _detail_payload(m, user, role):
             CampChapterCertification.chapter_id.in_(
                 [p.chapter_id for p in plans])).all()
         certs = {(r.student_user_id, r.chapter_id): r for r in cert_rows}
+        # 课内材料数（2026-09-20 修「导生看不到」：导生审阅矩阵格子带材料角标，
+        # 弹层查看下载——此前材料只在学员进度页可见，组会页无处可看）。
+        # member 同步下发自己的份数：组员视图「未认证」与「已认证」之间补「已提交」
+        # 态（材料已交、待导生认证），学员交完不再对着"未认证"干等
+        mat_uids = [u.id for u in students] if is_leader else ([user.id] if role == 'member' else [])
+        mat_counts = {}
+        if plans and mat_uids:
+            for r in CampChapterMaterial.query.filter(
+                    CampChapterMaterial.camp_session_id == m.camp_session_id,
+                    CampChapterMaterial.chapter_id.in_([p.chapter_id for p in plans]),
+                    CampChapterMaterial.student_user_id.in_(mat_uids)).all():
+                mat_counts[(r.student_user_id, r.chapter_id)] = \
+                    mat_counts.get((r.student_user_id, r.chapter_id), 0) + 1
         for p in plans:
             ch = {"chapter_id": p.chapter_id, "course_id": p.course_id,
                   "chapter_title": ch_names.get(p.chapter_id, str(p.chapter_id)),
@@ -826,6 +840,8 @@ def _detail_payload(m, user, role):
                 ch["certs"] = {str(u.id): (None if (u.id, p.chapter_id) not in certs
                                            else {"score": certs[(u.id, p.chapter_id)].score})
                                for u in students}
+                ch["material_counts"] = {str(u.id): mat_counts.get((u.id, p.chapter_id), 0)
+                                         for u in students}
                 ch["certified_count"] = sum(1 for v in ch["certs"].values() if v)
             elif role == 'staff':
                 ch["certified_count"] = sum(
@@ -833,6 +849,7 @@ def _detail_payload(m, user, role):
             else:
                 r = certs.get((user.id, p.chapter_id))
                 ch["my_cert"] = None if r is None else {"score": r.score}
+                ch["my_material_count"] = mat_counts.get((user.id, p.chapter_id), 0)
             chapters_out.append(ch)
 
     out = {"code": 200, "is_leader": is_leader, "viewer_role": role,
@@ -1222,24 +1239,56 @@ def _zip_name(s):
     return (cleaned[:80] or '_')
 
 
+def _planned_materials(m, students):
+    """本次组会布置章的课内材料（2026-09-20 打包口径对齐「全部提交」）：
+    返回 {(student_user_id, chapter_id): [CampChapterMaterial]}，仅本组学员、仅布置章。"""
+    plans = (CampMeetingChapterPlan.query.filter_by(meeting_id=m.id)
+             .order_by(CampMeetingChapterPlan.id).all())
+    out = {}
+    if plans and students:
+        for r in CampChapterMaterial.query.filter(
+                CampChapterMaterial.camp_session_id == m.camp_session_id,
+                CampChapterMaterial.chapter_id.in_([p.chapter_id for p in plans]),
+                CampChapterMaterial.student_user_id.in_([u.id for u in students])).all():
+            out.setdefault((r.student_user_id, r.chapter_id), []).append(r)
+    return plans, out
+
+
+def _meeting_zip_empty(m, students, tasks):
+    """空包判定（token 预检与 zip 端点共用）：任务提交与课内材料皆无才为空。
+    预检放 token 端点，让前端在换签时就收到 400 走 toast——修「新标签页裸渲染
+    JSON message 页」（zip 端点开着 token 后新窗打开，前端无法捕获其错误体）。"""
+    if tasks and CampMeetingTaskSubmission.query.filter(
+            CampMeetingTaskSubmission.task_id.in_([t.id for t in tasks])).count():
+        return False
+    _, mats = _planned_materials(m, students)
+    return not mats
+
+
 @bp.route("/meetings/<int:mid>/submissions/zip/token")
 @jwt_required()
 def meeting_zip_token(mid):
-    """换组会提交打包短签（组长；zip 生成耗时，直链走短签双通道鉴权）。"""
+    """换组会提交打包短签（组长；zip 生成耗时，直链走短签双通道鉴权）。
+    空包在此预检返回 400（前端 toast），不再等新窗打开 zip 端点看 JSON。"""
     m, err = _meeting_or_404(mid)
     if err:
         return err
     user = _current_user()
     if not _can_manage(user, m):
         return jsonify({"code": 403, "message": "仅组长可打包下载"}), 403
+    if _meeting_zip_empty(m, _group_students(m),
+                          CampMeetingTask.query.filter_by(meeting_id=m.id).all()):
+        return jsonify({"code": 400, "message": "本次组会暂无提交可打包"}), 400
     return media_token_response('meeting_zip', mid, user.id,
                                 path=f"/camp/meetings/{mid}/submissions/zip")
 
 
 @bp.route("/meetings/<int:mid>/submissions/zip")
 def meeting_submissions_zip(mid):
-    """一键打包本次组会全部任务提交（组长）：zip 按 学生/任务 分文件夹，文字提交转 txt、
-    未交任务夹内放「未提交.txt」标记；根目录「提交情况.txt」汇总矩阵。
+    """一键打包本次组会全部提交（组长）：zip 按 学生/任务 分文件夹，文字提交转 txt、
+    未交任务夹内放「未提交.txt」标记；课内布置章的材料进 学生/课内·章/ 夹（文字转
+    材料说明 txt，附件原名去重），与「全部提交」口径对齐（2026-09-20）；
+    根目录「提交情况.txt」汇总任务+课内两矩阵。
     流式打包（内存 64MB 优先，超限落盘用完即删），与课程资源批量下载同款。"""
     m, err = _meeting_or_404(mid)
     if err:
@@ -1261,12 +1310,20 @@ def meeting_submissions_zip(mid):
                 [s.id for s in subs])).all() if subs else []):
         atts.setdefault(a.submission_id, []).append(a)
     sub_by_key = {(s.task_id, s.student_user_id): s for s in subs}
-    if not any(sub_by_key.get((t.id, u.id)) for t in tasks for u in students):
+    plans, mats = _planned_materials(m, students)
+    mat_atts = {}
+    mat_ids = [x.id for rows in mats.values() for x in rows]
+    if mat_ids:
+        for a in CampChapterMaterialAttachment.query.filter(
+                CampChapterMaterialAttachment.material_id.in_(mat_ids)).all():
+            mat_atts.setdefault(a.material_id, []).append(a)
+    if _meeting_zip_empty(m, students, tasks):
         return jsonify({"code": 400, "message": "本次组会暂无提交可打包"}), 400
 
-    task_by_id = {t.id: t for t in tasks}
+    ch_names = {c.id: c.name for c in Chapter.query.filter(
+        Chapter.id.in_([p.chapter_id for p in plans])).all()}
     lines = [f"组会：{m.title}（{m.meeting_date.isoformat()}）",
-             f"组员 {len(students)} 人 · 任务 {len(tasks)} 项", ""]
+             f"组员 {len(students)} 人 · 任务 {len(tasks)} 项 · 课内章 {len(plans)} 项", ""]
     for t in tasks:
         lines.append(f"【任务】{t.title}（{SUBMIT_TYPE_TEXT.get(t.submit_type, t.submit_type)}）")
         for u in students:
@@ -1279,6 +1336,33 @@ def meeting_submissions_zip(mid):
             mark = '已交' if _submission_valid(s, t, n) else '未达标'
             lines.append(f"  {mark}  {u.username}（{text} · 文件×{n}）")
         lines.append("")
+    for p in plans:
+        lines.append(f"【课内】{ch_names.get(p.chapter_id, str(p.chapter_id))}")
+        for u in students:
+            rows = mats.get((u.id, p.chapter_id), [])
+            if not rows:
+                lines.append(f"  未交    {u.username}")
+                continue
+            n = sum(len(mat_atts.get(r.id, [])) for r in rows)
+            lines.append(f"  已交    {u.username}（材料×{len(rows)} · 文件×{n}）")
+        lines.append("")
+
+    def _copy_att(zf, folder, a, used):
+        """附件对象流式写入 zip（任务/材料两链共用；used 记 folder 内撞名计数加 (n) 后缀）。"""
+        base = a.filename or f"file_{a.id}"
+        if base in used:
+            used[base] += 1
+            stem, ext = os.path.splitext(base)
+            base = f"{stem}({used[base]}){ext}"
+        else:
+            used[base] = 1
+        obj = storage.get_object(a.object_key)
+        try:
+            with zf.open(f"{folder}/{_zip_name(base)}", 'w') as target:
+                shutil.copyfileobj(obj, target, length=1024 * 1024)
+        finally:
+            obj.close()
+            obj.release_conn()
 
     buf = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
     try:
@@ -1287,28 +1371,28 @@ def meeting_submissions_zip(mid):
             for u in students:
                 for t in tasks:
                     folder = f"{_zip_name(u.username)}/{_zip_name(t.title)}"
+                    used = {}
                     s = sub_by_key.get((t.id, u.id))
                     if not s:
                         zf.writestr(f"{folder}/未提交.txt", "该学员未提交本任务。")
                         continue
                     if (s.content or '').strip():
                         zf.writestr(f"{folder}/文字提交.txt", s.content)
-                    used = {}
                     for a in atts.get(s.id, []):
-                        base = a.filename or f"file_{a.id}"
-                        if base in used:
-                            used[base] += 1
-                            stem, ext = os.path.splitext(base)
-                            base = f"{stem}({used[base]}){ext}"
-                        else:
-                            used[base] = 1
-                        obj = storage.get_object(a.object_key)
-                        try:
-                            with zf.open(f"{folder}/{_zip_name(base)}", 'w') as target:
-                                shutil.copyfileobj(obj, target, length=1024 * 1024)
-                        finally:
-                            obj.close()
-                            obj.release_conn()
+                        _copy_att(zf, folder, a, used)
+                for p in plans:
+                    ch_title = ch_names.get(p.chapter_id, str(p.chapter_id))
+                    folder = f"{_zip_name(u.username)}/{_zip_name(f'课内·{ch_title}')}"
+                    used = {}
+                    rows = mats.get((u.id, p.chapter_id), [])
+                    if not rows:
+                        zf.writestr(f"{folder}/未提交材料.txt", "该学员未提交本章节材料。")
+                        continue
+                    for idx, r in enumerate(rows, 1):
+                        if (r.content or '').strip():
+                            zf.writestr(f"{folder}/材料说明{idx}.txt", r.content)
+                        for a in mat_atts.get(r.id, []):
+                            _copy_att(zf, folder, a, used)
         buf.seek(0)
         return send_file(buf, mimetype='application/zip', as_attachment=True,
                          download_name=f"{_zip_name(m.title)}-提交打包.zip", max_age=0)

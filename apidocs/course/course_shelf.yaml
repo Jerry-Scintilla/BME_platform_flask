@@ -1,0 +1,35 @@
+课程上下架（下架仅从学生端列表隐藏，详情页与已选课学员不受影响）
+---
+tags:
+  - 课程模块
+
+parameters:
+  - name: Authorization
+    in: header
+    type: string
+    required: true
+    description: 需 course_management 权限
+
+  - name: body
+    in: body
+    required: true
+    schema:
+      type: object
+      properties:
+        Course_Id:
+          type: string
+          description: 课程id
+        Status:
+          type: string
+          enum: [normal, off_shelf]
+          description: 目标状态
+
+responses:
+  200:
+    description: 已上架/已下架
+  401:
+    description: 用户未认证
+  402:
+    description: 参数错误/课程不存在/课程已删除
+  403:
+    description: 权限不足

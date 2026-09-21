@@ -2515,6 +2515,7 @@ def member_update(sid, uid):
         return jsonify({"code": 404, "message": "成员不存在"}), 404
     if m.role != 'student':
         return jsonify({"code": 400, "message": "仅学员可指定归属导生"}), 400
+    user = _current_user()   # 账本 operator_id 用（dfb3091 补通知块时漏定义，改派必 500）
     d = request.json or {}
     team_mentor_id = d.get("team_mentor_id")
     if team_mentor_id:
