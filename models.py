@@ -2250,3 +2250,86 @@ def _camp_member_default_filter(execute_state):
         return                                   # 逃生口：历史/复职判定查询
     execute_state.statement = execute_state.statement.options(
         _with_loader_criteria(CampMember, lambda cls: cls.status == 'active'))
+
+
+# ═══════════════════════════════════════════════════════════════
+# 用户反馈工单（2026-09-21 IA 重构 · 设计方案 §12.2D / 阶段 6A）
+# 旧 InformationModel.type=4 只有提交侧；工单是有责任人、状态和处理结果的
+# 业务对象。Message 管沟通内容（公开/内部），Event 管不可变状态轨迹——
+# 不用通知表代替审计。历史 type=4 行由 migrate_50 迁入（source_information_id 留映射）。
+# ═══════════════════════════════════════════════════════════════
+
+class FeedbackTicket(db.Model):
+    """反馈工单主体。状态机（后端校验，前端不可直写 status）：
+    new → triaged → in_progress → waiting_user → resolved → closed
+                       └──────────────────────→ rejected
+    resolved/closed → reopened；waiting_user 收到用户公开回复 → in_progress。"""
+    __tablename__ = 'feedback_ticket'
+    id = db.Column(db.Integer, primary_key=True)
+    reporter_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    category = db.Column(db.String(30), nullable=False, default='bug')
+        # bug / feature_request / content_issue / account_issue / other
+    severity = db.Column(db.String(20), nullable=False, default='normal')
+        # 用户选择的影响面描述（low/normal/high/critical），与处理优先级分离
+    priority = db.Column(db.String(20), nullable=False, default='medium')
+        # 管理员定序（low/medium/high/urgent），triage 时设定
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='new', index=True)
+        # new/triaged/in_progress/waiting_user/resolved/closed/rejected/reopened
+    assignee_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
+    resolution_code = db.Column(db.String(30), nullable=True)
+        # fixed / wont_fix / duplicate / need_more_info / not_reproducible / by_design
+    resolution_summary = db.Column(db.Text)
+    source_information_id = db.Column(db.Integer, nullable=True)
+        # 迁移期兼容：旧 InformationModel.type=4 的 id 映射（可空）
+    created_at = db.Column(db.DateTime, default=datetime.now, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    triaged_at = db.Column(db.DateTime, nullable=True)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+
+    reporter = db.relationship('UserModel', foreign_keys=[reporter_user_id])
+    assignee = db.relationship('UserModel', foreign_keys=[assignee_user_id])
+
+
+class FeedbackTicketAttachment(db.Model):
+    """工单附件：文件本体在 storage（双后端），访问走 media_sign 短签代理端点。
+    列表接口只回元数据与缩略 URL，不内嵌 Base64（旧 error/query 的载荷教训）。"""
+    __tablename__ = 'feedback_ticket_attachment'
+    id = db.Column(db.Integer, primary_key=True)
+    ticket_id = db.Column(db.Integer, db.ForeignKey('feedback_ticket.id'), nullable=False, index=True)
+    storage_key = db.Column(db.String(300), nullable=False)
+    original_name = db.Column(db.String(200), nullable=False)
+    mime_type = db.Column(db.String(100), nullable=False, default='application/octet-stream')
+    size = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class FeedbackTicketMessage(db.Model):
+    """工单消息：公开回复（用户可见）与内部备注（仅管理员可见）同一张表，
+    visibility 分离授权——用户接口查询层强制 visibility='public'（R-07）。"""
+    __tablename__ = 'feedback_ticket_message'
+    id = db.Column(db.Integer, primary_key=True)
+    ticket_id = db.Column(db.Integer, db.ForeignKey('feedback_ticket.id'), nullable=False, index=True)
+    author_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    visibility = db.Column(db.String(10), nullable=False, default='public')  # public / internal
+    body = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    author = db.relationship('UserModel')
+
+
+class FeedbackTicketEvent(db.Model):
+    """不可变状态轨迹：每次分派/优先级变更/状态迁移/回复都落一行（审计）。"""
+    __tablename__ = 'feedback_ticket_event'
+    id = db.Column(db.Integer, primary_key=True)
+    ticket_id = db.Column(db.Integer, db.ForeignKey('feedback_ticket.id'), nullable=False, index=True)
+    actor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    event_type = db.Column(db.String(30), nullable=False)
+        # created/triaged/assigned/priority_changed/public_replied/internal_noted/
+        # status_changed/withdrawn/reopened
+    from_status = db.Column(db.String(20), nullable=True)
+    to_status = db.Column(db.String(20), nullable=True)
+    metadata_json = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.now)

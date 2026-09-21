@@ -26,6 +26,8 @@ from models import (
     CampMentorProfile, CampMentorPreference, CampMentorMatch,
     CampChapterCertification, CampChapterMaterial, CampLearningProgress,
     Chapter, LessonModel, LearningProgressModel,
+    CampUnit, ProjectApplicationVersion, CampMilestone, CampSubmissionVersion,
+    CampOutcome, CampArchive, CampMembershipEvent,
     CAMP_CATEGORY_DEFAULTS,
 )
 
@@ -328,6 +330,49 @@ def cycle_create():
     db.session.add(c)
     db.session.commit()
     return jsonify({"code": 200, "message": "创建成功", "cycle_id": c.id})
+
+
+@bp.route("/cycles/<int:cid>", methods=["PUT"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="编辑教学周期")
+def cycle_update(cid):
+    """编辑教学周期（super_admin）。body: {name?, sort_order?}；code 是稳定标识不可改。"""
+    c = CampCycle.query.get(cid)
+    if not c:
+        return jsonify({"code": 404, "message": "周期不存在"}), 404
+    d = request.json or {}
+    if "name" in d:
+        name = (d.get("name") or "").strip()
+        if not name:
+            return jsonify({"code": 400, "message": "周期名称不能为空"}), 400
+        c.name = name
+    if "sort_order" in d:
+        try:
+            c.sort_order = int(d.get("sort_order") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"code": 400, "message": "sort_order 须为整数"}), 400
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已更新", "cycle": {
+        "id": c.id, "code": c.code, "name": c.name, "sort_order": c.sort_order}})
+
+
+@bp.route("/cycles/<int:cid>", methods=["DELETE"])
+@jwt_required()
+@camp_role()
+@audit_log(operation="删除教学周期")
+def cycle_delete(cid):
+    """删除空周期（super_admin）。仍挂有营期的周期不可删——先迁走在营营期。"""
+    c = CampCycle.query.get(cid)
+    if not c:
+        return jsonify({"code": 404, "message": "周期不存在"}), 404
+    session_count = CampSession.query.filter_by(cycle_id=cid).count()
+    if session_count:
+        return jsonify({"code": 409, "message":
+                        f"该周期下仍有 {session_count} 个营期，请先迁移或删除营期"}), 409
+    db.session.delete(c)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已删除空周期"})
 
 
 # ─────────────────────────────────────────────
@@ -685,6 +730,107 @@ def session_detail(sid):
         "available_perspectives": perspectives or None,
         "my_permissions": sorted(staff_permissions(staff.role)) if staff else [],
     }})
+
+
+@bp.route("/sessions/<int:sid>/admin-overview")
+@jwt_required()
+def session_admin_overview(sid):
+    """营期工作区·概览聚合（管理端，2026-09-21 IA 重构）。
+
+    只回决策摘要：阶段/构成/各待办计数/能力开关/类型统计/最近事件——
+    不内嵌成员与审批明细（明细由各业务端点分页返回，概览不重复拉全量）。
+    """
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    user = _current_user()
+    if not user.is_admin() and not camp_staff_row(sid, user.id):
+        return jsonify({"code": 403, "message": "仅管理员与本营负责人可查看营期概览"}), 403
+
+    stage_labels = {'draft': '草稿', 'upcoming': '待开放', 'selecting': '报名与选导生',
+                    'running': '进行中', 'archived': '已结营'}
+    students = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
+    mentors = CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()
+
+    pending_join = CampJoinRequest.query.filter_by(camp_session_id=sid, status='pending').count()
+    oldest_join = (db.session.query(db.func.min(CampJoinRequest.created_at))
+                   .filter_by(camp_session_id=sid, status='pending').scalar())
+    pending_leave = CampLeave.query.filter_by(camp_session_id=sid, status='pending').count()
+
+    overview = {
+        "stage": camp.status,
+        "stage_label": stage_labels.get(camp.status, camp.status),
+        "start_date": camp.start_date.isoformat(),
+        "end_date": camp.end_date.isoformat(),
+        "counts": {
+            "student": len(students), "mentor": len(mentors),
+            "member": CampMember.query.filter_by(camp_session_id=sid, role='member').count(),
+            "unmatched": sum(1 for m in students if not m.team_mentor_id),
+        },
+        "pending": {
+            "join": pending_join,
+            "leave": pending_leave,
+            "delivery": 0,
+            "oldest_join_at": oldest_join.isoformat() if oldest_join else None,
+        },
+        "capabilities": _policy_dict(camp.policy, camp.category).get("capabilities"),
+        # 当前阶段可执行的迁移动作（概览「下一步」提示用；执行仍走 /transitions）
+        "available_transitions": [a for a, (src, _dst) in CAMP_TRANSITIONS.items()
+                                  if src == camp.status],
+    }
+
+    if camp.category == 'project':
+        # 项目营摘要：申报/项目/待审交付/成果（对齐 delivery_admin 的审队口径：team 全量 + member 负责人份额）
+        units = CampUnit.query.filter_by(camp_session_id=sid, unit_type='project').all()
+        unit_ids = [u.id for u in units]
+        overview["project_summary"] = {
+            "pending_applications": ProjectApplicationVersion.query.filter_by(
+                camp_session_id=sid, status='pending').count(),
+            "project_count": len(units),
+            "pending_reviews": 0,
+            "outcomes_submitted": 0,
+            "archived": bool(CampArchive.query.filter_by(camp_session_id=sid).first()),
+        }
+        if unit_ids:
+            team_ms = CampMilestone.query.filter(
+                CampMilestone.unit_id.in_(unit_ids), CampMilestone.submit_mode == 'team').all()
+            pending_reviews = CampSubmissionVersion.query.filter(
+                CampSubmissionVersion.milestone_id.in_([m.id for m in team_ms]),
+                CampSubmissionVersion.status == 'submitted').count()
+            for u in units:  # member 模式负责人份额
+                owner_ms = CampMilestone.query.filter(
+                    CampMilestone.unit_id == u.id, CampMilestone.submit_mode == 'member').all()
+                for m in owner_ms:
+                    pending_reviews += CampSubmissionVersion.query.filter_by(
+                        milestone_id=m.id, status='submitted',
+                        submitted_by=u.owner_user_id).count()
+            overview["project_summary"]["pending_reviews"] = pending_reviews
+            overview["pending"]["delivery"] = pending_reviews
+            overview["project_summary"]["outcomes_submitted"] = CampOutcome.query.filter(
+                CampOutcome.unit_id.in_(unit_ids), CampOutcome.status == 'submitted').count()
+    elif camp.category == 'learning':
+        # 培训营摘要：选导生就绪度（对齐 teacher_overview 的 ms_stats 口径）
+        ms_stats = None
+        if camp.mentor_selection_enabled and camp.status != 'archived':
+            profile_uids = {p.user_id for p in CampMentorProfile.query
+                            .filter_by(camp_session_id=sid).all()}
+            submitted = {p.student_user_id for p in CampMentorPreference.query
+                         .filter_by(camp_session_id=sid).all()}
+            ms_stats = {
+                "mentors_without_profile": len([m for m in mentors if m.user_id not in profile_uids]),
+                "students_without_preference": len([m for m in students if m.user_id not in submitted]),
+                "preference_deadline": camp.ms_preference_deadline.isoformat()
+                if camp.ms_preference_deadline else None,
+            }
+        overview["learning_summary"] = {"ms_stats": ms_stats}
+
+    events = (CampMembershipEvent.query.filter_by(camp_session_id=sid)
+              .order_by(CampMembershipEvent.id.desc()).limit(8).all())
+    overview["recent_events"] = [{"id": e.id, "user_id": e.user_id, "unit_id": e.unit_id,
+                                  "action": e.action, "source": e.source,
+                                  "occurred_at": e.occurred_at.isoformat() if e.occurred_at else None}
+                                 for e in events]
+    return jsonify({"code": 200, "overview": overview})
 
 
 @bp.route("/sessions/<int:sid>", methods=["PUT"])

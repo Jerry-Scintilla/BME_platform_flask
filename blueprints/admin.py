@@ -23,6 +23,15 @@ from models import (
     CampSession,
     CheckRecord,
     LLMQuotaRequestModel,
+    CampJoinRequest,
+    CampLeave,
+    CampMember,
+    CampAttendancePlan,
+    CampUnit,
+    ProjectApplicationVersion,
+    CampMilestone,
+    CampSubmissionVersion,
+    SeatModel,
 )
 from . import check_permission, audit_log, _current_user
 
@@ -304,3 +313,145 @@ def admin_overview():
             "pending_quota": pending_quota,
         }
     })
+
+
+@bp.route("/workbench/summary")
+@jwt_required()
+@check_permission('system_management')
+def workbench_summary():
+    """管理员工作台摘要（2026-09-21 IA 重构，方案 §12.2A）。
+
+    回答「今天要处理什么 / 哪些营在跑 / 哪里有风险」：
+    - pending：跨域待办计数（只计数，名单明细由各业务端点分页返回）；
+    - running_camps：进行中营期摘要 + 各自待办数；
+    - risks：规则型风险（D-10：只做可明确判断的规则，不做健康分）。
+    各子域独立容错——单域查询失败回 0/空，不拖垮整页（R-03）。
+    """
+    from datetime import datetime, timedelta
+
+    def safe(fn, default):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    def _delivery_pending_count(before=None):
+        # 待审交付 = team 模式全量 + member 模式负责人份额（与 delivery_admin 审队口径一致）
+        def base(q):
+            return q.filter(CampSubmissionVersion.created_at < before) if before else q
+
+        team_q = CampSubmissionVersion.query.filter(
+            CampSubmissionVersion.status == 'submitted',
+            CampSubmissionVersion.milestone_id.in_(
+                db.session.query(CampMilestone.id)
+                .join(CampUnit, CampMilestone.unit_id == CampUnit.id)
+                .filter(CampUnit.unit_type == 'project',
+                        CampMilestone.submit_mode == 'team')))
+        member_q = (CampSubmissionVersion.query
+                    .join(CampMilestone, CampSubmissionVersion.milestone_id == CampMilestone.id)
+                    .join(CampUnit, CampMilestone.unit_id == CampUnit.id)
+                    .filter(CampUnit.unit_type == 'project',
+                            CampMilestone.submit_mode == 'member',
+                            CampSubmissionVersion.status == 'submitted',
+                            CampSubmissionVersion.submitted_by == CampUnit.owner_user_id))
+        return base(team_q).count() + base(member_q).count()
+
+    def _feedback_ticket_pending():
+        # 工单模型随 6A 落地（migrate_50）；未建表前该域回 0，不阻塞工作台其余摘要
+        from models import FeedbackTicket
+        return FeedbackTicket.query.filter(
+            FeedbackTicket.status.in_(['new', 'triaged', 'reopened'])).count()
+
+    pending = {
+        "camp_join": safe(lambda: CampJoinRequest.query.filter_by(status='pending').count(), 0),
+        "camp_leave": safe(lambda: CampLeave.query.filter_by(status='pending').count(), 0),
+        "project_application": safe(
+            lambda: ProjectApplicationVersion.query.filter_by(status='pending').count(), 0),
+        "project_delivery": safe(lambda: _delivery_pending_count(), 0),
+        "quota_request": safe(lambda: LLMQuotaRequestModel.query.filter_by(
+            status=LLMQuotaRequestModel.STATUS_PENDING).count(), 0),
+        "feedback_ticket": safe(_feedback_ticket_pending, 0),
+    }
+    oldest = {
+        "camp_join": safe(lambda: db.session.query(func.min(CampJoinRequest.created_at))
+                          .filter_by(status='pending').scalar(), None),
+        "camp_leave": safe(lambda: db.session.query(func.min(CampLeave.created_at))
+                           .filter_by(status='pending').scalar(), None),
+    }
+
+    running_camps = []
+    risks = []
+
+    def _camp_caps(camp):
+        # capabilities 是 JSON 字符串列：走 _policy_dict 与类型默认值合并（勿裸读列）
+        from .camp import _policy_dict
+        return _policy_dict(camp.policy, camp.category).get("capabilities") or {}
+
+    for camp in safe(lambda: CampSession.query.filter_by(status='running')
+                     .order_by(CampSession.start_date.desc()).all(), []):
+        sid = camp.id
+        caps = _camp_caps(camp)
+        join_n = safe(lambda: CampJoinRequest.query.filter_by(
+            camp_session_id=sid, status='pending').count(), 0)
+        leave_n = safe(lambda: CampLeave.query.filter_by(
+            camp_session_id=sid, status='pending').count(), 0)
+        unmatched = safe(lambda: CampMember.query.filter_by(
+            camp_session_id=sid, role='student').filter(
+            CampMember.team_mentor_id.is_(None)).count(), 0)
+        running_camps.append({
+            "id": sid, "name": camp.name, "category": camp.category,
+            "cycle_name": camp.cycle.name if camp.cycle else None,
+            "start_date": camp.start_date.isoformat(), "end_date": camp.end_date.isoformat(),
+            "member_count": safe(lambda: CampMember.query.filter_by(
+                camp_session_id=sid).count(), 0),
+            "pending_join": join_n, "pending_leave": leave_n, "unmatched": unmatched,
+        })
+        # 规则：启用考勤但未生成考勤计划（跑起来却没铺考勤）
+        if camp.category == 'learning' and caps.get('attendance', True):
+            plan_n = safe(lambda: CampAttendancePlan.query.filter_by(camp_session_id=sid).count(), 0)
+            if not plan_n:
+                risks.append({"camp_id": sid, "camp_name": camp.name,
+                              "rule": "attendance_not_configured",
+                              "detail": "已启用考勤但营内没有考勤计划（承诺出勤日未生成）"})
+        # 规则：培训营 running 仍有未归属学员（选导生未收尾）
+        if camp.category == 'learning' and unmatched:
+            risks.append({"camp_id": sid, "camp_name": camp.name,
+                          "rule": "students_unmatched",
+                          "detail": f"{unmatched} 名学员未归属导生"})
+
+    # 规则：即将开营（≤14 天）但还没有成员
+    horizon = date.today() + timedelta(days=14)
+    upcoming = safe(lambda: CampSession.query.filter(
+        CampSession.status == 'upcoming',
+        CampSession.start_date <= horizon).all(), [])
+    for camp in upcoming:
+        member_n = safe(lambda: CampMember.query.filter_by(camp_session_id=camp.id).count(), 0)
+        if not member_n:
+            risks.append({"camp_id": camp.id, "camp_name": camp.name,
+                          "rule": "opening_without_members",
+                          "detail": f"{camp.start_date.isoformat()} 开营但尚无成员"})
+
+    # 规则：启用座位能力但平台没有物理座位资源（全局一次性提示）
+    seat_cap_camps = safe(lambda: CampSession.query.filter(
+        CampSession.status.in_((['upcoming', 'selecting', 'running']))).all(), [])
+    if any(_camp_caps(c).get('seat') for c in seat_cap_camps):
+        seat_total = safe(lambda: SeatModel.query.count(), 0)
+        if not seat_total:
+            risks.append({"camp_id": None, "camp_name": None,
+                          "rule": "no_physical_seats",
+                          "detail": "有营期启用座位能力，但平台尚未录入任何物理座位"})
+
+    # 规则：待审交付超 72 小时未处理（项目营）
+    stale_deadline = datetime.now() - timedelta(hours=72)
+    stale = safe(lambda: _delivery_pending_count(before=stale_deadline), 0)
+    if stale:
+        risks.append({"camp_id": None, "camp_name": None,
+                      "rule": "stale_delivery_reviews",
+                      "detail": f"{stale} 份待审交付材料已超过 72 小时未处理"})
+
+    return jsonify({"code": 200, "data": {
+        "pending": pending,
+        "oldest_pending_at": {k: v.isoformat() if v else None for k, v in oldest.items()},
+        "running_camps": running_camps,
+        "risks": risks,
+    }})

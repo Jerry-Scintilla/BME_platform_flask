@@ -26,6 +26,7 @@ MEDIA_PATHS = {
     # meeting_zip：组会提交打包（路径含后缀，调 media_signed_url 时显式传 path）
     'meeting_zip': '/camp/meetings',
     'resource': '/resources/standalone',                  # 学习资源中心·平台资料
+    'feedback_ticket': '/feedback-tickets/attachments',   # 用户反馈工单附件
 }
 
 
