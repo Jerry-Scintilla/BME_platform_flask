@@ -122,6 +122,13 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             SELECT 'discussion' AS type, t.id, t.title, LEFT(t.content, 200) AS summary,
                    t.images_json AS images_raw, t.category, t.project_id,
                    sp.title AS project_title,
+                   sp.summary AS project_summary,
+                   CONCAT(SUBSTRING_INDEX(sp.cover, '.', 1), '_thumb.',
+                          SUBSTRING_INDEX(sp.cover, '.', -1)) AS project_cover_thumb,
+                   sp.project_status AS project_status,
+                   sp.source AS project_source,
+                   sp.tags AS project_tags_raw,
+                   sp.view_count AS project_view_count,
                    t.author_id, u.username AS author_name, u.avatar_url AS author_avatar_raw,
                    COALESCE(t.last_reply_at, t.created_at) AS rank_dt,
                    t.created_at AS created_dt,
@@ -145,6 +152,9 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             SELECT 'article' AS type, a.id, a.title, LEFT(a.introduction, 200) AS summary,
                    NULL AS images_raw, NULL AS category, NULL AS project_id,
                    NULL AS project_title,
+                   NULL AS project_summary, NULL AS project_cover_thumb,
+                   NULL AS project_status, NULL AS project_source,
+                   NULL AS project_tags_raw, NULL AS project_view_count,
                    a.author_id, u.username AS author_name, u.avatar_url AS author_avatar_raw,
                    COALESCE(agg.last_reply_at, a.publish_time) AS rank_dt,
                    a.publish_time AS created_dt,
@@ -165,6 +175,9 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             SELECT 'article' AS type, a.id, a.title, LEFT(a.introduction, 200) AS summary,
                    NULL AS images_raw, NULL AS category, NULL AS project_id,
                    NULL AS project_title,
+                   NULL AS project_summary, NULL AS project_cover_thumb,
+                   NULL AS project_status, NULL AS project_source,
+                   NULL AS project_tags_raw, NULL AS project_view_count,
                    a.author_id, u.username AS author_name, u.avatar_url AS author_avatar_raw,
                    COALESCE(agg.last_reply_at, a.publish_time) AS rank_dt,
                    a.publish_time AS created_dt,
@@ -203,6 +216,7 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
 
     page_items = []
     from .discussion import CATEGORY_TEXT, _thread_images
+    from .showcase import STATUS_TEXT as SHOWCASE_STATUS_TEXT, SOURCE_TEXT as SHOWCASE_SOURCE_TEXT
     for r in rows:
         item = {
             "type": r["type"], "id": r["id"], "title": r["title"],
@@ -221,6 +235,21 @@ def _build_feed_page(content_type, sort, page, per_page, is_admin, now):
             "article_id": r["article_id"],
             "_like_tid": r["like_tid"],
         }
+        # 关联项目摘要投影（XLab 引流优化 §7.2）：LEFT JOIN 只带 visible 项目，
+        # 下架/无关联帖子的 project_title 为 NULL，这里不落字段——前端据此不渲染项目卡
+        if r["type"] == 'discussion' and r["project_id"] and r["project_title"]:
+            item["project_summary"] = r["project_summary"]
+            item["project_cover_thumb"] = r["project_cover_thumb"]
+            item["project_status"] = r["project_status"]
+            item["project_status_text"] = SHOWCASE_STATUS_TEXT.get(
+                r["project_status"], r["project_status"])
+            item["project_source"] = r["project_source"]
+            item["project_source_text"] = SHOWCASE_SOURCE_TEXT.get(r["project_source"], r["project_source"])
+            try:
+                item["project_tags"] = json.loads(r["project_tags_raw"]) if r["project_tags_raw"] else []
+            except (TypeError, ValueError):
+                item["project_tags"] = []
+            item["project_view_count"] = r["project_view_count"] or 0
         if r["type"] == 'article':
             item["article_version"] = r["article_version"]
             item["cover"] = r["cover"]

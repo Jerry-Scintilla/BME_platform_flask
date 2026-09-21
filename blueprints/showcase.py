@@ -16,10 +16,12 @@ import uuid
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
 
+from sqlalchemy.orm import joinedload
+
 from exts import db
 from models import (
     UserModel, ShowcaseProject, ShowcaseFavorite,
-    CampUnit, ProjectProfile, CampMember,
+    CampUnit, CampSession, ProjectProfile, CampMember,
 )
 from storage import storage
 import imaging
@@ -62,8 +64,11 @@ def _gallery_list(p):
     return json.loads(p.images_json) if p.images_json else []
 
 
-def _p_dict(p, user=None, favorited=None):
-    owner = UserModel.query.get(p.owner_user_id)
+def _p_dict(p, user=None, favorited=None, owner=None, fav_count=None):
+    """条目序列化。owner/fav_count 允许调用方注入批量预取结果（列表路径消 N+1）；
+    缺省时单条自查（详情/创建/编辑等单条路径，社团级数据量可接受）。"""
+    if owner is None:
+        owner = UserModel.query.get(p.owner_user_id)
     out = {
         "id": p.id, "source": p.source, "source_text": SOURCE_TEXT.get(p.source, p.source),
         "source_ref": p.source_ref, "owner_user_id": p.owner_user_id,
@@ -75,8 +80,9 @@ def _p_dict(p, user=None, favorited=None):
         "project_status": p.project_status,
         "project_status_text": STATUS_TEXT.get(p.project_status, p.project_status),
         "status": p.status, "view_count": p.view_count,
-        # 09-16 详情页 meta 补收藏数（社团级数据量，逐行 count 可接受）
-        "favorite_count": ShowcaseFavorite.query.filter_by(project_id=p.id).count(),
+        # 09-16 详情页 meta 补收藏数；列表路径传入聚合结果，单条路径逐行 count
+        "favorite_count": fav_count if fav_count is not None
+        else ShowcaseFavorite.query.filter_by(project_id=p.id).count(),
         "members": json.loads(p.members_json) if p.members_json else [],
         "links": json.loads(p.links_json) if p.links_json else [],
         "archive_ref": p.archive_ref,
@@ -86,11 +92,10 @@ def _p_dict(p, user=None, favorited=None):
     if user is not None:
         out["favorited"] = bool(favorited)
         out["can_manage"] = user.is_admin() or p.owner_user_id == user.id
-    # camp 溯源：营期名 + 周期
+    # camp 溯源：营期名 + 周期（列表路径由调用方批量补齐，见 project_list）
     if p.source == 'camp' and p.source_ref:
         unit = CampUnit.query.get(p.source_ref)
         if unit:
-            from models import CampSession
             camp = CampSession.query.get(unit.camp_session_id)
             out["camp_name"] = camp.name if camp else None
             out["camp_cycle"] = camp.cycle.name if camp and camp.cycle else None
@@ -109,9 +114,28 @@ def _can_manage(p, user):
 @bp.route("/projects")
 @jwt_required()
 def project_list():
-    """展示条目列表（?source=&project_status=&tag=&q=；hidden 条目仅 admin 可见）。
-    数据量社团级，MVP 全量返回 + count；分页参数留扩展位。"""
+    """展示条目列表（?source=&project_status=&tag=&q=&sort=&limit=；hidden 条目仅 admin 可见）。
+
+    排序（XLab 引流优化 §7.1）：
+    - 不传 sort：旧契约 status ASC + updated_at DESC（现有 XLab 页面行为不变）；
+    - sort=latest：created_at DESC, id DESC（编辑旧项目不再重排到顶）；
+    - sort=popular：view_count DESC → 收藏数 DESC → created_at DESC, id DESC（收藏数走聚合子查询）。
+    limit 取 1..20 且在 DB 层生效；total 恒为筛选后总数（不受 limit 影响）。
+    非法参数一律 400，不静默兜底。序列化所需 owner/收藏数/camp 溯源批量预取（消 N+1）。
+    """
     user = _current_user()
+    sort = request.args.get("sort")
+    if sort is not None and sort not in ('latest', 'popular'):
+        return jsonify({"code": 400, "message": "sort 仅支持 latest/popular"}), 400
+    limit = request.args.get("limit")
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return jsonify({"code": 400, "message": "limit 须为 1..20 的整数"}), 400
+        if not 1 <= limit <= 20:
+            return jsonify({"code": 400, "message": "limit 须为 1..20 的整数"}), 400
+
     q = ShowcaseProject.query
     if not user.is_admin():
         q = q.filter(ShowcaseProject.status == 'visible')
@@ -129,16 +153,76 @@ def project_list():
         like = f"%{kw}%"
         q = q.filter(db.or_(ShowcaseProject.title.like(like),
                             ShowcaseProject.summary.like(like)))
-    rows = q.order_by(ShowcaseProject.status, ShowcaseProject.updated_at.desc()).all()
+    total = q.count()
+
+    if sort == 'latest':
+        q = q.order_by(ShowcaseProject.created_at.desc(), ShowcaseProject.id.desc())
+    elif sort == 'popular':
+        fav_sub = (db.session.query(ShowcaseFavorite.project_id.label('pid'),
+                                    db.func.count().label('fc'))
+                   .group_by(ShowcaseFavorite.project_id).subquery())
+        q = (q.outerjoin(fav_sub, fav_sub.c.pid == ShowcaseProject.id)
+             .order_by(ShowcaseProject.view_count.desc(),
+                       db.func.coalesce(fav_sub.c.fc, 0).desc(),
+                       ShowcaseProject.created_at.desc(),
+                       ShowcaseProject.id.desc()))
+    else:
+        q = q.order_by(ShowcaseProject.status, ShowcaseProject.updated_at.desc())
+    if limit is not None:
+        q = q.limit(limit)
+    rows = q.all()
+
+    # ── 批量预取（§12.1.7：查询次数不随项目数逐条增长）──
+    owner_map, fav_count_map, camp_info_map = _prefetch_list_context(rows)
+
     fav_ids = set()
     if rows:
         fav_ids = {f.project_id for f in ShowcaseFavorite.query.filter(
             ShowcaseFavorite.user_id == user.id,
             ShowcaseFavorite.project_id.in_([r.id for r in rows])).all()}
-    return jsonify({"code": 200, "total": len(rows),
-                    "projects": [_p_dict(r, user, r.id in fav_ids) for r in rows],
+    projects = []
+    for r in rows:
+        d = _p_dict(r, user, r.id in fav_ids,
+                    owner=owner_map.get(r.owner_user_id),
+                    fav_count=fav_count_map.get(r.id, 0))
+        info = camp_info_map.get(r.source_ref) if (r.source == 'camp' and r.source_ref) else None
+        if info:
+            d.update(info)
+        projects.append(d)
+    return jsonify({"code": 200, "total": total,
+                    "projects": projects,
                     "all_tags": sorted({t for r in rows
                                         for t in (json.loads(r.tags) if r.tags else [])})})
+
+
+def _prefetch_list_context(rows):
+    """列表序列化的批量上下文：owner / 收藏计数 / camp 溯源各一条 IN 查询（或两跳）。"""
+    owner_map = {}
+    owner_ids = {r.owner_user_id for r in rows}
+    if owner_ids:
+        owner_map = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(owner_ids)).all()}
+    fav_count_map = {}
+    if rows:
+        fav_count_map = dict(
+            db.session.query(ShowcaseFavorite.project_id, db.func.count())
+            .filter(ShowcaseFavorite.project_id.in_([r.id for r in rows]))
+            .group_by(ShowcaseFavorite.project_id).all())
+    camp_info_map = {}
+    unit_ids = {r.source_ref for r in rows if r.source == 'camp' and r.source_ref}
+    if unit_ids:
+        units = CampUnit.query.filter(CampUnit.id.in_(unit_ids)).all()
+        camps = CampSession.query.options(joinedload(CampSession.cycle)).filter(
+            CampSession.id.in_([u.camp_session_id for u in units])).all()
+        camp_by_id = {c.id: c for c in camps}
+        for u in units:
+            camp = camp_by_id.get(u.camp_session_id)
+            if camp:
+                camp_info_map[u.id] = {
+                    "camp_name": camp.name,
+                    "camp_cycle": camp.cycle.name if camp.cycle else None,
+                    "camp_status": camp.status,
+                }
+    return owner_map, fav_count_map, camp_info_map
 
 
 @bp.route("/projects/<int:pid>")
