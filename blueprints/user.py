@@ -223,6 +223,7 @@ def user_profile(user_id):
         "Skill_Tags": user.skill_tags,
         "College": user.college,
         "role": user.role,
+        "level": user.level,
         "role_rank": user.role_rank,
         "officers": public_officers(user.id),
         "groups": public_groups(user.id),
