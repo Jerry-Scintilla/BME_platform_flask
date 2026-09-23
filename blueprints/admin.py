@@ -9,9 +9,10 @@ GET /admin/overview —— 后台首页一次性聚合各业务域统计
 """
 from datetime import date
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from sqlalchemy import func
+from sqlalchemy.orm import joinedload
 
 from exts import db
 from models import (
@@ -26,6 +27,7 @@ from models import (
     CampJoinRequest,
     CampLeave,
     CampMember,
+    CampStaff,
     CampAttendancePlan,
     CampUnit,
     ProjectApplicationVersion,
@@ -325,36 +327,45 @@ def workbench_summary():
     - pending：跨域待办计数（只计数，名单明细由各业务端点分页返回）；
     - running_camps：进行中营期摘要 + 各自待办数；
     - risks：规则型风险（D-10：只做可明确判断的规则，不做健康分）。
-    各子域独立容错——单域查询失败回 0/空，不拖垮整页（R-03）。
+    各子域独立容错；失败显式标记 unavailable，不能把未知误报为 0。
     """
     from datetime import datetime, timedelta
 
-    def safe(fn, default):
+    unavailable = set()
+
+    def read(key, fn):
         try:
             return fn()
         except Exception:
-            return default
+            current_app.logger.exception("workbench summary source unavailable: %s", key)
+            db.session.rollback()
+            unavailable.add(key)
+            return None
 
-    def _delivery_pending_count(before=None):
+    def grouped_counts(model, camp_column, *conditions):
+        return {sid: count for sid, count in db.session.query(
+            camp_column, func.count(model.id)).filter(*conditions)
+            .group_by(camp_column).all()}
+
+    def delivery_counts(before=None):
         # 待审交付 = team 模式全量 + member 模式负责人份额（与 delivery_admin 审队口径一致）
-        def base(q):
-            return q.filter(CampSubmissionVersion.created_at < before) if before else q
-
-        team_q = CampSubmissionVersion.query.filter(
-            CampSubmissionVersion.status == 'submitted',
-            CampSubmissionVersion.milestone_id.in_(
-                db.session.query(CampMilestone.id)
+        base = (db.session.query(CampUnit.camp_session_id, func.count(CampSubmissionVersion.id))
+                .select_from(CampSubmissionVersion)
+                .join(CampMilestone, CampSubmissionVersion.milestone_id == CampMilestone.id)
                 .join(CampUnit, CampMilestone.unit_id == CampUnit.id)
-                .filter(CampUnit.unit_type == 'project',
-                        CampMilestone.submit_mode == 'team')))
-        member_q = (CampSubmissionVersion.query
-                    .join(CampMilestone, CampSubmissionVersion.milestone_id == CampMilestone.id)
-                    .join(CampUnit, CampMilestone.unit_id == CampUnit.id)
-                    .filter(CampUnit.unit_type == 'project',
-                            CampMilestone.submit_mode == 'member',
-                            CampSubmissionVersion.status == 'submitted',
-                            CampSubmissionVersion.submitted_by == CampUnit.owner_user_id))
-        return base(team_q).count() + base(member_q).count()
+                .filter(
+            CampSubmissionVersion.status == 'submitted',
+                    CampUnit.unit_type == 'project'))
+        if before:
+            base = base.filter(CampSubmissionVersion.created_at < before)
+        team = base.filter(CampMilestone.submit_mode == 'team').group_by(CampUnit.camp_session_id).all()
+        member = base.filter(CampMilestone.submit_mode == 'member',
+                             CampSubmissionVersion.submitted_by == CampUnit.owner_user_id)
+        member = member.group_by(CampUnit.camp_session_id).all()
+        result = {sid: count for sid, count in team}
+        for sid, count in member:
+            result[sid] = result.get(sid, 0) + count
+        return result
 
     def _feedback_ticket_pending():
         # 工单模型随 6A 落地（migrate_50）；未建表前该域回 0，不阻塞工作台其余摘要
@@ -362,21 +373,31 @@ def workbench_summary():
         return FeedbackTicket.query.filter(
             FeedbackTicket.status.in_(['new', 'triaged', 'reopened'])).count()
 
-    pending = {
-        "camp_join": safe(lambda: CampJoinRequest.query.filter_by(status='pending').count(), 0),
-        "camp_leave": safe(lambda: CampLeave.query.filter_by(status='pending').count(), 0),
-        "project_application": safe(
-            lambda: ProjectApplicationVersion.query.filter_by(status='pending').count(), 0),
-        "project_delivery": safe(lambda: _delivery_pending_count(), 0),
-        "quota_request": safe(lambda: LLMQuotaRequestModel.query.filter_by(
-            status=LLMQuotaRequestModel.STATUS_PENDING).count(), 0),
-        "feedback_ticket": safe(_feedback_ticket_pending, 0),
+    by_camp = {
+        'camp_join': read('camp_join', lambda: grouped_counts(
+            CampJoinRequest, CampJoinRequest.camp_session_id, CampJoinRequest.status == 'pending')),
+        'camp_leave': read('camp_leave', lambda: grouped_counts(
+            CampLeave, CampLeave.camp_session_id, CampLeave.status == 'pending')),
+        'project_application': read('project_application', lambda: grouped_counts(
+            ProjectApplicationVersion, ProjectApplicationVersion.camp_session_id,
+            ProjectApplicationVersion.status == 'pending')),
+        'project_delivery': read('project_delivery', delivery_counts),
     }
+    pending_ids = set().union(*(counts.keys() for counts in by_camp.values() if counts))
+    pending_camps = read('pending_camps', lambda: [
+        {'id': camp.id, 'name': camp.name, 'category': camp.category, 'status': camp.status}
+        for camp in CampSession.query.filter(CampSession.id.in_(pending_ids)).all()
+    ]) if pending_ids else []
+    pending = {key: sum(counts.values()) if counts is not None else None
+               for key, counts in by_camp.items()}
+    pending['quota_request'] = read('quota_request', lambda: LLMQuotaRequestModel.query.filter_by(
+        status=LLMQuotaRequestModel.STATUS_PENDING).count())
+    pending['feedback_ticket'] = read('feedback_ticket', _feedback_ticket_pending)
     oldest = {
-        "camp_join": safe(lambda: db.session.query(func.min(CampJoinRequest.created_at))
-                          .filter_by(status='pending').scalar(), None),
-        "camp_leave": safe(lambda: db.session.query(func.min(CampLeave.created_at))
-                           .filter_by(status='pending').scalar(), None),
+        "camp_join": read('oldest_camp_join', lambda: db.session.query(func.min(CampJoinRequest.created_at))
+                          .filter_by(status='pending').scalar()),
+        "camp_leave": read('oldest_camp_leave', lambda: db.session.query(func.min(CampLeave.created_at))
+                           .filter_by(status='pending').scalar()),
     }
 
     running_camps = []
@@ -387,71 +408,119 @@ def workbench_summary():
         from .camp import _policy_dict
         return _policy_dict(camp.policy, camp.category).get("capabilities") or {}
 
-    for camp in safe(lambda: CampSession.query.filter_by(status='running')
-                     .order_by(CampSession.start_date.desc()).all(), []):
+    running = read('running_camps', lambda: CampSession.query.filter_by(status='running')
+                   .options(joinedload(CampSession.cycle), joinedload(CampSession.policy))
+                   .order_by(CampSession.start_date.desc()).all())
+    running_ids = [camp.id for camp in running or []]
+    member_counts = read('camp_members', lambda: grouped_counts(
+        CampMember, CampMember.camp_session_id,
+        CampMember.camp_session_id.in_(running_ids))) if running_ids else {}
+    unmatched_counts = read('camp_unmatched', lambda: grouped_counts(
+        CampMember, CampMember.camp_session_id,
+        CampMember.camp_session_id.in_(running_ids), CampMember.role == 'student',
+        CampMember.team_mentor_id.is_(None))) if running_ids else {}
+    attendance_counts = read('attendance_plans', lambda: grouped_counts(
+        CampAttendancePlan, CampAttendancePlan.camp_session_id,
+        CampAttendancePlan.camp_session_id.in_(running_ids))) if running_ids else {}
+
+    for camp in running or []:
         sid = camp.id
         caps = _camp_caps(camp)
-        join_n = safe(lambda: CampJoinRequest.query.filter_by(
-            camp_session_id=sid, status='pending').count(), 0)
-        leave_n = safe(lambda: CampLeave.query.filter_by(
-            camp_session_id=sid, status='pending').count(), 0)
-        unmatched = safe(lambda: CampMember.query.filter_by(
-            camp_session_id=sid, role='student').filter(
-            CampMember.team_mentor_id.is_(None)).count(), 0)
+        join_n = by_camp['camp_join'].get(sid, 0) if by_camp['camp_join'] is not None else None
+        leave_n = by_camp['camp_leave'].get(sid, 0) if by_camp['camp_leave'] is not None else None
+        project_application_n = (by_camp['project_application'].get(sid, 0)
+                                 if by_camp['project_application'] is not None else None)
+        project_delivery_n = (by_camp['project_delivery'].get(sid, 0)
+                              if by_camp['project_delivery'] is not None else None)
+        unmatched = unmatched_counts.get(sid, 0) if unmatched_counts is not None else None
         running_camps.append({
             "id": sid, "name": camp.name, "category": camp.category,
             "cycle_name": camp.cycle.name if camp.cycle else None,
             "start_date": camp.start_date.isoformat(), "end_date": camp.end_date.isoformat(),
-            "member_count": safe(lambda: CampMember.query.filter_by(
-                camp_session_id=sid).count(), 0),
+            "member_count": member_counts.get(sid, 0) if member_counts is not None else None,
             "pending_join": join_n, "pending_leave": leave_n, "unmatched": unmatched,
+            "pending_project_application": project_application_n,
+            "pending_project_delivery": project_delivery_n,
         })
         # 规则：启用考勤但未生成考勤计划（跑起来却没铺考勤）
-        if camp.category == 'learning' and caps.get('attendance', True):
-            plan_n = safe(lambda: CampAttendancePlan.query.filter_by(camp_session_id=sid).count(), 0)
-            if not plan_n:
+        if camp.category == 'learning' and caps.get('attendance', True) and attendance_counts is not None:
+            if not attendance_counts.get(sid, 0):
                 risks.append({"camp_id": sid, "camp_name": camp.name,
                               "rule": "attendance_not_configured",
                               "detail": "已启用考勤但营内没有考勤计划（承诺出勤日未生成）"})
         # 规则：培训营 running 仍有未归属学员（选导生未收尾）
-        if camp.category == 'learning' and unmatched:
+        if camp.category == 'learning' and unmatched is not None and unmatched:
             risks.append({"camp_id": sid, "camp_name": camp.name,
                           "rule": "students_unmatched",
                           "detail": f"{unmatched} 名学员未归属导生"})
 
     # 规则：即将开营（≤14 天）但还没有成员
     horizon = date.today() + timedelta(days=14)
-    upcoming = safe(lambda: CampSession.query.filter(
+    upcoming = read('upcoming_camps', lambda: CampSession.query.filter(
         CampSession.status == 'upcoming',
-        CampSession.start_date <= horizon).all(), [])
-    for camp in upcoming:
-        member_n = safe(lambda: CampMember.query.filter_by(camp_session_id=camp.id).count(), 0)
-        if not member_n:
+        CampSession.start_date <= horizon).all())
+    upcoming_ids = [camp.id for camp in upcoming or []]
+    upcoming_members = read('upcoming_members', lambda: grouped_counts(
+        CampMember, CampMember.camp_session_id,
+        CampMember.camp_session_id.in_(upcoming_ids))) if upcoming_ids else {}
+    for camp in upcoming or []:
+        if upcoming_members is not None and not upcoming_members.get(camp.id, 0):
             risks.append({"camp_id": camp.id, "camp_name": camp.name,
                           "rule": "opening_without_members",
                           "detail": f"{camp.start_date.isoformat()} 开营但尚无成员"})
 
     # 规则：启用座位能力但平台没有物理座位资源（全局一次性提示）
-    seat_cap_camps = safe(lambda: CampSession.query.filter(
-        CampSession.status.in_((['upcoming', 'selecting', 'running']))).all(), [])
-    if any(_camp_caps(c).get('seat') for c in seat_cap_camps):
-        seat_total = safe(lambda: SeatModel.query.count(), 0)
-        if not seat_total:
+    seat_cap_camps = read('seat_camps', lambda: CampSession.query.filter(
+        CampSession.status.in_(['upcoming', 'selecting', 'running']))
+        .options(joinedload(CampSession.policy)).all())
+    active_ids = [camp.id for camp in seat_cap_camps or []]
+    owner_counts = read('active_owners', lambda: grouped_counts(
+        CampStaff, CampStaff.camp_session_id,
+        CampStaff.camp_session_id.in_(active_ids), CampStaff.status == 'active',
+        CampStaff.role == 'owner')) if active_ids else {}
+    for camp in seat_cap_camps or []:
+        if owner_counts is not None and not owner_counts.get(camp.id, 0):
+            risks.append({"camp_id": camp.id, "camp_name": camp.name,
+                          "rule": "owner_missing", "detail": f"{camp.name} 尚未委任主负责人"})
+    if seat_cap_camps is not None and any(_camp_caps(c).get('seat') for c in seat_cap_camps):
+        seat_total = read('seat_total', lambda: SeatModel.query.count())
+        if seat_total == 0:
             risks.append({"camp_id": None, "camp_name": None,
                           "rule": "no_physical_seats",
                           "detail": "有营期启用座位能力，但平台尚未录入任何物理座位"})
 
     # 规则：待审交付超 72 小时未处理（项目营）
     stale_deadline = datetime.now() - timedelta(hours=72)
-    stale = safe(lambda: _delivery_pending_count(before=stale_deadline), 0)
-    if stale:
-        risks.append({"camp_id": None, "camp_name": None,
-                      "rule": "stale_delivery_reviews",
-                      "detail": f"{stale} 份待审交付材料已超过 72 小时未处理"})
+    stale_by_camp = read('stale_delivery_reviews', lambda: delivery_counts(before=stale_deadline))
+    if stale_by_camp:
+        camp_names = {camp.id: camp.name for camp in seat_cap_camps or []}
+        for sid, count in stale_by_camp.items():
+            name = camp_names.get(sid) or f'营期 #{sid}'
+            risks.append({"camp_id": sid, "camp_name": camp_names.get(sid),
+                          "rule": "stale_delivery_reviews",
+                          "detail": f"{name} 有 {count} 份待审交付材料超过 72 小时"})
 
+    risk_sources = {'running_camps', 'camp_unmatched', 'attendance_plans',
+                    'upcoming_camps', 'upcoming_members', 'seat_camps', 'seat_total', 'active_owners',
+                    'stale_delivery_reviews'}
+    if unavailable & risk_sources:
+        risks = []
+    as_of = datetime.now().isoformat()
+    section_status = {
+        'running_camps': 'unavailable' if unavailable & {
+            'running_camps', 'camp_members', 'camp_unmatched', 'camp_join', 'camp_leave',
+            'project_application', 'project_delivery'} else 'ok',
+        'risks': 'unavailable' if unavailable & risk_sources else 'ok',
+    }
     return jsonify({"code": 200, "data": {
         "pending": pending,
+        "pending_by_camp": {key: {str(sid): n for sid, n in counts.items()}
+                            if counts is not None else None for key, counts in by_camp.items()},
+        "pending_camps": pending_camps,
         "oldest_pending_at": {k: v.isoformat() if v else None for k, v in oldest.items()},
         "running_camps": running_camps,
         "risks": risks,
+        "source_status": {key: 'unavailable' for key in unavailable},
+        "section_status": section_status,
+        "as_of": as_of,
     }})

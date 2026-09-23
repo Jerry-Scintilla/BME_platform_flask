@@ -5,6 +5,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import config
 from exts import db, mail, limiter, redis_client
 from storage import storage
+from services.request_guard import enforce_request_access
 from flask_migrate import Migrate
 
 # 导入蓝图模块
@@ -142,29 +143,8 @@ ensure_ai_topic_schema(app)
 init_ai_topic_scheduler(app)
 
 
-@app.before_request
-def _block_banned_users():
-    """封禁即全站失效（2026-09-11 用户管理）：带有效 JWT 的请求统一核对 status。
-
-    - 仅拦「token 有效且属于被封禁用户」；无效 token / 无 token 不在此处理，交给各端点自己的 401 语义
-    - /auth/ 前缀放行（登录在 auth.py 内单独拒封禁）
-    - 代价：每个带 token 的请求多一次 user 查询，当前规模可接受
-    """
-    from flask import request, jsonify
-    auth_header = request.headers.get('Authorization', '')
-    if not auth_header.startswith('Bearer ') or request.path.startswith('/auth/'):
-        return None
-    try:
-        from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
-        verify_jwt_in_request()
-        identity = get_jwt_identity()
-    except Exception:
-        return None
-    from models import UserModel
-    user = UserModel.query.filter_by(email=identity).first()
-    if user and (user.status or 'active') == 'banned':
-        return jsonify({"code": 403, "message": "账号已被封禁，请联系管理员"}), 403
-    return None
+# 与原全站封禁检查共用一次用户查询，并增加 /admin/ 路径的角色门禁。
+app.before_request(enforce_request_access)
 
 
 @app.route('/')

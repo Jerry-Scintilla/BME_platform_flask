@@ -5,7 +5,7 @@ from flask_limiter.util import get_remote_address
 # import app
 
 from .forms import RegisterForm, LoginForm
-from models import UserModel, UserPermissionModel
+from models import UserModel
 from exts import db, mail, redis_client, limiter, revoke_token
 from flask import jsonify
 from flask_jwt_extended import (
@@ -238,18 +238,6 @@ def admin_login():
             }), 403
 
         try:
-            user_permission = UserPermissionModel.query.filter_by(
-                user_id=admin.id,
-            ).first()
-
-            if not user_permission and not admin.is_staff():
-                # 403 而非 401：401 在前端语义是「登录失效」会触发清 token 踢下线
-                # （packages/api 401 处理器），权限不足不该走那条路
-                return jsonify({
-                    "code": 403,
-                    'message': "无管理端访问权限"
-                }), 403
-
             if not admin.check_password(password):
                 return jsonify({
                     "code": 402,
@@ -259,6 +247,13 @@ def admin_login():
                 }),402
 
             else:
+                # 先验证凭据再判断准入，避免借不同状态码探测普通用户邮箱。
+                # 单项业务权限不等于管理端准入；营期老师使用用户端工作台。
+                if not admin.is_staff():
+                    return jsonify({
+                        "code": 403,
+                        'message': "无管理端访问权限"
+                    }), 403
                 # 历史遗留的明文(MD5)密码，登录成功后自动升级为加盐哈希
                 if not admin.password_is_hashed:
                     admin.set_password(password)
