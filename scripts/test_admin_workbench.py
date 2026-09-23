@@ -13,12 +13,14 @@ from sqlalchemy.ext.compiler import compiles
 
 from exts import db
 from models import (
-    CampJoinRequest, CampLeave, CampMember, CampMilestone,
-    CampSession, CampSubmissionVersion, CampUnit, PermissionModel,
-    ProjectApplicationVersion, UserModel, UserPermissionModel,
+    CampJoinRequest, CampLeave, CampMember, CampMilestone, CampStaff,
+    CampSession, CampSubmissionVersion, CampUnit, FeedbackTicket,
+    LLMQuotaRequestModel, PermissionModel, ProjectApplicationVersion,
+    UserModel, UserPermissionModel,
 )
 from blueprints import admin as admin_module, auth as auth_module
 from services.request_guard import enforce_request_access
+from services.workbench_items import list_workbench_items
 
 
 @compiles(MEDIUMTEXT, 'sqlite')
@@ -179,6 +181,93 @@ class AdminWorkbenchTest(unittest.TestCase):
         ])
         db.session.commit()
         self.assertEqual(query_count(), baseline)
+
+    def test_workbench_items_paginate_filter_and_link_to_source(self):
+        learning = CampSession(name='培训营', category='learning', status='running',
+                               start_date=date.today(), end_date=date.today())
+        project = CampSession(name='项目营', category='project', status='running',
+                              start_date=date.today(), end_date=date.today())
+        db.session.add_all([learning, project])
+        db.session.flush()
+        join = CampJoinRequest(camp_session_id=learning.id, user_id=self.operator.id,
+                               status='pending', apply_role='student')
+        mentor_join = CampJoinRequest(camp_session_id=learning.id, user_id=self.admin.id,
+                                      status='pending', apply_role='mentor')
+        leave = CampLeave(camp_session_id=learning.id, user_id=self.operator.id,
+                          status='pending', start_date=date.today(), end_date=date.today())
+        application = ProjectApplicationVersion(camp_session_id=project.id,
+                                                submitted_by=self.operator.id,
+                                                leader_user_id=self.operator.id,
+                                                name='新项目', status='pending')
+        unit = CampUnit(camp_session_id=project.id, unit_type='project', name='项目组',
+                        owner_user_id=self.operator.id)
+        db.session.add(unit)
+        db.session.flush()
+        milestone = CampMilestone(camp_session_id=project.id, unit_id=unit.id,
+                                  title='交付节点', submit_mode='team')
+        db.session.add(milestone)
+        db.session.flush()
+        delivery = CampSubmissionVersion(milestone_id=milestone.id, version=1,
+                                         submitted_by=self.operator.id, status='submitted')
+        quota = LLMQuotaRequestModel(user_id=self.operator.id, requested_budget=100,
+                                     status='pending')
+        ticket = FeedbackTicket(reporter_user_id=self.operator.id, title='反馈问题',
+                                status='new', assignee_user_id=self.admin.id)
+        db.session.add_all([join, mentor_join, leave, application, delivery, quota, ticket])
+        db.session.add(CampStaff(camp_session_id=learning.id, user_id=self.admin.id,
+                                 assigned_by=self.admin.id, role='owner', status='active'))
+        db.session.commit()
+
+        all_items = list_workbench_items(user_id=self.admin.id, page_size=2)
+        self.assertEqual(all_items['total'], 7)
+        self.assertEqual(len(all_items['items']), 2)
+        mine = list_workbench_items(user_id=self.admin.id, scope='mine')
+        self.assertEqual(mine['total'], 4)
+        unassigned = list_workbench_items(user_id=self.admin.id, scope='unassigned')
+        self.assertEqual({item['key'] for item in unassigned['items']},
+                         {f'project_application:{application.id}',
+                          f'project_delivery:{delivery.id}'})
+        self.assertEqual(list_workbench_items(user_id=self.admin.id, scope='overdue')['total'], 0)
+        joins = list_workbench_items(user_id=self.admin.id, item_type='camp_join')['items']
+        targets = {item['source_id']: item['target_route'] for item in joins}
+        self.assertEqual(targets[join.id], f'/camps/{learning.id}/people/applications')
+        self.assertEqual(targets[mentor_join.id], f'/camps/{learning.id}/learning/mentor-matching')
+        self.assertEqual(next(item['title'] for item in joins if item['source_id'] == mentor_join.id),
+                         '导生报名申请')
+        targets_by_type = {item['type']: item for item in list_workbench_items(
+            user_id=self.admin.id)['items'] if item['type'] != 'camp_join'}
+        self.assertEqual(targets_by_type['camp_leave']['target_query']['focus'], leave.id)
+        self.assertEqual(targets_by_type['project_application']['target_query']['focus'], application.id)
+        self.assertEqual(targets_by_type['project_delivery']['target_query']['focus'], delivery.id)
+        self.assertEqual(targets_by_type['quota_request']['target_query']['focus'], quota.id)
+        self.assertEqual(targets_by_type['feedback_ticket']['target_route'],
+                         f'/operations/feedback-tickets/{ticket.id}')
+        self.assertEqual(list_workbench_items(user_id=self.admin.id, camp_id=project.id)['total'], 2)
+        with self.app.test_request_context('/admin/workbench/summary'):
+            summary = inspect.unwrap(admin_module.workbench_summary)().get_json()['data']
+        for kind in ('camp_join', 'camp_leave', 'project_application',
+                     'project_delivery', 'quota_request', 'feedback_ticket'):
+            self.assertEqual(list_workbench_items(user_id=self.admin.id, item_type=kind)['total'],
+                             summary['pending'][kind])
+        join.status = 'approved'
+        db.session.commit()
+        self.assertEqual(list_workbench_items(user_id=self.admin.id,
+                                              item_type='camp_join')['total'], 1)
+
+    def test_workbench_items_endpoint_rejects_bad_filters_and_non_admin(self):
+        self.app.register_blueprint(admin_module.bp)
+        client = self.app.test_client()
+        admin_token = create_access_token(identity=self.admin.email)
+        user_token = create_access_token(identity=self.operator.email)
+        headers = {'Authorization': f'Bearer {admin_token}'}
+        self.assertEqual(client.get('/admin/workbench/items', headers={
+            'Authorization': f'Bearer {user_token}',
+        }).status_code, 403)
+        self.assertEqual(client.get('/admin/workbench/items?scope=unknown', headers=headers).status_code, 400)
+        self.assertEqual(client.get('/admin/workbench/items?page_size=101', headers=headers).status_code, 400)
+        response = client.get('/admin/workbench/items', headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['data']['total'], 0)
 
 
 if __name__ == '__main__':

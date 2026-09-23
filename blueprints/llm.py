@@ -584,10 +584,13 @@ def set_user_quota(user_id):
 @check_permission(LLM_PERMISSION)
 def list_quota_requests():
     status = request.args.get('status', type=str)
+    focus_id = request.args.get('id', type=int)
     page = request.args.get('page', 1, type=int)
     per_page = min(request.args.get('per_page', 20, type=int), 100)
 
     query = LLMQuotaRequestModel.query
+    if focus_id:
+        query = query.filter_by(id=focus_id)
     if status:
         query = query.filter_by(status=status)
     pagination = query.order_by(LLMQuotaRequestModel.created_at.desc()).paginate(

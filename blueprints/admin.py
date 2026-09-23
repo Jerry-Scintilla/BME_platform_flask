@@ -40,6 +40,31 @@ from . import check_permission, audit_log, _current_user
 bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 
+@bp.route('/workbench/items')
+@jwt_required()
+@check_permission('system_management')
+def workbench_items():
+    """跨域待办只读列表；登录者身份与数据范围由服务端确定。"""
+    from services.workbench_items import TYPES, list_workbench_items
+
+    scope = request.args.get('scope', 'all')
+    item_type = request.args.get('type') or None
+    status = request.args.get('status', 'pending')
+    page = request.args.get('page', 1, type=int)
+    page_size = request.args.get('page_size', 20, type=int)
+    raw_camp_id = request.args.get('camp_id')
+    if (scope not in ('all', 'mine', 'unassigned', 'overdue')
+            or (item_type is not None and item_type not in TYPES)
+            or status != 'pending' or page < 1 or page_size < 1 or page_size > 100
+            or (raw_camp_id and (not raw_camp_id.isdecimal() or int(raw_camp_id) < 1))):
+        return jsonify({'code': 400, 'message': '待办筛选参数无效'}), 400
+    camp_id = int(raw_camp_id) if raw_camp_id else None
+    current = _current_user()
+    data = list_workbench_items(user_id=current.id, scope=scope, item_type=item_type,
+                                camp_id=camp_id, page=page, page_size=page_size)
+    return jsonify({'code': 200, 'data': data})
+
+
 @bp.route("/users/<int:user_id>/role", methods=["PUT"])
 @jwt_required()
 @check_permission('system_management')
