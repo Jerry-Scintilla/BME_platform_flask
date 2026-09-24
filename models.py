@@ -2391,8 +2391,9 @@ class ScheduleProfile(db.Model):
     day_start_time = db.Column(db.String(5), nullable=False, default='09:00')  # HH:MM
     day_end_time = db.Column(db.String(5), nullable=False, default='22:00')    # HH:MM
     default_reminder_minutes = db.Column(db.Integer, nullable=False, default=15)
-    automation_mode = db.Column(db.String(20), nullable=False, default='manual')
-        # manual / suggest / auto —— Phase 1 仅存储展示，Phase 2 排程消费
+    automation_mode = db.Column(db.String(20), nullable=False, default='suggest')
+        # manual / suggest / auto —— suggest=适度自动（新任务自动安排、AI 未锁定块
+        # 可被重排）；Phase 2 起默认。migrate_55 已把存量 manual 全员升级。
     version = db.Column(db.Integer, nullable=False, default=1)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
@@ -2646,3 +2647,120 @@ class ScheduleReminder(db.Model):
             'delivered_at': self.delivered_at.strftime('%Y-%m-%d %H:%M') if self.delivered_at else None,
             'attempts': self.attempts,
         }
+
+
+class ScheduleCapture(db.Model):
+    """意图录入（Phase 2 文字版；input_type 预留 'audio'）。一次输入可拆出多个
+    事项；request_id 幂等（网络重试复用同一键不重复建行）。
+
+    状态机：pending →(worker claim 小事务)→ processing →(最终大事务【条件更新】
+    SET 终态 WHERE status='processing'，rowcount=0 整体回滚)→ done / clarify_
+    needed / failed。条件更新是防重复落库的锚点：被惰性恢复抢先判死的旧 worker
+    提交时自动放弃全部业务写入。LLM 原始输出不落库不进日志（§12 隐私）。"""
+    __tablename__ = 'schedule_capture'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    request_id = db.Column(db.String(64), nullable=False)
+        # 客户端幂等键（uuid4 hex），重试复用
+    input_type = db.Column(db.String(10), nullable=False, default='text')
+        # text / audio（语音后置）
+    text = db.Column(db.String(2000), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='pending')
+        # pending / processing / done / failed / clarify_needed
+    error = db.Column(db.String(200))
+        # 用户可读中文，不含供应商细节
+    error_code = db.Column(db.String(30))
+        # llm_timeout / llm_invalid / rate_limited / stale_timeout / internal
+    items_json = db.Column(db.Text)
+        # 服务端规范化后的结构化结果（含 version 字段备演进），非 LLM 原文
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'request_id', name='uq_schedule_capture_request'),
+        db.Index('ix_schedule_capture_user_time', 'user_id', 'created_at'),
+    )
+
+    def to_dict(self, with_items=False):
+        data = {
+            'id': self.id,
+            'input_type': self.input_type,
+            'text': self.text,
+            'status': self.status,
+            'error': self.error,
+            'error_code': self.error_code,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
+        }
+        if with_items and self.items_json:
+            import json as _json
+            try:
+                data['result'] = _json.loads(self.items_json)
+            except (ValueError, TypeError):
+                data['result'] = None
+        return data
+
+
+class SchedulePlan(db.Model):
+    """排程方案：一次规划的 ops 快照（diff_json）与应用/撤销状态。suggest 模式
+    生成后同事务直接 applied（仍落库：可撤销、可解释）；manual 模式只落
+    proposed，等用户 POST apply（逐实体复验 diff 内嵌版本基线，不符 409 重生成）。
+    无 version 列——状态条件转移即乐观控制（apply 抢 proposed、revert 抢 applied）。"""
+    __tablename__ = 'schedule_plan'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    trigger = db.Column(db.String(20), nullable=False)
+        # capture / task / event / manual
+    status = db.Column(db.String(20), nullable=False, default='proposed')
+        # proposed / applied / expired / reverted
+    capture_id = db.Column(db.Integer, db.ForeignKey('schedule_capture.id'), nullable=True)
+    reason = db.Column(db.String(500))
+        # 中文变更说明（排程摘要）
+    diff_json = db.Column(db.Text)
+        # 应用前的 ops 快照（含逐实体版本基线，apply 复验用）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    applied_at = db.Column(db.DateTime, nullable=True)
+    reverted_at = db.Column(db.DateTime, nullable=True)
+
+    __table_args__ = (
+        db.Index('ix_schedule_plan_user_created', 'user_id', 'created_at'),
+        db.Index('ix_schedule_plan_capture', 'capture_id'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'trigger': self.trigger,
+            'status': self.status,
+            'capture_id': self.capture_id,
+            'reason': self.reason,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
+            'applied_at': self.applied_at.strftime('%Y-%m-%d %H:%M') if self.applied_at else None,
+            'reverted_at': self.reverted_at.strftime('%Y-%m-%d %H:%M') if self.reverted_at else None,
+        }
+
+
+class ScheduleChange(db.Model):
+    """方案变更账（撤销的补偿依据）。id 自增即应用顺序——revert 按 id DESC 严格
+    逆序补偿（先撤块再撤任务，重叠移动自洽还原）。补偿是逻辑复位不是物理删除。
+
+    after_json 必含 entity_version（本次操作完成后的对象 version）——revert 时
+    比对当前 version 判断「我之后有没有人动过」，不符则该项跳过并列出。"""
+    __tablename__ = 'schedule_change'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    plan_id = db.Column(db.Integer, db.ForeignKey('schedule_plan.id'), nullable=False)
+    entity = db.Column(db.String(10), nullable=False)
+        # task / event / block
+    entity_id = db.Column(db.Integer, nullable=False)
+    operation = db.Column(db.String(10), nullable=False)
+        # create / update / cancel
+    before_json = db.Column(db.Text)
+        # create 时 NULL；update 含 start_at/end_at
+    after_json = db.Column(db.Text, nullable=False)
+        # 必含 entity_version
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('ix_schedule_change_plan', 'plan_id', 'id'),
+        db.Index('ix_schedule_change_user_time', 'user_id', 'created_at'),
+    )

@@ -63,6 +63,15 @@ ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shang
 SCHEDULE_REMINDER_SCAN_ENABLED = os.getenv("SCHEDULE_REMINDER_SCAN_ENABLED", "true").lower() == "true"
 SCHEDULE_REMINDER_SCAN_INTERVAL_SECONDS = int(os.getenv("SCHEDULE_REMINDER_SCAN_INTERVAL_SECONDS", "30"))
 
+# 个人日程意图理解与智能排程（Phase 2）。意图=「说一句」文字 LLM 提取（DeepSeek
+# 直连，复用 litellm_chat）；排程=纯规则贪心零 LLM。PLANNER 总开关熔断用：
+# 关闭后 capture 仍可用（只创建不排程）、POST /tasks 不挂钩自动安排。
+SCHEDULE_INTENT_ENABLED = os.getenv("SCHEDULE_INTENT_ENABLED", "true").lower() == "true"
+SCHEDULE_INTENT_DAILY_LIMIT = int(os.getenv("SCHEDULE_INTENT_DAILY_LIMIT", "50"))
+SCHEDULE_INTENT_LLM_TIMEOUT = int(os.getenv("SCHEDULE_INTENT_LLM_TIMEOUT", "45"))
+SCHEDULE_INTENT_MODEL = os.getenv("SCHEDULE_INTENT_MODEL")   # 缺省回落 AI_TOPIC_MODEL
+SCHEDULE_PLANNER_ENABLED = os.getenv("SCHEDULE_PLANNER_ENABLED", "true").lower() == "true"
+
 # 本地数据根目录：头像/名片照片/文章/作业/错误图等本地文件的统一根（存量默认 ./data 不变）；
 # 部署时指到数据盘挂载点即离开系统盘。local 存储后端的附件仓库在其下 storage/ 子目录
 DATA_ROOT = os.getenv("DATA_ROOT", "./data")

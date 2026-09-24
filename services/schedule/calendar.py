@@ -133,7 +133,7 @@ def _deadline_from_payload(payload, task=None):
 
 # ── 任务 ─────────────────────────────────────────────────────────────────
 
-def create_task(owner_id, payload):
+def create_task(owner_id, payload, *, source='manual'):
     title = _text(payload.get('title'), '标题', 200)
     precision, due_at, due_date = _deadline_from_payload(payload)
     priority = payload.get('priority') or 'medium'
@@ -149,7 +149,7 @@ def create_task(owner_id, payload):
         reminder_minutes=_optional_int(payload.get('reminder_minutes'), '提醒提前量'))
     db.session.add(task)
     db.session.flush()
-    _log(owner_id, 'task_create', task_id=task.id)
+    _log(owner_id, 'task_create', task_id=task.id, source=source)
     reminder_created = rematerialize_target('task', task)
     return {'task': task.to_dict(), 'reminder_created': reminder_created}
 
@@ -306,7 +306,7 @@ def list_tasks(owner_id, *, page=1, per_page=20, bucket='all', q=''):
 
 # ── 固定日程 ─────────────────────────────────────────────────────────────
 
-def create_event(owner_id, payload):
+def create_event(owner_id, payload, *, source='manual'):
     title = _text(payload.get('title'), '标题', 200)
     start_at = parse_datetime(payload.get('start_at'), '开始时间')
     end_at = parse_datetime(payload.get('end_at'), '结束时间')
@@ -323,7 +323,7 @@ def create_event(owner_id, payload):
         reminder_minutes=_optional_int(payload.get('reminder_minutes'), '提醒提前量'))
     db.session.add(event)
     db.session.flush()
-    _log(owner_id, 'event_create')
+    _log(owner_id, 'event_create', source=source)
     rematerialize_target('event', event)
     return {'event': event.to_dict(), 'conflicts': conflicts_for(owner_id, 'event', event)}
 
@@ -436,16 +436,27 @@ def cancel_block(owner_id, block_id):
 
 # ── 聚合视图与冲突 ───────────────────────────────────────────────────────
 
-def _conflict_items(owner_id, window_start, window_end):
-    """窗口内参与冲突检测的对象：active+busy+非全天日程 与 planned 执行块。"""
-    items = []
-    events = ScheduleEvent.query.filter(
+def busy_events_in_window(owner_id, window_start, window_end):
+    """忙闲谓词单点（Phase 2 起与 planner 共用；改这里两处同步）：
+    active + busy + 非全天的日程才占用时间轴。"""
+    return ScheduleEvent.query.filter(
         ScheduleEvent.owner_id == owner_id, ScheduleEvent.status == 'active',
         ScheduleEvent.busy.is_(True), ScheduleEvent.all_day.is_(False),
         ScheduleEvent.start_at < window_end, ScheduleEvent.end_at > window_start).all()
-    blocks = ScheduleBlock.query.filter(
+
+
+def planned_blocks_in_window(owner_id, window_start, window_end):
+    """忙闲谓词单点：planned 状态的执行块占用时间轴。"""
+    return ScheduleBlock.query.filter(
         ScheduleBlock.owner_id == owner_id, ScheduleBlock.status == 'planned',
         ScheduleBlock.start_at < window_end, ScheduleBlock.end_at > window_start).all()
+
+
+def _conflict_items(owner_id, window_start, window_end):
+    """窗口内参与冲突检测的对象：active+busy+非全天日程 与 planned 执行块。"""
+    items = []
+    events = busy_events_in_window(owner_id, window_start, window_end)
+    blocks = planned_blocks_in_window(owner_id, window_start, window_end)
     for e in events:
         items.append({'type': 'event', 'id': e.id, 'title': e.title,
                       'start_at': e.start_at, 'end_at': e.end_at})

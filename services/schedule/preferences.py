@@ -25,6 +25,20 @@ def parse_hhmm(value, field='时间'):
     return time(hour, minute)
 
 
+def lock_profile(user_id):
+    """排程序闸锁（锁序规范见包 docstring）：将要运行规划器的事务必须先持
+    该用户 profile 行锁，再写任何 task/event/block 行。返回 profile。"""
+    profile = (db.session.query(ScheduleProfile)
+               .filter(ScheduleProfile.user_id == user_id)
+               .with_for_update().populate_existing().first())
+    if profile is None:
+        profile = get_or_create_profile(user_id)
+        db.session.flush()
+        # get_or_create 无并发竞争防护，但 uq_schedule_profile_user 撞键即
+        # IntegrityError → 整事务失败重试，语义可接受（首次访问才会走到）
+    return profile
+
+
 def get_or_create_profile(user_id):
     """返回该用户的 Profile；首次访问自动建行（默认值见模型定义）。
     只 add/flush 不 commit（事务边界见包 docstring）。"""

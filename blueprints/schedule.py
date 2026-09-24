@@ -1,20 +1,24 @@
-"""个人日程蓝图（2026-09-24 · AI 智能日程管理模块 Phase 1，migrate_54）。
+"""个人日程蓝图（2026-09-24 · Phase 1 手动闭环；同日 Phase 2 增意图与排程）。
 
-面向全体用户的私人日程（规划文档 §11 的 Phase 1 子集）：任务/固定日程/执行块
-CRUD + 聚合视图 + 偏好。归属一律从登录态推导，不接受客户端传 owner_id；
-teacher/super_admin 身份不自动获得他人日程访问权（§12 权限口径）。
+面向全体用户的私人日程：任务/固定日程/执行块 CRUD + 聚合视图 + 偏好 +
+意图录入（captures）与排程方案（plans）。归属一律从登录态推导，不接受客户端
+传 owner_id；teacher/super_admin 身份不自动获得他人日程访问权（§12 权限口径）。
 
 错误口径：400 参数或状态迁移不合法、404 不存在或越权（不区分两者）、
-409 乐观锁版本冲突（expected_version 机制）；成功统一 {"code":200,...}。
+409 乐观锁版本冲突、429 意图日限、503 意图开关关闭。
+
+锁序规范（防死锁，见 services/schedule/__init__.py）：POST /tasks 与
+POST/PATCH /events 会触发规划器，必须先 lock_profile 再写对象行。
 
 提醒无 CRUD 端点：纯服务端物料化（对象写操作联动重算），投递由
 schedule_scheduler 定时扫描（services/schedule/reminders.py）。
-Phase 2 的 captures/plans/undo、Phase 3 的 reports/subscriptions 不在本期。
+Phase 3 的 reports/subscriptions 不在本期。
 """
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import jwt_required
 
 from exts import db
+from models import ScheduleCapture, SchedulePlan
 
 from services.schedule import NotFound, VersionConflict
 from services.schedule import calendar, preferences
@@ -100,11 +104,34 @@ def tasks_list():
 @bp.route("/tasks", methods=["POST"])
 @jwt_required()
 def tasks_create():
+    """创建任务；suggest 模式下同事务自动安排执行块（响应带 plan 摘要）。
+    锁序：先 lock_profile 再 create_task（规划器入口锁）。"""
     owner = _owner_id()
     if owner is None:
         return _error(401, "登录状态无效")
+    from services.schedule import planner as planner_svc
+    from services.schedule.preferences import lock_profile
     try:
+        profile = lock_profile(owner)          # 锁序规范：规划器相关写前先持
         data = calendar.create_task(owner, _payload())
+        plan_summary = None
+        if (planner_svc.planner_enabled()
+                and data['task']['deadline_precision'] != 'none'):
+            task_row = db.session.query(calendar.ScheduleTask).get(data['task']['id'])
+            scheduling = planner_svc.auto_schedule(owner, [task_row], profile=profile)
+            if scheduling.get('plan') is not None:
+                plan_summary = {
+                    'id': scheduling['plan'].id, 'mode': scheduling['mode'],
+                    'reason': scheduling['reason'],
+                    'blocks': [{'start_at': op['start_at'].strftime('%Y-%m-%d %H:%M'),
+                                'end_at': op['end_at'].strftime('%Y-%m-%d %H:%M')}
+                               for op in scheduling['ops'] if op['op'] == 'create_block'],
+                    'unscheduled': scheduling['unscheduled']}
+            else:
+                plan_summary = {'id': None, 'mode': 'none',
+                                'reason': scheduling['reason'], 'blocks': [],
+                                'unscheduled': scheduling['unscheduled']}
+        data['plan'] = plan_summary
         db.session.commit()
     except ValueError as exc:
         db.session.rollback()
@@ -177,16 +204,38 @@ def task_actions(task_id):
 @bp.route("/events", methods=["POST"])
 @jwt_required()
 def events_create():
+    """创建固定日程；与既有 AI 未锁定块冲突时触发有限重排（响应带 replan 摘要）。
+    锁序：先 lock_profile 再 create_event。"""
     owner = _owner_id()
     if owner is None:
         return _error(401, "登录状态无效")
+    data, replan = _create_event_with_replan(owner, _payload())
+    if isinstance(data, tuple):
+        return data
+    return jsonify({"code": 200, "data": {**data, 'replan': replan}})
+
+
+def _create_event_with_replan(owner, payload):
+    from services.schedule import planner as planner_svc
+    from services.schedule.preferences import lock_profile
     try:
-        data = calendar.create_event(owner, _payload())
+        profile = lock_profile(owner)
+        data = calendar.create_event(owner, payload)
+        replan = None
+        if planner_svc.planner_enabled():
+            event_row = db.session.query(calendar.ScheduleEvent).get(data['event']['id'])
+            outcome = planner_svc.replan_conflicts(owner, event_row, profile=profile)
+            if outcome:
+                replan = {
+                    'plan_id': outcome['plan'].id, 'mode': outcome['mode'],
+                    'moved': sum(1 for op in outcome['ops'] if op['op'] == 'move_block'),
+                    'cancelled': sum(1 for op in outcome['ops'] if op['op'] == 'cancel_block'),
+                    'reason': outcome['plan'].reason}
         db.session.commit()
+        return data, replan
     except ValueError as exc:
         db.session.rollback()
-        return _error(400, str(exc))
-    return jsonify({"code": 200, "data": data})
+        return _error(400, str(exc)), None
 
 
 @bp.route("/events/<int:event_id>", methods=["PATCH"])
@@ -195,8 +244,21 @@ def events_update(event_id):
     owner = _owner_id()
     if owner is None:
         return _error(401, "登录状态无效")
+    from services.schedule import planner as planner_svc
+    from services.schedule.preferences import lock_profile
     try:
+        profile = lock_profile(owner)
         data = calendar.update_event(owner, event_id, _payload(), _expected_version(_payload()))
+        replan = None
+        if planner_svc.planner_enabled():
+            event_row = db.session.query(calendar.ScheduleEvent).get(data['event']['id'])
+            outcome = planner_svc.replan_conflicts(owner, event_row, profile=profile)
+            if outcome:
+                replan = {
+                    'plan_id': outcome['plan'].id, 'mode': outcome['mode'],
+                    'moved': sum(1 for op in outcome['ops'] if op['op'] == 'move_block'),
+                    'cancelled': sum(1 for op in outcome['ops'] if op['op'] == 'cancel_block'),
+                    'reason': outcome['plan'].reason}
         db.session.commit()
     except ValueError as exc:
         db.session.rollback()
@@ -207,7 +269,7 @@ def events_update(event_id):
     except NotFound:
         db.session.rollback()
         return _error(404, "日程不存在")
-    return jsonify({"code": 200, "data": data})
+    return jsonify({"code": 200, "data": {**data, 'replan': replan}})
 
 
 @bp.route("/events/<int:event_id>", methods=["DELETE"])
@@ -318,3 +380,153 @@ def preferences_update():
         db.session.rollback()
         return _error(409, str(exc))
     return jsonify({"code": 200, "data": profile.to_dict()})
+
+
+# ── 意图录入（Phase 2：说一句，帮我安排） ─────────────────────────────────
+
+@bp.route("/captures", methods=["POST"])
+@jwt_required()
+def captures_create():
+    """文字录入 → 建行（幂等）→ 线程池异步处理 → 前端短轮询 GET。
+    request_id 由客户端生成（uuid），网络重试复用同一键不重复建行。"""
+    owner = _owner_id()
+    if owner is None:
+        return _error(401, "登录状态无效")
+    if not current_app.config.get("SCHEDULE_INTENT_ENABLED", True):
+        return _error(503, "智能录入暂未开放")
+    payload = _payload()
+    text = (payload.get("text") or "").strip()
+    if not text or len(text) > 2000:
+        return _error(400, "请输入 1-2000 字的描述")
+    request_id = str(payload.get("request_id") or "")[:64]
+
+    # 用户级日限（Redis incr；故障降级放行——可用性优先，article_v2 同口径）
+    from exts import redis_client
+    try:
+        from datetime import date as _date
+        key = f"schedule_intent:{owner}:{_date.today().strftime('%Y%m%d')}"
+        used = redis_client.incr(key)
+        if used == 1:
+            redis_client.expire(key, 86400)
+        if used > current_app.config.get("SCHEDULE_INTENT_DAILY_LIMIT", 50):
+            return _error(429, "今日智能录入次数已用完，可手动创建任务")
+    except Exception:
+        pass
+
+    from services.schedule import capture as capture_svc
+    row, created = capture_svc.create_capture(owner, text, request_id)
+    if row is None:
+        return _error(400, "录入创建失败")
+    if created:
+        db.session.commit()
+        capture_svc.submit_capture(current_app, row.id)
+        return jsonify({"code": 200, "data": {"capture": row.to_dict(), "submitted": True}}), 202
+    db.session.rollback()
+    return jsonify({"code": 200, "data": {"capture": row.to_dict(), "submitted": False}})
+
+
+@bp.route("/captures/<int:capture_id>", methods=["GET"])
+@jwt_required()
+def captures_detail(capture_id):
+    """轮询端点：顺带惰性恢复卡死行（worker 进程被杀/排队过久）。"""
+    owner = _owner_id()
+    if owner is None:
+        return _error(401, "登录状态无效")
+    from services.schedule import capture as capture_svc
+    capture_svc.lazy_recover(capture_id)
+    row = ScheduleCapture.query.filter_by(id=capture_id, user_id=owner).first()
+    if row is None:
+        return _error(404, "录入不存在")
+    return jsonify({"code": 200, "data": row.to_dict(with_items=True)})
+
+
+@bp.route("/captures/<int:capture_id>/resolve", methods=["POST"])
+@jwt_required()
+def captures_resolve(capture_id):
+    """歧义补答：同步执行（不再调 LLM），一次请求返回终态。
+    body: {answers: {"<item index>": {"<field>": "<完整值或 __unset__>"}}}"""
+    owner = _owner_id()
+    if owner is None:
+        return _error(401, "登录状态无效")
+    answers = _payload().get("answers")
+    if not isinstance(answers, dict) or not answers:
+        return _error(400, "请先选择或填写补充信息")
+    from services.schedule import capture as capture_svc
+    try:
+        row = capture_svc.resolve_capture(owner, capture_id, answers)
+        db.session.commit()
+    except ValueError as exc:
+        db.session.rollback()
+        return _error(400, str(exc))
+    except VersionConflict as exc:
+        db.session.rollback()
+        return _error(409, str(exc))
+    except NotFound:
+        db.session.rollback()
+        return _error(404, "录入不存在")
+    return jsonify({"code": 200, "data": row.to_dict(with_items=True)})
+
+
+# ── 排程方案（Phase 2：应用/撤销） ────────────────────────────────────────
+
+@bp.route("/plans", methods=["GET"])
+@jwt_required()
+def plans_recent():
+    """最近方案列表（撤销入口兜底；limit 钳 20）。"""
+    owner = _owner_id()
+    if owner is None:
+        return _error(401, "登录状态无效")
+    try:
+        limit = min(20, max(1, int(request.args.get("limit", 10))))
+    except (ValueError, TypeError):
+        return _error(400, "limit 参数错误")
+    rows = (SchedulePlan.query.filter(SchedulePlan.user_id == owner)
+            .order_by(SchedulePlan.id.desc()).limit(limit).all())
+    return jsonify({"code": 200, "data": [p.to_dict() for p in rows]})
+
+
+@bp.route("/plans/<int:plan_id>/apply", methods=["POST"])
+@jwt_required()
+def plans_apply(plan_id):
+    """manual 模式的方案确认：逐实体复验版本基线，任一不符 409 重新生成。
+    锁序：先 profile 再 plan。"""
+    owner = _owner_id()
+    if owner is None:
+        return _error(401, "登录状态无效")
+    from services.schedule import planner as planner_svc
+    from services.schedule.preferences import lock_profile
+    try:
+        lock_profile(owner)
+        result = planner_svc.apply_proposed(owner, plan_id)
+        db.session.commit()
+    except VersionConflict as exc:
+        db.session.rollback()
+        return _error(409, str(exc))
+    except NotFound:
+        db.session.rollback()
+        return _error(404, "方案不存在")
+    return jsonify({"code": 200,
+                    "data": {"plan": result["plan"].to_dict(), "changes_n": result["changes_n"]}})
+
+
+@bp.route("/plans/<int:plan_id>/revert", methods=["POST"])
+@jwt_required()
+def plans_revert(plan_id):
+    """撤销方案：带版本检查的部分补偿（skipped 项明示原因）。
+    锁序：先 profile 再 plan。"""
+    owner = _owner_id()
+    if owner is None:
+        return _error(401, "登录状态无效")
+    from services.schedule import planner as planner_svc
+    from services.schedule.preferences import lock_profile
+    try:
+        lock_profile(owner)
+        result = planner_svc.revert_plan(owner, plan_id)
+        db.session.commit()
+    except VersionConflict as exc:
+        db.session.rollback()
+        return _error(409, str(exc))
+    except NotFound:
+        db.session.rollback()
+        return _error(404, "方案不存在")
+    return jsonify({"code": 200, "data": result})
