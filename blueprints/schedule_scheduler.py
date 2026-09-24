@@ -59,14 +59,10 @@ def _release_lock():
 
 
 def _job_reminder_scan(app):
-    with app.app_context():
-        try:
-            from services.schedule.reminders import scan_due_reminders
-            stats = scan_due_reminders()
-            if any(stats.values()):
-                app.logger.info(f"[schedule_scheduler] 扫描投递：{stats}")
-        except Exception as e:
-            app.logger.exception(f"[schedule_scheduler] 提醒扫描失败: {e}")
+    """扫描入口（09-24 批次 A 起包装心跳）：成功/失败/零条扫描都落
+    schedule_service_runtime 心跳，管理端据此推导服务状态。"""
+    from services.schedule.observability import run_reminder_scan_with_heartbeat
+    run_reminder_scan_with_heartbeat(app)
 
 
 def init_schedule_scheduler(app):

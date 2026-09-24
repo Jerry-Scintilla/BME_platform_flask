@@ -81,22 +81,30 @@ def create_capture(user_id, text, request_id, input_type='text'):
 
 
 def claim(capture_id):
-    """pending → processing 小事务；被抢先（重复投递/已处理）返回 False。"""
+    """pending → processing 小事务（顺带记 started_at，观测口径见 migrate_56）；
+    被抢先（重复投递/已处理）返回 False。"""
     result = db.session.execute(
         update(ScheduleCapture)
         .where(ScheduleCapture.id == capture_id, ScheduleCapture.status == 'pending')
-        .values(status='processing'))
+        .values(status='processing', started_at=datetime.now().replace(microsecond=0)))
     db.session.commit()
     return result.rowcount == 1
 
 
 def mark_failed(capture_id, message, code):
-    """失败小事务：仅条件更新（processing → failed），无业务写入可回滚。"""
+    """失败小事务：仅条件更新（processing → failed），无业务写入可回滚。
+    顺带补 finished_at/elapsed_ms（started_at 缺失的旧行保持 NULL=未采集）。"""
     try:
+        now = datetime.now()
+        row = db.session.get(ScheduleCapture, capture_id)
+        elapsed = None
+        if row is not None and row.started_at:
+            elapsed = max(0, int((now - row.started_at).total_seconds() * 1000))
         db.session.execute(
             update(ScheduleCapture)
             .where(ScheduleCapture.id == capture_id, ScheduleCapture.status == 'processing')
-            .values(status='failed', error=(message or '')[:200], error_code=code))
+            .values(status='failed', error=(message or '')[:200], error_code=code,
+                    finished_at=now.replace(microsecond=0), elapsed_ms=elapsed))
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -218,11 +226,23 @@ def _finalize(capture_id, parsed, now):
                           'items': items_out, 'unparsed': parsed['unparsed'],
                           'plan_ids': plan_ids}, ensure_ascii=False)
 
+    # 观测计数（管理端脱敏口径：只出数量不出内容；行级 None=未采集）
+    counts = {
+        'created_count': sum(1 for o in items_out
+                             if isinstance(o.get('result'), dict) and o.get('status') in ('scheduled', 'created')),
+        'clarify_count': sum(1 for o in items_out if o.get('status') == 'needs_clarification'),
+        'failed_count': sum(1 for o in items_out if o.get('status') == 'failed'),
+    }
+    elapsed_ms = None
+    if capture.started_at:
+        elapsed_ms = max(0, int((now - capture.started_at).total_seconds() * 1000))
+
     # 条件转移终态：被惰性恢复抢先 → rowcount=0 → 整体放弃（不产生重复任务）
     result = db.session.execute(
         update(ScheduleCapture)
         .where(ScheduleCapture.id == capture_id, ScheduleCapture.status == 'processing')
-        .values(status=terminal, items_json=payload))
+        .values(status=terminal, items_json=payload, finished_at=now.replace(microsecond=0),
+                elapsed_ms=elapsed_ms, **counts))
     if result.rowcount == 0:
         db.session.rollback()
         return 'abandoned'
@@ -382,4 +402,11 @@ def resolve_capture(user_id, capture_id, answers, *, now=None):
     still_clarify = any(o.get('status') == 'needs_clarification' for o in data.get('items', []))
     capture.status = 'clarify_needed' if still_clarify else 'done'
     capture.items_json = json.dumps(data, ensure_ascii=False)
+    # 补答可能新增落库项：重算三计数；finished_at/elapsed_ms 保持首终态值
+    # （覆写会把「补答完成时刻」冒充「处理完成时刻」，违反 §5.3 三段时刻语义）
+    items = data.get('items', [])
+    capture.created_count = sum(1 for o in items
+                                if isinstance(o.get('result'), dict) and o.get('status') in ('scheduled', 'created'))
+    capture.clarify_count = sum(1 for o in items if o.get('status') == 'needs_clarification')
+    capture.failed_count = sum(1 for o in items if o.get('status') == 'failed')
     return capture

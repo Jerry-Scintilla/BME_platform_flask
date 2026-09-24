@@ -530,12 +530,25 @@ def workbench_summary():
                     'stale_delivery_reviews'}
     if unavailable & risk_sources:
         risks = []
+    # 日程服务风险（09-25 面板批次 A）：独立降级域——刻意不并入 risk_sources，
+    # 否则营期源故障会连带清空日程风险行（§7 域隔离：互不拖垮）。列表为空≠
+    # unavailable，需读 source 区分（查询失败时 source 标记 schedule_unavailable）。
+    schedule_risks = None
+    try:
+        from services.schedule.admin_queries import list_workbench_risks
+        schedule_risks = list_workbench_risks()
+    except Exception:
+        current_app.logger.exception("workbench summary source unavailable: schedule_risks")
+        db.session.rollback()
+    if schedule_risks:
+        risks.extend(schedule_risks)
     as_of = datetime.now().isoformat()
     section_status = {
         'running_camps': 'unavailable' if unavailable & {
             'running_camps', 'camp_members', 'camp_unmatched', 'camp_join', 'camp_leave',
             'project_application', 'project_delivery'} else 'ok',
         'risks': 'unavailable' if unavailable & risk_sources else 'ok',
+        'schedule': 'ok' if schedule_risks is not None else 'unavailable',
     }
     return jsonify({"code": 200, "data": {
         "pending": pending,

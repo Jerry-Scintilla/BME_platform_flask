@@ -183,6 +183,7 @@ def _process_one(reminder_id, now, profile_cache):
         if not ok:
             row.status = 'expired'
             row.last_error = reason
+            row.status_reason_code = reason       # 安全枚举（管理端只出码不出原文）
             db.session.commit()
             return 'expired'
 
@@ -196,6 +197,7 @@ def _process_one(reminder_id, now, profile_cache):
         row.delivered_at = now
         row.notification_id = notification.id
         row.last_error = None
+        row.last_error_code = None                # 重试成功投递后清旧错误码
         db.session.commit()
         return 'delivered'
     except Exception as exc:
@@ -206,6 +208,7 @@ def _process_one(reminder_id, now, profile_cache):
                 row.status = 'failed'
                 row.attempts += 1
                 row.last_error = str(exc)[:500] or 'unknown'
+                row.last_error_code = 'notification_write_failed'
                 row.next_retry_at = now + RETRY_DELAY
                 db.session.commit()
         except Exception:

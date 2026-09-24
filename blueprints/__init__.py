@@ -399,6 +399,7 @@ from .resource_center import bp as resource_center_bp
 from .feedback_tickets import bp as feedback_tickets_bp
 from .feedback_tickets_admin import bp as feedback_tickets_admin_bp
 from .schedule import bp as schedule_bp
+from .admin_schedule import bp as admin_schedule_bp
 
 __all__ = [
     'auth_bp',
@@ -439,5 +440,6 @@ __all__ = [
     'resource_center_bp',
     'feedback_tickets_bp',
     'feedback_tickets_admin_bp',
-    'schedule_bp'
+    'schedule_bp',
+    'admin_schedule_bp'
 ]

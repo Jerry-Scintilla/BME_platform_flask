@@ -2617,6 +2617,10 @@ class ScheduleReminder(db.Model):
     trigger_at = db.Column(db.DateTime, nullable=False)
     status = db.Column(db.String(20), nullable=False, default='pending')
         # pending / delivered / cancelled / expired / failed
+    status_reason_code = db.Column(db.String(30), nullable=True)
+        # 进入非 pending 态的安全原因码（09-24 管理面板批次 A，migrate_56）：
+        # target_gone / stale_version / target_inactive / no_deadline / missed；
+        # cancelled 由目标完结联动产生，不单列原因
     title_snapshot = db.Column(db.String(200))
         # 物料化时标题快照；发送前仍重读目标，此列仅兜底展示
     notification_id = db.Column(db.Integer, nullable=True)
@@ -2624,6 +2628,10 @@ class ScheduleReminder(db.Model):
     delivered_at = db.Column(db.DateTime, nullable=True)
     attempts = db.Column(db.Integer, nullable=False, default=0)
     last_error = db.Column(db.String(500))
+        # 原始异常文本（受限服务日志用；管理接口只出 last_error_code，绝不透传本列）
+    last_error_code = db.Column(db.String(30), nullable=True)
+        # notification_write_failed（09-24 管理面板批次 A，migrate_56）；
+        # 重试成功投递后清空
     next_retry_at = db.Column(db.DateTime, nullable=True)
         # failed 重试到期时刻
     created_at = db.Column(db.DateTime, default=datetime.now)
@@ -2673,12 +2681,25 @@ class ScheduleCapture(db.Model):
         # llm_timeout / llm_invalid / rate_limited / stale_timeout / internal
     items_json = db.Column(db.Text)
         # 服务端规范化后的结构化结果（含 version 字段备演进），非 LLM 原文
+    started_at = db.Column(db.DateTime, nullable=True)
+        # worker claim 时刻（09-24 管理面板批次 A，migrate_56）；旧行 NULL=未采集
+    finished_at = db.Column(db.DateTime, nullable=True)
+        # 首个终态时刻（不含 clarify 补答后的状态变化）
+    elapsed_ms = db.Column(db.Integer, nullable=True)
+        # 异步处理墙钟耗时（claim→终态）；旧行 NULL=未采集
+    created_count = db.Column(db.Integer, nullable=True)
+        # 已落库事项数（_finalize 由 items 统计，resolve 后重算）
+    clarify_count = db.Column(db.Integer, nullable=True)
+        # 待补充事项数
+    failed_count = db.Column(db.Integer, nullable=True)
+        # 失败事项数
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
     __table_args__ = (
         db.UniqueConstraint('user_id', 'request_id', name='uq_schedule_capture_request'),
         db.Index('ix_schedule_capture_user_time', 'user_id', 'created_at'),
+        db.Index('ix_schedule_capture_status_created', 'status', 'created_at'),
     )
 
     def to_dict(self, with_items=False):
@@ -2763,4 +2784,44 @@ class ScheduleChange(db.Model):
     __table_args__ = (
         db.Index('ix_schedule_change_plan', 'plan_id', 'id'),
         db.Index('ix_schedule_change_user_time', 'user_id', 'created_at'),
+    )
+
+
+class ScheduleServiceRuntime(db.Model):
+    """日程服务运行心跳（管理面板批次 A，migrate_56）。首批 service_key 仅
+    'reminder_scan'（唯一周期服务）；意图/排程是请求驱动，观测来自
+    capture/plan 业务表，不写本表。
+
+    每个锁持有进程一行（UQ(service_key, instance_id)）。fcntl 锁保证任一时刻
+    单写者，故「最新行（updated_at DESC, id DESC 双键，防同秒并列）」即当前
+    活实例；旧行来自进程死亡/接管残留，不算失联。environment/deployment_version
+    仅展示，不参与状态推导。心跳写自身失败只记日志，绝不影响业务投递。"""
+    __tablename__ = 'schedule_service_runtime'
+    id = db.Column(db.Integer, primary_key=True)
+    environment = db.Column(db.String(30), nullable=False, default='default')
+    service_key = db.Column(db.String(30), nullable=False)
+    instance_id = db.Column(db.String(36), nullable=False)
+        # 锁持有进程 uuid4.hex（observability 懒生成）
+    deployment_version = db.Column(db.String(64), nullable=True)
+    enabled_snapshot = db.Column(db.Boolean, nullable=False, default=True)
+        # 心跳写入时刻的扫描开关快照（配置不一致比对用）
+    interval_seconds = db.Column(db.Integer, nullable=False, default=30)
+    config_fingerprint = db.Column(db.String(64), nullable=True)
+        # 非敏感白名单值的 sha256（如 "enabled=1;interval=30"）
+    last_started_at = db.Column(db.DateTime, nullable=True)
+    last_finished_at = db.Column(db.DateTime, nullable=True)
+    last_success_at = db.Column(db.DateTime, nullable=True)
+        # 成功完成即刷新（含零条扫描——空转也是健康心跳）
+    last_outcome = db.Column(db.String(20), nullable=True)
+        # running / success / failed
+    safe_error_code = db.Column(db.String(30), nullable=True)
+        # db_error / timeout / internal（异常类名白名单映射，不存原文）
+    last_batch_counts = db.Column(db.Text)
+        # 最近一轮扫描计数 JSON（delivered/expired/failed）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('service_key', 'instance_id', name='uq_schedule_service_instance'),
+        db.Index('ix_schedule_service_latest', 'service_key', 'updated_at'),
     )
