@@ -44,7 +44,7 @@ def create_notification(user_id, title, content, category='group',
       user_id       — 接收人 ID
       title         — 通知标题
       content       — 通知内容
-      category      — 'system' | 'group' | 'course' | 'camp'
+      category      — 'system' | 'group' | 'course' | 'camp' | 'schedule'（个人日程提醒）
       source_type   — 触发来源: 'leave', 'task', 'homework', 'notice', 'admin', 'reward', 'join_request'
       source_id     — 原始业务记录 ID
       group_id      — 所属小组 ID（group 类型时必填）

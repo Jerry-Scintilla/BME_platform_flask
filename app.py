@@ -13,6 +13,7 @@ from blueprints import *
 from blueprints.attendance_report import init_scheduler, ensure_recipient_permission
 from blueprints.camp_scheduler import init_camp_scheduler
 from blueprints.ai_topic import init_ai_topic_scheduler, ensure_ai_topic_account, ensure_ai_topic_schema
+from blueprints.schedule_scheduler import init_schedule_scheduler
 
 from flask_cors import CORS
 
@@ -129,6 +130,7 @@ app.register_blueprint(banner_bp)
 app.register_blueprint(resource_center_bp)
 app.register_blueprint(feedback_tickets_bp)
 app.register_blueprint(feedback_tickets_admin_bp)
+app.register_blueprint(schedule_bp)
 
 # 每日出勤报告：幂等创建收件人权限 + 启动定时任务（多 worker 下仅一个生效）
 ensure_recipient_permission(app)
@@ -141,6 +143,8 @@ with app.app_context():
     db.create_all()
 ensure_ai_topic_schema(app)
 init_ai_topic_scheduler(app)
+# 个人日程提醒扫描（AI 日程模块 Phase 1）：秒级短周期，锁与营期调度独立
+init_schedule_scheduler(app)
 
 
 # 与原全站封禁检查共用一次用户查询，并增加 /admin/ 路径的角色门禁。

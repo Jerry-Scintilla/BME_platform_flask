@@ -868,6 +868,7 @@ class NotificationModel(db.Model):
         # 'group'   — 小组内业务通知（请假/任务/作业/通知等）
         # 'course'  — 课程相关通知（预留）
         # 'camp'    — 营期通知（请假审批/奖励发放/考勤提醒等）
+        # 'schedule' — 个人日程提醒（AI 日程模块，09-24 起）
         # 'gratitude' — 感谢信送达提醒（source_id 指向 gratitude 表）
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
     source_type = db.Column(db.String(20), nullable=True)
@@ -2366,3 +2367,282 @@ class FeedbackTicketEvent(db.Model):
     to_status = db.Column(db.String(20), nullable=True)
     metadata_json = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 个人日程域（2026-09-24 · AI 智能日程管理模块 Phase 1，migrate_54）
+# 面向全体用户的私人日程：任务 Task / 固定日程 Event / 执行块 Block 三类对象
+# + 偏好 Profile + 事实流水 Activity + 提醒账本 Reminder。与教学 Task 完全
+# 解耦，归属一律从登录态推导（teacher/super_admin 不自动获得他人日程读取权）。
+#
+# 时间口径：全列 naive 本地时间（Asia/Shanghai），比较一律 datetime.now()。
+# 刻意偏离规划文档 §10「UTC 存储」的建议，与全站既有 DateTime 列保持同一
+# 口径避免混用陷阱；跨时区需求出现时再统一迁移（profile.timezone 已预留）。
+# Phase 2 的 capture/plan/change 等语音与自动排程表本期不建。
+# ═══════════════════════════════════════════════════════════════
+
+class ScheduleProfile(db.Model):
+    """日程偏好（每人一行，get_or_create）。timezone Phase 1 仅存储不消费；
+    day_end_time 是 date-only 截止任务的提醒基线（用户日终边界，不伪称 23:59）。"""
+    __tablename__ = 'schedule_profile'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    timezone = db.Column(db.String(64), nullable=False, default='Asia/Shanghai')
+    day_start_time = db.Column(db.String(5), nullable=False, default='09:00')  # HH:MM
+    day_end_time = db.Column(db.String(5), nullable=False, default='22:00')    # HH:MM
+    default_reminder_minutes = db.Column(db.Integer, nullable=False, default=15)
+    automation_mode = db.Column(db.String(20), nullable=False, default='manual')
+        # manual / suggest / auto —— Phase 1 仅存储展示，Phase 2 排程消费
+    version = db.Column(db.Integer, nullable=False, default=1)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', name='uq_schedule_profile_user'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'timezone': self.timezone,
+            'day_start_time': self.day_start_time,
+            'day_end_time': self.day_end_time,
+            'default_reminder_minutes': self.default_reminder_minutes,
+            'automation_mode': self.automation_mode,
+            'version': self.version,
+        }
+
+
+class ScheduleTask(db.Model):
+    """私人任务：待完成内容 + 截止约束。计划不落在任务上（执行时间在
+    ScheduleBlock）；截止三态由服务层校验自洽：precision='datetime' →
+    due_at 必填，'date' → due_date 必填，'none' → 两列皆空。
+    逾期口径（services/schedule/calendar.py 单点定义，前后端共用）：
+    'datetime' 且 due_at < now，或 'date' 且 due_date < today；'none' 永不逾期。"""
+    __tablename__ = 'schedule_task'
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default='open')
+        # open / done / cancelled
+    due_at = db.Column(db.DateTime, nullable=True)
+    due_date = db.Column(db.Date, nullable=True)
+    deadline_precision = db.Column(db.String(20), nullable=False, default='none')
+        # none / datetime / date
+    estimated_minutes = db.Column(db.Integer, nullable=True)
+    remaining_minutes = db.Column(db.Integer, nullable=True)
+        # 进度反馈写此列（"还差一小时"→60），与 estimated 独立
+    priority = db.Column(db.String(10), nullable=False, default='medium')
+        # low / medium / high
+    splittable = db.Column(db.Boolean, nullable=False, default=True)
+        # Phase 2 自动排程消费，Phase 1 仅存储
+    reminder_minutes = db.Column(db.Integer, nullable=True)
+        # 事项级提醒提前量；NULL → profile.default_reminder_minutes
+    version = db.Column(db.Integer, nullable=False, default=1)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.Index('ix_schedule_task_owner_status_due', 'owner_id', 'status', 'due_at'),
+        db.Index('ix_schedule_task_owner_updated', 'owner_id', 'updated_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'status': self.status,
+            'due_at': self.due_at.strftime('%Y-%m-%d %H:%M') if self.due_at else None,
+            'due_date': self.due_date.strftime('%Y-%m-%d') if self.due_date else None,
+            'deadline_precision': self.deadline_precision,
+            'estimated_minutes': self.estimated_minutes,
+            'remaining_minutes': self.remaining_minutes,
+            'priority': self.priority,
+            'splittable': self.splittable,
+            'reminder_minutes': self.reminder_minutes,
+            'version': self.version,
+            'completed_at': self.completed_at.strftime('%Y-%m-%d %H:%M') if self.completed_at else None,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
+            'updated_at': self.updated_at.strftime('%Y-%m-%d %H:%M') if self.updated_at else None,
+        }
+
+
+class ScheduleEvent(db.Model):
+    """固定日程：明确起止的会议/实验/课程，默认不可被自动移动（Phase 2 排程
+    硬约束）。软删（status='cancelled'）。all_day 或 busy=False 不参与精确区间
+    重叠（对齐营期 meeting 只有日期不占忙闲的口径），前端渲染为当日横幅。"""
+    __tablename__ = 'schedule_event'
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    location = db.Column(db.String(200))
+    start_at = db.Column(db.DateTime, nullable=False)
+    end_at = db.Column(db.DateTime, nullable=False)
+    all_day = db.Column(db.Boolean, nullable=False, default=False)
+    busy = db.Column(db.Boolean, nullable=False, default=True)
+    status = db.Column(db.String(20), nullable=False, default='active')
+        # active / cancelled（软删）
+    reminder_minutes = db.Column(db.Integer, nullable=True)
+        # 事项级提前量；NULL → profile.default_reminder_minutes
+    version = db.Column(db.Integer, nullable=False, default=1)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.Index('ix_schedule_event_owner_start', 'owner_id', 'start_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'location': self.location,
+            'start_at': self.start_at.strftime('%Y-%m-%d %H:%M') if self.start_at else None,
+            'end_at': self.end_at.strftime('%Y-%m-%d %H:%M') if self.end_at else None,
+            'all_day': self.all_day,
+            'busy': self.busy,
+            'status': self.status,
+            'reminder_minutes': self.reminder_minutes,
+            'version': self.version,
+        }
+
+
+class ScheduleBlock(db.Model):
+    """执行块：任务的一段计划执行时间，不等于实际耗时（事实在 Activity）。
+    owner_id 冗余存储（免 join 查周历/冲突）。Phase 1 全手动创建默认
+    locked=True（用户显式选定的时间不被自动重排）；Phase 2 AI 生成的块
+    默认 False，允许在授权范围内移动。"""
+    __tablename__ = 'schedule_block'
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    task_id = db.Column(db.Integer, db.ForeignKey('schedule_task.id', ondelete='CASCADE'), nullable=False)
+    start_at = db.Column(db.DateTime, nullable=False)
+    end_at = db.Column(db.DateTime, nullable=False)
+    locked = db.Column(db.Boolean, nullable=False, default=True)
+    status = db.Column(db.String(20), nullable=False, default='planned')
+        # planned / done / cancelled
+    version = db.Column(db.Integer, nullable=False, default=1)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    task = db.relationship('ScheduleTask')
+
+    __table_args__ = (
+        db.Index('ix_schedule_block_owner_start', 'owner_id', 'start_at'),
+        db.Index('ix_schedule_block_task', 'task_id'),
+    )
+
+    def to_dict(self, with_task=False):
+        data = {
+            'id': self.id,
+            'task_id': self.task_id,
+            'start_at': self.start_at.strftime('%Y-%m-%d %H:%M') if self.start_at else None,
+            'end_at': self.end_at.strftime('%Y-%m-%d %H:%M') if self.end_at else None,
+            'locked': self.locked,
+            'status': self.status,
+            'version': self.version,
+        }
+        if with_task and self.task:
+            data['task_title'] = self.task.title
+            data['task_status'] = self.task.status
+        return data
+
+
+class ScheduleActivity(db.Model):
+    """不可变事实流水：创建/修改/完成/进度/取消等动作各落一行（append-only，
+    不更新不删除）。Phase 2 日报与撤销以本表为事实来源；occurred_at 表示
+    实际发生时刻（支持补记），recorded_at 表示录入时刻。"""
+    __tablename__ = 'schedule_activity'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    task_id = db.Column(db.Integer, db.ForeignKey('schedule_task.id', ondelete='CASCADE'), nullable=True)
+    block_id = db.Column(db.Integer, nullable=True)
+    action = db.Column(db.String(30), nullable=False)
+        # task_create/task_update/task_complete/task_reopen/task_cancel/task_progress
+        # event_create/event_update/event_cancel
+        # block_create/block_update/block_cancel/block_confirm
+    occurred_at = db.Column(db.DateTime, nullable=False)
+    recorded_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    actual_minutes = db.Column(db.Integer, nullable=True)
+        # 进度/完成时用户报告的实际投入，可空
+    note = db.Column(db.String(500))
+        # 如未完成原因、进度说明
+    source = db.Column(db.String(20), nullable=False, default='manual')
+        # manual / ai / plan —— Phase 2 起 ai 录入与自动排程区分来源
+
+    __table_args__ = (
+        db.Index('ix_schedule_activity_user_time', 'user_id', 'occurred_at'),
+        db.Index('ix_schedule_activity_task', 'task_id'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'task_id': self.task_id,
+            'block_id': self.block_id,
+            'action': self.action,
+            'occurred_at': self.occurred_at.strftime('%Y-%m-%d %H:%M') if self.occurred_at else None,
+            'recorded_at': self.recorded_at.strftime('%Y-%m-%d %H:%M') if self.recorded_at else None,
+            'actual_minutes': self.actual_minutes,
+            'note': self.note,
+            'source': self.source,
+        }
+
+
+class ScheduleReminder(db.Model):
+    """提醒账本（Phase 1 单站内通道：账本与投递状态合一；Phase 3 加邮件时
+    拆 delivery 表，本表回归计划真相）。物料化策略：对象每次写操作删除该
+    目标旧的 pending/cancelled 行后重插（target_version 取对象当前 version，
+    唯一键兜底网络重试重复提交）。扫描器发送前复核版本与目标状态。
+    状态机：pending → delivered / cancelled（目标完成或取消）/ expired（版本
+    不符、目标已亡、错过太久不补发）/ failed（通知创建异常，attempts<5 按
+    next_retry_at 重试）。行锁 FOR UPDATE + 同事务写通知 = 站内通道恰好一次。"""
+    __tablename__ = 'schedule_reminder'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    target_type = db.Column(db.String(20), nullable=False)
+        # event / task / block
+    target_id = db.Column(db.Integer, nullable=False)
+    target_version = db.Column(db.Integer, nullable=False)
+        # 物料化时对象 version；发送前复核，不符即 expired
+    kind = db.Column(db.String(20), nullable=False)
+        # start（event/block 开始前）/ due（task 截止前）
+    trigger_at = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='pending')
+        # pending / delivered / cancelled / expired / failed
+    title_snapshot = db.Column(db.String(200))
+        # 物料化时标题快照；发送前仍重读目标，此列仅兜底展示
+    notification_id = db.Column(db.Integer, nullable=True)
+        # 投递产生的 notification.id 回填（审计）
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    last_error = db.Column(db.String(500))
+    next_retry_at = db.Column(db.DateTime, nullable=True)
+        # failed 重试到期时刻
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'target_type', 'target_id', 'kind', 'target_version',
+                            name='uq_schedule_reminder_dedup'),
+        db.Index('ix_schedule_reminder_scan', 'status', 'trigger_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'target_type': self.target_type,
+            'target_id': self.target_id,
+            'target_version': self.target_version,
+            'kind': self.kind,
+            'trigger_at': self.trigger_at.strftime('%Y-%m-%d %H:%M') if self.trigger_at else None,
+            'status': self.status,
+            'delivered_at': self.delivered_at.strftime('%Y-%m-%d %H:%M') if self.delivered_at else None,
+            'attempts': self.attempts,
+        }
