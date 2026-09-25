@@ -403,16 +403,15 @@ def captures_create():
         return _error(400, "请输入 1-2000 字的描述")
     request_id = str(payload.get("request_id") or "")[:64]
 
-    # 用户级日限（Redis incr；故障降级放行——可用性优先，article_v2 同口径）
+    # 用户级日限（单位=提交次数；GET 预检 + 仅新建计数——同一 request_id 的
+    # 网络重试不重复消耗额度；Redis 故障降级放行，article_v2 同口径）
     from exts import redis_client
+    from datetime import date as _date
+    from services.schedule.runtime_config import intent_daily_limit
+    redis_key = f"schedule_intent:{owner}:{_date.today().strftime('%Y%m%d')}"
     try:
-        from datetime import date as _date
-        key = f"schedule_intent:{owner}:{_date.today().strftime('%Y%m%d')}"
-        used = redis_client.incr(key)
-        if used == 1:
-            redis_client.expire(key, 86400)
-        from services.schedule.runtime_config import intent_daily_limit
-        if used > intent_daily_limit():
+        used = redis_client.get(redis_key)
+        if used is not None and int(used) >= intent_daily_limit():
             return _error(429, "今日智能录入次数已用完，可手动创建任务")
     except Exception:
         pass
@@ -422,6 +421,12 @@ def captures_create():
     if row is None:
         return _error(400, "录入创建失败")
     if created:
+        try:
+            used = redis_client.incr(redis_key)
+            if used == 1:
+                redis_client.expire(redis_key, 86400)
+        except Exception:
+            pass
         db.session.commit()
         capture_svc.submit_capture(current_app, row.id)
         return jsonify({"code": 200, "data": {"capture": row.to_dict(), "submitted": True}}), 202

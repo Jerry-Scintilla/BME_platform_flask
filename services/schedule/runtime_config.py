@@ -30,9 +30,11 @@ EDITABLE_KEYS = {
         'note': '关闭不取消既有任务、执行块和提醒，仅停止新的自动安排',
     },
     'SCHEDULE_INTENT_DAILY_LIMIT': {
-        'label': 'AI 录入每日限额（每用户）', 'type': 'int', 'min': 1, 'max': 1000,
+        'label': 'AI 录入每日限额', 'type': 'int', 'min': 1, 'max': 1000,
+        'unit': '次/天（每用户）',
         'component': 'POST /schedule/captures 限流',
-        'note': '超出限额的用户当日收到 429 提示',
+        'note': '单位=提交次数：每用户每天最多提交 N 句「说一句」录入（一句话记 1 次，'
+                '与拆出的事项数无关；同一 request_id 的网络重试不重复计数）；超出当日返回 429',
     },
     'SCHEDULE_INTENT_MODEL': {
         'label': '意图理解模型', 'type': 'str', 'max_len': 60,
@@ -204,6 +206,7 @@ def editable_view():
             publisher = user.username if user else None
         item = {
             'key': key, 'label': spec['label'], 'type': spec['type'],
+            'unit': spec.get('unit'),
             'component': spec['component'], 'note': spec.get('note'),
             'overridden': overridden,
             'version': row.version if row is not None else 0,

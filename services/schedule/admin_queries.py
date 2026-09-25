@@ -419,23 +419,11 @@ def build_settings():
             {'key': 'SCAN_BATCH_LIMIT（单轮扫描上限）', 'value': SCAN_BATCH_LIMIT,
              'source': 'code', 'component': 'reminders.scan_due_reminders', 'restart_needed': True},
         ]},
-        {'section': 'AI 意图理解', 'items': [
-            {'key': 'SCHEDULE_INTENT_ENABLED', 'value': bool(cfg.get('SCHEDULE_INTENT_ENABLED', True)),
-             'source': 'env' if os.getenv('SCHEDULE_INTENT_ENABLED') else 'default',
-             'component': 'POST /schedule/captures', 'restart_needed': False},
-            {'key': 'SCHEDULE_INTENT_LLM_TIMEOUT',
+        {'section': 'AI 意图理解（其余项在上方在线配置区）', 'items': [
+            {'key': 'SCHEDULE_INTENT_LLM_TIMEOUT（秒）',
              'value': int(cfg.get('SCHEDULE_INTENT_LLM_TIMEOUT', 45)),
              'source': 'env' if os.getenv('SCHEDULE_INTENT_LLM_TIMEOUT') else 'default',
              'component': 'intent.parse_capture', 'restart_needed': False},
-            {'key': 'SCHEDULE_INTENT_DAILY_LIMIT（用户/日）',
-             'value': int(cfg.get('SCHEDULE_INTENT_DAILY_LIMIT', 50)),
-             'source': 'env' if os.getenv('SCHEDULE_INTENT_DAILY_LIMIT') else 'default',
-             'component': 'POST /schedule/captures', 'restart_needed': False},
-        ]},
-        {'section': '自动排程', 'items': [
-            {'key': 'SCHEDULE_PLANNER_ENABLED', 'value': bool(cfg.get('SCHEDULE_PLANNER_ENABLED', True)),
-             'source': 'env' if os.getenv('SCHEDULE_PLANNER_ENABLED') else 'default',
-             'component': 'planner（POST /tasks、事件重排）', 'restart_needed': False},
         ]},
         {'section': '投递重试（代码常量）', 'items': [
             {'key': 'MAX_ATTEMPTS（失败重试上限）', 'value': MAX_ATTEMPTS,
