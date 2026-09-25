@@ -394,6 +394,9 @@ def captures_create():
         return _error(401, "登录状态无效")
     if not current_app.config.get("SCHEDULE_INTENT_ENABLED", True):
         return _error(503, "智能录入暂未开放")
+    from services.schedule.runtime_config import intent_enabled
+    if not intent_enabled():
+        return _error(503, "智能录入暂未开放")
     payload = _payload()
     text = (payload.get("text") or "").strip()
     if not text or len(text) > 2000:
@@ -408,7 +411,8 @@ def captures_create():
         used = redis_client.incr(key)
         if used == 1:
             redis_client.expire(key, 86400)
-        if used > current_app.config.get("SCHEDULE_INTENT_DAILY_LIMIT", 50):
+        from services.schedule.runtime_config import intent_daily_limit
+        if used > intent_daily_limit():
             return _error(429, "今日智能录入次数已用完，可手动创建任务")
     except Exception:
         pass

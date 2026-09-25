@@ -2825,3 +2825,27 @@ class ScheduleServiceRuntime(db.Model):
         db.UniqueConstraint('service_key', 'instance_id', name='uq_schedule_service_instance'),
         db.Index('ix_schedule_service_latest', 'service_key', 'updated_at'),
     )
+
+
+class ScheduleSetting(db.Model):
+    """日程服务在线配置（面板批次 B3，migrate_57）。仅存白名单低耦合参数的
+    「平台覆盖值」——读取优先级：本表非空 value > 环境变量/应用默认（§9.2）。
+    value=NULL 表示「恢复默认」（发布新版本而非擦除历史：previous_value 与
+    version 递增保留轨迹）。expected_version 乐观锁防并发覆盖；每次变更记录
+    操作者与原因。模型/扫描间隔等需重建生效机制的键不进本表（仍走 .env）。"""
+    __tablename__ = 'schedule_setting'
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(60), nullable=False)
+        # 白名单：SCHEDULE_INTENT_ENABLED / SCHEDULE_PLANNER_ENABLED / SCHEDULE_INTENT_DAILY_LIMIT
+    value = db.Column(db.String(200), nullable=True)
+        # NULL=跟随默认（env/应用默认）
+    version = db.Column(db.Integer, nullable=False, default=1)
+    previous_value = db.Column(db.String(200), nullable=True)
+    reason = db.Column(db.String(200), nullable=True)
+    updated_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('key', name='uq_schedule_setting_key'),
+    )

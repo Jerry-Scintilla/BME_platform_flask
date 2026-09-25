@@ -200,8 +200,10 @@ def scan_service_status(now):
 
 
 def intent_service_status():
-    """AI 理解服务卡：请求驱动无心跳——观测=最近完成的 capture。"""
-    enabled = bool(current_app.config.get('SCHEDULE_INTENT_ENABLED', True))
+    """AI 理解服务卡：请求驱动无心跳——观测=最近完成的 capture。
+    enabled 读在线配置（B3：DB 覆盖 > env/默认）。"""
+    from .runtime_config import intent_enabled
+    enabled = bool(intent_enabled())
     last = db.session.query(db.func.max(ScheduleCapture.finished_at)).scalar()
     return {'key': 'intent', 'enabled': enabled, 'state': 'ok' if enabled else 'disabled',
             'last_finished_at': _fmt(last), 'observed': 'capture 表最近完成时刻'}
@@ -209,8 +211,9 @@ def intent_service_status():
 
 def planner_service_status():
     """自动排程服务卡：观测=最近 applied 方案（created_at 每次 capture 都建行，
-    证不了排程引擎，必须用 applied_at）。"""
-    enabled = bool(current_app.config.get('SCHEDULE_PLANNER_ENABLED', True))
+    证不了排程引擎，必须用 applied_at）。enabled 读在线配置（B3）。"""
+    from .runtime_config import planner_enabled
+    enabled = bool(planner_enabled())
     last = db.session.query(db.func.max(SchedulePlan.applied_at)) \
         .filter(SchedulePlan.status == 'applied').scalar()
     return {'key': 'planner', 'enabled': enabled, 'state': 'ok' if enabled else 'disabled',
@@ -455,6 +458,9 @@ def build_settings():
         {'key': 'DEEPSEEK_API_KEY', 'configured': bool(os.getenv('DEEPSEEK_API_KEY')),
          'value': None, 'note': '密钥只显示配置状态，修改走 .env 并重启'},
     ]
+    from .runtime_config import editable_view
     return {'as_of': _fmt(datetime.now()),
-            'scope_note': '以下为本 API 进程有效值；后台进程（调度器/worker）启动时各自读取环境变量',
-            'groups': groups, 'secrets': secrets}
+            'scope_note': '只读项为本 API 进程有效值（后台进程启动时各自读取环境变量）；'
+                          '「在线配置」区的三个参数发布后即时生效（请求路径直读 DB）',
+            'groups': groups, 'secrets': secrets,
+            'editable': editable_view()}

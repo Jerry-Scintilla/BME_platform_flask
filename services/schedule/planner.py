@@ -56,7 +56,12 @@ def _floor15(minutes):
 
 
 def planner_enabled():
-    return _cfg('SCHEDULE_PLANNER_ENABLED', True)
+    """在线可改（B3）：DB 覆盖 > env/默认（runtime_config 白名单）。"""
+    from .runtime_config import planner_enabled as _rc_enabled
+    try:
+        return _rc_enabled()
+    except Exception:                          # 无 app 上下文等极端场景回落
+        return _cfg('SCHEDULE_PLANNER_ENABLED', True)
 
 
 # ── 忙闲图 ────────────────────────────────────────────────────────────────
