@@ -64,13 +64,16 @@ def parse_capture(text, now=None, *, llm=None):
 
     items 每项：{index, kind(task/event), title, evidence, status(ready/
     needs_clarification/failed), fields{...}, duration_source, ambiguities}。
+    模型与密钥走 runtime_config 在线解析链（DB 覆盖 > env/默认）。
     LLM 两次结构不可解析 raise IntentError('llm_invalid')。"""
+    from .runtime_config import intent_model, llm_api_key
     now = now or datetime.now()
     call = llm or chat_completion
+    api_key = llm_api_key() if llm is None else None      # 测试注入 llm 时不覆盖密钥
     from flask import current_app
     try:
         timeout = current_app.config.get('SCHEDULE_INTENT_LLM_TIMEOUT', 45)
-        model = current_app.config.get('SCHEDULE_INTENT_MODEL')
+        model = intent_model()
     except RuntimeError:
         timeout, model = 45, None
 
@@ -79,7 +82,8 @@ def parse_capture(text, now=None, *, llm=None):
     for _ in range(2):
         try:
             content = call(build_messages(text, now), model=model,
-                           temperature=0.2, timeout=timeout, response_json=True)
+                           temperature=0.2, timeout=timeout, response_json=True,
+                           api_key=api_key)
             raw = json.loads(content)
             break
         except (json.JSONDecodeError, ValueError) as exc:   # 仅解析失败重试

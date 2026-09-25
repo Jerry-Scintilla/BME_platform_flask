@@ -15,15 +15,16 @@ from flask import current_app
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 
-def chat_completion(messages, model=None, temperature=0.7, timeout=120, response_json=False):
+def chat_completion(messages, model=None, temperature=0.7, timeout=120, response_json=False, api_key=None):
     """调 DeepSeek chat/completions，返回助手消息文本。
 
     response_json=True 时要求模型只输出 JSON（response_format=json_object），调用方自行解析。
-    DEEPSEEK_API_KEY 从环境读（app 启动时 load_dotenv 注入）。
+    api_key 可显式传入（管理端在线覆盖值），缺省回落环境变量 DEEPSEEK_API_KEY
+    （app 启动时 load_dotenv 注入）。
     """
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    key = api_key or os.environ.get("DEEPSEEK_API_KEY")
     if not key:
-        raise RuntimeError("DEEPSEEK_API_KEY 未设置（写入 .env 或 export 到环境）")
+        raise RuntimeError("DEEPSEEK_API_KEY 未设置（写入 .env、export 到环境或经管理端在线配置）")
     model = model or current_app.config.get("AI_TOPIC_MODEL", "deepseek-chat")
     body = {"model": model, "messages": messages, "temperature": temperature}
     if response_json:

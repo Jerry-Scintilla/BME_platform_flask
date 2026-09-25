@@ -407,16 +407,6 @@ def build_settings():
     import os
     cfg = current_app.config
 
-    intent_model = cfg.get('SCHEDULE_INTENT_MODEL')
-    if intent_model:
-        model_source = 'env'
-    elif cfg.get('AI_TOPIC_MODEL'):
-        intent_model = cfg.get('AI_TOPIC_MODEL')
-        model_source = 'env(AI_TOPIC_MODEL 回退)'
-    else:
-        intent_model = 'deepseek-chat'
-        model_source = 'default'
-
     groups = [
         {'section': '提醒扫描', 'items': [
             {'key': 'SCHEDULE_REMINDER_SCAN_ENABLED', 'value': bool(cfg.get('SCHEDULE_REMINDER_SCAN_ENABLED', True)),
@@ -433,8 +423,6 @@ def build_settings():
             {'key': 'SCHEDULE_INTENT_ENABLED', 'value': bool(cfg.get('SCHEDULE_INTENT_ENABLED', True)),
              'source': 'env' if os.getenv('SCHEDULE_INTENT_ENABLED') else 'default',
              'component': 'POST /schedule/captures', 'restart_needed': False},
-            {'key': 'SCHEDULE_INTENT_MODEL', 'value': intent_model, 'source': model_source,
-             'component': 'intent.parse_capture', 'restart_needed': False},
             {'key': 'SCHEDULE_INTENT_LLM_TIMEOUT',
              'value': int(cfg.get('SCHEDULE_INTENT_LLM_TIMEOUT', 45)),
              'source': 'env' if os.getenv('SCHEDULE_INTENT_LLM_TIMEOUT') else 'default',
@@ -454,13 +442,9 @@ def build_settings():
              'source': 'code', 'component': 'reminders._process_one', 'restart_needed': True},
         ]},
     ]
-    secrets = [
-        {'key': 'DEEPSEEK_API_KEY', 'configured': bool(os.getenv('DEEPSEEK_API_KEY')),
-         'value': None, 'note': '密钥只显示配置状态，修改走 .env 并重启'},
-    ]
     from .runtime_config import editable_view
     return {'as_of': _fmt(datetime.now()),
             'scope_note': '只读项为本 API 进程有效值（后台进程启动时各自读取环境变量）；'
-                          '「在线配置」区的三个参数发布后即时生效（请求路径直读 DB）',
-            'groups': groups, 'secrets': secrets,
+                          '「在线配置」区参数发布后即时生效（请求路径逐次读取，无进程缓存）',
+            'groups': groups,
             'editable': editable_view()}
