@@ -195,6 +195,10 @@ def _finalize(capture_id, parsed, now):
             plan=plan if profile.automation_mode == 'suggest' else None, now=now)
     _annotate_scheduling(items_out, scheduling)
 
+    # manual 模式：提案摘要随结果卡下发（前端渲染方案确认卡，补上「下一步」）
+    proposal = (_proposal_summary(scheduling, ready_tasks)
+                if scheduling and scheduling.get('mode') == 'proposed' else None)
+
     # 事件可能压到既有 AI 未锁定块（本次排程已避开，但历史块未动）→ 让位重排
     extra_plan_ids = []
     for event_row in created_events:
@@ -224,7 +228,8 @@ def _finalize(capture_id, parsed, now):
 
     payload = json.dumps({'version': 1, 'now': now.strftime('%Y-%m-%d %H:%M'),
                           'items': items_out, 'unparsed': parsed['unparsed'],
-                          'plan_ids': plan_ids}, ensure_ascii=False)
+                          'plan_ids': plan_ids, 'proposal': proposal},
+                         ensure_ascii=False)
 
     # 观测计数（管理端脱敏口径：只出数量不出内容；行级 None=未采集）
     counts = {
@@ -248,6 +253,22 @@ def _finalize(capture_id, parsed, now):
         return 'abandoned'
     db.session.commit()
     return terminal
+
+
+def _proposal_summary(scheduling, tasks):
+    """manual 模式提案摘要（结果卡渲染「应用安排」确认卡用）。tasks 提供
+    task_id→标题映射；suggest/applied 模式不产生提案。"""
+    plan = scheduling.get('plan')
+    titles = {t.id: t.title for t in tasks}
+    return {
+        'plan_id': plan.id,
+        'reason': (scheduling.get('reason') or '已生成执行安排建议')[:500],
+        'blocks': [{'start_at': op['start_at'].strftime('%Y-%m-%d %H:%M'),
+                    'end_at': op['end_at'].strftime('%Y-%m-%d %H:%M')}
+                   for op in scheduling.get('ops') or [] if op['op'] == 'create_block'],
+        'unscheduled': [{'title': titles.get(u['task_id'], '任务'), 'minutes': u['minutes']}
+                        for u in scheduling.get('unscheduled') or []],
+    }
 
 
 def _annotate_scheduling(items, scheduling):
@@ -376,6 +397,10 @@ def resolve_capture(user_id, capture_id, answers, *, now=None):
             user_id, resolved_tasks, profile=profile, capture_id=capture.id,
             plan=plan if profile.automation_mode == 'suggest' else None, now=now)
     _annotate_scheduling(data.get('items', []), scheduling)
+
+    # manual 模式：新提案覆盖旧摘要；无新提案时保留旧提案（仍可应用）
+    if scheduling and scheduling.get('mode') == 'proposed':
+        data['proposal'] = _proposal_summary(scheduling, resolved_tasks)
 
     # 补答创建的固定日程可能与首次录入已排的块重叠 → 触发有限重排让位
     # （与蓝图 POST /events 挂钩同口径；重排 plan 计入 plan_ids 供整次撤销）

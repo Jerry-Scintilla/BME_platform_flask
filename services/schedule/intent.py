@@ -9,7 +9,8 @@ worker 的单个大事务里（全有或全无）。
 注来源（30 分钟 → duration_source='default_30'）。
 """
 import json
-from datetime import datetime, timedelta
+import re
+from datetime import date, datetime, time, timedelta
 
 import requests
 
@@ -24,6 +25,127 @@ PAST_TOLERANCE = timedelta(minutes=5)
 WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
 
 _UNSET = '__unset__'      # 歧义选项「不设定该时间」的哨兵值
+
+# ── 宽松时间解析（用户补答/LLM 溢出格式；严格格式优先，绝不猜语义） ────────
+# 支持组合：日期段（今天/明天/后天/M月D[日]/M-D/M-D H:MM/YYYY-M-D）× 时段词
+# （上午/下午/晚上/中午…）× 时刻（15:00 / 3点40 / 八点半 / 汉字小时）。
+# 裸小时（「3点」，无时段词）不猜上午下午，返回歧义标记由上层出选项。
+
+_DATE_WORDS = {'今天': 0, '今日': 0, '今早': 0, '今晚': 0,
+               '明天': 1, '明日': 1, '明早': 1, '明晚': 1,
+               '后天': 2, '大后天': 3}
+_MERIDIEMS = [('凌晨', 'am'), ('清晨', 'am'), ('早上', 'am'), ('上午', 'am'),
+              ('中午', 'noon'), ('下午', 'pm'), ('傍晚', 'pm'),
+              ('晚上', 'pm'), ('夜里', 'pm'), ('晚间', 'pm')]
+_ZH_DIGITS = {'一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6,
+              '七': 7, '八': 8, '九': 9}
+_TIME_RE = re.compile(r'([0-9]+|[一两二三四五六七八九十]{1,3})'
+                      r'(?::(\d{1,2})|[点时](半|[0-9]{1,2}|[一两二三四五六七八九十]{1,2})?分?)?')
+
+
+def _zh_int(s):
+    """汉字数字（一~二十三）转 int；不匹配返回 None。"""
+    if not s:
+        return None
+    m = re.fullmatch(r'十([一两二三四五六七八九]?)', s)
+    if m:
+        return 10 + _ZH_DIGITS.get(m.group(1), 0)
+    m = re.fullmatch(r'([一两二三四五六七八九]?)十([一两二三四五六七八九]?)', s)
+    if m and (m.group(1) or m.group(2)):
+        return _ZH_DIGITS.get(m.group(1) or '一', 1) * 10 + _ZH_DIGITS.get(m.group(2), 0)
+    return _ZH_DIGITS.get(s)
+
+
+def _loose_date(s, now):
+    """剥掉日期前缀，返回 (date 或 None, 剩余串)。None=没有日期段。"""
+    for word, offset in _DATE_WORDS.items():
+        if s.startswith(word):
+            return now.date() + timedelta(days=offset), s[len(word):]
+    m = re.match(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))), s[m.end():]
+        except ValueError:
+            return None, ''
+    m = re.match(r'(\d{1,2})月(\d{1,2})日?', s)
+    if m:
+        try:
+            return date(now.year, int(m.group(1)), int(m.group(2))), s[m.end():]
+        except ValueError:
+            return None, ''
+    m = re.match(r'(\d{1,2})[日号]', s)
+    if m:
+        try:
+            return date(now.year, now.month, int(m.group(1))), s[m.end():]
+        except ValueError:
+            return None, ''
+    m = re.match(r'(\d{1,2})[-/](\d{1,2})', s)
+    if m:
+        try:
+            return date(now.year, int(m.group(1)), int(m.group(2))), s[m.end():]
+        except ValueError:
+            return None, ''
+    return None, s
+
+
+def _loose_parse_datetime(text, now):
+    """宽松解析时间字符串。返回 datetime；裸小时返回 {'ambiguous_hour':
+    (date, hour, minute)}；解析不了返回 None。"""
+    s = str(text).strip().replace('：', ':')
+    if not s:
+        return None
+    day, rest = _loose_date(s, now)
+    if rest == '' and day is None:
+        return None
+    mer = None
+    rest = rest.lstrip()
+    for word, tag in _MERIDIEMS:
+        if rest.startswith(word):
+            mer, rest = tag, rest[len(word):].lstrip()
+            break
+    rest = rest.replace(' ', '')
+    m = _TIME_RE.fullmatch(rest)
+    if not m:
+        return None
+    hour = int(m.group(1)) if m.group(1).isdigit() else _zh_int(m.group(1))
+    if hour is None:
+        return None
+    minute = 0
+    if m.group(2):
+        minute = int(m.group(2))
+    elif m.group(3) == '半':
+        minute = 30
+    elif m.group(3):
+        minute = int(m.group(3)) if m.group(3).isdigit() else _zh_int(m.group(3))
+        if minute is None:
+            return None
+    if hour > 23 or minute > 59:
+        return None
+    bare_hour = mer is None and day is None and not m.group(2)
+    if mer == 'pm' and hour < 12:
+        hour += 12
+    elif mer == 'noon' and hour < 11:
+        hour += 12                     # 中午 12 点=12:00、中午 1 点=13:00
+    if bare_hour:
+        if hour >= 12 or hour == 0:
+            return None                # 「12 点」语义不明，交回上层提问
+        return {'ambiguous_hour': (now.date(), hour, minute)}
+    when = datetime.combine(day or now.date(), time(hour, minute))
+    # 纯钟点（「15:00」，无日期无时段词）且已过去 → 顺延到明天；
+    # 其余过去时间交由上层 past 追问给选项
+    bare_clock = day is None and mer is None and ':' in rest
+    if bare_clock and when < now - PAST_TOLERANCE:
+        when += timedelta(days=1)
+    return when
+
+
+def _loose_parse_date(text, now):
+    """宽松解析纯日期（截止日补答）：今天/明天/M月D日/M-D/YYYY-M-D。"""
+    s = str(text).strip()
+    day, rest = _loose_date(s, now)
+    if day is None or rest.strip() != '':
+        return None
+    return day
 
 
 class IntentError(Exception):
@@ -121,10 +243,55 @@ def _ask(item, field, question, options=None):
 
 
 def _past_question(now, field):
-    tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+    tomorrow = now + timedelta(days=1)
+    if field == 'due_date':
+        return [
+            {'label': '改为明天', 'value': tomorrow.strftime('%Y-%m-%d')},
+            {'label': '不设定该时间', 'value': _UNSET},
+        ]
     return [
-        {'label': '明天同一时间', 'value': f'{tomorrow} {now.strftime("%H:%M")}'},
+        {'label': '明天同一时间', 'value': f"{tomorrow.strftime('%Y-%m-%d')} {now.strftime('%H:%M')}"},
         {'label': '不设定该时间', 'value': _UNSET},
+    ]
+
+
+def _hour_question(now, day, hour, minute):
+    """裸小时（「3点」）不猜上下午：出两个候选选项。下午候选已过时则整体
+    顺延到明天（保证选项拿来即用，不再触发过去时间追问）。"""
+    pm_hour = hour + 12 if hour < 12 else hour
+    if datetime.combine(day, time(pm_hour, minute)) < now + PAST_TOLERANCE:
+        day = day + timedelta(days=1)
+
+    def _fmt(h):
+        return f"{day.strftime('%Y-%m-%d')} {h:02d}:{minute:02d}"
+    return [
+        {'label': f'上午 {hour} 点', 'value': _fmt(hour)},
+        {'label': f'下午 {hour} 点', 'value': _fmt(pm_hour)},
+    ]
+
+
+def _suggest_times(now, after=None):
+    """起止时刻追问的快捷候选（前端另有日期时间选择器兜底，选项只是省事）。
+    after 给定时是「几点结束」：相对开始时刻的三个时长。"""
+
+    def _fmt(d):
+        return d.strftime('%Y-%m-%d %H:%M')
+    if after is not None:
+        out = []
+        for minutes, label in ((30, '半小时'), (60, '一小时'), (120, '两小时')):
+            when = after + timedelta(minutes=minutes)
+            out.append({'label': f'{when.strftime("%H:%M")} 结束（{label}）',
+                        'value': _fmt(when)})
+        return out
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    two_hours = now + timedelta(hours=2)
+    tomorrow_am = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    tomorrow_pm = tomorrow_am.replace(hour=14)
+    return [
+        {'label': f'下一个整点 {next_hour.strftime("%H:%M")}', 'value': _fmt(next_hour)},
+        {'label': f'两小时后 {two_hours.strftime("%H:%M")}', 'value': _fmt(two_hours)},
+        {'label': f'明早九点', 'value': _fmt(tomorrow_am)},
+        {'label': f'明天下午两点', 'value': _fmt(tomorrow_pm)},
     ]
 
 
@@ -175,35 +342,43 @@ def normalize_item(raw, idx, now, *, answers=None):
         try:
             f['due_date'] = parse_date(due_date_raw, '截止日期')
         except ValueError:
-            _ask(item, 'due_date', '截止日期无法识别，请直接输入正确日期')
+            f['due_date'] = _loose_parse_date(due_date_raw, now)
+            if f['due_date'] is None:
+                _ask(item, 'due_date', '截止日期无法识别，请在下方选择正确日期')
         if f['due_date'] and f['due_date'] < now.date():
             _ask(item, 'due_date', '截止日期是过去的日期，按哪一种处理？', _past_question(now, 'due_date'))
 
     if f['start_at'] and f['end_at'] and f['end_at'] <= f['start_at']:
-        _ask(item, 'end_at', '结束时间必须晚于开始时间，请直接输入正确时间')
+        _ask(item, 'end_at', '结束时间必须晚于开始时间，请在下方选择正确时间')
 
     # 时刻语义纠偏：任务但用户/补答给出了确定起止 → 是固定日程（确认的时间
     # 必须落成事实，不能静默丢弃）；只给了开始 → 追问结束时刻
     if item['kind'] == 'task' and f['start_at']:
         item['kind'] = 'event'
 
-    # event 完整性：起止缺一即问（已因解析失败/过去时间问过的字段不重复问）；
-    # 两个时刻都被 '_unset' 清掉 → 退化为任务
-    if item['kind'] == 'event' and not f['start_at'] and not f['end_at'] and item['status'] != 'failed':
+    # 用户明确「不设定该时间」的固定日程 → 降级为待办（否则起止追问会死循环）
+    if item['kind'] == 'event' and (answers.get('start_at') == _UNSET
+                                    or answers.get('end_at') == _UNSET):
         item['kind'] = 'task'
+        f['start_at'] = f['end_at'] = None
+
+    # event 完整性：起止缺一即问（已因解析失败/过去时间问过的字段不重复问）。
+    # 「不设定该时间」的降级在上面处理过；纯缺起止的事件不静默降任务——
+    # 用户说的是固定安排，直接问几点开始。
     if item['kind'] == 'event' and item['status'] != 'failed':
         asked = {a['field'] for a in item['ambiguities']}
         if not f['start_at'] and 'start_at' not in asked:
-            _ask(item, 'start_at', '这件事几点到几点？（请输入完整时间，如 2026-09-25 15:00）')
+            _ask(item, 'start_at', '这件事几点开始？', _suggest_times(now))
         if f['start_at'] and not f['end_at'] and 'end_at' not in asked:
-            duration = _norm_int(raw.get('duration_minutes'), 1, 1440)
+            duration = _norm_int(answers.get('duration_minutes', raw.get('duration_minutes')), 1, 1440)
             if duration:
                 f['end_at'] = f['start_at'] + timedelta(minutes=duration)
             else:
-                _ask(item, 'end_at', '「%s」几点结束？（请输入完整时间）' % item['title'])
+                _ask(item, 'end_at', '「%s」几点结束？' % item['title'],
+                     _suggest_times(now, after=f['start_at']))
 
     # duration
-    duration = _norm_int(raw.get('duration_minutes'), 1, 1440)
+    duration = _norm_int(answers.get('duration_minutes', raw.get('duration_minutes')), 1, 1440)
     if item['kind'] == 'event' and f['start_at'] and f['end_at']:
         duration = int((f['end_at'] - f['start_at']).total_seconds() / 60)
     if item['kind'] == 'task':
@@ -216,11 +391,11 @@ def normalize_item(raw, idx, now, *, answers=None):
                                    'date' if f['due_date'] else 'none')
     f['duration_minutes'] = duration
 
-    priority = raw.get('priority')
+    priority = answers.get('priority', raw.get('priority'))
     f['priority'] = priority if priority in ('low', 'medium', 'high') else 'medium'
-    reminder = _norm_int(raw.get('reminder_minutes'), 0, 1440)
+    reminder = _norm_int(answers.get('reminder_minutes', raw.get('reminder_minutes')), 0, 1440)
     f['reminder_minutes'] = reminder
-    location = raw.get('location')
+    location = answers.get('location', raw.get('location'))
     f['location'] = str(location).strip()[:200] if location else None
 
     if item['ambiguities']:
@@ -229,16 +404,27 @@ def normalize_item(raw, idx, now, *, answers=None):
 
 
 def _parse_time_field(item, field, value, now):
-    """解析单个时刻字段；解析失败/过去时间 → 歧义（不写成已确定事实）。"""
+    """解析单个时刻字段；解析失败/过去时间 → 歧义（不写成已确定事实）。
+    严格格式优先，之后宽松解析自然语言（「明天下午三点」「26号9点」「15:00」）；
+    裸小时不猜上下午，转为带选项的追问。"""
     if value is None or value == _UNSET:
         return None
     if not isinstance(value, str):
-        _ask(item, field, '时间无法识别，请直接输入完整时间（如 2026-09-25 15:00）')
+        _ask(item, field, '时间无法识别，请在下方选择正确时间', _suggest_times(now))
         return None
+    parsed = None
     try:
         parsed = parse_datetime(value.strip(), field)
     except ValueError:
-        _ask(item, field, '时间无法识别，请直接输入完整时间（如 2026-09-25 15:00）')
+        loose = _loose_parse_datetime(value, now)
+        if isinstance(loose, dict):
+            day, hour, minute = loose['ambiguous_hour']
+            _ask(item, field, f'{hour} 点是上午还是下午？',
+                 _hour_question(now, day, hour, minute))
+            return None
+        parsed = loose
+    if parsed is None:
+        _ask(item, field, '时间无法识别，请在下方选择正确时间', _suggest_times(now))
         return None
     if parsed < now - PAST_TOLERANCE:
         _ask(item, field, '这个时间是过去的，按哪一种处理？', _past_question(now, field))
