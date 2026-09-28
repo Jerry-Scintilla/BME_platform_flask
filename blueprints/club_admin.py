@@ -15,7 +15,8 @@ from flask_jwt_extended import jwt_required
 
 from exts import db
 from models import UserModel, ClubGroup, ClubPosition, ClubOfficer, ClubMembership
-from . import check_permission, audit_log
+from . import check_permission, audit_log, _current_user
+from services.work.events import record_org_event
 
 bp = Blueprint("club_admin", __name__, url_prefix="/admin/club")
 
@@ -171,7 +172,21 @@ def archive_group(gid):
         return jsonify({"code": 409, "message": f"组内还有 {active_officers} 名在任干事，请先卸任"}), 409
     if refs["members"]:
         return jsonify({"code": 409, "message": f"组内还有 {refs['members']} 名成员归属，请先迁出"}), 409
+    # 内部工作台（方案 §5.4）：组工作区仍有未完成事项时提醒先处理/移交
+    from models import WorkItem, WorkWorkspace
+    ws = WorkWorkspace.query.filter_by(club_group_id=gid).first()
+    if ws:
+        open_items = WorkItem.query.filter(
+            WorkItem.workspace_id == ws.id,
+            WorkItem.status.in_(('draft', 'open', 'todo', 'in_progress', 'blocked', 'review'))).count()
+        if open_items:
+            return jsonify({"code": 409,
+                            "message": f"该组工作区还有 {open_items} 项未完成工作事项，请先完结或移交再归档"}), 409
     g.status = 'archived'
+    current = _current_user()
+    record_org_event('group_archived', to_group_id=gid,
+                     operator_id=current.id if current else None,
+                     detail={'name': g.name})
     db.session.commit()
     return jsonify({"code": 200, "message": f"已归档「{g.name}」（记录保留）", "data": _group_dict(g)})
 
@@ -379,7 +394,9 @@ def get_membership(user_id):
     data = {"primary": None, "secondary": None}
     for m in rows:
         g = ClubGroup.query.get(m.group_id)
-        data[m.slot] = {"id": g.id, "name": g.name} if g else None
+        # membership_id：归属行 id（内部工作台授权的来源行依据；id 仍为组 id，兼容旧 UI）
+        data[m.slot] = ({"id": g.id, "name": g.name, "membership_id": m.id}
+                        if g else None)
     return jsonify({"code": 200, "message": "获取归属成功", "data": data})
 
 
@@ -421,6 +438,16 @@ def set_membership(user_id):
             return jsonify({"code": 400,
                             "message": f"与现有{other_names[field]}相同，不能同组"}), 400
 
+    # 组织变更留痕（内部工作台 §3.3）：归属原地覆盖无历史，变更前后同事务落事件
+    org_changes = []
+    for field, g in slots.items():
+        row = existing.get(field)
+        old_gid = row.group_id if row else None
+        new_gid = g.id if g else None
+        if old_gid != new_gid:
+            org_changes.append({'slot': field, 'membership_id': row.id if row else None,
+                                'from_group_id': old_gid, 'to_group_id': new_gid})
+
     for field, g in slots.items():
         row = existing.get(field)
         if g is None:
@@ -432,6 +459,15 @@ def set_membership(user_id):
         else:
             db.session.add(ClubMembership(user_id=user_id, group_id=g.id,
                                           slot=field, joined_at=date.today()))
+    if org_changes:
+        current = _current_user()
+        first = org_changes[0]
+        record_org_event('membership_set', user_id=user_id,
+                         membership_id=first['membership_id'],
+                         from_group_id=first['from_group_id'],
+                         to_group_id=first['to_group_id'],
+                         operator_id=current.id if current else None,
+                         detail={'changes': org_changes})
     db.session.commit()
     return jsonify({"code": 200, "message": f"已更新 {user.username} 的组归属"})
 
@@ -450,6 +486,7 @@ def batch_membership():
         return jsonify({"code": 400, "message": "单批至多 200 条"}), 400
 
     results, ok, rejected = [], 0, 0
+    org_changes = []          # 组织变更留痕（内部工作台 §3.3）：批量逐项收集，一次落事件
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
             results.append({"index": idx, "ok": False, "reason": "条目格式错误"})
@@ -498,8 +535,14 @@ def batch_membership():
             continue
 
         existing = {m.slot: m for m in ClubMembership.query.filter_by(user_id=user.id).all()}
+        item_changes = []
         for field, g in slots.items():
             row = existing.get(field)
+            old_gid = row.group_id if row else None
+            new_gid = g.id if g else None
+            if old_gid != new_gid:
+                item_changes.append({'slot': field, 'membership_id': row.id if row else None,
+                                     'from_group_id': old_gid, 'to_group_id': new_gid})
             if g is None:
                 if row:
                     db.session.delete(row)
@@ -509,9 +552,16 @@ def batch_membership():
             else:
                 db.session.add(ClubMembership(user_id=user.id, group_id=g.id,
                                               slot=field, joined_at=date.today()))
+        if item_changes:
+            org_changes.append({'user_id': user.id, 'changes': item_changes})
         results.append({"index": idx, "ok": True, "username": user.username})
         ok += 1
 
+    if org_changes:
+        current = _current_user()
+        record_org_event('membership_batch',
+                         operator_id=current.id if current else None,
+                         detail={'items': org_changes})
     db.session.commit()
     return jsonify({"code": 200, "message": f"批量归属完成：{ok} 成功 / {rejected} 拒绝",
                     "data": {"results": results, "ok": ok, "rejected": rejected}})

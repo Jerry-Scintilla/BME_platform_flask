@@ -58,6 +58,9 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
 ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shanghai")
 
+# 内部工作台调度器（feature/work-collab M3）：到期提醒 1 分钟扫描 + 转交过期 5 分钟扫描
+WORK_SCHEDULER_ENABLED = os.getenv("WORK_SCHEDULER_ENABLED", "true").lower() == "true"
+
 # 本地数据根目录：头像/名片照片/文章/作业/错误图等本地文件的统一根（存量默认 ./data 不变）；
 # 部署时指到数据盘挂载点即离开系统盘。local 存储后端的附件仓库在其下 storage/ 子目录
 DATA_ROOT = os.getenv("DATA_ROOT", "./data")

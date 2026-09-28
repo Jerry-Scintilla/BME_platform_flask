@@ -418,6 +418,12 @@ def workbench_summary():
     pending['quota_request'] = read('quota_request', lambda: LLMQuotaRequestModel.query.filter_by(
         status=LLMQuotaRequestModel.STATUS_PENDING).count())
     pending['feedback_ticket'] = read('feedback_ticket', _feedback_ticket_pending)
+    # 内部工作台（feature/work-collab M5）：需接管事项计数（授权有效性为 Python 判定，
+    # 不入 SQL 联合；处理入口在 组织架构→协作授权 的接管队列）
+    def _work_takeover_count():
+        from services.work.tasks import takeover_candidates
+        return len(takeover_candidates())
+    pending['work_takeover'] = read('work_takeover', _work_takeover_count)
     oldest = {
         "camp_join": read('oldest_camp_join', lambda: db.session.query(func.min(CampJoinRequest.created_at))
                           .filter_by(status='pending').scalar()),

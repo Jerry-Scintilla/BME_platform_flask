@@ -869,9 +869,11 @@ class NotificationModel(db.Model):
         # 'course'  — 课程相关通知（预留）
         # 'camp'    — 营期通知（请假审批/奖励发放/考勤提醒等）
         # 'gratitude' — 感谢信送达提醒（source_id 指向 gratitude 表）
+        # 'work'    — 内部工作台（source_id 指向 work_item；最小信息原则，不含受限正文）
     camp_session_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
     source_type = db.Column(db.String(20), nullable=True)
-        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin', 'reward', 'join_request', 'gratitude'
+        # 触发来源：'leave', 'task', 'homework', 'notice', 'admin', 'reward', 'join_request', 'gratitude',
+        #           'work_item'（内部工作台事项，前端 notificationTarget 解析深链 /work/items/{id}）
     source_id = db.Column(db.Integer, nullable=True)
         # 关联的原始记录 ID（如请假ID、任务ID）
     group_id = db.Column(db.Integer, nullable=True, index=True)
@@ -2366,3 +2368,384 @@ class FeedbackTicketEvent(db.Model):
     to_status = db.Column(db.String(20), nullable=True)
     metadata_json = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 内部工作台·社团协作与工作留痕（2026-09-28 设计方案，feature/work-collab，migrate_58）
+# 依托现有社团组织框架（ClubGroup/ClubOfficer/ClubMembership）建独立授权层，
+# 不写回 UserModel.role、不用职位/sort_rank/徽标判权（方案 §5.1）。
+# 时间约定：与全库一致 naive Asia/Shanghai（方案 §8.5 写 UTC，为避免跨模块换算税
+# 统一本库约定，偏差已记录于迁移说明；仅日期截止=当天 23:59:59 由应用层写入）。
+# FK 策略：模块内结构引用真 FK；user_id/操作人/事件引用裸 Integer（留痕行跨人员
+# 变动存活，NotificationModel.user_id / ClubOfficer.appointed_by 先例）。
+# ═══════════════════════════════════════════════════════════════
+
+class WorkWorkspace(db.Model):
+    """组工作区：一个启用组别最多一个（club_group_id 唯一），只存协作配置，
+    不复制组名/父组/成员名单（组织事实归 club_* 表，方案 §4.2）。"""
+    __tablename__ = 'work_workspace'
+    id = db.Column(db.Integer, primary_key=True)
+    club_group_id = db.Column(db.Integer, db.ForeignKey('club_group.id'),
+                              nullable=False, unique=True, index=True)
+    status = db.Column(db.String(20), nullable=False, default='active', index=True)
+        # active / disabled（停用=入口只读关闸，数据与授权记录保留，D04）
+    default_reviewer_user_id = db.Column(db.Integer)             # 默认验收人建议（选填）
+    config_json = db.Column(db.Text)                             # 值班时段/提醒窗口/配额覆盖
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class WorkAccessGrant(db.Model):
+    """协作授权（方案 §5.1）。资格（组织身份）≠授权：本表才是操作权限的真相源。
+    有效性=每请求实时判定（services/work/access.py）：status/有效期 + 来源行仍匹配——
+    officer 来源要求任职仍 active 且在任期内（到期即失效，不等定时卸任）；
+    membership 来源要求归属行仍在授权时快照的组（A06 防原地改组带权漂移）。
+    岗位模板仅三值，不做任意权限表达式。"""
+    __tablename__ = 'work_access_grant'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False)
+        # member（本组工作人员）/ coordinator（本组协调员）/ governance（授权治理，全局）
+    workspace_id = db.Column(db.Integer, db.ForeignKey('work_workspace.id'),
+                             nullable=True, index=True)          # governance 授权为 NULL=全局
+    source_type = db.Column(db.String(20), nullable=False)       # officer / membership / direct
+    source_id = db.Column(db.Integer, nullable=True)             # officer_id 或 membership_id；direct 为空
+    group_id_snapshot = db.Column(db.Integer, nullable=True)     # membership 来源必填：授权时组快照
+    valid_from = db.Column(db.Date, nullable=True)               # 空=即时生效
+    valid_until = db.Column(db.Date, nullable=True)              # 空=不限期（覆盖任期判断）
+    status = db.Column(db.String(20), nullable=False, default='active', index=True)
+        # active / revoked
+    revoke_reason = db.Column(db.String(200))
+    granted_by = db.Column(db.Integer, nullable=False)           # 操作人留痕（非 FK）
+    grant_reason = db.Column(db.String(200), nullable=False)     # 授权原因（方案 §5.4 必填）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.Index('ix_work_access_grant_ws_role', 'workspace_id', 'role'),
+    )
+
+
+class WorkItem(db.Model):
+    """工作事项（话题与任务同构，方案 §7/§8）：kind 区分合法状态集——
+    topic: draft/open/closed；task: draft/todo/in_progress/blocked/review/done/cancelled。
+    话题转任务保留原 ID 与讨论（promote 同事务切换 kind/status，B04）。"""
+    __tablename__ = 'work_item'
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey('work_workspace.id'),
+                             nullable=False, index=True)
+    kind = db.Column(db.String(10), nullable=False)              # topic / task
+    title = db.Column(db.String(200), nullable=False)
+    body = db.Column(db.Text)                                    # markdown（服务端 nh3 清洗后存储）
+    visibility = db.Column(db.String(20), nullable=False, default='workspace', index=True)
+        # workspace（本工作区可见）/ participants（仅指定参与人，协调员无天然阅读权）
+    status = db.Column(db.String(20), nullable=False, default='draft', index=True)
+    created_by = db.Column(db.Integer, nullable=False, index=True)
+    version = db.Column(db.Integer, nullable=False, default=1)   # 乐观锁（expected_version）
+    idempotency_key = db.Column(db.String(64), nullable=True)    # 创建幂等键
+    promoted_at = db.Column(db.DateTime, nullable=True)          # 话题转任务时刻
+    closed_reason = db.Column(db.String(200))
+    last_reply_seq = db.Column(db.Integer, nullable=False, default=0)  # 回复序号水位
+    last_activity_at = db.Column(db.DateTime, default=datetime.now, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('idempotency_key', name='uq_work_item_idem'),
+        db.Index('ix_work_item_ws_kind_status', 'workspace_id', 'kind', 'status'),
+    )
+
+
+class WorkItemParticipant(db.Model):
+    """事项参与关系（协作者/观察者）。参与关系不越过有效协作资格（邀请时校验）；
+    同一用户不重复激活：重邀原地复活（removed_at 置空，ClubMembership 覆盖先例）。"""
+    __tablename__ = 'work_item_participant'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    ptype = db.Column(db.String(20), nullable=False, default='collaborator')
+        # collaborator / reviewer / observer
+    invited_by = db.Column(db.Integer, nullable=True)
+    joined_at = db.Column(db.DateTime, default=datetime.now)
+    removed_at = db.Column(db.DateTime, nullable=True)
+    __table_args__ = (
+        db.UniqueConstraint('item_id', 'user_id', name='uq_work_item_participant_item_user'),
+    )
+
+
+class WorkTask(db.Model):
+    """任务属性（与 work_item 一对一）。负责人唯一；草稿允许缺负责人/时限，
+    发布前必须补齐（应用层）。due_at 为逾期计算源（逾期≠状态，方案 §8.2）。"""
+    __tablename__ = 'work_task'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, unique=True)
+    assignee_user_id = db.Column(db.Integer, nullable=True, index=True)
+    reviewer_user_id = db.Column(db.Integer, nullable=True, index=True)   # 指定验收人（选填）
+    start_at = db.Column(db.DateTime, nullable=True)
+    due_at = db.Column(db.DateTime, nullable=True, index=True)
+    priority = db.Column(db.String(20), nullable=False, default='normal')  # normal / high / urgent
+    accept_criteria = db.Column(db.Text)                         # 验收标准
+    published_at = db.Column(db.DateTime, nullable=True)
+    last_accepted_submission_id = db.Column(db.Integer, nullable=True)    # 冗余：最近通过提交
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class WorkReply(db.Model):
+    """事项回复（单层时间线，可引用同事项另一条）。撤回=removed_at 置位留占位
+    不回正文；编辑走 work_reply_revision 留修订史（超窗只能追加更正）。
+    client_request_id 按发送者幂等（B01：网络重试不生成重复回复）。"""
+    __tablename__ = 'work_reply'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    seq = db.Column(db.Integer, nullable=False)                  # 事项内单调递增（服务器分配）
+    author_id = db.Column(db.Integer, nullable=False, index=True)
+    body = db.Column(db.Text, nullable=False)                    # 纯文本（首期）
+    reply_to_id = db.Column(db.Integer, db.ForeignKey('work_reply.id'), nullable=True)
+    client_request_id = db.Column(db.String(64), nullable=False)
+    edited_at = db.Column(db.DateTime, nullable=True)
+    removed_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, index=True)
+    __table_args__ = (
+        db.UniqueConstraint('item_id', 'seq', name='uq_work_reply_item_seq'),
+        db.UniqueConstraint('author_id', 'client_request_id', name='uq_work_reply_author_request'),
+    )
+
+
+class WorkReplyRevision(db.Model):
+    """回复修订史：编辑窗口内的历史版本全量留存，正文列只存当前值。"""
+    __tablename__ = 'work_reply_revision'
+    id = db.Column(db.Integer, primary_key=True)
+    reply_id = db.Column(db.Integer, db.ForeignKey('work_reply.id'), nullable=False, index=True)
+    seq = db.Column(db.Integer, nullable=False)                  # 同回复内递增
+    body = db.Column(db.Text, nullable=False)                    # 修订前正文
+    edited_by = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('reply_id', 'seq', name='uq_work_reply_revision_reply_seq'),
+    )
+
+
+class WorkResponseRequest(db.Model):
+    """待回应请求（方案 §7.2）：明确要求某人回应时才建，已读≠回应。
+    创建/回复同事务维护状态。"""
+    __tablename__ = 'work_response_request'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    reply_id = db.Column(db.Integer, nullable=True)              # 挂在某条回复上（选填）
+    responder_user_id = db.Column(db.Integer, nullable=False, index=True)
+    due_at = db.Column(db.DateTime, nullable=True)               # 建议回复时限
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+        # pending / responded / declined / expired / cancelled
+    response_reply_id = db.Column(db.Integer, nullable=True)     # 回应回复（responded 时）
+    created_by = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    responded_at = db.Column(db.DateTime, nullable=True)
+
+
+class WorkTransferRequest(db.Model):
+    """负责人转交请求（方案 §8.4）：目标明确接手后才替换负责人；
+    「同事项仅一个待确认」由应用层 FOR UPDATE 锁事项行保证（MySQL 无部分唯一索引）。"""
+    __tablename__ = 'work_transfer_request'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    from_user_id = db.Column(db.Integer, nullable=False)
+    to_user_id = db.Column(db.Integer, nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+        # pending / accepted / rejected / withdrawn / expired
+    reason = db.Column(db.String(200))
+    expires_at = db.Column(db.DateTime, nullable=False)
+    item_version = db.Column(db.Integer, nullable=False)         # 发起时事项版本（过期判定参考）
+    decided_at = db.Column(db.DateTime, nullable=True)
+    created_by = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class WorkSubmission(db.Model):
+    """任务交付提交：每次提交不可覆盖；验收决策绑定具体提交行（B05——交付文件
+    经 work_file_link(purpose=submission_result) 固定版本，验收后内容不可被悄悄替换）。"""
+    __tablename__ = 'work_submission'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    seq = db.Column(db.Integer, nullable=False)
+    submitted_by = db.Column(db.Integer, nullable=False)
+    result_note = db.Column(db.Text)                             # 结果说明
+    decision = db.Column(db.String(20), nullable=True)           # accepted / returned（空=待验收）
+    decided_by = db.Column(db.Integer, nullable=True)
+    decided_at = db.Column(db.DateTime, nullable=True)
+    decision_note = db.Column(db.Text)                           # 退回原因（退回必填）
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('item_id', 'seq', name='uq_work_submission_item_seq'),
+    )
+
+
+class WorkEvent(db.Model):
+    """工作时间线（方案 §10.1）：不可变追加记录，与业务变更同事务落库；
+    对话可修订、事件只追加。actor_snapshot 存操作时职位/组快照（换届后仍可解释
+    「当时为什么有权」）。"""
+    __tablename__ = 'work_event'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    seq = db.Column(db.Integer, nullable=False)                  # 事项内事件序号唯一
+    actor_user_id = db.Column(db.Integer, nullable=True)         # 空=系统后台动作
+    actor_snapshot = db.Column(db.String(200), nullable=True)    # 操作时身份快照（职位·组）
+    event_type = db.Column(db.String(30), nullable=False)
+        # created/published/edited/replied/closed/reopened/promoted/assigned/transfer_requested/
+        # transfer_accepted/status_changed/due_changed/priority_changed/submitted/reviewed/
+        # participant_added/participant_removed/file_attached/visibility_changed/emergency_access
+    diff_json = db.Column(db.Text)                               # 前后差异（最小字段）
+    reason = db.Column(db.String(200))
+    request_id = db.Column(db.String(64))                        # 幂等/追踪
+    created_at = db.Column(db.DateTime, default=datetime.now, index=True)
+    __table_args__ = (
+        db.UniqueConstraint('item_id', 'seq', name='uq_work_event_item_seq'),
+    )
+
+
+class WorkReadState(db.Model):
+    """已读游标（按人×事项）：只进不退，服务端校验不得越过本人可见最大 seq。"""
+    __tablename__ = 'work_read_state'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    last_read_seq = db.Column(db.Integer, nullable=False, default=0)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'item_id', name='uq_work_read_state_user_item'),
+    )
+
+
+class WorkFile(db.Model):
+    """私有工作文件（逻辑文件）：属于事项（首期必挂事项，方案 §9.1），非个人网盘；
+    本体在 storage 私有命名空间（work/ 前缀不经 /media 公开链路）。"""
+    __tablename__ = 'work_file'
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey('work_workspace.id'), nullable=False, index=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    display_name = db.Column(db.String(200), nullable=False)     # 显示名（存储键服务端生成）
+    status = db.Column(db.String(20), nullable=False, default='uploading', index=True)
+        # uploading / active / quarantined / removed
+    current_version_id = db.Column(db.Integer, nullable=True)    # 裸引用避免与版本表循环 FK
+    created_by = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class WorkFileVersion(db.Model):
+    """文件版本（不可变）：上传新版本生成新行不覆盖旧文件；格式校验与病毒扫描
+    状态分开保存（首期未启用扫描=not_required，状态位先行，方案 §9.2）。"""
+    __tablename__ = 'work_file_version'
+    id = db.Column(db.Integer, primary_key=True)
+    file_id = db.Column(db.Integer, db.ForeignKey('work_file.id'), nullable=False, index=True)
+    version_no = db.Column(db.Integer, nullable=False)           # 同文件内递增
+    object_key = db.Column(db.String(300), nullable=False)       # work/files/{item}/{file}/v{n}_{uuid}{ext}
+    size = db.Column(db.Integer, nullable=False, default=0)
+    content_type = db.Column(db.String(100))
+    checksum_sha256 = db.Column(db.String(64), nullable=True)
+    format_check = db.Column(db.String(20), nullable=False, default='pending')
+        # pending / passed / failed（扩展名∩魔数∩声明类型交叉）
+    scan_status = db.Column(db.String(20), nullable=False, default='not_required')
+        # not_required / pending / passed / failed
+    detect_rules_version = db.Column(db.String(20), nullable=True)
+    uploaded_by = db.Column(db.Integer, nullable=False)
+    prev_version_id = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('object_key', name='uq_work_file_version_key'),
+        db.UniqueConstraint('file_id', 'version_no', name='uq_work_file_version_file_no'),
+    )
+
+
+class WorkFileLink(db.Model):
+    """文件引用（显式外键，方案 §9.5）：附件归属事项；交付固定版本（submission
+    用途 version_id 必填）。下载按「本次关联」判权，不因上传者是本人放行。"""
+    __tablename__ = 'work_file_link'
+    id = db.Column(db.Integer, primary_key=True)
+    file_id = db.Column(db.Integer, db.ForeignKey('work_file.id'), nullable=False, index=True)
+    version_id = db.Column(db.Integer, nullable=True)            # NULL=跟随最新；submission 用途必填
+    target_type = db.Column(db.String(20), nullable=False)       # item / submission（白名单）
+    target_id = db.Column(db.Integer, nullable=False)
+    purpose = db.Column(db.String(20), nullable=False, default='attachment')
+        # attachment / submission_result
+    shared_from_link_id = db.Column(db.Integer, nullable=True)   # 授权转交来源（后续阶段）
+    created_by = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class WorkNotificationReceipt(db.Model):
+    """工作通知回执：事件×接收人×类型数据库去重（超时重试不产生重复提醒，
+    方案 §10.2）。与业务变更同事务写入。"""
+    __tablename__ = 'work_notification_receipt'
+    id = db.Column(db.Integer, primary_key=True)
+    event_id = db.Column(db.Integer, nullable=False, index=True)  # 裸引用（与事件同事务）
+    user_id = db.Column(db.Integer, nullable=False)
+    notify_type = db.Column(db.String(30), nullable=False)
+        # reply_to_me/response_requested/mentioned/assigned/transfer_pending/review_requested/
+        # status_changed/due_soon/overdue/follow_up
+    notification_id = db.Column(db.Integer, nullable=True)        # 生成的通知行
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('event_id', 'user_id', 'notify_type',
+                            name='uq_work_notification_receipt_dedupe'),
+    )
+
+
+class WorkReminder(db.Model):
+    """持久提醒（方案 §10.3）：任务改期/完成/换人时旧提醒按版本自然失效
+    （regenerate 取消旧 pending 后按新版本写入）；扫描器原子认领、重启可恢复。
+    object_version 语义随 slot：due_soon/overdue/follow_up=事项 version；
+    response_due=回应请求 id。"""
+    __tablename__ = 'work_reminder'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    slot = db.Column(db.String(20), nullable=False)
+        # due_soon / overdue / follow_up / response_due
+    object_version = db.Column(db.Integer, nullable=False)
+    trigger_at = db.Column(db.DateTime, nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+        # pending / claimed / sent / failed / cancelled
+    retry_count = db.Column(db.Integer, nullable=False, default=0)
+    next_retry_at = db.Column(db.DateTime, nullable=True)
+    claimed_at = db.Column(db.DateTime, nullable=True)           # 认领超时回收依据（C04）
+    sent_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('item_id', 'user_id', 'slot', 'object_version',
+                            name='uq_work_reminder_dedupe'),
+    )
+
+
+class ClubOrgEvent(db.Model):
+    """组织变更事件（方案 §3.3/§17.1）：ClubMembership 原地覆盖无历史，本表补
+    变更留痕，供授权解释与交接还原。由 club_admin/officers 集中挂钩写入（同事务）。"""
+    __tablename__ = 'club_org_event'
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(30), nullable=False, index=True)
+        # membership_set / membership_batch / group_archived / officer_appointed /
+        # officer_edited / officer_ended
+    user_id = db.Column(db.Integer, nullable=True, index=True)
+    membership_id = db.Column(db.Integer, nullable=True)
+    officer_id = db.Column(db.Integer, nullable=True)
+    from_group_id = db.Column(db.Integer, nullable=True)
+    to_group_id = db.Column(db.Integer, nullable=True)
+    operator_id = db.Column(db.Integer, nullable=True)
+    detail_json = db.Column(db.Text)
+    occurred_at = db.Column(db.DateTime, default=datetime.now, index=True)
+
+
+class WorkBusinessLink(db.Model):
+    """业务关联（方案 §11.3）：只读投影，关联不授予原业务权限、完成不自动改变
+    原业务。source_type 白名单（course/camp_session/feedback_ticket），服务层验证
+    目标存在与访问权，不接受任意表名。"""
+    __tablename__ = 'work_business_link'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    source_type = db.Column(db.String(30), nullable=False)
+    source_id = db.Column(db.Integer, nullable=False)
+    relation = db.Column(db.String(20), nullable=False, default='related')
+    created_by = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('item_id', 'source_type', 'source_id',
+                            name='uq_work_business_link_unique'),
+    )

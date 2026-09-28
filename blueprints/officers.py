@@ -20,6 +20,7 @@ from flask_jwt_extended import jwt_required
 from exts import db
 from models import UserModel, ClubOfficer, ClubPosition, ClubGroup, ClubMembership
 from . import check_permission, audit_log, _current_user
+from services.work.events import record_org_event
 
 bp = Blueprint("officers", __name__, url_prefix="/admin/officers")
 
@@ -337,6 +338,11 @@ def appoint_officer():
         appointed_by=current.id if current else None,
     )
     db.session.add(officer)
+    db.session.flush()          # 拿 id 供组织事件留痕
+    record_org_event('officer_appointed', user_id=user.id, officer_id=officer.id,
+                     to_group_id=officer.group_id,
+                     operator_id=current.id if current else None,
+                     detail={'title': pos.name})
     db.session.commit()
     return jsonify({"code": 200, "message": f"已任命 {user.username} 为 {pos.name}",
                     "data": _officer_dict(officer, user)})
@@ -433,6 +439,10 @@ def edit_officer(officer_id):
         return jsonify({"code": 404, "message": "任职记录不存在"}), 404
     data = request.get_json(silent=True) or {}
 
+    # 编辑前快照：组织事件留痕用（换届后仍可解释「当时为什么有权」，§10.1）
+    before = {'title': officer.title, 'group_id': officer.group_id,
+              'term_start': str(officer.term_start), 'term_end': str(officer.term_end or ''),
+              'end_reason': officer.end_reason or ''}
     if officer.status == 'active':
         # 入参只认一种轨道：显式 id 优先；传名则不带旧 id（否则 id 解析会盖掉改名入参）；
         # 都不传回落当前值（组转原组名解析）。department 显式 null = 清空（不挂组职位）。
@@ -483,6 +493,16 @@ def edit_officer(officer_id):
         if "end_reason" in data:
             officer.end_reason = (str(data.get("end_reason") or "").strip() or None)
 
+    current = _current_user()
+    after = {'title': officer.title, 'group_id': officer.group_id,
+             'term_start': str(officer.term_start), 'term_end': str(officer.term_end or ''),
+             'end_reason': officer.end_reason or ''}
+    changed = {k: {'from': before[k], 'to': after[k]} for k in before if before[k] != after[k]}
+    if changed:
+        record_org_event('officer_edited', user_id=officer.user_id, officer_id=officer.id,
+                         from_group_id=before['group_id'], to_group_id=officer.group_id,
+                         operator_id=current.id if current else None,
+                         detail={'changes': changed})
     db.session.commit()
     user = UserModel.query.get(officer.user_id)
     return jsonify({"code": 200, "message": "任职信息已更新", "data": _officer_dict(officer, user)})
@@ -519,6 +539,10 @@ def end_officer(officer_id):
     officer.term_end = term_end
     officer.end_reason = reason
     officer.ended_by = current.id if current else None
+    record_org_event('officer_ended', user_id=officer.user_id, officer_id=officer.id,
+                     from_group_id=officer.group_id,
+                     operator_id=current.id if current else None,
+                     detail={'term_end': str(term_end), 'reason': reason})
     db.session.commit()
     user = UserModel.query.get(officer.user_id)
     return jsonify({"code": 200, "message": "已卸任（记录保留）", "data": _officer_dict(officer, user)})
