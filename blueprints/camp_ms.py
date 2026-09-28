@@ -220,6 +220,16 @@ def _apply_ms_fields(camp, d):
             camp.ms_tags = None
 
 
+def _validate_directions(camp):
+    """方向定义完整性（2026-09-28 方向解耦）：与选导生开关正交——只要配了方向，
+    无论是否启用选导生，每个方向至少绑定一门有效课程（0 方向是否允许由调用方
+    按启用态自行拦截）。"""
+    for d in _ms_directions(camp):
+        if not d["course_ids"]:
+            return f"分类「{d['name']}」未关联有效课程（方向制：每个方向至少绑定一门课程）"
+    return None
+
+
 def _validate_ms(camp):
     """选导生配置校验（create/update 存库前调用）。返回 None 或错误 message。
     09-12 时间统领拍板：选导生是营期的第一个阶段——志愿时间窗必须落在营期起止之内
@@ -243,10 +253,7 @@ def _validate_ms(camp):
     dirs = _ms_directions(camp)
     if not dirs:
         return "启用选导生需至少配置一个分类方向"
-    for d in dirs:
-        if not d["course_ids"]:
-            return f"分类「{d['name']}」未关联有效课程（方向制：每个方向至少绑定一门课程）"
-    return None
+    return _validate_directions(camp)
 
 
 def _ms_phase(camp, now=None):

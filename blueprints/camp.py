@@ -23,7 +23,7 @@ from models import (
     CampSeat, CampLeave, CampJoinRequest, CheckRecord, CourseModel, UserCourseModel,
     MedalModel, MedalUserModel, UserModel, SeatModel, CampStaff, CampMemberEvent,
     CampAttendanceChange,
-    CampMentorProfile, CampMentorPreference, CampMentorMatch,
+    CampMentorProfile, CampMentorPreference, CampMentorMatch, CampCourseAssignment,
     CampChapterCertification, CampChapterMaterial, CampLearningProgress,
     Chapter, LessonModel, LearningProgressModel,
     CampUnit, ProjectApplicationVersion, CampMilestone, CampSubmissionVersion,
@@ -35,9 +35,10 @@ from . import camp_role, audit_log, _current_user
 from .notification import create_notification
 from .camp_staff import (camp_access, camp_staff_row, camp_responsible_ids,
                          has_camp_access, staff_permissions)
-from .camp_ms import (_apply_ms_fields, _validate_ms, _ms_dict, _ms_phase, _ms_tags_list,
+from .camp_ms import (_apply_ms_fields, _validate_ms, _validate_directions, _ms_dict,
+                      _ms_phase, _ms_tags_list,
                       _ms_directions, _inherit_direction_course)
-from .camp_course_assign import end_member_assignments
+from .camp_course_assign import upsert_assignment, end_member_assignments
 
 bp = Blueprint("camp", __name__, url_prefix="/camp")
 
@@ -870,16 +871,23 @@ def session_update(sid):
         db.session.rollback()
         return jsonify({"code": 400, "message": "开始日期不能晚于结束日期"}), 400
     # 选导生配置（部分更新：只处理出现的键）；改过则重置过渡通知游标（见 _maybe_notify_transition）
-    ms_touched = any(k in d for k in (
+    # 2026-09-28 方向解耦：流程键（开关/时间窗）仍是开营前配置；方向定义（ms_tags）
+    # 是教学内容——running 期放行（B5 传播已有），仅 archived 锁。此前 ms_tags 与流程键
+    # 一起被锁进 draft/upcoming，导致前端"开跑后改课程绑定"入口必 409（前后端脱节）。
+    ms_flow_touched = any(k in d for k in (
         "mentor_selection_enabled", "ms_preference_start", "ms_preference_deadline",
-        "ms_round1_deadline", "ms_round2_deadline", "ms_tags"))
-    # 阶段守卫（2026-09-21 收缩）：选导生配置只能开营前改——running 起流程已结束、
-    # archived 只读；阶段冲突给 409（非 401/403，防前端误判登录失效）
-    if ms_touched and camp.status in ('running', 'archived'):
+        "ms_round1_deadline", "ms_round2_deadline"))
+    ms_tags_touched = "ms_tags" in d
+    ms_touched = ms_flow_touched or ms_tags_touched
+    # 阶段守卫（2026-09-21 收缩，09-28 按键拆分）：阶段冲突给 409（非 401/403，防前端误判登录失效）
+    if ms_flow_touched and camp.status in ('running', 'archived'):
         db.session.rollback()
         return jsonify({"code": 409, "message": (
             f"选导生配置仅限开营前修改：营期当前为「"
             f"{'进行中' if camp.status == 'running' else '已结营'}」，选导生流程已结束")}), 409
+    if ms_tags_touched and camp.status == 'archived':
+        db.session.rollback()
+        return jsonify({"code": 409, "message": "营期已结营，方向配置只读"}), 409
     old_ms_tags = camp.ms_tags                    # 方向课程变更传播的前值快照（B5）
     propagated = 0
     if ms_touched:
@@ -888,7 +896,8 @@ def session_update(sid):
         except (ValueError, TypeError) as e:
             db.session.rollback()
             return jsonify({"code": 400, "message": f"参数格式错误: {e}"}), 400
-        err = _validate_ms(camp)
+        # 方向完整性独立校验（09-28 解耦）：未启用选导生的营配了方向同样要完整
+        err = _validate_ms(camp) or _validate_directions(camp)
         if err:
             db.session.rollback()
             return jsonify({"code": 400, "message": err}), 400
@@ -1182,9 +1191,24 @@ def member_list(sid):
     page = max(1, int(request.args.get("page", 1))) if paged else 1
     page_size = min(100, max(1, int(request.args.get("page_size", 20)))) if paged else 0
 
+    # 方向解耦（09-28）：mentor 行带名片方向（管理端成员页方向列数据源）；
+    # 批量查一次名片，无 N+1。学员行不带——前端按 team_mentor_id 映射导生方向。
+    mentor_uids = {m.user_id for m, _ in rows if m.role == 'mentor'}
+    _dir_by_uid = {}
+    if mentor_uids:
+        for p in CampMentorProfile.query.filter(
+                CampMentorProfile.camp_session_id == sid,
+                CampMentorProfile.user_id.in_(mentor_uids)).all():
+            try:
+                t = json.loads(p.tags) if p.tags else None
+            except (ValueError, TypeError):
+                t = None
+            if isinstance(t, list) and t:
+                _dir_by_uid[p.user_id] = str(t[0])
     data = [{
             "user_id": m.user_id, "username": u.username,
             "role": m.role, "team_mentor_id": m.team_mentor_id,
+            "direction": _dir_by_uid.get(m.user_id) if m.role == 'mentor' else None,
             "joined_at": m.joined_at.isoformat() if m.joined_at else None,
             "status": m.status,
             "ended_at": m.ended_at.isoformat() if m.ended_at else None,
@@ -2581,6 +2605,214 @@ def member_update(sid, uid):
     return jsonify({"code": 200, "message": "已更新"})
 
 
+@bp.route("/sessions/<int:sid>/mentor-direction", methods=["PUT"])
+@jwt_required()
+@camp_access('member.manage')
+@audit_log(operation="设置导生方向")
+def mentor_direction_set(sid):
+    """管理员/负责人代设导生方向（2026-09-28 方向解耦）：方向真相仍落名片 tags[0]
+    （_direction_of_mentor / 继承 / 看板等全下游读取链零改动）；未启用选导生的营
+    也可用（不开流程只走方向制）。导生本人在名片可编辑窗口内仍可自改
+    （last-write-wins，用户拍板）。方向变更后名下学员按「只增不减」补入读新方向
+    课程（对齐 B5 传播语义，旧课保留学习历史）。
+    body: {"user_id": int, "direction": "方向名"}"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
+    d = request.json or {}
+    try:
+        uid = int(d.get("user_id"))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "缺少有效 user_id"}), 400
+    direction = str(d.get("direction") or "").strip()
+    m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
+    if not m or m.role != 'mentor':
+        return jsonify({"code": 400, "message": "仅本营导生可设置方向"}), 400
+    directions = _ms_directions(camp)
+    # 只认绑定了课程的方向：ms_tags 未配置时 _ms_directions 会回落营级默认标签集
+    # （legacy 容忍，无课程），设到那种"幽灵方向"学员学不到课——一并拦下
+    named = {d_["name"]: d_ for d_ in directions if d_["course_ids"]}
+    if not named:
+        return jsonify({"code": 400, "message": "本营尚未配置有效的学习方向（需绑定课程），请先在营期设置中配置"}), 400
+    if direction not in named:
+        return jsonify({"code": 400, "message": "方向须为本营已配置的方向之一"}), 400
+    profile = CampMentorProfile.query.filter_by(camp_session_id=sid, user_id=uid).first()
+    old_dir = None
+    if profile and profile.tags:
+        try:
+            t = json.loads(profile.tags)
+            if isinstance(t, list) and t:
+                old_dir = str(t[0])
+        except (ValueError, TypeError):
+            old_dir = None
+    if old_dir == direction:
+        return jsonify({"code": 200, "message": "方向未变化", "propagated": 0})
+    if not profile:
+        # 未启用选导生的营没有名片自助入口：此处代建最小名片行（bio 空/名额不限），
+        # UQ(camp,user) 由查询+insert 竞态兜底（管理端低频操作，撞唯一键整体 400 可重试）
+        profile = CampMentorProfile(camp_session_id=sid, user_id=uid, capacity=None)
+        db.session.add(profile)
+    profile.tags = json.dumps([direction], ensure_ascii=False)
+
+    # 方向变更传播（只增不减）：名下学员补入读新方向课程（_inherit 幂等——已在修
+    # 的课复用全局行、ended 分配行复活；旧方向课不动）；实际新增的学员聚一条通知
+    new_cids = named[direction]["course_ids"]
+    propagated = 0
+    for s in CampMember.query.filter_by(
+            camp_session_id=sid, role='student', team_mentor_id=uid).all():
+        existing = {r.course_id for r in CampCourseAssignment.query.filter_by(
+            camp_session_id=sid, student_user_id=s.user_id,
+            status=CampCourseAssignment.STATUS_ACTIVE).all()}
+        added = [cid for cid in new_cids if cid not in existing]
+        _inherit_direction_course(camp, s.user_id, uid)
+        if not added:
+            continue
+        titles = [c.title for c in CourseModel.query.filter(
+            CourseModel.id.in_(added)).all()] or [str(cid) for cid in added]
+        propagated += 1
+        create_notification(
+            s.user_id, "学习方向课程已更新",
+            f"你在「{camp.name}」的导生方向已调整为「{direction}」，"
+            f"已为你加入该方向的课程：{'、'.join(titles)}。",
+            category='camp', source_type='camp_course',
+            source_id=camp.id, camp_session_id=camp.id)
+    operator = _current_user()
+    create_notification(
+        uid, "你的方向已被设置",
+        f"管理员/老师将你在「{camp.name}」的学习方向设置为「{direction}」"
+        f"（原方向：{old_dir or '未设置'}）。如需调整请在名片编辑窗口内自行修改。",
+        category='camp', source_type='camp_session', source_id=sid, camp_session_id=sid)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已设置", "propagated": propagated})
+
+
+def _camp_course_catalog_ids(camp):
+    """营期可选课程目录（手动入课的合法范围）：learning=分类方向派生（与
+    course_list 同口径），project=CampCourse 绑定目录。"""
+    if camp.category == 'learning':
+        seen = set()
+        for d_ in _ms_directions(camp):
+            seen.update(d_["course_ids"])
+        return seen
+    return {cc.course_id for cc in CampCourse.query.filter_by(camp_session_id=camp.id).all()}
+
+
+@bp.route("/sessions/<int:sid>/course-assign", methods=["GET"])
+@jwt_required()
+@camp_access('member.manage')
+def course_assign_list(sid):
+    """学员在本营的修读清单（管理端「调整课程」对话框数据源）：active 分配行
+    + 课程名 + 来源（direction=方向继承 / manual=手动入课）。?user_id=<int>"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    try:
+        uid = int(request.args.get("user_id"))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "缺少有效 user_id"}), 400
+    rows = (CampCourseAssignment.query.filter_by(
+        camp_session_id=sid, student_user_id=uid,
+        status=CampCourseAssignment.STATUS_ACTIVE)
+        .order_by(CampCourseAssignment.assigned_at, CampCourseAssignment.id).all())
+    titles = {c.id: c.title for c in CourseModel.query.filter(
+        CourseModel.id.in_([r.course_id for r in rows])).all()} if rows else {}
+    return jsonify({"code": 200, "items": [{
+        "course_id": r.course_id,
+        "title": titles.get(r.course_id, f"#{r.course_id}"),
+        "source_type": r.source_type,
+        "assigned_at": r.assigned_at.isoformat() if r.assigned_at else None,
+    } for r in rows]})
+
+
+@bp.route("/sessions/<int:sid>/course-assign", methods=["POST"])
+@jwt_required()
+@camp_access('member.manage')
+@audit_log(operation="手动入读课程")
+def course_assign_add(sid):
+    """管理员/负责人给学员手动入课（2026-09-28 方向解耦补位）：方向继承之外的
+    个别纠偏/加课通道。body: {"user_id": int, "course_id": int}。
+    UserCourse 全局行复用/新建（dropped 拉回在读），分配行 source_type='manual'。"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
+    d = request.json or {}
+    try:
+        uid, cid = int(d.get("user_id")), int(d.get("course_id"))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "缺少有效 user_id / course_id"}), 400
+    m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
+    if not m or m.role != 'student':
+        return jsonify({"code": 400, "message": "仅本营学员可手动入课"}), 400
+    course = CourseModel.query.get(cid)
+    if not course:
+        return jsonify({"code": 404, "message": "课程不存在"}), 404
+    if cid not in _camp_course_catalog_ids(camp):
+        return jsonify({"code": 400, "message": "该课程不在本营课程目录内（培训营目录由方向派生）"}), 400
+    uc = UserCourseModel.query.filter_by(user_id=uid, course_id=cid).first()
+    if uc:
+        if uc.status == UserCourseModel.STATUS_DROPPED:   # 曾退课拉回在读（与方向继承同口径）
+            uc.status = UserCourseModel.STATUS_ACTIVE
+    else:
+        db.session.add(UserCourseModel(user_id=uid, course_id=cid,
+                                       status=UserCourseModel.STATUS_ACTIVE))
+    upsert_assignment(camp, uid, cid,
+                      source_type='manual', source_ref_id=_current_user().id)
+    create_notification(
+        uid, "老师为你添加了课程",
+        f"「{camp.name}」的老师为你添加了课程「{course.title}」，请开始学习。",
+        category='camp', source_type='camp_course',
+        source_id=camp.id, camp_session_id=camp.id)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已入课"})
+
+
+@bp.route("/sessions/<int:sid>/course-assign", methods=["DELETE"])
+@jwt_required()
+@camp_access('member.manage')
+@audit_log(operation="移除营期修读课程")
+def course_assign_remove(sid):
+    """移除学员在本营的修读（方向继承与手动入课通用）：本营分配行置 ended；
+    UserCourse 全局行仅当其他营也无 active 分配且未学完时置 dropped
+    （completed 不降级；跨营在修不动——对齐「学习历史保留」口径）。
+    body: {"user_id": int, "course_id": int}"""
+    camp = CampSession.query.get(sid)
+    if not camp:
+        return jsonify({"code": 404, "message": "营期不存在"}), 404
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
+    d = request.json or {}
+    try:
+        uid, cid = int(d.get("user_id")), int(d.get("course_id"))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "缺少有效 user_id / course_id"}), 400
+    row = CampCourseAssignment.query.filter_by(
+        camp_session_id=sid, student_user_id=uid,
+        course_id=cid, status=CampCourseAssignment.STATUS_ACTIVE).first()
+    if not row:
+        return jsonify({"code": 400, "message": "该学员未在本营修读此课程"}), 400
+    row.status = CampCourseAssignment.STATUS_ENDED
+    row.ended_at = datetime.now()
+    still_active_elsewhere = CampCourseAssignment.query.filter(
+        CampCourseAssignment.student_user_id == uid,
+        CampCourseAssignment.course_id == cid,
+        CampCourseAssignment.status == CampCourseAssignment.STATUS_ACTIVE).first() is not None
+    uc = UserCourseModel.query.filter_by(user_id=uid, course_id=cid).first()
+    if uc and not still_active_elsewhere and uc.status == UserCourseModel.STATUS_ACTIVE:
+        uc.status = UserCourseModel.STATUS_DROPPED
+    course = CourseModel.query.get(cid)
+    create_notification(
+        uid, "营期课程已移除",
+        f"「{camp.name}」的老师移除了你的课程「{course.title if course else cid}」。",
+        category='camp', source_type='camp_course',
+        source_id=camp.id, camp_session_id=camp.id)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已移除"})
+
+
 # ─────────────────────────────────────────────
 # 方向制学习（2026-09-12，migrate_24）：团队进度 + 导生按章认证
 # ─────────────────────────────────────────────
@@ -3135,7 +3367,7 @@ def my_direction(sid):
     if not direction or not direction["course_ids"]:
         return jsonify({"code": 200, "direction": direction["name"] if direction else None,
                         "courses": [],
-                        "hint": "归属导生尚未设置方向，请联系导生完善名片"})
+                        "hint": "归属导生尚未设置方向，请联系老师或导生设置方向"})
     mentor = UserModel.query.get(m.team_mentor_id)
     return jsonify({"code": 200, "direction": direction["name"],
                     "mentor_name": mentor.username if mentor else "",
