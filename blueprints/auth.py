@@ -296,6 +296,23 @@ def _revoke_claims(claims):
     revoke_token(claims["jti"], datetime.fromtimestamp(claims["exp"], tz=timezone.utc))
 
 
+@bp.route("/dev_accounts", methods=["GET"])
+def dev_accounts():
+    """开发测试账号面板（登录页 dev 快捷登录的数据源）：返回 @seed.dev 域账号的
+    昵称/角色/标签，密码约定统一 12345678（见两仓 README 开发测试账号节）。
+    门禁：仅 debug 模式或显式 DEV_TEST_ACCOUNTS 配置时可见，生产一律 404——
+    不构成生产后门（登录本身仍走 /auth/login 正常校验）。"""
+    from flask import current_app
+    if not (current_app.debug or current_app.config.get("DEV_TEST_ACCOUNTS")):
+        return jsonify({"code": 404, "message": "not found"}), 404
+    rows = (UserModel.query
+            .filter(UserModel.email.like("%@seed.dev"))
+            .order_by(UserModel.role.asc(), UserModel.id.asc()).all())
+    return jsonify({"code": 200, "data": {"accounts": [
+        {"email": u.email, "username": u.username, "role": u.role, "admin_tag": u.admin_tag}
+        for u in rows]}})
+
+
 @bp.route("/refresh", methods=["POST"])
 @jwt_required(refresh=True)
 def refresh():

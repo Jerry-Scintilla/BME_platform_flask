@@ -34,6 +34,23 @@
 - `/permissions/revoke`: 撤销用户权限
 - `/permissions/user/<user_id>`: 获取用户权限列表
 
+## 开发测试账号
+
+本地开发库（dev MySQL）固定测试账号，密码统一 `12345678`（登录走 md5 协议，
+脚本改密码须 `set_password(md5(明文))`）：
+
+| 账号 | 角色 | 用途 |
+| --- | --- | --- |
+| `admin@seed.dev` | super_admin | 管理端超管 |
+| `teacher@seed.dev` | super_admin | 管理端老师视角 |
+| `stu1@seed.dev` ~ `stu4@seed.dev` | user | 用户端学员（stu4 兼营期预览） |
+
+注意：`python seed.py` 中的正式超管（admin@bme.sysu.edu.cn 等）自 09-17 安全加固后
+密码为随机生成、seed 时打印一次，与上述开发测试账号无关。前端两端在 dev server 下
+有独立「测试账号面板」页（/dev/accounts，登录页入口进入）：账号按角色分组卡片化，
+点击一键登录；数据来自 `GET /auth/dev_accounts`（debug 模式自动可用，非 debug 需
+`.env` 设 `DEV_TEST_ACCOUNTS=on`，生产一律 404）。
+
 ## 安装
 
 1. 安装MySQL8.0.39
