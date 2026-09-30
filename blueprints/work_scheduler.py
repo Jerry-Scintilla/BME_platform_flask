@@ -2,10 +2,11 @@
 
 两个任务（全部幂等，可安全补跑）：
 1. work_reminder_scan（每分钟）：原子认领到期 pending 提醒 → 同事务发站内通知
-   + 标记 sent；失败退避重试（5/30/120 分钟，≥5 次转 failed）；认领超时回收
-   （claimed 超 10 分钟回 pending，C04 进程崩溃恢复）。
+   + 标记 sent；失败退避重试（5/30/120 分钟，≥5 次转 failed）。claim 与 send
+   同事务提交：进程崩溃即整体回滚回 pending（C04 崩溃恢复由此保证）；
+   认领超时回收（claimed 超 10 分钟回 pending）为纵深防御，正常不可达。
 2. work_transfer_expire_scan（每 5 分钟）：过期待确认转交 → expired + 通知发起人
-   （B03：过期后当前负责人保持不变）。
+   （B03：过期后当前负责人保持不变；逐行 FOR UPDATE 复查 status，与 accept 并发安全）。
 
 基础设施沿用 attendance_report / camp_scheduler 模式：APScheduler + fcntl 文件锁
 （多 worker 单实例），崩溃后内核回收锁由新 worker 接管。

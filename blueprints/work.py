@@ -2,7 +2,8 @@
 
 用户端 API：资格探测（me，无资格回 200 空形——前端据此隐藏入口，不报错）、
 可读工作区列表。事项/回复/任务命令随 M2/M3 迁入本蓝图；私有文件在
-work_files.py（M4）。
+work_files.py（M4）。治理域逻辑在 services/work/governance.py（#32 分层），
+蓝图只留门禁 + commit + 序列化。
 
 治理接口挂 /work/governance/*——刻意避开 /admin/ 前缀：request_guard 对
 /admin/ 一律超管硬门禁，而设计方案 §5.4 允许治理人员为非超管成员，故本蓝图
@@ -12,25 +13,18 @@ work_files.py（M4）。
 错误约定（§13）：不存在 ∨ 无权统一 404（防存在性探测）；状态/版本/幂等冲突
 409；权限不足（对象已知）403。响应统一 {code, message, data}。
 """
-from datetime import datetime, timedelta
-
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 
 from exts import db
-from models import (UserModel, ClubGroup, ClubMembership, ClubOfficer,
-                    WorkAccessGrant, WorkItem, WorkResponseRequest, WorkTask,
-                    WorkTransferRequest, WorkWorkspace)
+from models import UserModel, ClubGroup, WorkAccessGrant, WorkItem, WorkWorkspace
 from . import _current_user, audit_log
 from .notification import create_notification
-from services.work import access, items as items_service, tasks as tasks_service, \
-    integrations as integrations_service
+from services.work import access, governance as governance_service, \
+    items as items_service, tasks as tasks_service, integrations as integrations_service
 from services.work.access import WorkApiError
 
 bp = Blueprint("work", __name__, url_prefix="/work")
-
-# 任务活跃状态集（逾期/到期统计范围；done/cancelled 不计）
-ACTIVE_TASK_STATUSES = ('todo', 'in_progress', 'blocked', 'review')
 
 
 @bp.errorhandler(WorkApiError)
@@ -42,37 +36,6 @@ def _ws_dict(ws, group_name, role=None):
     return {
         "id": ws.id, "club_group_id": ws.club_group_id, "group_name": group_name,
         "status": ws.status, "role": role,
-    }
-
-
-def _todo_counts(user):
-    """我的待办摘要计数（§6.1：未读与待办分开；全部经访问过滤，撤权即归零）。"""
-    now = datetime.now()
-    uid = user.id
-    pending_responses = WorkResponseRequest.query.filter_by(
-        responder_user_id=uid, status='pending').count()
-    pending_transfers = WorkTransferRequest.query.filter_by(
-        to_user_id=uid, status='pending').count()
-
-    def _my_tasks():
-        q = (db.session.query(WorkTask).join(WorkItem, WorkItem.id == WorkTask.item_id)
-             .filter(WorkItem.status.in_(ACTIVE_TASK_STATUSES),
-                     WorkTask.assignee_user_id == uid))
-        return access.filter_items_query(q, user)
-
-    to_review = access.filter_items_query(
-        db.session.query(WorkTask).join(WorkItem, WorkItem.id == WorkTask.item_id)
-        .filter(WorkItem.status == 'review', WorkTask.reviewer_user_id == uid), user).count()
-    mine = _my_tasks()
-    due_soon = mine.filter(WorkTask.due_at.isnot(None), WorkTask.due_at >= now,
-                           WorkTask.due_at < now + timedelta(hours=24)).count()
-    overdue = mine.filter(WorkTask.due_at.isnot(None), WorkTask.due_at < now).count()
-    return {
-        "pending_responses": pending_responses,
-        "pending_transfers": pending_transfers,
-        "to_review": to_review,
-        "due_soon": due_soon,
-        "overdue": overdue,
     }
 
 
@@ -99,7 +62,7 @@ def work_me():
         "eligibility": access.eligibility(user),
         "is_governance": access.is_governance(user),
         "workspaces": workspaces,
-        "todo": _todo_counts(user),
+        "todo": governance_service.todo_counts(user),
     }})
 
 
@@ -128,24 +91,10 @@ def list_my_workspaces():
 @jwt_required()
 def list_candidates():
     """参与邀请候选人与回应人选择源：全部有效授权持有人 ∪ 在任干事
-    （§5.3 无权查看者不出现在可发送提及列表中——无资格者不返回）。"""
-    from datetime import date as _date
+    （§5.3 无权查看者不出现在可发送提及列表中——无资格者不返回；
+    门禁为资格判定：纯在任干事可被邀为参与者，#43）。"""
     user = _require_user()
-    if not access.grants_for(user) and not access.is_governance(user):
-        raise WorkApiError(403, '需要内部协作权限')
-    today = _date.today()
-    uids = set()
-    for g in WorkAccessGrant.query.filter_by(status='active').all():
-        if access._grant_effective(g):
-            uids.add(g.user_id)
-    for o in ClubOfficer.query.filter_by(status='active').all():
-        if o.term_start <= today and (o.term_end is None or today <= o.term_end):
-            uids.add(o.user_id)
-    rows = []
-    if uids:
-        names = {u.id: u.username for u in
-                 UserModel.query.filter(UserModel.id.in_(list(uids))).all()}
-        rows = [{'user_id': uid, 'username': names.get(uid)} for uid in sorted(uids)]
+    rows = governance_service.list_candidates(user)
     return jsonify({"code": 200, "message": "ok", "data": {"candidates": rows}})
 
 
@@ -351,32 +300,12 @@ def my_todos():
 # 治理：工作区管理（/work/governance/workspaces）
 # ────────────────────────────────
 
-def _parse_date(raw, field):
-    if raw is None:
-        return None, None
-    try:
-        return datetime.strptime(str(raw), "%Y-%m-%d").date(), None
-    except ValueError:
-        return None, (jsonify({"code": 400, "message": f"{field} 格式应为 YYYY-MM-DD"}), 400)
-
-
 @bp.route("/governance/workspaces", methods=["GET"])
 @jwt_required()
 def governance_list_workspaces():
     user = _current_user()
     access.require_governance(user)
-    rows = WorkWorkspace.query.order_by(WorkWorkspace.id).all()
-    gids = [r.club_group_id for r in rows]
-    groups = {g.id: g for g in ClubGroup.query.filter(ClubGroup.id.in_(gids)).all()} if gids else {}
-    items = []
-    for r in rows:
-        g = groups.get(r.club_group_id)
-        items.append({
-            **_ws_dict(r, g.name if g else None),
-            "group_status": g.status if g else None,
-            "active_grants": WorkAccessGrant.query.filter_by(
-                workspace_id=r.id, status='active').count(),
-        })
+    items = governance_service.list_workspaces()
     return jsonify({"code": 200, "message": "ok", "data": {"workspaces": items}})
 
 
@@ -464,20 +393,21 @@ def governance_list_grants():
     可按 user_id / workspace_id 过滤。含实时有效性判定与失效原因。"""
     user = _current_user()
     access.require_governance(user)
-    try:
-        page = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        page, page_size = 1, 20
+    # int 参数统一 400（#5：恶意参数不再 ValueError→500）
+    page = max(1, access.int_or_400(request.args.get("page"), "page", default=1))
+    page_size = min(100, max(1, access.int_or_400(
+        request.args.get("page_size"), "page_size", default=20)))
     status = request.args.get("status", "all")
 
     query = WorkAccessGrant.query
     if status in ('active', 'revoked'):
         query = query.filter(WorkAccessGrant.status == status)
     if request.args.get("user_id"):
-        query = query.filter(WorkAccessGrant.user_id == int(request.args["user_id"]))
+        query = query.filter(WorkAccessGrant.user_id == access.int_or_400(
+            request.args["user_id"], "user_id"))
     if request.args.get("workspace_id"):
-        query = query.filter(WorkAccessGrant.workspace_id == int(request.args["workspace_id"]))
+        query = query.filter(WorkAccessGrant.workspace_id == access.int_or_400(
+            request.args["workspace_id"], "workspace_id"))
     total = query.count()
     rows = (query.order_by(WorkAccessGrant.status, WorkAccessGrant.id.desc())
             .offset((page - 1) * page_size).limit(page_size).all())
@@ -495,110 +425,16 @@ def governance_list_grants():
     }})
 
 
-def _validate_grant_payload(actor, data):
-    """治理开通授权的集中校验（§5.2/§5.4）：返回 (字段dict, 错误响应)。
-
-    规则：governance 岗位仅超管可授（治理不能造治理）；member/coordinator
-    必须指定工作区；来源行必须存在且属于该用户；membership 来源强制写组快照。"""
-    try:
-        uid = int(data.get("user_id"))
-    except (TypeError, ValueError):
-        return None, (jsonify({"code": 400, "message": "缺少 user_id"}), 400)
-    target = UserModel.query.get(uid)
-    if not target:
-        return None, (jsonify({"code": 404, "message": "用户不存在"}), 404)
-
-    role = data.get("role")
-    if role not in access.GRANT_ROLES:
-        return None, (jsonify({"code": 400,
-                               "message": f"role 仅支持 {'/'.join(access.GRANT_ROLES)}"}), 400)
-
-    grant_reason = (str(data.get("grant_reason") or "").strip())
-    if not grant_reason or len(grant_reason) > 200:
-        return None, (jsonify({"code": 400, "message": "授权原因必填且 ≤200 字"}), 400)
-
-    source_type = data.get("source_type")
-    if source_type not in access.GRANT_SOURCES:
-        return None, (jsonify({"code": 400,
-                               "message": f"source_type 仅支持 {'/'.join(access.GRANT_SOURCES)}"}), 400)
-
-    workspace_id = None
-    group_snapshot = None
-    source_id = None
-    if role == 'governance':
-        if not actor.is_admin():
-            return None, (jsonify({"code": 403, "message": "治理岗位授权仅超级管理员可以开通"}), 403)
-        if data.get("workspace_id") not in (None, ''):
-            return None, (jsonify({"code": 400, "message": "治理授权为全局，不能指定工作区"}), 400)
-        if source_type != 'direct':
-            return None, (jsonify({"code": 400, "message": "治理授权来源须为 direct"}), 400)
-    else:
-        try:
-            workspace_id = int(data.get("workspace_id"))
-        except (TypeError, ValueError):
-            return None, (jsonify({"code": 400, "message": "缺少 workspace_id"}), 400)
-        ws = WorkWorkspace.query.get(workspace_id)
-        if not ws:
-            return None, (jsonify({"code": 404, "message": "工作区不存在"}), 404)
-        g = ClubGroup.query.get(ws.club_group_id)
-        if not g or g.status != 'active':
-            return None, (jsonify({"code": 400, "message": "工作区所属组已归档"}), 400)
-
-        if source_type == 'officer':
-            try:
-                source_id = int(data.get("source_id"))
-            except (TypeError, ValueError):
-                return None, (jsonify({"code": 400, "message": "officer 来源须提供 source_id"}), 400)
-            off = ClubOfficer.query.get(source_id)
-            if not off or off.user_id != uid:
-                return None, (jsonify({"code": 400, "message": "任职来源行不存在或不属于该用户"}), 400)
-        elif source_type == 'membership':
-            try:
-                source_id = int(data.get("source_id"))
-            except (TypeError, ValueError):
-                return None, (jsonify({"code": 400, "message": "membership 来源须提供 source_id"}), 400)
-            m = ClubMembership.query.get(source_id)
-            if not m or m.user_id != uid:
-                return None, (jsonify({"code": 400, "message": "归属来源行不存在或不属于该用户"}), 400)
-            group_snapshot = m.group_id          # A06：授权时组快照，防归属行原地改组带权漂移
-        else:
-            return None, (jsonify({"code": 400, "message": "direct 来源仅限治理岗位授权"}), 400)
-
-    valid_from, err = _parse_date(data.get("valid_from"), "valid_from")
-    if err:
-        return None, err
-    valid_until, err = _parse_date(data.get("valid_until"), "valid_until")
-    if err:
-        return None, err
-    if valid_from and valid_until and valid_until < valid_from:
-        return None, (jsonify({"code": 400, "message": "valid_until 不能早于 valid_from"}), 400)
-
-    dup = WorkAccessGrant.query.filter_by(
-        user_id=uid, role=role, workspace_id=workspace_id,
-        source_type=source_type, source_id=source_id, status='active').first()
-    if dup:
-        return None, (jsonify({"code": 409, "message": "该用户已存在同样的有效授权"}), 409)
-
-    return {
-        "user_id": uid, "role": role, "workspace_id": workspace_id,
-        "source_type": source_type, "source_id": source_id,
-        "group_id_snapshot": group_snapshot,
-        "valid_from": valid_from, "valid_until": valid_until,
-        "grant_reason": grant_reason,
-    }, None
-
-
 @bp.route("/governance/grants", methods=["POST"])
 @jwt_required()
 @audit_log(operation="开通内部协作授权")
 def governance_create_grant():
-    """开通授权（§5.4）：依据现有任职/组归属 + 明确范围、有效期与事由。"""
+    """开通授权（§5.4）：依据现有任职/组归属 + 明确范围、有效期与事由。
+    校验在 governance_service.validate_grant_payload（含 #7 来源组绑定）。"""
     user = _current_user()
     access.require_governance(user)
     data = request.get_json(silent=True) or {}
-    fields, err = _validate_grant_payload(user, data)
-    if err:
-        return err
+    fields = governance_service.validate_grant_payload(user, data)
     grant = WorkAccessGrant(granted_by=user.id, status='active', **fields)
     db.session.add(grant)
     # 同事务通知被授权人（最小信息，不含工作区敏感内容）
@@ -663,8 +499,17 @@ def governance_takeover_queue():
     uids = list({r["assignee_user_id"] for r in rows if r["assignee_user_id"]})
     if uids:
         names = {u.id: u.username for u in UserModel.query.filter(UserModel.id.in_(uids)).all()}
+    # 所属工作区组名（管理端接管队列列）：批量解析，不在 service 逐行查
+    gnames = {}
+    ws_ids = list({r["workspace_id"] for r in rows if r.get("workspace_id")})
+    if ws_ids:
+        wss = {w.id: w for w in WorkWorkspace.query.filter(WorkWorkspace.id.in_(ws_ids)).all()}
+        gmap = {g.id: g.name for g in ClubGroup.query.filter(
+            ClubGroup.id.in_([w.club_group_id for w in wss.values()])).all()}
+        gnames = {wid: gmap.get(w.club_group_id) for wid, w in wss.items()}
     for r in rows:
         r["assignee_name"] = names.get(r["assignee_user_id"])
+        r["group_name"] = gnames.get(r.get("workspace_id"))
     return jsonify({"code": 200, "message": "ok", "data": {"items": rows}})
 
 
@@ -677,7 +522,7 @@ def governance_handover():
     target_id = request.args.get("user_id")
     if not target_id:
         return jsonify({"code": 400, "message": "缺少 user_id"}), 400
-    target = UserModel.query.get(int(target_id))
+    target = UserModel.query.get(access.int_or_400(target_id, "user_id"))
     if not target:
         return jsonify({"code": 404, "message": "用户不存在"}), 404
     data = integrations_service.handover_overview(target.id)

@@ -80,14 +80,22 @@ def _object_key(item_id, file_id, version_no, ext):
     return f'work/files/{item_id}/{file_id}/v{version_no}_{uuid.uuid4().hex}{("." + ext) if ext else ""}'
 
 
-def _quota_used(item_id):
-    """事项当前 active 版本字节和（配额口径：活跃版本，隔离/移除不计）。"""
-    rows = (db.session.query(WorkFileVersion.id, WorkFileVersion.size)
-            .join(WorkFile, WorkFile.id == WorkFileVersion.file_id)
-            .filter(WorkFile.item_id == item_id,
-                    WorkFile.status == 'active',
-                    WorkFileVersion.format_check == 'passed').all())
-    return {r[0]: r[1] for r in rows}, sum(r[1] for r in rows)
+def _quota_used(item_id, exclude_file_id=None):
+    """事项当前活跃版本字节和。
+
+    配额口径（#4 对齐注释）：只计各文件 current_version_id 指向的 passed 版本
+    ——历史版本不计活跃配额（B05 版本永留不放大占用）；为既有文件传新版本
+    （exclude_file_id）时，该文件即将被新版本替换的现 current 也不计入预占。
+    隔离/移除文件不计。"""
+    query = (db.session.query(WorkFileVersion.size)
+             .join(WorkFile, WorkFile.id == WorkFileVersion.file_id)
+             .filter(WorkFile.item_id == item_id,
+                     WorkFile.status == 'active',
+                     WorkFileVersion.id == WorkFile.current_version_id,
+                     WorkFileVersion.format_check == 'passed'))
+    if exclude_file_id is not None:
+        query = query.filter(WorkFile.id != exclude_file_id)
+    return sum(r[0] for r in query.all())
 
 
 def _require_upload_access(user, item_id):
@@ -103,7 +111,9 @@ def upload_version(user, item_id, file_storage, *, file_id=None):
 
     事务段（持有事项行锁串行化配额预占，C01）：校验 → 建行(uploading/pending) →
     落对象 → stat 复核大小 → 交叉校验 → 通过置 active + 附件关联 + 事件；
-    失败置 quarantined 并删对象（半成品不可下载）。"""
+    置 quarantined 的失败路径先 commit 隔离记录再拒绝（#39：拒绝上传留审计
+    痕迹，对象已清不可下载）。文件移除端点（释放配额）待后续批次，现状
+    removed 状态暂无写入方。"""
     from storage import storage
 
     item = _require_upload_access(user, item_id)
@@ -123,8 +133,9 @@ def upload_version(user, item_id, file_storage, *, file_id=None):
     if not ok:
         raise WorkApiError(415, why)          # 未落任何行/对象，直接拒绝
 
-    # 配额原子预占：持事项行锁下核算（并发上传串行化）
-    size_map, used = _quota_used(item.id)
+    # 配额原子预占：持事项行锁下核算（并发上传串行化；传新版本时被替换的
+    # 现 current 不计入，#4 口径）
+    used = _quota_used(item.id, exclude_file_id=file_id)
     content_length = file_storage.content_length or 0
     single_limit = MAX_FILE_MB * 1024 * 1024
     quota_limit = ITEM_QUOTA_MB * 1024 * 1024
@@ -171,8 +182,9 @@ def upload_version(user, item_id, file_storage, *, file_id=None):
     version.size = actual
     if actual > single_limit:
         _quarantine(storage, version, wf)
+        db.session.commit()          # 隔离记录先落库再拒绝（#39：审计痕迹）
         raise WorkApiError(413, f'单文件不能超过 {MAX_FILE_MB}MB')
-    # 同文件旧版本不计入活跃配额（current 版本口径）：新版本通过校验后旧版本转为保留态
+    # 配额只按各文件 current 版本口径核算（见 _quota_used 注释，#4）
     if used + actual > quota_limit:
         _remove_object(storage, version.object_key)
         db.session.rollback()
@@ -187,9 +199,8 @@ def upload_version(user, item_id, file_storage, *, file_id=None):
         head_actual = head
     ok, why = _check_format(ext, head_actual)
     if not ok:
-        version.format_check = 'failed'
-        wf.status = 'quarantined'
-        _remove_object(storage, version.object_key)
+        _quarantine(storage, version, wf)
+        db.session.commit()          # 隔离记录先落库再拒绝（#39：审计痕迹）
         raise WorkApiError(415, why)
 
     version.format_check = 'passed'
@@ -209,8 +220,13 @@ def upload_version(user, item_id, file_storage, *, file_id=None):
 
 
 def _quarantine(storage, version, wf):
+    """拒绝上传的隔离落库准备（#39）：版本行标 failed + 对象清除。
+
+    无既有可用版本的文件（新文件半成品）整体置 quarantined；已有 current 的
+    既有文件保持 active——坏的新版本只隔离自身，不毁掉可用的旧版本。"""
     version.format_check = 'failed'
-    wf.status = 'quarantined'
+    if not wf.current_version_id:
+        wf.status = 'quarantined'
     _remove_object(storage, version.object_key)
 
 
@@ -223,64 +239,91 @@ def _remove_object(storage, key):
 
 # ── 查询与下载 ──────────────────────────────────────────────
 
-def file_dict(wf, versions=None):
-    current = WorkFileVersion.query.get(wf.current_version_id) if wf.current_version_id else None
+def _version_brief(v):
+    return {
+        'id': v.id, 'version_no': v.version_no, 'size': v.size,
+        'content_type': v.content_type,
+        'format_check': v.format_check, 'scan_status': v.scan_status,
+        'uploaded_by': v.uploaded_by,
+        'created_at': v.created_at.strftime('%Y-%m-%d %H:%M') if v.created_at else None,
+    }
+
+
+def file_dict(wf, versions=None, current=None):
+    """文件序列化；current 版本可由调用方批量预取后传入（#33：免逐文件查询）。"""
+    if current is None and wf.current_version_id:
+        current = WorkFileVersion.query.get(wf.current_version_id)
     data = {
         'id': wf.id, 'item_id': wf.item_id, 'display_name': wf.display_name,
         'status': wf.status,
-        'current_version': {
-            'id': current.id, 'version_no': current.version_no,
-            'size': current.size, 'content_type': current.content_type,
-            'format_check': current.format_check,
-            'scan_status': current.scan_status,
-            'uploaded_by': current.uploaded_by,
-            'created_at': current.created_at.strftime('%Y-%m-%d %H:%M') if current.created_at else None,
-        } if current else None,
+        'current_version': _version_brief(current) if current else None,
     }
     if versions is not None:
-        data['versions'] = [{
-            'id': v.id, 'version_no': v.version_no, 'size': v.size,
-            'content_type': v.content_type,
-            'format_check': v.format_check, 'scan_status': v.scan_status,
-            'uploaded_by': v.uploaded_by,
-            'created_at': v.created_at.strftime('%Y-%m-%d %H:%M') if v.created_at else None,
-        } for v in versions]
+        data['versions'] = [_version_brief(v) for v in versions]
     return data
 
 
-def require_file_read(user, file_id):
-    """文件读取权 = 所属事项读取权（附件与正文同一对象权限，§13）。"""
+def _has_emergency_access(user, item_id):
+    """治理紧急介入是否已留痕（§5.4）：事件不可变，存在该治理者对本事项的
+    emergency_access 事件即视为持有有效介入权（下载沿介入读取语义放行，#6）。"""
+    return bool(WorkEvent.query.filter_by(
+        item_id=item_id, event_type='emergency_access',
+        actor_user_id=user.id).first())
+
+
+def require_file_read(user, file_id, *, emergency_ok=False):
+    """文件读取权 = 所属事项读取权（附件与正文同一对象权限，§13）。
+
+    emergency_ok：下载/版本链路对治理身份的补充放行——常规读取权不通过时，
+    持本事项有效紧急介入记录的治理者可读（#6：紧急介入「看得见也拿得到」，
+    与 §5.4 介入读取语义对齐；列表/详情链路不走本参数维持原口径）。"""
     wf = WorkFile.query.filter_by(id=file_id).first()
     if not wf:
         raise WorkApiError(404, '文件不存在')
     item = WorkItem.query.get(wf.item_id)
-    access.require_read(user, item)
+    try:
+        access.require_read(user, item)
+    except WorkApiError:
+        if not emergency_ok or item is None:
+            raise
+        if not access.is_governance(user) or not _has_emergency_access(user, item.id):
+            raise
     return wf
 
 
 def list_versions(user, file_id):
-    wf = require_file_read(user, file_id)
+    wf = require_file_read(user, file_id, emergency_ok=True)
     versions = (WorkFileVersion.query.filter_by(file_id=wf.id)
                 .order_by(WorkFileVersion.version_no.desc()).all())
-    return file_dict(wf, versions)
+    current = next((v for v in versions if v.id == wf.current_version_id), None)
+    return file_dict(wf, versions, current=current)
 
 
 def download(user, file_id, link_id):
     """鉴权下载（§9.3）：JWT 会话 + 当前访问权 + 按「本次关联」判权；
-    撤权后新请求必须失败（A07）；404 统一形态防探测。返回 (wf, version, display)。"""
+    撤权后新请求必须失败（A07）；404 统一形态防探测。
+
+    紧急介入放行（#6）：治理者持本事项有效 emergency_access 事件时可下载，
+    下载同样以 emergency_access 事件留痕（purpose=file_download）。"""
     from storage import storage as _storage  # noqa: F401  供蓝图流式读取
 
-    wf = require_file_read(user, file_id)
+    wf = require_file_read(user, file_id, emergency_ok=True)
     try:
         link_id = int(link_id)
     except (TypeError, ValueError):
-        raise WorkApiError(404, '文件不存在')
+        raise WorkApiError(404, '文件不存在')   # link_id 沿 404 统一形态防探测
     link = WorkFileLink.query.filter_by(id=link_id, file_id=wf.id).first()
     if not link:
         raise WorkApiError(404, '文件不存在')
     # 关联目标须仍是当前可访问事项（submission 关联沿其事项判权）
     item = WorkItem.query.get(wf.item_id)
-    access.require_read(user, item)
+    via_emergency = False
+    try:
+        access.require_read(user, item)
+    except WorkApiError:
+        if not access.is_governance(user) or not _has_emergency_access(user, item.id):
+            raise
+        via_emergency = True
 
     version = None
     if link.version_id is not None:
@@ -289,6 +332,12 @@ def download(user, file_id, link_id):
         version = WorkFileVersion.query.get(wf.current_version_id)
     if not version or version.format_check != 'passed':
         raise WorkApiError(404, '文件不存在')
+    if via_emergency:
+        # 介入下载留痕：复用 emergency_access 事件（最小改动），diff 标注用途
+        item = (WorkItem.query.filter_by(id=item.id).with_for_update().first())
+        record_event(item, 'emergency_access', actor_user_id=user.id,
+                     diff={'by': 'governance', 'purpose': 'file_download',
+                           'file_id': wf.id, 'version_id': version.id})
     return wf, version
 
 
@@ -317,17 +366,21 @@ def bind_submission_files(item, submission, version_ids, actor):
     return links
 
 
-def item_files(user, item_id):
-    """事项附件列表（详情聚合用，读取权由调用方已校验）。
-    附 item 关联 link_id（下载按本次关联判权，§9.3）。"""
+def item_files(item_id):
+    """事项附件列表（详情聚合用，读取权由调用方已校验；#43 去掉未用的 user 形参）。
+    附 item 关联 link_id（下载按本次关联判权，§9.3）；current 版本一次预取（#33）。"""
     rows = WorkFile.query.filter_by(item_id=item_id).order_by(WorkFile.id).all()
     links = {l.file_id: l.id for l in WorkFileLink.query.filter_by(
         target_type='item', target_id=item_id).all()}
+    rows = [wf for wf in rows if wf.status != 'quarantined']
+    version_map = {}
+    if rows:
+        version_map = {v.id: v for v in WorkFileVersion.query.filter(
+            WorkFileVersion.id.in_([wf.current_version_id for wf in rows
+                                   if wf.current_version_id])).all()}
     out = []
     for wf in rows:
-        if wf.status == 'quarantined':
-            continue
-        data = file_dict(wf)
+        data = file_dict(wf, current=version_map.get(wf.current_version_id))
         data['link_id'] = links.get(wf.id)
         out.append(data)
     return out
@@ -335,25 +388,32 @@ def item_files(user, item_id):
 
 def search_files(user, q=None, page=1, page_size=20):
     """「工作资料」附件索引：跨我的可见事项聚合，文件名受限检索（§12.3）。"""
-    page = max(1, int(page or 1))
-    page_size = min(100, max(1, int(page_size or 20)))
+    page = max(1, access.int_or_400(page, 'page', default=1))
+    page_size = min(100, max(1, access.int_or_400(page_size, 'page_size', default=20)))
     query = (db.session.query(WorkFile)
              .join(WorkItem, WorkItem.id == WorkFile.item_id)
              .filter(WorkFile.status == 'active', WorkFile.current_version_id.isnot(None)))
     query = access.filter_items_query(query, user)
     if q:
-        like = f"%{(str(q) or '').strip()[:50]}%"
-        query = query.filter(WorkFile.display_name.like(like))
+        # 通配符转义（#38）：检索词中的 %/_ 按字面匹配（与 items._like_pattern 同规则）
+        text = (str(q) or '').strip()[:50]
+        escaped = (text.replace('\\', '\\\\')
+                   .replace('%', '\\%').replace('_', '\\_'))
+        query = query.filter(WorkFile.display_name.like(f'%{escaped}%', escape='\\'))
     total = query.count()
     rows = (query.order_by(WorkFile.updated_at.desc(), WorkFile.id.desc())
             .offset((page - 1) * page_size).limit(page_size).all())
     names = _names({w.created_by for w in rows})
     items_map = {i.id: i for i in WorkItem.query.filter(
         WorkItem.id.in_({w.item_id for w in rows})).all()} if rows else {}
+    version_map = {}
+    if rows:
+        version_map = {v.id: v for v in WorkFileVersion.query.filter(
+            WorkFileVersion.id.in_([w.current_version_id for w in rows])).all()}
     files = []
     for w in rows:
         item = items_map.get(w.item_id)
-        version = WorkFileVersion.query.get(w.current_version_id)
+        version = version_map.get(w.current_version_id)
         files.append({
             'id': w.id, 'display_name': w.display_name,
             'size': version.size if version else 0,

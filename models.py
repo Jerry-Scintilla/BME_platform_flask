@@ -2449,7 +2449,8 @@ class WorkItem(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     __table_args__ = (
-        db.UniqueConstraint('idempotency_key', name='uq_work_item_idem'),
+        # 幂等键按创建者隔离（B01：跨用户撞 key 不互相干扰，也不能占位他人 key 致 500）
+        db.UniqueConstraint('created_by', 'idempotency_key', name='uq_work_item_idem'),
         db.Index('ix_work_item_ws_kind_status', 'workspace_id', 'kind', 'status'),
     )
 
@@ -2511,7 +2512,9 @@ class WorkReply(db.Model):
 
 
 class WorkReplyRevision(db.Model):
-    """回复修订史：编辑窗口内的历史版本全量留存，正文列只存当前值。"""
+    """回复修订史：编辑窗口内的历史版本全量留存，正文列只存当前值。
+    首期契约：回复编辑 UI 与对应端点推迟（设计 §7.4 已记录该裁剪），本表为
+    预留结构，暂无写入方；接入编辑端点时由服务层在此留修订行。"""
     __tablename__ = 'work_reply_revision'
     id = db.Column(db.Integer, primary_key=True)
     reply_id = db.Column(db.Integer, db.ForeignKey('work_reply.id'), nullable=False, index=True)

@@ -20,7 +20,7 @@ from services.work import access, reminders
 from services.work.access import WorkApiError
 from services.work.events import record_event, fan_out
 from services.work.items import (bump_version, ensure_version, _ensure_assignee_participant,
-                                 _notify_item_audience, _parse_task_params)
+                                 _notify_item_audience, _parse_task_params, parse_due_at)
 
 TERMINAL_STATUSES = ('done', 'cancelled')
 ACTIVE_TASK_STATUSES = ('todo', 'in_progress', 'blocked', 'review')
@@ -309,18 +309,9 @@ def _cmd_reschedule(user, item, task, access_, payload):
 
 
 def _parse_due(raw):
-    if not raw:
-        raise WorkApiError(400, '缺少 due_at')
-    for fmt in ('%Y-%m-%dT%H:%M', '%Y-%m-%d'):
-        try:
-            dt = datetime.strptime(str(raw)[:16 if 'T' in str(raw) else 10], fmt)
-            if fmt == '%Y-%m-%d':
-                # 仅日期：解释为当地当天 23:59:59（方案 §8.5 偏差决策）
-                dt = dt.replace(hour=23, minute=59, second=59)
-            return dt
-        except ValueError:
-            continue
-    raise WorkApiError(400, 'due_at 格式应为 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM')
+    """改期截止解析：统一走 items.parse_due_at（#36：与草稿创建同一 23:59:59
+    口径，两种入口不再产生不同逾期判定）。"""
+    return parse_due_at(raw, 'due_at')
 
 
 def _cmd_reassign(user, item, task, access_, payload):
@@ -584,47 +575,66 @@ def decide_transfer(user, transfer_id, action):
 
 
 def expire_transfers():
-    """过期转交扫描（调度器；B03：过期后当前负责人保持不变）。"""
+    """过期转交扫描（调度器；B03：过期后当前负责人保持不变）。
+
+    逐行 FOR UPDATE + 复查 status（#12）：与 accept 竞态时后到者空转，
+    已接受的转交不会被覆写为 expired；事项行同样加锁，保证 record_event
+    的 seq 分配串行（并发命令撞 uq_work_event_item_seq 会整轮扫描回滚）。"""
     now = datetime.now()
     rows = (WorkTransferRequest.query
             .filter(WorkTransferRequest.status == 'pending',
                     WorkTransferRequest.expires_at < now).all())
+    expired = 0
     for req in rows:
-        req.status = 'expired'
-        req.decided_at = now
-        item = WorkItem.query.get(req.item_id)
+        # 行锁下重读最新状态（快照可能已过期：accept 恰在本轮扫描窗口内提交）
+        locked = (WorkTransferRequest.query.filter_by(id=req.id)
+                  .with_for_update().populate_existing().first())
+        if not locked or locked.status != 'pending':
+            continue
+        item = (WorkItem.query.filter_by(id=locked.item_id)
+                .with_for_update().populate_existing().first())
+        locked.status = 'expired'
+        locked.decided_at = now
         if item:
             record_event(item, 'transfer_requested', actor_user_id=None,
                          diff={'transfer': 'expired'})
             event = (WorkEvent.query.filter_by(item_id=item.id)
                      .order_by(WorkEvent.seq.desc()).first())
             if event:
-                fan_out(item, event, [(req.from_user_id, 'status_changed')])
-    return len(rows)
+                fan_out(item, event, [(locked.from_user_id, 'status_changed')])
+        expired += 1
+    return expired
 
 
 # ── 需接管标记（D01 标记段；治理队列视图 M5 完善）─────────────
 
 def takeover_candidates():
-    """活跃任务的负责人已失去协作资格 → 需接管（撤权即时、历史操作者不变）。"""
-    rows = (db.session.query(WorkTask).join(WorkItem, WorkItem.id == WorkTask.item_id)
+    """活跃任务的负责人已失去协作资格 → 需接管（撤权即时、历史操作者不变）。
+
+    事项/用户/资格批量预取（#33）：两次 in_ + join 取双实体，替代逐行 get。"""
+    rows = (db.session.query(WorkTask, WorkItem)
+            .join(WorkItem, WorkItem.id == WorkTask.item_id)
             .filter(WorkItem.status.in_(ACTIVE_TASK_STATUSES),
                     WorkTask.assignee_user_id.isnot(None)).all())
-    out = []
-    for task in rows:
-        user = UserModel.query.get(task.assignee_user_id)
-        if not user or not access.participation_eligible(user):
-            item = WorkItem.query.get(task.item_id)
-            out.append({'item_id': task.item_id, 'title': item.title if item else None,
-                        'assignee_user_id': task.assignee_user_id,
-                        'status': item.status if item else None})
-    return out
+    if not rows:
+        return []
+    uids = list({t.assignee_user_id for t, _ in rows})
+    users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(uids)).all()}
+    eligible = access.participation_eligible_bulk(users.values())
+    return [{'item_id': task.item_id, 'title': item.title,
+             'workspace_id': item.workspace_id,
+             'assignee_user_id': task.assignee_user_id,
+             'status': item.status}
+            for task, item in rows
+            if task.assignee_user_id not in users or not eligible.get(task.assignee_user_id)]
 
 
 # ── 我的待办四桶（§6.1：待接手/待回复/待验收/到期）────────────
 
 def my_todos(user):
-    """合并任务桶与回应桶（M2 items.my_todos 的待回复），全部经访问过滤。"""
+    """合并任务桶与回应桶（M2 items.my_todos 的待回复），全部经访问过滤。
+
+    join 直接取 (WorkTask, WorkItem) 双实体（#33：不再逐行取事项标题）。"""
     from services.work import items as items_service
     data = items_service.my_todos(user)
 
@@ -633,41 +643,46 @@ def my_todos(user):
                  .filter_by(to_user_id=user.id, status='pending')
                  .order_by(WorkTransferRequest.expires_at.asc()).all())
     pending_transfers = []
-    for t in transfers:
-        item = WorkItem.query.get(t.item_id)
-        if not item or access.can_read_item(user, item) is None:
-            continue
-        pending_transfers.append({
-            'transfer_id': t.id, 'item_id': t.item_id, 'item_title': item.title,
-            'from_user_id': t.from_user_id,
-            'expires_at': t.expires_at.strftime('%Y-%m-%d %H:%M'),
-        })
+    if transfers:
+        t_items = {i.id: i for i in WorkItem.query.filter(WorkItem.id.in_(
+            [t.item_id for t in transfers])).all()}
+        for t in transfers:
+            item = t_items.get(t.item_id)
+            if not item or access.can_read_item(user, item) is None:
+                continue
+            pending_transfers.append({
+                'transfer_id': t.id, 'item_id': t.item_id, 'item_title': item.title,
+                'from_user_id': t.from_user_id,
+                'expires_at': t.expires_at.strftime('%Y-%m-%d %H:%M'),
+            })
     data['pending_transfers'] = pending_transfers
 
     # 待验收：我是验收人且事项在 review
-    review_items = access.filter_items_query(
-        db.session.query(WorkTask).join(WorkItem, WorkItem.id == WorkTask.item_id)
+    review_rows = access.filter_items_query(
+        db.session.query(WorkTask, WorkItem).join(
+            WorkItem, WorkItem.id == WorkTask.item_id)
         .filter(WorkItem.status == 'review', WorkTask.reviewer_user_id == user.id),
         user).all()
     data['to_review'] = [{
-        'item_id': t.item_id,
-        'item_title': (WorkItem.query.get(t.item_id) or WorkItem()).title,
-        'due_at': t.due_at.strftime('%Y-%m-%d %H:%M') if t.due_at else None,
-    } for t in review_items]
+        'item_id': item.id,
+        'item_title': item.title,
+        'due_at': task.due_at.strftime('%Y-%m-%d %H:%M') if task.due_at else None,
+    } for task, item in review_rows]
 
     # 到期（含逾期标记；未来 72h 内到期 + 已逾期）
     now = datetime.now()
     due_rows = access.filter_items_query(
-        db.session.query(WorkTask).join(WorkItem, WorkItem.id == WorkTask.item_id)
+        db.session.query(WorkTask, WorkItem).join(
+            WorkItem, WorkItem.id == WorkTask.item_id)
         .filter(WorkItem.status.in_(ACTIVE_TASK_STATUSES),
                 WorkTask.assignee_user_id == user.id,
                 WorkTask.due_at.isnot(None),
                 WorkTask.due_at < now + timedelta(hours=72)),
         user).order_by(WorkTask.due_at.asc()).all()
     data['due'] = [{
-        'item_id': t.item_id,
-        'item_title': (WorkItem.query.get(t.item_id) or WorkItem()).title,
-        'due_at': t.due_at.strftime('%Y-%m-%d %H:%M'),
-        'overdue': t.due_at < now,
-    } for t in due_rows]
+        'item_id': item.id,
+        'item_title': item.title,
+        'due_at': task.due_at.strftime('%Y-%m-%d %H:%M'),
+        'overdue': task.due_at < now,
+    } for task, item in due_rows]
     return data

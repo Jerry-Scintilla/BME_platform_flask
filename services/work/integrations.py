@@ -80,34 +80,45 @@ def project_for(user, item_id):
 # ── 治理视图（M5）：交接清单与紧急介入 ──────────────────────
 
 def handover_overview(user_id):
-    """交接清单（§5.4）：未完成任务/待验收/待回复/参与事项/失效授权。"""
+    """交接清单（§5.4）：未完成任务/待验收/待回复/参与事项/失效授权。
+
+    事项批量预取（#33/#43：join 取双实体 + 一次 in_，去掉逐行 get 与空模型兜底）。"""
     from models import WorkAccessGrant, WorkResponseRequest, WorkTask, WorkTransferRequest
 
     active_task_statuses = ('todo', 'in_progress', 'blocked', 'review')
-    tasks = (db.session.query(WorkTask).join(WorkItem, WorkItem.id == WorkTask.item_id)
-             .filter(WorkItem.status.in_(active_task_statuses),
-                     (WorkTask.assignee_user_id == user_id)
-                     | (WorkTask.reviewer_user_id == user_id)).all())
+    task_rows = (db.session.query(WorkTask, WorkItem)
+                 .join(WorkItem, WorkItem.id == WorkTask.item_id)
+                 .filter(WorkItem.status.in_(active_task_statuses),
+                         (WorkTask.assignee_user_id == user_id)
+                         | (WorkTask.reviewer_user_id == user_id)).all())
     unfinished, to_review = [], []
-    for t in tasks:
-        item = WorkItem.query.get(t.item_id)
-        row = {'item_id': t.item_id, 'title': item.title if item else None,
-               'status': item.status if item else None,
+    for t, item in task_rows:
+        row = {'item_id': t.item_id, 'title': item.title,
+               'status': item.status,
                'role': 'assignee' if t.assignee_user_id == user_id else 'reviewer',
                'due_at': t.due_at.strftime('%Y-%m-%d %H:%M') if t.due_at else None}
         (to_review if row['role'] == 'reviewer' and item.status == 'review'
          else unfinished).append(row)
 
+    extra_ids = set()
+    for q in (WorkResponseRequest.query.filter_by(
+                responder_user_id=user_id, status='pending'),
+              WorkTransferRequest.query.filter_by(
+                to_user_id=user_id, status='pending')):
+        extra_ids.update(r.item_id for r in q.all())
+    items_map = {i.id: i for i in WorkItem.query.filter(
+        WorkItem.id.in_(list(extra_ids))).all()} if extra_ids else {}
+
     pending_responses = [{
         'request_id': r.id, 'item_id': r.item_id,
-        'title': (WorkItem.query.get(r.item_id) or WorkItem()).title,
+        'title': items_map[r.item_id].title if r.item_id in items_map else None,
         'due_at': r.due_at.strftime('%Y-%m-%d %H:%M') if r.due_at else None,
     } for r in WorkResponseRequest.query.filter_by(
         responder_user_id=user_id, status='pending').all()]
 
     pending_transfers = [{
         'transfer_id': t.id, 'item_id': t.item_id,
-        'title': (WorkItem.query.get(t.item_id) or WorkItem()).title,
+        'title': items_map[t.item_id].title if t.item_id in items_map else None,
         'expires_at': t.expires_at.strftime('%Y-%m-%d %H:%M'),
     } for t in WorkTransferRequest.query.filter_by(
         to_user_id=user_id, status='pending').all()]

@@ -39,7 +39,8 @@ def upload_file(item_id):
         return jsonify({"code": 400, "message": "缺少 file 字段"}), 400
     file_id = request.form.get("file_id") or None
     wf, version = files_service.upload_version(
-        user, item_id, file_storage, file_id=int(file_id) if file_id else None)
+        user, item_id, file_storage,
+        file_id=access.int_or_400(file_id, 'file_id') if file_id else None)
     db.session.commit()
     return jsonify({"code": 200, "message": "已上传",
                     "data": {"file_id": wf.id, "version_id": version.id,
@@ -72,6 +73,9 @@ def download_file(file_id):
     from storage import storage
     user = _require_user()
     wf, version = files_service.download(user, file_id, request.args.get("link_id"))
+    # 紧急介入下载的服务层留痕（emergency_access 事件）在此提交（#6）；
+    # 常规路径无待提交变更，commit 为空操作
+    db.session.commit()
     try:
         obj = storage.get_object(version.object_key)
         data = obj.read()

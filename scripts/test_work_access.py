@@ -249,6 +249,60 @@ class WorkAccessTest(unittest.TestCase):
                                 headers=self._auth(self.super_admin), json={})
         self.assertEqual(resp.status_code, 400)
 
+    # ── #7：授权来源组与工作区组绑定校验（收紧拍板） ──────
+
+    def test_grant_membership_source_must_match_workspace_group(self):
+        """A 组 membership 授 B 组工作区 → 400（跨组协作走事项参与者邀请）。"""
+        ws_soft = self._open_workspace(self.g_soft)
+        ws_hard = self._open_workspace(self.g_hard)
+        resp = self.client.post('/work/governance/grants', headers=self._auth(self.super_admin),
+                                json={'user_id': self.member_user.id, 'role': 'member',
+                                      'workspace_id': ws_hard.id,
+                                      'source_type': 'membership',
+                                      'source_id': self.membership.id,
+                                      'grant_reason': '跨组越界'})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('归属来源与工作区组不一致', resp.get_json()['message'])
+        # 同组开通不受影响
+        self._grant(self.super_admin, self.member_user, ws_soft, 'member',
+                    'membership', self.membership)
+
+    def test_grant_officer_group_mismatch_rejected_but_club_level_allowed(self):
+        """挂组任职授他组工作区 → 400；社团级职位（group_id 空）放行任意组。"""
+        ws_soft = self._open_workspace(self.g_soft)
+        ws_hard = self._open_workspace(self.g_hard)
+        # 干事甲挂软件组 → 授硬件组工作区被拒
+        resp = self.client.post('/work/governance/grants', headers=self._auth(self.super_admin),
+                                json={'user_id': self.officer_user.id, 'role': 'coordinator',
+                                      'workspace_id': ws_hard.id,
+                                      'source_type': 'officer',
+                                      'source_id': self.officer.id,
+                                      'grant_reason': '挂组越界'})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('任职来源挂靠组与工作区组不一致', resp.get_json()['message'])
+        # 社团级职位（如社长，group_id=None）可授任意组工作区
+        club_officer = ClubOfficer(
+            user_id=self.plain_user.id, title_id=self.position.id, title='社长',
+            group_id=None, term_start=date.today() - timedelta(days=10), status='active')
+        db.session.add(club_officer)
+        db.session.commit()
+        self._grant(self.super_admin, self.plain_user, ws_hard, 'member',
+                    'officer', club_officer)
+        data = self._me(self.plain_user)
+        self.assertEqual(len(data['workspaces']), 1)
+        self.assertEqual(data['workspaces'][0]['id'], ws_hard.id)
+
+    def test_candidates_gate_is_eligibility_based(self):
+        """#43：候选人口径为资格判定——纯在任干事（无任何授权）可调取
+        （可被邀为参与者/需要选回应人）；无资格者仍 403。"""
+        r = self.client.get('/work/candidates', headers=self._auth(self.officer_user))
+        self.assertEqual(r.status_code, 200)
+        uids = [c['user_id'] for c in r.get_json()['data']['candidates']]
+        self.assertIn(self.officer_user.id, uids)       # 在任干事即入选
+        self.assertNotIn(self.member_user.id, uids)     # 未开通授权的组员不在列
+        r = self.client.get('/work/candidates', headers=self._auth(self.plain_user))
+        self.assertEqual(r.status_code, 403)
+
     # ── A06：归属行原地改组，授权不跟随漂移 ────────────────
 
     def test_a06_membership_group_drift_invalidates_grant(self):
@@ -552,6 +606,49 @@ class WorkItemsTest(_WorkItemsBase):
         self.assertEqual(r1.get_json()['data']['id'], r2.get_json()['data']['id'])
         self.assertEqual(WorkItem.query.filter_by(title='幂等话题').count(), 1)
 
+    def test_b01_idem_key_scoped_per_user(self):
+        """#13：幂等键按创建者隔离——跨用户撞 key 各自成文，不 500 不占位。"""
+        r1 = self.client.post('/work/items', headers=self._auth(self.coord), json={
+            'workspace_id': self.ws_soft.id, 'kind': 'topic', 'title': '甲的话题',
+            'idempotency_key': 'shared-key'})
+        r2 = self.client.post('/work/items', headers=self._auth(self.member1), json={
+            'workspace_id': self.ws_soft.id, 'kind': 'topic', 'title': '乙的话题',
+            'idempotency_key': 'shared-key'})
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        self.assertNotEqual(r1.get_json()['data']['id'], r2.get_json()['data']['id'])
+        # 甲方重试同 key 仍回自己的原事项
+        r1b = self.client.post('/work/items', headers=self._auth(self.coord), json={
+            'workspace_id': self.ws_soft.id, 'kind': 'topic', 'title': '甲的重试',
+            'idempotency_key': 'shared-key'})
+        self.assertEqual(r1b.get_json()['data']['id'], r1.get_json()['data']['id'])
+
+    def test_b01_reply_request_id_scoped_per_item(self):
+        """#14：client_request_id 限定本事项——撞其他事项的同名 key 明确 409。"""
+        item_a = self._create_item(self.coord, self.ws_soft.id, title='事项甲')
+        item_b = self._create_item(self.coord, self.ws_soft.id, title='事项乙')
+        r1 = self._reply(self.member1, item_a, body='甲的回复', crid='same-crid')
+        self.assertEqual(r1.status_code, 200)
+        # 同一作者在事项乙复用该 key：不返回甲的回复当成功，明确冲突
+        r2 = self._reply(self.member1, item_b, body='乙的回复', crid='same-crid')
+        self.assertEqual(r2.status_code, 409)
+        self.assertIn('其他事项', r2.get_json()['message'])
+        from models import WorkReply
+        self.assertEqual(WorkReply.query.filter_by(client_request_id='same-crid').count(), 1)
+        # 事项甲内重试同 key 仍幂等返回原回复
+        r3 = self._reply(self.member1, item_a, body='甲的重试', crid='same-crid')
+        self.assertEqual(r3.status_code, 200)
+        self.assertEqual(r3.get_json()['data']['seq'], r1.get_json()['data']['seq'])
+
+    def test_b01_receipt_links_notification_row(self):
+        """#3：回执 notification_id 真实回填（回执→通知链路可用）。"""
+        from models import WorkNotificationReceipt
+        item = self._create_item(self.coord, self.ws_soft.id)
+        self._reply(self.member1, item, body='产生通知', crid='cr-nid')
+        receipts = WorkNotificationReceipt.query.all()
+        self.assertTrue(receipts)
+        self.assertTrue(all(r.notification_id is not None for r in receipts))
+
     # ── 流转与编辑 ─────────────────────────────────────────
 
     def test_publish_close_reopen_with_notifications(self):
@@ -594,6 +691,73 @@ class WorkItemsTest(_WorkItemsBase):
                               json={'title': '越权', 'expected_version': 3})
         self.assertEqual(r.status_code, 403)
 
+    def test_patch_concurrent_edit_stale_version_rejected(self):
+        """#1：并发 PATCH 模拟——双方基于同一 version 编辑，后写者必须 409
+        并刷新后重试，先写者的修改不被静默覆盖（patch 路径行锁 + 乐观校验）。"""
+        item = self._create_item(self.member1, self.ws_soft.id, title='初版')  # v2
+        # 协调员与作者同时读到 v2；作者先提交（v2→v3）
+        r_author = self.client.patch(f'/work/items/{item}', headers=self._auth(self.member1),
+                                     json={'title': '作者的修改', 'expected_version': 2})
+        self.assertEqual(r_author.status_code, 200)
+        self.assertEqual(r_author.get_json()['data']['version'], 3)
+        # 协调员持过期 v2 提交 → 409（不是覆盖成功的 200）
+        r_coord = self.client.patch(f'/work/items/{item}', headers=self._auth(self.coord),
+                                    json={'title': '协调员的修改', 'expected_version': 2})
+        self.assertEqual(r_coord.status_code, 409)
+        # 先写者的标题未被覆盖；协调员刷新后按新版本重试成功
+        self.assertEqual(WorkItem.query.get(item).title, '作者的修改')
+        r_coord2 = self.client.patch(f'/work/items/{item}', headers=self._auth(self.coord),
+                                     json={'title': '协调员的修改', 'expected_version': 3})
+        self.assertEqual(r_coord2.status_code, 200)
+        self.assertEqual(WorkItem.query.get(item).title, '协调员的修改')
+        self.assertEqual(WorkItem.query.get(item).version, 4)
+
+    def test_int_query_params_rejected_400(self):
+        """#5：非法 int 参数统一 400，不再 ValueError→500。"""
+        item = self._create_item(self.coord, self.ws_soft.id)
+        r = self.client.get('/work/items?page=abc', headers=self._auth(self.member1))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get('/work/items?page_size=abc', headers=self._auth(self.member1))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get(f'/work/items/{item}/replies?after_seq=abc',
+                            headers=self._auth(self.member1))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get(f'/work/items/{item}/replies?limit=abc',
+                            headers=self._auth(self.member1))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(f'/work/items/{item}/read', headers=self._auth(self.member1),
+                             json={'last_read_seq': 'abc'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_search_wildcards_escaped(self):
+        """#38：检索词中的 %/_ 按字面匹配（不再当通配符）。"""
+        self._create_item(self.coord, self.ws_soft.id, title='进度100%')
+        self._create_item(self.coord, self.ws_soft.id, title='进度100分')
+        r = self.client.get('/work/items?q=100%25', headers=self._auth(self.member1))
+        data = r.get_json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['items'][0]['title'], '进度100%')
+        # 下划线同理：只命中字面
+        self._create_item(self.coord, self.ws_soft.id, title='A_b')
+        self._create_item(self.coord, self.ws_soft.id, title='Axb')
+        r = self.client.get('/work/items?q=A_b', headers=self._auth(self.member1))
+        titles = [i['title'] for i in r.get_json()['data']['items']]
+        self.assertIn('A_b', titles)
+        self.assertNotIn('Axb', titles)
+
+    def test_clean_body_truncates_without_partial_tag(self):
+        """#37：先截原始再清洗——超长正文不会切出残缺 HTML 标记。"""
+        import re
+        from services.work import items as items_service
+        raw = '<p>安全段落</p>' * 6000                # 远超 20000 上限
+        out = items_service.clean_body(raw)
+        self.assertIsNotNone(out)
+        self.assertLessEqual(len(out), items_service.MAX_BODY_LEN)
+        self.assertIsNone(re.search(r'<[^>]*$', out))   # 尾部无未闭合片段
+        # 脚本内容剥离（正文文本保留）；短正文原样保留
+        self.assertEqual(items_service.clean_body('<script>alert(1)</script>你好'), '你好')
+        self.assertEqual(items_service.clean_body('普通正文'), '普通正文')
+
     # ── 已读游标 ───────────────────────────────────────────
 
     def test_read_cursor_and_unread_flag(self):
@@ -611,6 +775,20 @@ class WorkItemsTest(_WorkItemsBase):
         self.assertEqual(r.status_code, 200)
         r = self.client.get('/work/items', headers=self._auth(self.member1))
         self.assertFalse(r.get_json()['data']['items'][0]['unread'])
+
+    def test_read_cursor_never_regresses(self):
+        """#8：已读游标只进不退——低值重放不回退（条件更新语义）。"""
+        item = self._create_item(self.coord, self.ws_soft.id)
+        self._reply(self.coord, item, body='r1', crid='c-1')
+        self._reply(self.coord, item, body='r2', crid='c-2')
+        r = self.client.post(f'/work/items/{item}/read', headers=self._auth(self.member1),
+                             json={'last_read_seq': 2})
+        self.assertEqual(r.status_code, 200)
+        # 并发/重试场景：旧值（1）后到，游标保持 2
+        r = self.client.post(f'/work/items/{item}/read', headers=self._auth(self.member1),
+                             json={'last_read_seq': 1})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['data']['last_read_seq'], 2)
 
     # ── 待回应请求（§7.2） ─────────────────────────────────
 
@@ -637,6 +815,60 @@ class WorkItemsTest(_WorkItemsBase):
         r = self._reply(self.coord, item, body='请局外人回应', crid='cr-rr-3',
                         response={'user_id': self.plain.id})
         self.assertEqual(r.status_code, 400)
+
+    def test_response_due_reminder_lifecycle(self):
+        """#40：带时限的回应请求生成 response_due 提醒，回应完结即取消。"""
+        from models import WorkReminder
+        item = self._create_item(self.coord, self.ws_soft.id)
+        due = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%dT%H:%M')
+        r = self._reply(self.coord, item, body='请明天前确认', crid='cr-rd-1',
+                        response={'user_id': self.member1.id, 'due_at': due})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        row = WorkReminder.query.filter_by(slot='response_due', status='pending').one()
+        self.assertEqual(row.user_id, self.member1.id)
+        self.assertEqual(row.item_id, item)
+        req_id = row.object_version              # object_version = 回应请求 id
+        # 回应 → 提醒取消
+        r = self._reply(self.member1, item, body='已确认', crid='cr-rd-2',
+                        response_to_request_id=req_id)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(WorkReminder.query.get(row.id).status, 'cancelled')
+        # 无时限请求不生成提醒
+        r = self._reply(self.coord, item, body='请尽快看一眼', crid='cr-rd-3',
+                        response={'user_id': self.member1.id})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(WorkReminder.query.filter_by(
+            slot='response_due', status='pending').count(), 0)
+
+    def test_publish_topic_command_rejects_task_kind(self):
+        """#35：服务层兜底——任务经 command_topic.publish 发布被拒（任务发布
+        走 tasks._cmd_publish 的补齐前置检查）。"""
+        from services.work import items as items_service
+        from services.work.access import WorkApiError
+        r = self.client.post('/work/items', headers=self._auth(self.coord), json={
+            'workspace_id': self.ws_soft.id, 'kind': 'task', 'title': '草稿任务',
+            'task': {'due_at': (date.today() + timedelta(days=3)).isoformat()},
+            'idempotency_key': 'pub-guard-1'})
+        task_id = r.get_json()['data']['id']
+        with self.assertRaises(WorkApiError) as ctx:
+            items_service.command_topic(self.coord, task_id, 'publish',
+                                        {'expected_version': 1})
+        self.assertEqual(ctx.exception.code, 409)
+        self.assertEqual(WorkItem.query.get(task_id).status, 'draft')
+
+    def test_due_at_date_only_unified_end_of_day(self):
+        """#36：仅日期的 due_at 统一 23:59:59（草稿创建与改期同口径）。"""
+        from models import WorkTask
+        item_id, v = self._create_task(self.coord, self.member1, due_offset_days=5)
+        task = WorkTask.query.filter_by(item_id=item_id).one()
+        self.assertEqual((task.due_at.hour, task.due_at.minute, task.due_at.second),
+                         (23, 59, 59))
+        # 改期同样口径
+        self._cmd(self.coord, item_id, 'reschedule', v, reason='统一口径',
+                  due_at=(date.today() + timedelta(days=6)).isoformat())
+        task = WorkTask.query.filter_by(item_id=item_id).one()
+        self.assertEqual((task.due_at.hour, task.due_at.minute, task.due_at.second),
+                         (23, 59, 59))
 
     def test_events_timeline_and_reply_reference(self):
         item = self._create_item(self.coord, self.ws_soft.id)
@@ -762,6 +994,30 @@ class WorkTasksTest(_WorkItemsBase):
         self._cmd(self.member1, item_id, 'reschedule', v, reason='x',
                   due_at=(date.today() + timedelta(days=5)).isoformat(), expect=403)
 
+    def test_b06_follow_up_survives_reschedule(self):
+        """#11（B06 变体）：受阻任务改期后 follow_up 提醒存活（不再被版本
+        bump 静默丢弃）。"""
+        from models import WorkReminder
+        item_id, v = self._create_task(self.coord, self.member1, due_offset_days=10)
+        self._cmd(self.member1, item_id, 'start', v); v += 1
+        follow_at = datetime.now() + timedelta(days=2)
+        self._cmd(self.member1, item_id, 'block', v, blocker_reason='等外协到位',
+                  follow_up_at=follow_at.strftime('%Y-%m-%dT%H:%M')); v += 1
+        follow = WorkReminder.query.filter_by(
+            item_id=item_id, slot='follow_up', status='pending').one()
+        # 改期（版本 bump）后：follow_up 保留，due 提醒按新版本重建
+        self._cmd(self.coord, item_id, 'reschedule', v, reason='整体延期',
+                  due_at=(date.today() + timedelta(days=20)).isoformat()); v += 1
+        after = WorkReminder.query.get(follow.id)
+        self.assertEqual(after.status, 'pending')
+        self.assertEqual(after.trigger_at, follow.trigger_at)   # 触发点不被重建改动
+        self.assertTrue(WorkReminder.query.filter_by(
+            item_id=item_id, slot='due_soon', status='pending',
+            object_version=v).first())
+        # unblock 仍正常取消 follow_up（生命周期归 block/unblock 管）
+        self._cmd(self.member1, item_id, 'unblock', v)
+        self.assertEqual(WorkReminder.query.get(follow.id).status, 'cancelled')
+
     # ── 组内直派 vs 跨组转交（§8.3/§8.4） ──────────────────
 
     def test_reassign_scope_guard(self):
@@ -829,6 +1085,30 @@ class WorkTasksTest(_WorkItemsBase):
         r = self.client.post(f'/work/transfers/{tid2}/reject', headers=self._auth(self.member2))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self._task_row(item_id2).assignee_user_id, self.member1.id)
+
+    def test_b03_expire_never_overwrites_decided_transfer(self):
+        """#12：调度器持旧快照时已决转交不被覆写——行锁下复查 status。"""
+        from models import WorkTransferRequest
+        from services.work import tasks as tasks_service
+        item_id, _v = self._create_task(self.coord, self.member1)
+        self.client.post(f'/work/items/{item_id}/participants', headers=self._auth(self.coord),
+                         json={'user_id': self.member2.id})
+        r = self.client.post(f'/work/items/{item_id}/transfers', headers=self._auth(self.coord),
+                             json={'to_user_id': self.member2.id})
+        tid = r.get_json()['data']['transfer_id']
+        # 对方接受（负责人已换）
+        r = self.client.post(f'/work/transfers/{tid}/accept', headers=self._auth(self.member2))
+        self.assertEqual(r.status_code, 200)
+        # 模拟扫描器读到 accept 前的旧快照：expires_at 已过、扫描窗口内提交完成
+        WorkTransferRequest.query.filter_by(id=tid).update(
+            {'expires_at': datetime.now() - timedelta(hours=1)})
+        db.session.commit()
+        with self.app.test_request_context():
+            n = tasks_service.expire_transfers()
+            db.session.commit()
+        self.assertEqual(n, 0)                    # 已决（accepted）不复写
+        self.assertEqual(WorkTransferRequest.query.get(tid).status, 'accepted')
+        self.assertEqual(self._task_row(item_id).assignee_user_id, self.member2.id)
 
     # ── C04：提醒认领与恢复 ────────────────────────────────
 
@@ -1045,6 +1325,108 @@ class WorkFilesTest(_WorkItemsBase):
         r = self.client.get('/work/files?q=排期', headers=self._auth(self.member2))
         self.assertEqual(r.get_json()['data']['total'], 0)
 
+    def test_emergency_access_allows_file_download_logged(self):
+        """#6：紧急介入者可下载该事项附件（下载同样留痕），未介入仍 404。"""
+        from models import WorkEvent, WorkFile
+        super_admin = UserModel(username='介入超管', email='em-super@t.dev', role='super_admin')
+        super_admin.set_password('a' * 32)
+        db.session.add(super_admin)
+        db.session.commit()
+        item = self._create_item(self.member1, self.ws_soft.id,
+                                 visibility='participants', title='介入下载事项')
+        self._upload(self.member1, item, '证据.txt', '介入内容'.encode())
+        wf = WorkFile.query.filter_by(item_id=item).one()
+        link = self._item_link(wf.id)
+        # 未介入：治理身份也拿不到（404 统一形态）
+        r = self.client.get(f'/work/files/{wf.id}/download?link_id={link.id}',
+                            headers=self._auth(super_admin))
+        self.assertEqual(r.status_code, 404)
+        # 介入后：可下载 + 下载再留一条 emergency_access 事件
+        r = self.client.post('/work/governance/emergency-access',
+                             headers=self._auth(super_admin),
+                             json={'item_id': item, 'reason': '审计核查'})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        r = self.client.get(f'/work/files/{wf.id}/download?link_id={link.id}',
+                            headers=self._auth(super_admin))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('介入内容', r.get_data(as_text=True))
+        em_events = WorkEvent.query.filter_by(
+            item_id=item, event_type='emergency_access',
+            actor_user_id=super_admin.id).all()
+        self.assertEqual(len(em_events), 2)      # 介入读取 + 介入下载各一条
+        # 非治理用户即使有历史介入者也无效（member2 无介入记录）
+        r = self.client.get(f'/work/files/{wf.id}/download?link_id={link.id}',
+                            headers=self._auth(self.member2))
+        self.assertEqual(r.status_code, 404)
+
+    def test_quarantined_rejection_persisted_for_audit(self):
+        """#39：超限拒绝先落隔离记录再报错（DB 留审计痕迹，对象已清）。"""
+        from models import WorkFile
+        from services.work import files as files_service
+        item = self._create_item(self.coord, self.ws_soft.id)
+        original = files_service.MAX_FILE_MB
+        files_service.MAX_FILE_MB = 1
+        try:
+            self._upload(self.member1, item, '超大.txt', b'a' * (1024 * 1024 + 10), expect=413)
+        finally:
+            files_service.MAX_FILE_MB = original
+        row = WorkFile.query.filter_by(item_id=item).one()
+        self.assertEqual(row.status, 'quarantined')      # 隔离记录已提交
+        self.assertEqual(len(self.fake_storage.objects), 0)
+        # 隔离文件不进附件列表
+        r = self.client.get(f'/work/items/{item}', headers=self._auth(self.member1))
+        self.assertEqual(r.get_json()['data']['files'], [])
+
+    def test_quarantine_bad_new_version_keeps_old_current(self):
+        """#39 细化：既有文件的坏新版本只隔离自身——文件保持 active、
+        旧版本仍可下载，同时留版本行审计痕迹。"""
+        from models import WorkFile, WorkFileVersion
+        from services.work import files as files_service
+        item = self._create_item(self.coord, self.ws_soft.id)
+        r = self._upload(self.member1, item, '迭代.txt', 'v1'.encode())
+        file_id = r.get_json()['data']['file_id']
+        v1_id = r.get_json()['data']['version_id']
+        link = self._item_link(file_id)
+        original = files_service.MAX_FILE_MB
+        files_service.MAX_FILE_MB = 1
+        try:
+            self._upload(self.member1, item, '迭代.txt', b'x' * (1024 * 1024 + 10),
+                         file_id=file_id, expect=413)
+        finally:
+            files_service.MAX_FILE_MB = original
+        wf = WorkFile.query.get(file_id)
+        self.assertEqual(wf.status, 'active')              # 文件未被毁
+        self.assertEqual(wf.current_version_id, v1_id)     # current 仍指 v1
+        failed = WorkFileVersion.query.filter_by(file_id=file_id,
+                                                 format_check='failed').one()
+        self.assertEqual(failed.version_no, 2)             # 坏版本留痕
+        self.assertNotIn(failed.object_key, self.fake_storage.objects)
+        r = self.client.get(f'/work/files/{file_id}/download?link_id={link.id}',
+                            headers=self._auth(self.member1))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('v1', r.get_data(as_text=True))
+
+    def test_quota_counts_current_version_only(self):
+        """#4：配额按各文件 current 版本口径——同文件传新版本不双计旧版。"""
+        from models import WorkFile
+        from services.work import files as files_service
+        item = self._create_item(self.coord, self.ws_soft.id)
+        originals = (files_service.MAX_FILE_MB, files_service.ITEM_QUOTA_MB)
+        files_service.MAX_FILE_MB = 1
+        files_service.ITEM_QUOTA_MB = 1
+        try:
+            r = self._upload(self.member1, item, '大文件.txt', b'a' * (700 * 1024))
+            file_id = r.get_json()['data']['file_id']
+            # 同文件 v2（500KB）：旧 current 700KB 不再计入 → 700+500 旧口径会拒，
+            # current 口径只算替换后的占用 → 通过
+            self._upload(self.member1, item, '大文件.txt', b'b' * (500 * 1024),
+                         file_id=file_id)
+            self.assertEqual(WorkFile.query.get(file_id).status, 'active')
+            # 另一新文件 600KB：current 合计 500+600 > 1MB → 拒
+            self._upload(self.member1, item, '再来.txt', b'c' * (600 * 1024), expect=413)
+        finally:
+            files_service.MAX_FILE_MB, files_service.ITEM_QUOTA_MB = originals
+
 
 class WorkGovernanceTest(_WorkItemsBase):
     """M5 业务关联投影/交接清单/紧急介入/归档门禁的隔离回归。"""
@@ -1120,6 +1502,40 @@ class WorkGovernanceTest(_WorkItemsBase):
         r = self.client.get(f'/work/governance/handover?user_id={self.member1.id}',
                             headers=self._auth(self.member1))
         self.assertEqual(r.status_code, 403)
+
+    def test_governance_int_params_rejected_400(self):
+        """#5：治理接口非法 int 参数统一 400（不再 ValueError→500）。"""
+        r = self.client.get('/work/governance/grants?user_id=abc',
+                            headers=self._auth(self.super_admin))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get('/work/governance/grants?workspace_id=abc',
+                            headers=self._auth(self.super_admin))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get('/work/governance/grants?page=abc',
+                            headers=self._auth(self.super_admin))
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get('/work/governance/handover?user_id=abc',
+                            headers=self._auth(self.super_admin))
+        self.assertEqual(r.status_code, 400)
+
+    def test_todo_counts_align_with_todos_after_revocation(self):
+        """#34：撤权后摘要计数与待办列表同口径——徽标数不大于列表条数。"""
+        from models import WorkAccessGrant
+        item = self._create_item(self.coord, self.ws_soft.id, title='待回复口径')
+        self._reply(self.coord, item, body='请确认', crid='align-1',
+                    response={'user_id': self.member1.id})
+        r = self.client.get('/work/me', headers=self._auth(self.member1))
+        self.assertEqual(r.get_json()['data']['todo']['pending_responses'], 1)
+        r = self.client.get('/work/me/todos', headers=self._auth(self.member1))
+        self.assertEqual(len(r.get_json()['data']['pending_responses']), 1)
+        # 撤权：计数与列表同时归零（旧口径计数仍为 1 → 口径不一致）
+        WorkAccessGrant.query.filter_by(user_id=self.member1.id) \
+            .update({'status': 'revoked'})
+        db.session.commit()
+        r = self.client.get('/work/me', headers=self._auth(self.member1))
+        self.assertEqual(r.get_json()['data']['todo']['pending_responses'], 0)
+        r = self.client.get('/work/me/todos', headers=self._auth(self.member1))
+        self.assertEqual(r.get_json()['data']['pending_responses'], [])
 
     def test_a03_emergency_access_logged(self):
         """A03 介入段：协调员读受限话题 404 → 治理紧急介入可读且留痕。"""

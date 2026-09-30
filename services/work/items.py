@@ -16,7 +16,7 @@ import nh3
 from exts import db
 from models import (UserModel, WorkItem, WorkItemParticipant, WorkReadState,
                     WorkReply, WorkResponseRequest, WorkTask, WorkEvent)
-from services.work import access
+from services.work import access, reminders
 from services.work.access import ItemAccess, WorkApiError
 from services.work.events import record_event, fan_out
 
@@ -34,11 +34,30 @@ MAX_PAGE_SIZE = 100
 
 
 def clean_body(raw):
-    """正文（markdown）服务端清洗：限长 + nh3 白名单（脚本/事件属性一律剥离）。"""
+    """正文（markdown）服务端清洗：限长 + nh3 白名单（脚本/事件属性一律剥离）。
+
+    先截原始文本再清洗（#37）：对清洗结果做硬截可能切在 HTML 标签中间产生
+    残缺标记；按比例收缩原始长度直至清洗结果不超过上限（实体转义会少量膨胀）。"""
     if raw is None:
         return None
-    text = str(raw)[:MAX_BODY_LEN + 100]
-    return nh3.clean(text, attributes={})[:MAX_BODY_LEN] if text.strip() else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    probe = text[:MAX_BODY_LEN]
+    cleaned = nh3.clean(probe, attributes={})
+    while len(cleaned) > MAX_BODY_LEN and probe:
+        probe = probe[:max(1, int(len(probe) * MAX_BODY_LEN / len(cleaned)))]
+        cleaned = nh3.clean(probe, attributes={})
+    return cleaned or None
+
+
+def _like_pattern(q):
+    """检索词转 LIKE 模式并转义 %/_/\\（#38：用户输入的通配符按字面匹配）。
+
+    返回 (pattern, escape_char)；escape_char 为单反斜杠，SQL 端 ESCAPE 子句用。"""
+    escaped = ((str(q) or '').strip()[:50]
+               .replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_'))
+    return f"%{escaped}%", '\\'
 
 
 def _usernames(uids):
@@ -76,6 +95,23 @@ def _item_dict(item, group_name=None, task=None, unread=None):
 
 # ── 创建（幂等）──────────────────────────────────────────────
 
+def parse_due_at(raw, field='due_at'):
+    """截止时间统一口径（#36）：YYYY-MM-DDTHH:MM 或仅日期；仅日期解释为
+    当天 23:59:59（方案 §8.5：逾期判定取当天末尾）。任务/改期两入口共用。"""
+    if not raw:
+        raise WorkApiError(400, f'缺少 {field}')
+    text = str(raw)
+    for fmt, cut in (('%Y-%m-%dT%H:%M', 16), ('%Y-%m-%d', 10)):
+        try:
+            dt = datetime.strptime(text[:cut], fmt)
+            if fmt == '%Y-%m-%d':
+                dt = dt.replace(hour=23, minute=59, second=59)
+            return dt
+        except ValueError:
+            continue
+    raise WorkApiError(400, f'{field} 格式应为 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM')
+
+
 def _parse_task_params(payload):
     """任务草稿参数：负责人/时限可缺（发布前必须补齐），字段超范围即 400。"""
     task = payload.get('task') or {}
@@ -91,13 +127,20 @@ def _parse_task_params(payload):
     for key in ('start_at', 'due_at'):
         raw = task.get(key)
         if raw:
+            if key == 'due_at':
+                # 截止统一 23:59:59 口径（#36，与改期命令一致）
+                params[key] = parse_due_at(raw, f'task.{key}')
+                continue
+            text = str(raw)
             try:
-                params[key] = datetime.strptime(str(raw)[:16], '%Y-%m-%dT%H:%M')
+                params[key] = datetime.strptime(text[:16], '%Y-%m-%dT%H:%M')
             except ValueError:
                 try:
-                    params[key] = datetime.strptime(str(raw)[:10], '%Y-%m-%d')
+                    # 开始时间仅日期取当天 00:00（起点语义，与截止的末尾口径对称）
+                    params[key] = datetime.strptime(text[:10], '%Y-%m-%d')
                 except ValueError:
-                    raise WorkApiError(400, f'task.{key} 格式应为 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM')
+                    raise WorkApiError(400,
+                                       f'task.{key} 格式应为 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM')
     if task.get('priority') is not None:
         if task['priority'] not in ('normal', 'high', 'urgent'):
             raise WorkApiError(400, 'task.priority 仅支持 normal/high/urgent')
@@ -147,8 +190,9 @@ def create_item(user, payload):
 
 def list_items(user, *, kind=None, status=None, workspace_id=None, mine=False,
                q=None, page=1, page_size=DEFAULT_PAGE_SIZE):
-    page = max(1, int(page or 1))
-    page_size = min(MAX_PAGE_SIZE, max(1, int(page_size or DEFAULT_PAGE_SIZE)))
+    page = max(1, access.int_or_400(page, 'page', default=1))
+    page_size = min(MAX_PAGE_SIZE, max(1, access.int_or_400(
+        page_size, 'page_size', default=DEFAULT_PAGE_SIZE)))
     if kind is not None and kind not in KINDS:
         raise WorkApiError(400, 'kind 参数非法')
     query = db.session.query(WorkItem)
@@ -168,8 +212,9 @@ def list_items(user, *, kind=None, status=None, workspace_id=None, mine=False,
                                      WorkItemParticipant.user_id == user.id,
                                      WorkItemParticipant.removed_at.is_(None))))
     if q:
-        like = f"%{(str(q) or '').strip()[:50]}%"
-        query = query.filter(WorkItem.title.like(like) | WorkItem.body.like(like))
+        like, escape_char = _like_pattern(q)
+        query = query.filter(WorkItem.title.like(like, escape=escape_char)
+                             | WorkItem.body.like(like, escape=escape_char))
     total = query.count()
     rows = (query.order_by(WorkItem.last_activity_at.desc(), WorkItem.id.desc())
             .offset((page - 1) * page_size).limit(page_size).all())
@@ -269,7 +314,7 @@ def _serialize_item(user, item, item_access):
     data = {
         **_item_dict(item, group_name, task),
         'body': item.body,
-        'files': files_service.item_files(user, item.id),
+        'files': files_service.item_files(item.id),
         'created_by_name': names.get(item.created_by),
         'participants': [{'user_id': p.user_id, 'username': names.get(p.user_id),
                           'ptype': p.ptype} for p in participants],
@@ -306,8 +351,14 @@ def _serialize_item(user, item, item_access):
 # ── 编辑（乐观版本）─────────────────────────────────────────
 
 def patch_item(user, item_id, payload):
-    """编辑标题/正文/可见范围：草稿仅作者；已发布=作者∨协调员（§5.2）。"""
-    item = WorkItem.query.filter_by(id=item_id).first()
+    """编辑标题/正文/可见范围：草稿仅作者；已发布=作者∨协调员（§5.2）。
+
+    与命令路径一致持事项行锁（#1）：版本比对-提交原子化，并发 PATCH 不再
+    静默丢失更新，record_event 的 seq 分配也回到锁内串行契约。"""
+    item = (WorkItem.query
+            .filter_by(id=item_id)
+            .with_for_update()
+            .first())
     item, item_access = access.require_read(user, item)
     if item.status == 'draft':
         if item.created_by != user.id:
@@ -390,6 +441,10 @@ def command_topic(user, item_id, command, payload):
     if command == 'publish':
         if not (is_author or is_coord):
             raise WorkApiError(403, '仅作者或本组协调员可以发布')
+        if item.kind != 'topic':
+            # 服务层兜底（#35）：任务发布走 tasks._cmd_publish（须补齐负责人与
+            # 截止），防止绕过蓝图路由直调本函数跳过任务发布前置检查
+            raise WorkApiError(409, '该事项不是话题')
         if item.status != 'draft':
             raise WorkApiError(409, '该事项已发布')
         item.status = 'open'
@@ -441,7 +496,9 @@ def _ensure_assignee_participant(item, assignee_id, actor):
 
 
 def _notify_item_audience(item, actor_id, notify_type, extra_targets=None):
-    """事项相关人通知：作者+有效参与者，剔除操作者，过滤失资格者（§10.2）。"""
+    """事项相关人通知：作者+有效参与者，剔除操作者，过滤失资格者（§10.2）。
+
+    用户与资格批量预取（#33：受众逐人查询改一次 in_，语义不变）。"""
     uids = {item.created_by}
     for p in WorkItemParticipant.query.filter_by(item_id=item.id, removed_at=None).all():
         uids.add(p.user_id)
@@ -451,19 +508,19 @@ def _notify_item_audience(item, actor_id, notify_type, extra_targets=None):
              .order_by(WorkEvent.seq.desc()).first())
     if not event:
         return
-    targets = []
-    for uid in uids:
-        if uid == actor_id:
-            continue
-        u = UserModel.query.get(uid)
-        if not u or not access.participation_eligible(u):
-            continue
-        targets.append((uid, notify_type))
+    uids.discard(actor_id)
+    users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(list(uids))).all()} \
+        if uids else {}
+    eligible = access.participation_eligible_bulk(users.values())
+    targets = [(uid, notify_type) for uid in uids
+               if uid in users and eligible.get(uid)]
     fan_out(item, event, targets)
 
 
 def _notify_workspace_members(item, actor_id, notify_type):
-    """发布通知：工作区可见事项通知全组有效授权成员；参与档只通知参与者。"""
+    """发布通知：工作区可见事项通知全组有效授权成员；参与档只通知参与者。
+
+    授权来源行/用户/资格批量预取（#33：百人工作区发布一次不再数百次查询）。"""
     if item.visibility != 'workspace':
         return _notify_item_audience(item, actor_id, notify_type)
     event = (WorkEvent.query.filter_by(item_id=item.id)
@@ -475,26 +532,34 @@ def _notify_workspace_members(item, actor_id, notify_type):
     if not ws:
         return
     grants = WorkAccessGrant.query.filter_by(workspace_id=ws.id, status='active').all()
+    effective = access.grants_effective_bulk(grants)
     targets = []
+    target_uids = set()
     for g in grants:
-        if g.user_id == actor_id:
-            continue
-        if not access._grant_effective(g):
+        if g.user_id == actor_id or not effective.get(g.id):
             continue
         targets.append((g.user_id, notify_type))
-    # 参与者也一并通知（含跨组被邀者）
-    for p in WorkItemParticipant.query.filter_by(item_id=item.id, removed_at=None).all():
-        if p.user_id != actor_id and all(t[0] != p.user_id for t in targets):
-            u = UserModel.query.get(p.user_id)
-            if u and access.participation_eligible(u):
-                targets.append((p.user_id, notify_type))
+        target_uids.add(g.user_id)
+    # 参与者也一并通知（含跨组被邀者；未被授权扇出覆盖的才补）
+    participants = [p.user_id for p in WorkItemParticipant.query.filter_by(
+        item_id=item.id, removed_at=None).all() if p.user_id != actor_id]
+    extras = [uid for uid in participants if uid not in target_uids]
+    if extras:
+        users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(extras)).all()}
+        eligible = access.participation_eligible_bulk(users.values())
+        for uid in extras:
+            if uid in users and eligible.get(uid):
+                targets.append((uid, notify_type))
     fan_out(item, event, targets)
 
 
 # ── 回复（幂等 + FOR UPDATE seq）────────────────────────────
 
 def create_reply(user, item_id, payload):
-    """留言/回信（§7）：成功保存才算发出；重试回原结果不重复（B01）。"""
+    """留言/回信（§7）：成功保存才算发出；重试回原结果不重复（B01）。
+
+    幂等检查在行锁与读取权之后（#14）：查询限定本事项，同一请求 ID 撞到
+    其他事项的回复时按冲突拒绝，不再跨事项串扰返回、也不再跳过权限检查。"""
     body = (str(payload.get('body') or '').strip())
     if not body or len(body) > MAX_REPLY_LEN:
         raise WorkApiError(400, f'回复内容必填且 ≤{MAX_REPLY_LEN} 字')
@@ -502,21 +567,28 @@ def create_reply(user, item_id, payload):
     if not client_request_id or len(client_request_id) > 64:
         raise WorkApiError(400, '缺少 client_request_id')
 
-    # 幂等短路：同作者同请求 ID 直接回原回复（不产生新事件/通知）
-    existed = WorkReply.query.filter_by(author_id=user.id,
-                                        client_request_id=client_request_id).first()
-    if existed:
-        return existed, False
-
     item = (WorkItem.query
             .filter_by(id=item_id)
             .with_for_update()
             .first())
     item, item_access = access.require_read(user, item)
+
+    # 幂等复查（行锁后）：同作者同请求 ID 且同事项 → 回原回复（不产生新事件/通知）
+    existed = WorkReply.query.filter_by(item_id=item.id, author_id=user.id,
+                                        client_request_id=client_request_id).first()
+    if existed:
+        return existed, False
+
     if item.status == 'draft':
         raise WorkApiError(409, '草稿不能回复')
     if item.status == 'closed':
         raise WorkApiError(409, '话题已关闭，停止回复')
+    # 请求 ID 为作者全局唯一（uq_work_reply_author_request）：撞到其他事项的
+    # 同名 key 属客户端误用，明确 409 而非撞唯一约束 500
+    dup_other = WorkReply.query.filter_by(
+        author_id=user.id, client_request_id=client_request_id).first()
+    if dup_other:
+        raise WorkApiError(409, '该 client_request_id 已用于其他事项的回复')
 
     reply_to_id = payload.get('reply_to_id')
     if reply_to_id is not None:
@@ -548,7 +620,7 @@ def create_reply(user, item_id, payload):
     # 发起人可指定回应人（need_reply）：形成待回复记录（§7.2）
     response_spec = payload.get('response')
     if isinstance(response_spec, dict) and response_spec.get('user_id'):
-        responder_id = int(response_spec['user_id'])
+        responder_id = access.int_or_400(response_spec['user_id'], 'response.user_id')
         responder = UserModel.query.get(responder_id)
         if not responder or not access.participation_eligible(responder):
             raise WorkApiError(400, '回应人不具备协作资格')
@@ -560,14 +632,21 @@ def create_reply(user, item_id, payload):
                 due_at = datetime.strptime(str(response_spec['due_at'])[:16], '%Y-%m-%dT%H:%M')
             except ValueError:
                 raise WorkApiError(400, '回应时限格式应为 YYYY-MM-DDTHH:MM')
-        db.session.add(WorkResponseRequest(
+        request_new = WorkResponseRequest(
             item_id=item.id, reply_id=reply.id, responder_user_id=responder_id,
-            due_at=due_at, status='pending', created_by=user.id))
+            due_at=due_at, status='pending', created_by=user.id)
+        db.session.add(request_new)
+        db.session.flush()                   # 取请求行主键供提醒 object_version 用
+        # 回应时限提醒（#40 接入 for_response_request：到点催办回应人）
+        if due_at:
+            reminders.for_response_request(request_new)
 
     if request_row is not None:
         request_row.status = 'responded'
         request_row.response_reply_id = reply.id
         request_row.responded_at = datetime.now()
+        # 已回应：其 response_due 提醒随完结取消（#40）
+        reminders.cancel_for_response_request(request_row)
 
     event = (WorkEvent.query.filter_by(item_id=item.id)
              .order_by(WorkEvent.seq.desc()).first())
@@ -578,11 +657,14 @@ def create_reply(user, item_id, payload):
 
 
 def list_replies(user, item_id, *, after_seq=0, limit=50):
-    """回复按服务器序号分页；断线恢复从最后游标增量拉取（§7.5）。"""
+    """回复按服务器序号分页；断线恢复从最后游标增量拉取（§7.5）。
+
+    edited_at/removed 为回复编辑/撤回的预留位：首期契约——编辑 UI 与端点
+    推迟（设计 §7.4），WorkReplyRevision 表预留暂无写入方，两字段暂恒空。"""
     item = WorkItem.query.filter_by(id=item_id).first()
     access.require_read(user, item)
-    limit = min(100, max(1, int(limit or 50)))
-    after_seq = max(0, int(after_seq or 0))
+    limit = min(100, max(1, access.int_or_400(limit, 'limit', default=50)))
+    after_seq = max(0, access.int_or_400(after_seq, 'after_seq', default=0))
     rows = (WorkReply.query
             .filter(WorkReply.item_id == item.id, WorkReply.seq > after_seq)
             .order_by(WorkReply.seq.asc())
@@ -673,20 +755,24 @@ def remove_participant(user, item_id, target_id, reason=None):
 def advance_read(user, item_id, last_read_seq):
     item = WorkItem.query.filter_by(id=item_id).first()
     access.require_read(user, item)
-    try:
-        seq = int(last_read_seq)
-    except (TypeError, ValueError):
-        raise WorkApiError(400, 'last_read_seq 须为整数')
+    seq = access.int_or_400(last_read_seq, 'last_read_seq', default=0)
     if seq < 0 or seq > item.last_reply_seq:
         raise WorkApiError(409, '已读游标不能越过可见的最新回复')
+    # 条件更新保「只进不退」（#8）：读-比-写三步无锁时，并发推进由后提交者
+    # 胜可回退游标；UPDATE ... WHERE last_read_seq < :seq 让较小值永不落库。
+    updated = (WorkReadState.query
+               .filter(WorkReadState.user_id == user.id,
+                       WorkReadState.item_id == item.id,
+                       WorkReadState.last_read_seq < seq)
+               .update({'last_read_seq': seq}, synchronize_session=False))
+    if updated:
+        return WorkReadState.query.filter_by(
+            user_id=user.id, item_id=item.id).first()
     row = WorkReadState.query.filter_by(user_id=user.id, item_id=item.id).first()
     if row:
-        if seq <= row.last_read_seq:
-            return row                      # 只进不退：不报错，幂等返回
-        row.last_read_seq = seq
-    else:
-        row = WorkReadState(user_id=user.id, item_id=item.id, last_read_seq=seq)
-        db.session.add(row)
+        return row                          # 已不落后（并发已推进/幂等重试）
+    row = WorkReadState(user_id=user.id, item_id=item.id, last_read_seq=seq)
+    db.session.add(row)                     # 首次写入竞态由 uq(user,item) 兜底
     return row
 
 
@@ -701,8 +787,8 @@ def list_events(user, item_id, *, page=1, page_size=50):
         if item is None or not access.is_governance(user):
             raise
         item_access = access.ItemAccess('emergency')
-    page = max(1, int(page or 1))
-    page_size = min(100, max(1, int(page_size or 50)))
+    page = max(1, access.int_or_400(page, 'page', default=1))
+    page_size = min(100, max(1, access.int_or_400(page_size, 'page_size', default=50)))
     query = WorkEvent.query.filter_by(item_id=item.id)
     # 治理类事件仅协调员/治理身份可见（紧急介入记录不对普通成员展示）
     if not (item_access.is_coordinator or access.is_governance(user)):

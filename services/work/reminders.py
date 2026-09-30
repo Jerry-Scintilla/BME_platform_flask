@@ -1,9 +1,12 @@
 """内部工作台·持久提醒（设计方案 §10.3，M3）。
 
-提醒是持久任务不是页面回调：任务改期/完成/取消/换人时旧提醒按版本自然失效
-（regenerate 先取消全部 pending 再按新版本写入，B06）；后台扫描器原子认领、
-同事务发通知并标记 sent、失败退避重试、claimed 超时回收（C04），程序重启后
-继续处理未完成记录。
+提醒是持久任务不是页面回调：任务改期/完成/取消/换人时版本绑定提醒
+（due_soon/overdue）按版本自然失效——regenerate 先取消这部分 pending 再按新
+版本写入（B06）；follow_up/response_due 与事项版本无关，regenerate 不动它们
+（follow_up 随 block/unblock、response_due 随回应完结各自管理生命周期）。
+后台扫描器原子认领、同事务发通知并标记 sent、失败退避重试；程序重启后
+继续处理未完成记录（claim 与 send 同事务，崩溃即整体回滚回 pending——
+C04 的「崩溃恢复」实际由回滚保证，见 claim_due 注释）。
 
 object_version 语义随 slot：due_soon/overdue/follow_up = 事项 version；
 response_due = 回应请求 id（uq (item,user,slot,object_version) 兜底去重）。
@@ -45,9 +48,14 @@ def cancel_for_item(item_id):
 def regenerate_for_item(item):
     """按事项当前版本重建任务提醒（调用方持有事项行锁）。
 
-    终态（done/cancelled）只取消不重建；无负责人/无截止不生成 due 提醒；
-    follow_up 由 block 命令单独写入（带跟进时间）。"""
-    cancel_for_item(item.id)
+    只重建版本绑定提醒（due_soon/overdue）：先取消这两类 pending 再按新版本
+    写入；follow_up（随 block/unblock）与 response_due（随回应完结）与事项
+    版本无关，版本 bump 不丢弃（B06 修正：按 item_id+slot 存活，不带版本条件）。
+    终态（done/cancelled）只取消不重建；无负责人/无截止不生成 due 提醒。"""
+    WorkReminder.query.filter(
+        WorkReminder.item_id == item.id, WorkReminder.status == 'pending',
+        WorkReminder.slot.in_(('due_soon', 'overdue'))
+    ).update({'status': 'cancelled'}, synchronize_session=False)
     if item.kind != 'task' or item.status in ('done', 'cancelled'):
         return
     task = WorkTask.query.filter_by(item_id=item.id).first()
@@ -61,10 +69,9 @@ def regenerate_for_item(item):
     # overdue：已过期立即触发（补发一次），未过期按点触发
     _add(item.id, task.assignee_user_id, 'overdue', item.version,
          due if due > now else now)
-    # 受阻跟进时间仍有效的保留重建（block 时写入，版本一致则 uq 命中幂等）
+    # follow_up 仍有效的保留（block 时写入；触发点已过的取消避免补发噪音）
     follow = WorkReminder.query.filter_by(
-        item_id=item.id, slot='follow_up', object_version=item.version,
-        status='pending').first()
+        item_id=item.id, slot='follow_up', status='pending').first()
     if follow and follow.trigger_at <= now:
         follow.status = 'cancelled'
 
@@ -82,11 +89,20 @@ def cancel_follow_ups(item_id):
 
 
 def for_response_request(request_row):
-    """待回应请求的时限提醒（§7.2 回应时限→response_due，M3 补）。"""
+    """待回应请求的时限提醒（§7.2 回应时限→response_due；#40 接入：
+    创建带时限的回应请求时由 items.create_reply 调用）。"""
     if not request_row.due_at:
         return None
     return _add(request_row.item_id, request_row.responder_user_id,
                 'response_due', request_row.id, request_row.due_at)
+
+
+def cancel_for_response_request(request_row):
+    """回应完结后取消其 response_due 提醒（已回应不再到点催办）。"""
+    WorkReminder.query.filter_by(
+        item_id=request_row.item_id, user_id=request_row.responder_user_id,
+        slot='response_due', object_version=request_row.id,
+        status='pending').update({'status': 'cancelled'}, synchronize_session=False)
 
 
 def _assignee_of(item):
@@ -97,7 +113,11 @@ def _assignee_of(item):
 # ── 扫描（work_scheduler 每分钟调用；可重入、可恢复） ────────
 
 def claim_due(limit=20):
-    """原子认领到期 pending 行：条件更新防多实例重复领取。"""
+    """原子认领到期 pending 行：条件更新防多实例重复领取。
+
+    认领与发送同事务由调度器统一提交（work_scheduler._job_reminder_scan）：
+    进程崩溃时 claimed 标记随事务一并回滚回 pending——C04 的「崩溃恢复」
+    实际由该回滚保证，正常路径不会出现游离的 claimed 行。"""
     now = datetime.now()
     rows = (WorkReminder.query
             .filter(WorkReminder.status == 'pending', WorkReminder.trigger_at <= now)
@@ -146,7 +166,11 @@ def mark_failed(reminder):
 
 
 def recover_stale_claims():
-    """认领超时回收（C04）：进程崩溃遗留的 claimed 行回 pending。"""
+    """认领超时回收（C04）：游离 claimed 行回 pending。
+
+    现行事务模型下 claim 与 send 同事务提交，崩溃即整体回滚，本函数正常
+    不可达（#41：真实崩溃恢复由事务回滚保证）；保留为纵深防御——若日后
+    claim 改为单独提交，此回收立即生效。"""
     threshold = datetime.now() - timedelta(minutes=CLAIM_STALE_MINUTES)
     return (WorkReminder.query
             .filter(WorkReminder.status == 'claimed', WorkReminder.claimed_at < threshold)

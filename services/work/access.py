@@ -34,6 +34,18 @@ class WorkApiError(Exception):
         self.message = message
 
 
+def int_or_400(raw, field, default=None):
+    """查询参数整数收敛（#5）：非法值统一 400 而不是 ValueError→500。
+
+    raw 为空（None/''）时返回 default；调用方自行夹取上下界。"""
+    if raw is None or raw == '':
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise WorkApiError(400, f'{field} 须为整数')
+
+
 class ItemAccess:
     """一次对象级访问判定结果。
 
@@ -90,6 +102,76 @@ def participation_eligible(user):
     return bool(grants_for(user))
 
 
+def participation_eligible_bulk(users):
+    """批量协作资格判定（语义与 participation_eligible 同源，N+1 修正）。
+
+    一次 in_ 预取任职/归属/授权行，返回 {user_id: bool}；传入可为空，
+    缺失用户不在返回映射中（调用方按 False 处理）。"""
+    from models import WorkAccessGrant
+    today = date.today()
+    uids = [u.id for u in users if u is not None]
+    if not uids:
+        return {}
+    officer_uids = set()
+    for o in ClubOfficer.query.filter(
+            ClubOfficer.user_id.in_(uids), ClubOfficer.status == 'active').all():
+        if o.term_start <= today and (o.term_end is None or today <= o.term_end):
+            officer_uids.add(o.user_id)
+    member_uids = {m.user_id for m in ClubMembership.query.filter(
+        ClubMembership.user_id.in_(uids)).all()}
+    grant_uids = set()
+    for g in WorkAccessGrant.query.filter(
+            WorkAccessGrant.user_id.in_(uids),
+            WorkAccessGrant.status == 'active').all():
+        if g.user_id in officer_uids or g.user_id in grant_uids:
+            continue                       # 已判有效（或已计入），跳过重复判定
+        if _grant_effective(g):
+            grant_uids.add(g.user_id)
+    return {uid: (uid in officer_uids) or (uid in member_uids and uid in grant_uids)
+            for uid in uids}
+
+
+def grants_effective_bulk(grants):
+    """批量授权有效性判定（语义与 grant_status_reason 同源，N+1 修正）。
+
+    一次 in_ 预取 officer/membership 来源行，返回 {grant.id: bool}。"""
+    officer_ids = {g.source_id for g in grants
+                   if g.source_type == 'officer' and g.source_id}
+    mship_ids = {g.source_id for g in grants
+                 if g.source_type == 'membership' and g.source_id}
+    officers = {o.id: o for o in ClubOfficer.query.filter(
+        ClubOfficer.id.in_(list(officer_ids))).all()} if officer_ids else {}
+    mships = {m.id: m for m in ClubMembership.query.filter(
+        ClubMembership.id.in_(list(mship_ids))).all()} if mship_ids else {}
+    today = date.today()
+    out = {}
+    for g in grants:
+        if g.status != 'active':
+            out[g.id] = False
+            continue
+        if g.valid_from and today < g.valid_from:
+            out[g.id] = False
+            continue
+        if g.valid_until and today > g.valid_until:
+            out[g.id] = False
+            continue
+        if g.source_type == 'officer':
+            row = officers.get(g.source_id)
+            out[g.id] = bool(
+                row and row.user_id == g.user_id and row.status == 'active'
+                and row.term_start <= today
+                and (row.term_end is None or today <= row.term_end))
+        elif g.source_type == 'membership':
+            row = mships.get(g.source_id)
+            out[g.id] = bool(row and row.user_id == g.user_id
+                             and row.group_id == g.group_id_snapshot)
+        elif g.source_type == 'direct':
+            out[g.id] = g.role == 'governance'
+        else:
+            out[g.id] = False
+    return out
+
+
 # ── 授权有效性（A05/A06 核心）────────────────────────────────
 
 def _grants_raw(user):
@@ -129,15 +211,14 @@ def grant_status_reason(g):
     return False, '来源类型未知'
 
 
-def _grant_effective(g, today=None):
+def _grant_effective(g):
     """单条授权有效性（判定语义见 grant_status_reason，二者同源）。"""
     return grant_status_reason(g)[0]
 
 
 def grants_for(user):
     """全部有效授权（含 governance）。每请求实时计算。"""
-    today = date.today()
-    return [g for g in _grants_raw(user) if _grant_effective(g, today)]
+    return [g for g in _grants_raw(user) if _grant_effective(g)]
 
 
 def is_governance(user):
@@ -152,12 +233,11 @@ def is_governance(user):
 def workspace_access(user):
     """有效工作区访问映射 {workspace_id: role}。仅 active 工作区；
     governance 授权不进本映射（治理≠阅读）；coordinator 优先于 member。"""
-    today = date.today()
     result = {}
     for g in _grants_raw(user):
         if g.role == 'governance' or g.workspace_id is None:
             continue
-        if not _grant_effective(g, today):
+        if not _grant_effective(g):
             continue
         ws = WorkWorkspace.query.get(g.workspace_id)
         if not ws or ws.status != 'active':

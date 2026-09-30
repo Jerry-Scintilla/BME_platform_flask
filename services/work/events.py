@@ -84,6 +84,9 @@ def fan_out(item, event, targets):
         notification = create_notification(
             uid, '内部工作台', NOTIFY_TEXTS.get(notify_type, '内部工作台有新动态'),
             category='work', source_type='work_item', source_id=item.id)
+        # create_notification 只 add 不 flush：先 flush 拿到通知行主键，
+        # 否则 receipt.notification_id 读到 None 落库（回执→通知链路失效，#3）
+        db.session.flush()
         receipt.notification_id = notification.id
         sent += 1
     return sent
