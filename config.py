@@ -25,6 +25,10 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET")
 JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=2)
 JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=14)
 
+# 开发测试账号面板（GET /auth/dev_accounts，登录页快捷登录数据源）：
+# debug 模式自动可用；非 debug 环境需显式 DEV_TEST_ACCOUNTS=on（.env），生产不设即关
+DEV_TEST_ACCOUNTS = os.getenv("DEV_TEST_ACCOUNTS", "").lower() in ("1", "on", "true")
+
 # JWT_SECRET 启动强校验：弱/缺失密钥 = 任何人可伪造 token，直接拒绝启动。
 # 生成：python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 if not JWT_SECRET_KEY or len(JWT_SECRET_KEY) < 32:
