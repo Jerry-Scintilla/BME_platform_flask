@@ -321,20 +321,23 @@ def _cookie_names(client_type):
 
 def _set_auth_cookies(resp, client_type, refresh, csrf_token):
     """refresh 落 HttpOnly cookie（Path 限定到本端续期端点，双端隔离）；
-    csrf 为可读 cookie 供双提交校验。SameSite=Lax：生产同源、dev 127.0.0.1
+    csrf 为可读 cookie 供双提交校验——Path 必须放宽到 '/'（限 /auth/* 时
+    页面 JS 的 document.cookie 读不到，双提交无法回填 header；它只是配对
+    随机值非凭据，宽 path 无泄露面）。SameSite=Lax：生产同源、dev 127.0.0.1
     跨端口仍属同站，可随 XHR 发送（不需要 SameSite=None）。"""
     rt, csrf = _cookie_names(client_type)
     max_age = int(config.JWT_REFRESH_TOKEN_EXPIRES.total_seconds())
-    common = dict(max_age=max_age, samesite="Lax", secure=config.AUTH_COOKIE_SECURE,
-                  path=f"/auth/{client_type}")
-    resp.set_cookie(rt, refresh, httponly=True, **common)
-    resp.set_cookie(csrf, csrf_token, httponly=False, **common)
+    resp.set_cookie(rt, refresh, max_age=max_age, httponly=True,
+                    samesite="Lax", secure=config.AUTH_COOKIE_SECURE,
+                    path=f"/auth/{client_type}")
+    resp.set_cookie(csrf, csrf_token, max_age=max_age, httponly=False,
+                    samesite="Lax", secure=config.AUTH_COOKIE_SECURE, path="/")
 
 
 def _clear_auth_cookies(resp, client_type):
     rt, csrf = _cookie_names(client_type)
-    for name in (rt, csrf):
-        resp.set_cookie(name, "", max_age=0, path=f"/auth/{client_type}")
+    resp.set_cookie(rt, "", max_age=0, path=f"/auth/{client_type}")
+    resp.set_cookie(csrf, "", max_age=0, path="/")
 
 
 def _csrf_ok(client_type):
