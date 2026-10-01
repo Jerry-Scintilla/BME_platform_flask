@@ -81,7 +81,9 @@ def create_case(actor):
     Idempotency：一人同时只有一个未终态案例（收集期内旧案例先撤回）。
     """
     user = actor.user
-    if user.account_kind != 'standard' or user.is_admin():
+    # 服务号不认领（虚构自然人禁入）；test 号与核验同口径放行（限制在正式营业务
+    # 写入，规格 9.3——dev 全流程演练也依赖 seed 号）
+    if user.account_kind == 'service' or user.is_admin():
         raise AuthRejected('该类账号不能发起账号认领', status=403, machine='FORBIDDEN')
     if user.person_id is None:
         raise AuthRejected('缺少人员档案（数据异常）', status=500, machine='PERSON_MISSING')

@@ -322,3 +322,27 @@ def operation_status():
     payload = request.get_json(silent=True) or {}
     out = linking.check_receipt(payload.get('receipt') or '')
     return jsonify({"code": 200, **out})
+
+
+@bp.route("/reauth", methods=["POST"])
+@jwt_required()
+@limiter.limit("5/minute")
+@_identity_endpoint
+def reauth():
+    """当前账号操作证明（规格 11）：{password}（前端 MD5 后传输，登录协议同款）。
+
+    密码重验即实际认证——更新当前会话 auth_time（规格 6.2），不返回常规会话、
+    不替换当前登录态。prove-initiator 的近期认证前置在超窗后经此恢复。
+    """
+    from datetime import datetime
+    actor = _actor()
+    payload = request.get_json(silent=True) or {}
+    password = payload.get("password") or ""
+    if not password or not actor.user.check_password(password):
+        raise AuthRejected("密码验证失败", status=422, machine="REAUTH_FAILED")
+    if actor.session is None:
+        raise AuthRejected("当前会话不支持操作证明，请重新登录",
+                           status=403, machine="REAUTH_REQUIRED")
+    actor.session.auth_time = datetime.now()
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已完成操作认证（5 分钟内有效）"})
