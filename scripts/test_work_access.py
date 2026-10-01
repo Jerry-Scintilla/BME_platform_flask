@@ -408,6 +408,26 @@ class WorkAccessTest(unittest.TestCase):
         self.assertEqual(ev.user_id, self.member_user.id)
         self.assertEqual(ev.to_group_id, self.g_hard.id)
 
+    def test_group_description_write_and_caps(self):
+        """小组介绍（组织页组态展示位）：PUT 可写、空串清空、超 500 字 400。"""
+        resp = self.client.put(f'/admin/club/groups/{self.g_soft.id}',
+                               headers=self._auth(self.super_admin),
+                               json={'description': '  负责课程维护与工具链。  '})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(self.g_soft.description, '负责课程维护与工具链。')
+        self.assertEqual(resp.get_json()['data']['description'], '负责课程维护与工具链。')
+        # 超长拒绝
+        resp = self.client.put(f'/admin/club/groups/{self.g_soft.id}',
+                               headers=self._auth(self.super_admin),
+                               json={'description': '长' * 501})
+        self.assertEqual(resp.status_code, 400)
+        # 空串=清空（组织页回落占位文案）
+        resp = self.client.put(f'/admin/club/groups/{self.g_soft.id}',
+                               headers=self._auth(self.super_admin),
+                               json={'description': ''})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(self.g_soft.description)
+
     # ── 授权自动化（2026-10-01 方案 §3.2/§3.3 派生矩阵）────
 
     def _open_auto_ws(self, group):

@@ -58,6 +58,7 @@ def _group_dict(g):
     return {
         "id": g.id, "name": g.name, "parent_id": g.parent_id,
         "sort_order": g.sort_order, "status": g.status,
+        "description": g.description or "",
         "refs": _group_refs(g.id),
     }
 
@@ -149,6 +150,13 @@ def update_group(gid):
             g.sort_order = int(data.get("sort_order") or 0)
         except (TypeError, ValueError):
             return jsonify({"code": 400, "message": "sort_order 须为整数"}), 400
+
+    # 小组介绍（组织页组态展示位）：≤500 字，空串=清空（回落占位文案）
+    if "description" in data:
+        desc = str(data.get("description") or "").strip()
+        if len(desc) > 500:
+            return jsonify({"code": 400, "message": "小组介绍至多 500 字"}), 400
+        g.description = desc or None
 
     db.session.commit()
     return jsonify({"code": 200, "message": "组信息已更新", "data": _group_dict(g)})

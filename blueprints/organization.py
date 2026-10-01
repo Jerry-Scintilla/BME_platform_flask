@@ -108,7 +108,7 @@ def org_chart():
             counts["secondary"] += c["counts"]["secondary"]
 
         return {
-            "id": g.id, "name": g.name,
+            "id": g.id, "name": g.name, "description": g.description or "",
             "oversee_by": oversee, "leader": lead,
             "counts": counts, "members": member_cards, "children": children,
         }

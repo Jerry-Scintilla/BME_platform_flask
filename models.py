@@ -2137,6 +2137,8 @@ class ClubGroup(db.Model):
     parent_id = db.Column(db.Integer, db.ForeignKey('club_group.id'), nullable=True, index=True)
     sort_order = db.Column(db.Integer, nullable=False, default=0)     # 同父内排序，小在前
     status = db.Column(db.String(20), nullable=False, default='active', index=True)  # active / archived
+    description = db.Column(db.Text)                                  # 小组介绍（组织页组态展示位，≤500 字）
+
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
