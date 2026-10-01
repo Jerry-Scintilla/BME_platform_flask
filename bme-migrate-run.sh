@@ -50,6 +50,8 @@ run init_seats.py
 run scripts/migrate/migrate_62_auth_foundation.py
 # D2 人员层（2026-10-01）：person 六表 + user.person_id（幂等；复合外键依赖内部顺序）
 run scripts/migrate/migrate_63_person_layer.py
+# D3a 核验与审批（2026-10-01）：学校配置/申请/挑战三表 + sysu 种子（幂等；索引兜底补齐）
+run scripts/migrate/migrate_64_identity_verification.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else
