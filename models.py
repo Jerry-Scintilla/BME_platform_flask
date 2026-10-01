@@ -434,7 +434,7 @@ class AccountLinkCaseModel(db.Model):
     __tablename__ = 'account_link_case'
     id = db.Column(db.String(64), primary_key=True)          # uuid4().hex
     account_a = db.Column(db.Integer, nullable=False)        # 发起方
-    account_b = db.Column(db.Integer, nullable=False)        # 被认领方
+    account_b = db.Column(db.Integer)                        # 被认领方（B 证明时回填）
     surviving_person_id = db.Column(db.Integer)              # 批准后确定的存续人员
     selected_primary_user_id = db.Column(db.Integer)         # 主参与号（推荐+人工改选）
     state = db.Column(db.String(40), nullable=False, server_default='collecting')

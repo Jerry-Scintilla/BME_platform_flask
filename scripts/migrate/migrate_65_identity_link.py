@@ -36,7 +36,7 @@ NEW_TABLES = {
         CREATE TABLE account_link_case (
           id VARCHAR(64) PRIMARY KEY COMMENT '服务器生成随机案例 ID',
           account_a INT NOT NULL COMMENT '发起方 user id（证明所有权的一端）',
-          account_b INT NOT NULL COMMENT '被认领方 user id（空壳副号/老号）',
+          account_b INT NULL COMMENT '被认领方 user id（B 端证明通过时回填）',
           surviving_person_id INT NULL COMMENT '批准后确定的存续人员',
           selected_primary_user_id INT NULL COMMENT '主参与号（推荐+人工改选）',
           state VARCHAR(40) NOT NULL DEFAULT 'collecting',
@@ -121,9 +121,21 @@ def migrate_tables(conn):
         print(f"[+] 已建表 {table}")
 
 
+def relax_account_b(conn):
+    """早期建出的 account_b NOT NULL 与两段回填设计不符——幂等放宽为可空。"""
+    cols = {c['name']: c for c in insp.get_columns('account_link_case')}
+    if cols.get('account_b', {}).get('nullable', True) is False:
+        conn.execute(text(
+            "ALTER TABLE account_link_case MODIFY account_b INT NULL "
+            "COMMENT '被认领方 user id（B 端证明通过时回填）'"))
+        conn.commit()
+        print("[+] account_link_case.account_b 已放宽为可空（B 证明时回填）")
+
+
 if __name__ == '__main__':
     with engine.connect() as conn:
         migrate_tables(conn)
+        relax_account_b(conn)
 
     from app import app  # noqa: E402,F401
     with app.app_context():

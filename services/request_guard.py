@@ -26,6 +26,7 @@ PUBLIC_AUTH_PATHS = {
     "/auth/find_password",
     "/auth/dev_accounts",
     "/auth/session/config",
+    "/identity/operation-status",
 }
 # 续期/退出端点：不跑本守卫的 access 校验，端点内做全量校验（含 CSRF）
 REFRESH_LOGOUT_PATHS = {

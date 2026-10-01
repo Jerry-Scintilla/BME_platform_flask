@@ -132,6 +132,56 @@ def reject(app_id):
                     "application": _app_detail(app)})
 
 
+@bp.route("/link-cases", methods=["GET"])
+@jwt_required()
+@_admin_endpoint
+def link_case_queue():
+    """关联案例队列（?state=awaiting_review 默认）。"""
+    _staff_actor()
+    from models import AccountLinkCaseModel
+    state = request.args.get('state') or 'awaiting_review'
+    q = AccountLinkCaseModel.query
+    if state != 'all':
+        q = q.filter(AccountLinkCaseModel.state == state)
+    rows = q.order_by(AccountLinkCaseModel.created_at.asc()).limit(200).all()
+    from services.identity import linking
+    out = []
+    for c in rows:
+        b = db.session.get(UserModel, c.account_b) if c.account_b else None
+        scan = linking.shell_scan_summary(b) if b else {'is_shell': False,
+                                                        'blockers': ['no_target']}
+        out.append({
+            'id': c.id, 'state': c.state, 'version': c.version,
+            'account_a': c.account_a, 'account_b': c.account_b,
+            'surviving_person_id': c.surviving_person_id,
+            'created_at': c.created_at.strftime('%Y-%m-%d %H:%M') if c.created_at else None,
+            'scan': scan,
+        })
+    return jsonify({"code": 200, "cases": out})
+
+
+@bp.route("/link-cases/<case_id>/decision", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def link_case_decision(case_id):
+    """案例审核决策：{decision: approved|rejected, reason}。
+
+    审核人须非当事人；有阻断项（特权/扫描异常）需 ≥2 名不同审核人批准。
+    """
+    actor = _staff_actor()
+    from models import AccountLinkCaseModel
+    from services.identity import linking
+    case = db.session.get(AccountLinkCaseModel, case_id)
+    if case is None:
+        return jsonify({"code": 404, "message": "案例不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    linking.review_case(case, actor.user,
+                         decision=payload.get('decision') or '',
+                         reason=payload.get('reason') or '')
+    db.session.commit()
+    return jsonify({"code": 200, "message": "决策已记录", "state": case.state})
+
+
 @bp.route("/schools", methods=["GET"])
 @jwt_required()
 @_admin_endpoint

@@ -141,3 +141,5 @@ if MFA_ENFORCE_FOR_ADMIN and not MFA_ENC_SECRET:
 IDENTITY_UI_ENABLED = os.getenv("IDENTITY_UI_ENABLED", "false").lower() in ("1", "on", "true")
 # 核验通道：停新申请/新挑战，不撤销已核验结果
 IDENTITY_VERIFICATION_ENABLED = os.getenv("IDENTITY_VERIFICATION_ENABLED", "false").lower() in ("1", "on", "true")
+# 双账号认领提交通道（规格 13.1）：关=停新案例提交；已建案例可查询
+ACCOUNT_LINK_APPLY_ENABLED = os.getenv("ACCOUNT_LINK_APPLY_ENABLED", "false").lower() in ("1", "on", "true")
