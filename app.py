@@ -135,6 +135,8 @@ app.register_blueprint(feedback_tickets_bp)
 app.register_blueprint(feedback_tickets_admin_bp)
 app.register_blueprint(work_bp)
 app.register_blueprint(work_files_bp)
+app.register_blueprint(identity_bp)
+app.register_blueprint(admin_identity_bp)
 
 # 每日出勤报告：幂等创建收件人权限 + 启动定时任务（多 worker 下仅一个生效）
 ensure_recipient_permission(app)

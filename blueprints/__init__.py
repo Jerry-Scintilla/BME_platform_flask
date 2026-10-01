@@ -451,6 +451,8 @@ from .feedback_tickets import bp as feedback_tickets_bp
 from .feedback_tickets_admin import bp as feedback_tickets_admin_bp
 from .work import bp as work_bp
 from .work_files import bp as work_files_bp
+from .identity import bp as identity_bp
+from .admin_identity import bp as admin_identity_bp
 
 __all__ = [
     'auth_bp',
@@ -493,5 +495,7 @@ __all__ = [
     'feedback_tickets_bp',
     'feedback_tickets_admin_bp',
     'work_bp',
-    'work_files_bp'
+    'work_files_bp',
+    'identity_bp',
+    'admin_identity_bp'
 ]

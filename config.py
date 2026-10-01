@@ -136,3 +136,8 @@ MFA_ENC_SECRET = os.getenv("MFA_ENC_SECRET")
 MFA_ENFORCE_FOR_ADMIN = os.getenv("MFA_ENFORCE_FOR_ADMIN", "false").lower() in ("1", "on", "true")
 if MFA_ENFORCE_FOR_ADMIN and not MFA_ENC_SECRET:
     raise RuntimeError("MFA_ENFORCE_FOR_ADMIN=true 但 MFA_ENC_SECRET 未配置，拒绝启动")
+# ── D3 身份核验与认领（migrate_64，规格 13.1：开关必须拆开）──
+# UI 总入口：停新入口，已提交申请仍可查询（默认关，随 D4 前端一起开）
+IDENTITY_UI_ENABLED = os.getenv("IDENTITY_UI_ENABLED", "false").lower() in ("1", "on", "true")
+# 核验通道：停新申请/新挑战，不撤销已核验结果
+IDENTITY_VERIFICATION_ENABLED = os.getenv("IDENTITY_VERIFICATION_ENABLED", "false").lower() in ("1", "on", "true")
