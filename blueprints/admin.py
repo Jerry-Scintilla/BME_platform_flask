@@ -35,6 +35,7 @@ from models import (
     CampSubmissionVersion,
     SeatModel,
 )
+from services import auth_sessions
 from . import check_permission, audit_log, _current_user
 
 bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -298,8 +299,13 @@ def admin_set_user_status(user_id):
 
     old = target.status
     target.status = status
+    if status == 'banned':
+        # D1：封禁即撤权——安全版本+1 + 撤全部会话 + 拒收旧协议 token
+        # （此前只改 status，存量 token 靠入口拦截兜底；现在旧 token 即刻全失效）
+        target = auth_sessions.lock_user(target.id)
+        auth_sessions.bump_security_version(target, reason=f"管理员封禁（操作者 {current.username if current else '-'}）")
     db.session.commit()
-    msg = f"已封禁 {target.username}（内容与归属保留，可随时解封）" if status == 'banned' else f"已解封 {target.username}"
+    msg = f"已封禁 {target.username}（内容与归属保留，可随时解封；全部登录已失效）" if status == 'banned' else f"已解封 {target.username}"
     return jsonify({"code": 200, "message": msg,
                     "data": {"user_id": target.id, "username": target.username,
                              "old_status": old, "status": status}})

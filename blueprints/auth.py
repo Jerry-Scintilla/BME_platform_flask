@@ -15,11 +15,17 @@ from flask_jwt_extended import (
 from datetime import datetime, timezone
 
 from flask_mail import Message
-import string
-import random
+import hmac
+import os
+import secrets
 
 import config
 from models import AuditLog
+from services import auth_sessions
+from services.auth_challenges import issue_captcha, verify_captcha
+from services.auth_context import (
+    AuthRejected, challenge_digest, constant_time_eq, validate_account_lifecycle,
+)
 from . import check_permission, get_user_permissions
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -44,16 +50,13 @@ def register():
         username = form.User_Name.data
         captcha = form.User_Captcha.data
         user = UserModel.query.filter_by(email=email).first()
-        # captcha_model = EmailCaptchaModel.query.filter_by(captcha=captcha).first()
 
-        # 从Redis中获取验证码
-        redis_captcha = redis_client.get(f"captcha:{email}")
-
-        if redis_captcha:
-            redis_captcha = redis_captcha.decode('utf-8')  # 将bytes解码为字符串
-
-        if not redis_captcha or redis_captcha != captcha:
-            print(redis_captcha)
+        # D1：验证码用途限定（register），一次性消费；Redis 故障 503（不静默放行）
+        try:
+            captcha_ok = verify_captcha(email, "register", captcha)
+        except AuthRejected as exc:
+            return exc.to_response()
+        if not captcha_ok:
             data = {
                 "code": 400,
                 "message": "验证码错误",
@@ -72,22 +75,17 @@ def register():
             user.set_password(password)
             db.session.add(user)
             db.session.commit()
-            token = create_access_token(identity=email)
+            # D1：注册即签发 v2 会话（sid+版本声明；auth_time=注册认证时刻）
             data = {
                 "code": 200,
                 "message": "注册成功",
-                "token": token,
-                "refresh_token": create_refresh_token(identity=email),
                 "User_Name": username,
             }
-
-            # 从数据库中删除验证码
-            # captcha_list = EmailCaptchaModel.query.filter_by(email=email).delete()
-            # db.session.commit()
-            # 从Redis中删除验证码
-            redis_client.delete(f"captcha:{email}")
-
-        return jsonify(data),200
+            issued, refresh, csrf_token = _issue_with_optional_cookie(
+                user, client_type="user", amr="pwd")
+            data.update(issued)
+            resp = _finalize_auth_response(data, "user", refresh, csrf_token)
+            return resp, 200
     else:
         data = {
             "code": 402,
@@ -136,13 +134,10 @@ def login():
                     db.session.commit()
                 code = 200
                 msg = "登录成功"
-                token = create_access_token(identity=email)
                 User_Name = user.username
                 data = {
                     "code": code,
                     "message": msg,
-                    "token": token,
-                    "refresh_token": create_refresh_token(identity=email),
                     "User_Name": User_Name,
                     "role": user.role,
                     "role_rank": user.role_rank,
@@ -161,7 +156,11 @@ def login():
                     "Github_Id": Github_Id,
                     "Skill_Tags": Skill_Tags,
                 }
-                return jsonify(data)
+                # D1：v2 会话签发（client_type=user；refresh 按 cookie 开关决定去向）
+                issued, refresh, csrf_token = _issue_with_optional_cookie(
+                    user, client_type="user", amr="pwd")
+                data.update(issued)
+                return _finalize_auth_response(data, "user", refresh, csrf_token)
 
             else:
                 code = 402
@@ -259,16 +258,19 @@ def admin_login():
                 if not admin.password_is_hashed:
                     admin.set_password(password)
                     db.session.commit()
-                return jsonify({
-                'code' : 200,
-                'msg' : "登录成功",
-                'token' : create_access_token(identity=email),
-                'refresh_token' : create_refresh_token(identity=email),
-                'User_Name' : admin.username,
-                'role' : admin.role,
-                'role_rank' : admin.role_rank,
-                'permissions' : get_user_permissions(admin.id),
-                }),200
+                data = {
+                    'code': 200,
+                    'msg': "登录成功",
+                    'User_Name': admin.username,
+                    'role': admin.role,
+                    'role_rank': admin.role_rank,
+                    'permissions': get_user_permissions(admin.id),
+                }
+                # D1：v2 会话签发（client_type=admin，续期端点核对双端隔离）
+                issued, refresh, csrf_token = _issue_with_optional_cookie(
+                    admin, client_type="admin", amr="pwd")
+                data.update(issued)
+                return _finalize_auth_response(data, "admin", refresh, csrf_token), 200
 
 
         except Exception as e:
@@ -295,6 +297,215 @@ def admin_login():
 def _revoke_claims(claims):
     """按 JWT claims 吊销令牌（jti + exp）。"""
     revoke_token(claims["jti"], datetime.fromtimestamp(claims["exp"], tz=timezone.utc))
+
+
+# ── D1 安全地基：cookie 会话 / CSRF / 原子轮换核心 ──────────────────────
+
+def _cookie_names(client_type):
+    return f"bme-{client_type}-rt", f"bme-{client_type}-csrf"
+
+
+def _set_auth_cookies(resp, client_type, refresh, csrf_token):
+    """refresh 落 HttpOnly cookie（Path 限定到本端续期端点，双端隔离）；
+    csrf 为可读 cookie 供双提交校验。SameSite=Lax：生产同源、dev 127.0.0.1
+    跨端口仍属同站，可随 XHR 发送（不需要 SameSite=None）。"""
+    rt, csrf = _cookie_names(client_type)
+    max_age = int(config.JWT_REFRESH_TOKEN_EXPIRES.total_seconds())
+    common = dict(max_age=max_age, samesite="Lax", secure=config.AUTH_COOKIE_SECURE,
+                  path=f"/auth/{client_type}")
+    resp.set_cookie(rt, refresh, httponly=True, **common)
+    resp.set_cookie(csrf, csrf_token, httponly=False, **common)
+
+
+def _clear_auth_cookies(resp, client_type):
+    rt, csrf = _cookie_names(client_type)
+    for name in (rt, csrf):
+        resp.set_cookie(name, "", max_age=0, path=f"/auth/{client_type}")
+
+
+def _csrf_ok(client_type):
+    """双提交校验：X-CSRF-Token 头 == 可读 csrf cookie（恒时比较）。"""
+    _rt, csrf_name = _cookie_names(client_type)
+    header = request.headers.get("X-CSRF-Token", "")
+    cookie = request.cookies.get(csrf_name, "")
+    return bool(header and cookie) and hmac.compare_digest(header, cookie)
+
+
+def _origin_ok():
+    """cookie 凭证（环境凭据）时的来源校验：Origin 白名单/同源；
+    无 Origin 时按 Fetch-Metadata 的 sec-fetch-site 判定。"""
+    origin = request.headers.get("Origin")
+    if origin:
+        allowed = {o.strip() for o in (os.getenv("CORS_ORIGINS") or "").split(",") if o.strip()}
+        if origin in allowed or origin == request.host_url.rstrip("/"):
+            return True
+        return False
+    site = request.headers.get("Sec-Fetch-Site", "")
+    return site in ("same-origin", "same-site", "none") if site else True
+
+
+def _issue_with_optional_cookie(user, *, client_type, amr):
+    """登录/注册统一签发：返回 (data_dict, csrf_token)。cookie 开关关时
+    data 含 refresh_token（兼容模式），开时由调用方 Set-Cookie 且 body 不含。"""
+    access, refresh, _session = auth_sessions.issue_session(
+        user, client_type=client_type, amr=amr)
+    csrf_token = secrets.token_hex(16)
+    data = {"token": access}
+    data["_refresh_token_body"] = refresh  # cookie 开关关闭时提升为 refresh_token
+    data["_csrf_token"] = csrf_token
+    return data, refresh, csrf_token
+
+
+def _finalize_auth_response(data, client_type, refresh, csrf_token):
+    """按开关决定 refresh 去向：cookie 模式=Set-Cookie（body 不含），
+    兼容模式=body 返回（现有前端/脚本契约不变）。"""
+    data.pop("_refresh_token_body", None)
+    data.pop("_csrf_token", None)
+    if config.AUTH_REFRESH_COOKIE_ENABLED:
+        resp = jsonify(data)
+        _set_auth_cookies(resp, client_type, refresh, csrf_token)
+        return resp
+    data["refresh_token"] = refresh
+    return jsonify(data)
+
+
+def _refresh_core(raw_token, claims, *, client_type=None):
+    """续期核心事务（锁序 user → auth_session，规格 8.2）：
+
+    v2：sid 行锁 → digest/generation 比对（不匹配=已轮换的重放 → 撤会话）→
+        同 sid 轮换，auth_time/amr 原值不动；
+    legacy：窗口内一次性兑换（UNIQUE 兜底），产物 amr=unknown。
+    返回 (access, refresh, user)。
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    identity = claims.get("sub")
+    base_user = UserModel.query.filter_by(email=identity).first()
+    if not base_user:
+        raise AuthRejected("账号不存在", status=401, machine="ACCOUNT_MISSING")
+    try:
+        user = auth_sessions.lock_user(base_user.id)
+        if not user:
+            raise AuthRejected("账号不存在", status=401, machine="ACCOUNT_MISSING")
+        validate_account_lifecycle(user)
+        if claims.get("token_schema") == "v2" and claims.get("sid"):
+            session = auth_sessions.lock_session(claims["sid"])
+            if session is None or session.user_id != user.id:
+                raise AuthRejected("会话不存在或已失效，请重新登录",
+                                   status=401, machine="SESSION_REVOKED")
+            if session.revoked_at is not None:
+                raise AuthRejected("登录已失效，请重新登录",
+                                   status=401, machine="SESSION_REVOKED")
+            if session.expires_at <= datetime.now():
+                raise AuthRejected("会话已过期，请重新登录",
+                                   status=401, machine="SESSION_EXPIRED")
+            raw_digest = challenge_digest(raw_token)
+            if not constant_time_eq(raw_digest, session.refresh_digest or ""):
+                # 同 sid 的旧 refresh（已被轮换）——并发或重放无法区分：撤会话（规格 6.2）
+                session.revoked_at = datetime.now()
+                db.session.commit()
+                raise AuthRejected("凭证已失效，请重新登录",
+                                   status=401, machine="SESSION_REVOKED")
+            access, refresh = auth_sessions.rotate_refresh(user, session, client_type=client_type)
+        else:
+            # legacy 协议：窗口/置位检查 + 一次性兑换
+            if user.require_versioned_tokens or datetime.now() > config.AUTH_LEGACY_TOKEN_DEADLINE:
+                raise AuthRejected("登录方式已升级，请重新登录",
+                                   status=401, machine="TOKEN_SCHEMA_REQUIRED")
+            access, refresh, _new = auth_sessions.consume_legacy_refresh(
+                user, claims, client_type=client_type or "user")
+        db.session.commit()
+    except IntegrityError:
+        # legacy 兑换 UNIQUE 冲突（并发双发）：只有一个成功
+        db.session.rollback()
+        raise AuthRejected("该凭证已使用，请重新登录",
+                           status=401, machine="SESSION_REVOKED")
+    except AuthRejected:
+        db.session.rollback()
+        raise
+    # blocklist 旧 refresh jti（补充防线，Redis 故障仅日志）
+    if claims.get("jti") and claims.get("exp"):
+        try:
+            _revoke_claims(claims)
+        except Exception:
+            pass
+    return access, refresh, user
+
+
+def _typed_refresh(client_type):
+    """/auth/{user,admin}/refresh：cookie（CSRF+Origin 强制）或 Bearer refresh。"""
+    _rt_name, _csrf_name = _cookie_names(client_type)
+    raw = request.cookies.get(_rt_name)
+    via_cookie = bool(raw)
+    if not raw:
+        header = request.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            raw = header[7:]
+    if not raw:
+        return jsonify({"code": 401, "message": "未提供访问令牌",
+                        "machine": "ACCESS_TOKEN_MISSING"}), 401
+    if via_cookie and not (_csrf_ok(client_type) and _origin_ok()):
+        return jsonify({"code": 403, "message": "请求来源校验失败",
+                        "machine": "CSRF_REJECTED"}), 403
+    try:
+        claims = decode_token(raw)
+        if claims.get("type") != "refresh":
+            raise ValueError("not a refresh token")
+    except Exception:
+        resp = jsonify({"code": 401, "message": "访问令牌无效",
+                        "machine": "INVALID_TOKEN"})
+        _clear_auth_cookies(resp, client_type)
+        return resp, 401
+    try:
+        access, refresh, user = _refresh_core(raw, claims, client_type=client_type)
+    except AuthRejected as exc:
+        resp, status = exc.to_response()
+        _clear_auth_cookies(resp, client_type)
+        return resp, status
+    data = {"code": 200, "token": access, "role": user.role,
+            "permissions": get_user_permissions(user.id), "level": user.level}
+    if config.AUTH_REFRESH_COOKIE_ENABLED:
+        resp = jsonify(data)
+        _rt, csrf_cookie = _cookie_names(client_type)
+        csrf_token = request.cookies.get(csrf_cookie) or secrets.token_hex(16)
+        _set_auth_cookies(resp, client_type, refresh, csrf_token)
+        return resp
+    data["refresh_token"] = refresh
+    return jsonify(data)
+
+
+def _typed_logout(client_type):
+    """/auth/{user,admin}/logout：DB 撤 sid + 清 cookie，幂等。"""
+    _rt_name, _ = _cookie_names(client_type)
+    raw = request.cookies.get(_rt_name)
+    via_cookie = bool(raw)
+    if not raw:
+        header = request.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            raw = header[7:]
+    if via_cookie and not _csrf_ok(client_type):
+        resp = jsonify({"code": 403, "message": "请求来源校验失败",
+                        "machine": "CSRF_REJECTED"})
+        _clear_auth_cookies(resp, client_type)
+        return resp, 403
+    for candidate in (raw, request.headers.get("Authorization", "")[7:] or None):
+        if not candidate:
+            continue
+        try:
+            claims = decode_token(candidate)
+        except Exception:
+            continue
+        if claims.get("sid"):
+            auth_sessions.revoke_session(claims["sid"])
+        if claims.get("jti") and claims.get("exp"):
+            try:
+                _revoke_claims(claims)
+            except Exception:
+                pass
+    db.session.commit()
+    resp = jsonify({"code": 200, "message": "已退出"})
+    _clear_auth_cookies(resp, client_type)
+    return resp
 
 
 @bp.route("/dev_accounts", methods=["GET"])
@@ -333,23 +544,46 @@ def session_config():
     return resp
 
 
+@bp.route("/user/refresh", methods=["POST"])
+def user_refresh():
+    """用户端续期（cookie 模式主通道；Bearer 兼容）。client_type 强制匹配。"""
+    return _typed_refresh("user")
+
+
+@bp.route("/admin/refresh", methods=["POST"])
+def admin_refresh():
+    """管理端续期（与用户端 cookie/会话完全隔离）。"""
+    return _typed_refresh("admin")
+
+
+@bp.route("/user/logout", methods=["POST"])
+def user_logout():
+    """用户端退出：DB 撤 sid + 清本端 cookie。幂等。"""
+    return _typed_logout("user")
+
+
+@bp.route("/admin/logout", methods=["POST"])
+def admin_logout():
+    """管理端退出：DB 撤 sid + 清本端 cookie。幂等。"""
+    return _typed_logout("admin")
+
+
 @bp.route("/refresh", methods=["POST"])
 @jwt_required(refresh=True)
 def refresh():
-    """用 refresh token 换发全新令牌对；旧 refresh 即时吊销（轮换防重放）。"""
-    identity = get_jwt_identity()
-    # 封禁/注销兜底：/auth/* 不经过 app.before_request 的封禁拦截，这里自查
-    user = UserModel.query.filter_by(email=identity).first()
-    if not user or (user.status or 'active') == 'banned':
-        return jsonify({"code": 403, "message": "账号不可用"}), 403
-    _revoke_claims(get_jwt())  # 旧 refresh 进 blocklist
-    # 身份随行（2026-09-17）：前端 store 的 role/permissions 只在登录时写一次、
-    # 永不更新，后台改身份后旧客户端要到重新登录才生效（降级用户营期页 isStaff
-    # 假真）。续期响应带上最新身份，前端 401 静默续期时同步回 store 自愈。
+    """旧端点（兼容期保留，下线计划见 D1 文档）：v2 token 走同轮换事务
+    （不校验 client_type——Bearer 显式凭证无跨端 cookie 问题）；legacy token
+    一次性兑换为 v2 会话。身份随行（2026-09-17）语义不变。"""
+    raw = request.headers.get("Authorization", "")
+    raw = raw[7:] if raw.startswith("Bearer ") else ""
+    try:
+        access, refresh_token, user = _refresh_core(raw, get_jwt(), client_type=None)
+    except AuthRejected as exc:
+        return exc.to_response()
     return jsonify({
         "code": 200,
-        "token": create_access_token(identity=identity),
-        "refresh_token": create_refresh_token(identity=identity),
+        "token": access,
+        "refresh_token": refresh_token,
         "role": user.role,
         "permissions": get_user_permissions(user.id),
         "level": user.level,
@@ -358,26 +592,34 @@ def refresh():
 
 @bp.route("/logout", methods=["POST"])
 def logout():
-    """退出登录：吊销当前 access（Bearer）与请求体携带的 refresh_token。
+    """旧退出端点（兼容期保留）：吊销 Bearer access 与 body refresh_token；
+    v2 token 额外撤销对应 auth_session（数据库真相源）。
 
     幂等设计——不挂 @jwt_required：token 已过期/已吊销时退出仍应成功，
     前端本地清理不依赖本端点结果（fire-and-forget）。
     """
+    candidates = []
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        try:
-            _revoke_claims(decode_token(auth_header[7:]))
-        except Exception:
-            pass  # 无效/过期 access：无甚可吊销
-
+        candidates.append(auth_header[7:])
     body = request.get_json(silent=True) or {}
     refresh_raw = body.get("refresh_token")
     if refresh_raw and isinstance(refresh_raw, str):
-        try:
-            _revoke_claims(decode_token(refresh_raw))
-        except Exception:
-            pass
+        candidates.append(refresh_raw)
 
+    for raw in candidates:
+        try:
+            claims = decode_token(raw)
+        except Exception:
+            continue  # 无效/过期：无甚可吊销
+        if claims.get("sid"):
+            auth_sessions.revoke_session(claims["sid"])
+        if claims.get("jti") and claims.get("exp"):
+            try:
+                _revoke_claims(claims)
+            except Exception:
+                pass
+    db.session.commit()
     return jsonify({"code": 200, "message": "已退出"}), 200
 
 
@@ -394,27 +636,40 @@ def logout():
 @swag_from('../apidocs/user/get_email_captcha.yaml')
 @audit_log(operation="获取邮件验证码", is_login=True)
 def get_email_captcha():
-    mail_list = request.get_json()
-    email = mail_list["User_Email"]
-    source = string.digits * 4
-    captcha = random.sample(source, 6)
-    captcha = "".join(captcha)
-    messages = Message(subject="BME卓越工程师在线教育平台", recipients=[email], body=f"您的验证码是:{captcha}")
-    mail.send(messages)
+    """D1：验证码用途限定（purpose=register|findpwd 必填）。
 
-    # email_captcha = EmailCaptchaModel(email=email, captcha=captcha)
-    # db.session.add(email_captcha)
-    # db.session.commit()
-
-    redis_client.setex(f"captcha:{email}", 300, captcha)
-
-    # print(captcha)
-    data = {
-        "code": 200,
-        "message": "邮件发送成功"
-        # "User_Captcha": captcha,
-    }
-    return jsonify(data)
+    生成走 services.auth_challenges（secrets 安全随机、HMAC 摘要存储、
+    60s 冷却 + 小时/日限次）；旧 random.sample 生成器与注册/找回共用 key 均退役。
+    两仓前端同批发布带 purpose 字段；陈旧 bundle 会收到 400 与明确提示。
+    """
+    payload = request.get_json(silent=True) or {}
+    email = (payload.get("User_Email") or "").strip()
+    purpose = payload.get("purpose")
+    if not email:
+        return jsonify({"code": 400, "message": "缺少邮箱"}), 400
+    if purpose not in ("register", "findpwd"):
+        return jsonify({"code": 400,
+                        "message": "缺少 purpose 参数（register/findpwd），请刷新页面后重试"}), 400
+    try:
+        captcha = issue_captcha(email, purpose)
+    except AuthRejected as exc:
+        resp, status = exc.to_response()
+        if exc.machine == "CHALLENGE_COOLDOWN":
+            resp.headers["Retry-After"] = "60"
+        return resp, status
+    try:
+        mail.send(Message(subject="BME卓越工程师在线教育平台",
+                          recipients=[email], body=f"您的验证码是:{captcha}"))
+    except Exception:
+        # 邮件发送失败：challenge 不算成功（删除登记，用户可立即重发）
+        from exts import redis_client as _rc
+        try:
+            _rc.delete(f"captcha:{purpose}:{(email or '').strip().lower()}")
+            _rc.delete(f"captcha:cd:{purpose}:{(email or '').strip().lower()}")
+        except Exception:
+            pass
+        return jsonify({"code": 503, "message": "邮件发送失败，请稍后重试"}), 503
+    return jsonify({"code": 200, "message": "邮件发送成功"})
 
 
 @bp.route("/find_password", methods=["POST"])
@@ -434,32 +689,25 @@ def find_password():
             "message": "账号或验证码有误"
         }), 400
 
-    # 从Redis中获取验证码
-    redis_captcha = redis_client.get(f"captcha:{email}")
-    if redis_captcha:
-        redis_captcha = redis_captcha.decode('utf-8')  # 将bytes解码为字符串
-
-    if not redis_captcha:
-        return jsonify({
-            "code": 401,
-            "message": "验证码不存在"
-        }), 401
-
-    if redis_captcha == captcha:
-        user.set_password(password)
-        # 从Redis中删除验证码
-        redis_client.delete(f"captcha:{email}")
-        db.session.commit()
-        return jsonify({
-            "code": 200,
-            "message": "密码修改成功"
-        })
-
-    else:
+    # D1：findpwd 专用验证码；通过后重置密码并撤回全部旧会话（安全版本+1）
+    try:
+        captcha_ok = verify_captcha(email, "findpwd", captcha)
+    except AuthRejected as exc:
+        return exc.to_response()
+    if not captcha_ok:
         return jsonify({
             "code": 402,
             "message": "验证码错误"
         }), 402
+
+    user = auth_sessions.lock_user(user.id)
+    user.set_password(password)
+    auth_sessions.bump_security_version(user, reason="找回密码重置")
+    db.session.commit()
+    return jsonify({
+        "code": 200,
+        "message": "密码修改成功，所有旧登录已失效，请使用新密码重新登录"
+    })
 
 # 管理员获取审计日志记录
 @bp.route("/audit_records", methods=["GET"])

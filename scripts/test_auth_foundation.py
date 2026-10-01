@@ -419,5 +419,250 @@ class SessionConfigEndpointTest(AuthFoundationTestBase):
         self.assertEqual(resp.headers['Cache-Control'], 'no-store')
 
 
+class RotationFlowTest(ResolveActorTestBase):
+    """B4：轮换/重放/bump/legacy 兑换（规格 6.2/6.3）。"""
+
+    def issue(self, user, **kw):
+        from services import auth_sessions
+        with self.app.test_request_context('/x'):
+            return auth_sessions.issue_session(user, client_type=kw.pop('client_type', 'user'),
+                                               amr=kw.pop('amr', 'pwd'), **kw)
+
+    def refresh_core(self, raw, client_type=None):
+        from blueprints.auth import _refresh_core
+        from flask_jwt_extended import decode_token
+        claims = decode_token(raw)
+        with self.app.test_request_context('/x'):
+            return _refresh_core(raw, claims, client_type=client_type)
+
+    def test_issue_carries_v2_claims_and_session_row(self):
+        user = self.make_user()
+        access, refresh, session = self.issue(user)
+        from flask_jwt_extended import decode_token
+        a_claims, r_claims = decode_token(access), decode_token(refresh)
+        self.assertEqual(a_claims["token_schema"], "v2")
+        self.assertEqual(a_claims["sid"], session.sid)
+        self.assertEqual(a_claims["security_version"], 0)
+        self.assertEqual(r_claims["gen"], 1)
+        self.assertEqual(session.amr, "pwd")
+        self.assertTrue(session.is_live)
+
+    def test_rotation_renews_and_replay_revokes_session(self):
+        from blueprints.auth import _refresh_core
+        from flask_jwt_extended import decode_token
+        from services.auth_context import AuthRejected
+        user = self.make_user()
+        access1, refresh1, session = self.issue(user)
+        with self.app.test_request_context('/x'):
+            access2, refresh2, _u = _refresh_core(
+                refresh1, decode_token(refresh1), client_type="user")
+        self.assertNotEqual(refresh1, refresh2)
+        self.assertEqual(session.generation, 2)
+        self.assertEqual(decode_token(access2)["sid"], session.sid)
+        db.session.refresh(session)
+        self.assertIsNone(session.revoked_at)
+        # 重放旧 refresh：digest 已轮换 → 撤会话
+        with self.app.test_request_context('/x'):
+            with self.assertRaises(AuthRejected) as ctx:
+                _refresh_core(refresh1, decode_token(refresh1), client_type="user")
+        self.assertEqual(ctx.exception.machine, "SESSION_REVOKED")
+        db.session.refresh(session)
+        self.assertIsNotNone(session.revoked_at)
+
+    def test_client_type_mismatch_rejected(self):
+        from services.auth_context import AuthRejected
+        from services import auth_sessions
+        user = self.make_user()
+        _a, _r, session = self.issue(user, client_type="admin")
+        with self.app.test_request_context('/x'):
+            locked_user = auth_sessions.lock_user(user.id)
+            with self.assertRaises(AuthRejected) as ctx:
+                auth_sessions.rotate_refresh(locked_user, session, client_type="user")
+        self.assertEqual(ctx.exception.machine, "CLIENT_TYPE_MISMATCH")
+
+    def test_bump_revokes_all_except_kept_sid(self):
+        from services import auth_sessions
+        user = self.make_user()
+        _a1, _r1, s1 = self.issue(user)
+        _a2, _r2, s2 = self.issue(user)
+        with self.app.test_request_context('/x'):
+            locked = auth_sessions.lock_user(user.id)
+            auth_sessions.bump_security_version(locked, except_sid=s2.sid, reason="测试")
+        db.session.refresh(s1)
+        db.session.refresh(s2)
+        self.assertIsNotNone(s1.revoked_at)          # 其余全撤
+        self.assertIsNone(s2.revoked_at)             # 当前页保留
+        self.assertEqual(s2.security_version, 1)     # 保留者同步新版本
+        self.assertEqual(user.security_version, 1)
+        self.assertTrue(user.require_versioned_tokens)
+
+    def test_legacy_exchange_once_then_rejected(self):
+        from blueprints.auth import _refresh_core
+        from flask_jwt_extended import create_refresh_token, decode_token
+        from services.auth_context import AuthRejected
+        user = self.make_user()
+        legacy = create_refresh_token(identity=user.email)  # 无声明的旧协议 token
+        with self.app.test_request_context('/x'):
+            access, refresh, _u = _refresh_core(legacy, decode_token(legacy), client_type="user")
+        a_claims = decode_token(access)
+        self.assertEqual(a_claims["token_schema"], "v2")
+        # 兑换产物 amr=unknown（低保证：敏感操作须重新认证）
+        session = db.session.get(AuthSessionModel, a_claims["sid"])
+        self.assertEqual(session.amr, "unknown")
+        # 重放旧 token：一次性消费，第二次拒绝
+        with self.app.test_request_context('/x'):
+            with self.assertRaises(AuthRejected) as ctx:
+                _refresh_core(legacy, decode_token(legacy), client_type="user")
+        self.assertEqual(ctx.exception.machine, "SESSION_REVOKED")
+
+    def test_legacy_rejected_after_bump(self):
+        from blueprints.auth import _refresh_core
+        from flask_jwt_extended import create_refresh_token, decode_token
+        from services.auth_context import AuthRejected
+        from services import auth_sessions
+        user = self.make_user()
+        with self.app.test_request_context('/x'):
+            auth_sessions.bump_security_version(
+                auth_sessions.lock_user(user.id), reason="重置")
+        db.session.commit()
+        legacy = create_refresh_token(identity=user.email)
+        with self.app.test_request_context('/x'):
+            with self.assertRaises(AuthRejected) as ctx:
+                _refresh_core(legacy, decode_token(legacy), client_type="user")
+        self.assertEqual(ctx.exception.machine, "TOKEN_SCHEMA_REQUIRED")
+
+
+class _FakeRedis:
+    """auth_challenges 的内存 Redis 桩（测试专用）。"""
+
+    def __init__(self):
+        self.store = {}
+
+    def _ttl_of(self, key):
+        return self.store[key][1]
+
+    def ping(self):
+        return True
+
+    def exists(self, key):
+        return 1 if key in self.store else 0
+
+    def ttl(self, key):
+        return self._ttl_of(key) if key in self.store else -2
+
+    def get(self, key):
+        v = self.store.get(key)
+        return v[0] if v else None
+
+    def setex(self, key, ttl, value):
+        self.store[key] = (value, ttl)
+
+    def delete(self, key):
+        self.store.pop(key, None)
+
+    def incr(self, key):
+        if key not in self.store:
+            self.store[key] = (0, -1)
+        val = self.store[key][0] + 1
+        self.store[key] = (val, self.store[key][1])
+        return val
+
+    def expire(self, key, window):
+        if key in self.store:
+            self.store[key] = (self.store[key][0], window)
+
+
+class CaptchaChallengeTest(AuthFoundationTestBase):
+    """B4：验证码用途限定/一次性/限次/冷却（规格 8.1）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = _FakeRedis()
+        import services.auth_challenges as challenges
+        self._orig_redis = challenges.redis_client
+        challenges.redis_client = self.fake
+
+    def tearDown(self):
+        import services.auth_challenges as challenges
+        challenges.redis_client = self._orig_redis
+        super().tearDown()
+
+    def test_issue_and_verify_consumes_once(self):
+        from services.auth_challenges import issue_captcha, verify_captcha
+        code = issue_captcha("a@x.dev", "register")
+        self.assertTrue(verify_captcha("a@x.dev", "register", code))
+        self.assertFalse(verify_captcha("a@x.dev", "register", code))  # 已消费
+
+    def test_purpose_isolation(self):
+        from services.auth_challenges import issue_captcha, verify_captcha
+        code = issue_captcha("a@x.dev", "register")
+        self.assertFalse(verify_captcha("a@x.dev", "findpwd", code))  # 跨用途不可用
+
+    def test_five_failures_lock_challenge(self):
+        from services.auth_challenges import issue_captcha, verify_captcha
+        code = issue_captcha("a@x.dev", "register")
+        for _i in range(5):
+            self.assertFalse(verify_captcha("a@x.dev", "register", "000000"))
+        # 第 5 次错误后 challenge 锁死：正确码也不可用
+        self.assertFalse(verify_captcha("a@x.dev", "register", code))
+
+    def test_four_failures_then_correct_still_passes(self):
+        from services.auth_challenges import issue_captcha, verify_captcha
+        code = issue_captcha("a@x.dev", "register")
+        for _i in range(4):
+            self.assertFalse(verify_captcha("a@x.dev", "register", "000000"))
+        self.assertTrue(verify_captcha("a@x.dev", "register", code))
+
+    def test_resend_cooldown(self):
+        from services.auth_challenges import issue_captcha
+        from services.auth_context import AuthRejected
+        issue_captcha("a@x.dev", "register")
+        with self.assertRaises(AuthRejected) as ctx:
+            issue_captcha("a@x.dev", "register")
+        self.assertEqual((ctx.exception.status, ctx.exception.machine), (429, "CHALLENGE_COOLDOWN"))
+
+    def test_resend_invalidates_old_code(self):
+        from services.auth_challenges import issue_captcha, verify_captcha
+        old = issue_captcha("a@x.dev", "register")
+        self.fake.delete("captcha:cd:register:a@x.dev")  # 跳过冷却模拟时间流逝
+        new = issue_captcha("a@x.dev", "register")
+        self.assertFalse(verify_captcha("a@x.dev", "register", old))
+        self.assertTrue(verify_captcha("a@x.dev", "register", new))
+
+    def test_hourly_limit(self):
+        from services.auth_challenges import issue_captcha
+        from services.auth_context import AuthRejected
+        for i in range(5):
+            issue_captcha(f"a@x.dev", "register")
+            self.fake.delete("captcha:cd:register:a@x.dev")
+        with self.assertRaises(AuthRejected) as ctx:
+            issue_captcha("a@x.dev", "register")
+        self.assertEqual(ctx.exception.machine, "CHALLENGE_LIMIT")
+
+
+class FindPasswordResetTest(AuthFoundationTestBase):
+    """B4：找回密码重置撤会话（此前存量 token 可活 14 天）。"""
+
+    def test_reset_bumps_and_revokes_sessions(self):
+        from unittest.mock import patch
+        from blueprints import auth as auth_module
+        from services import auth_sessions
+        user = self.make_user()
+        with self.app.test_request_context('/x'):
+            _a, _r, session = auth_sessions.issue_session(user, client_type="user", amr="pwd")
+        db.session.commit()
+        with patch.object(auth_module, 'verify_captcha', return_value=True), \
+                self.app.test_request_context(
+                    '/auth/find_password', method='POST',
+                    json={'User_Email': user.email, 'Password': 'b' * 32, 'Captcha': '123456'}):
+            resp = auth_module.find_password()
+        self.assertEqual(resp.get_json()['code'], 200)
+        db.session.refresh(user)
+        db.session.refresh(session)
+        self.assertEqual(user.security_version, 1)
+        self.assertTrue(user.require_versioned_tokens)
+        self.assertIsNotNone(session.revoked_at)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
