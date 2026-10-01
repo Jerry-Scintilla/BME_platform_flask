@@ -18,6 +18,7 @@ from flask_mail import Message
 import string
 import random
 
+import config
 from models import AuditLog
 from . import check_permission, get_user_permissions
 
@@ -311,6 +312,25 @@ def dev_accounts():
     return jsonify({"code": 200, "data": {"accounts": [
         {"email": u.email, "username": u.username, "role": u.role, "admin_tag": u.admin_tag}
         for u in rows]}})
+
+
+@bp.route("/session/config", methods=["GET"])
+def session_config():
+    """会话模式发现（公开，前端 facade 的探测端点）：
+
+    refresh_cookie_enabled 决定前端走 HttpOnly cookie 模式还是兼容模式
+    （localStorage 双键）；legacy_deadline / mfa_enforced_for_admin 供提示。
+    no-store：模式判定不做缓存共享（规格第 11 章 Cache-Control 要求）。
+    """
+    from flask import current_app
+    resp = jsonify({
+        "code": 200,
+        "refresh_cookie_enabled": bool(current_app.config.get("AUTH_REFRESH_COOKIE_ENABLED")),
+        "legacy_deadline": config.AUTH_LEGACY_TOKEN_DEADLINE.isoformat(),
+        "mfa_enforced_for_admin": bool(current_app.config.get("MFA_ENFORCE_FOR_ADMIN")),
+    })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @bp.route("/refresh", methods=["POST"])

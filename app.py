@@ -65,27 +65,29 @@ def _check_if_token_revoked(jwt_header, jwt_payload):
         return False
 
 
-# ── JWT 错误统一 401（2026-09-16 加固）──
+# ── JWT 错误统一 401 + machine 码（2026-09-16 加固；D1 起带 machine 供前端细分）──
 # flask-jwt-extended 默认对缺失/无效/过期/吊销令牌回 422，而前端约定 401=登录失效；
-# 统一 401 后，静默续期（401→refresh→重放）与踢下线逻辑才能咬合
-def _jwt_error_response(message):
-    return jsonify({"code": 401, "message": message}), 401
+# 统一 401 后，静默续期（401→refresh→重放）与踢下线逻辑才能咬合。
+# machine 语义（规格第 11 章）：仅 ACCESS_TOKEN_EXPIRED 触发前端自动续期；
+# SESSION_REVOKED/ACCOUNT_MERGED 等终态直接结束该端会话。
+def _jwt_error_response(message, machine):
+    return jsonify({"code": 401, "message": message, "machine": machine}), 401
 
 @jwt.unauthorized_loader
 def _jwt_no_token(_reason):
-    return _jwt_error_response("未提供访问令牌")
+    return _jwt_error_response("未提供访问令牌", "ACCESS_TOKEN_MISSING")
 
 @jwt.invalid_token_loader
 def _jwt_bad_token(_reason):
-    return _jwt_error_response("访问令牌无效")
+    return _jwt_error_response("访问令牌无效", "INVALID_TOKEN")
 
 @jwt.expired_token_loader
 def _jwt_expired_token(_jwt_header, _jwt_payload):
-    return _jwt_error_response("访问令牌已过期，请重新登录")
+    return _jwt_error_response("访问令牌已过期，请重新登录", "ACCESS_TOKEN_EXPIRED")
 
 @jwt.revoked_token_loader
 def _jwt_revoked_token(_jwt_header, _jwt_payload):
-    return _jwt_error_response("登录已失效，请重新登录")
+    return _jwt_error_response("登录已失效，请重新登录", "SESSION_REVOKED")
 swagger = Swagger(app)
 redis_client.init_app(app)
 # 对象存储（懒连接，服务未起不影响启动）

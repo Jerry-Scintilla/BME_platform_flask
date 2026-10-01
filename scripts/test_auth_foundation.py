@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
 
 from exts import db
+from services.request_guard import enforce_request_access
 from models import (
     AuthFactorModel, AuthLegacyRefreshConsumptionModel, AuthRecoveryCodeModel,
     AuthSessionModel, UserModel,
@@ -159,6 +160,263 @@ class RecoveryAndDigestTest(AuthFoundationTestBase):
         db.session.commit()
         self.assertEqual(factor.state, 'pending')
         self.assertIsNone(factor.last_accepted_counter)
+
+
+class ResolveActorTestBase(AuthFoundationTestBase):
+    """解析矩阵共用：v2/legacy token 的铸造与请求上下文。"""
+
+    def v2_claims(self, session, gen=1):
+        return {"sid": session.sid, "security_version": session.security_version,
+                "token_schema": "v2", "gen": gen, "jti": "j-" + session.sid, "exp": 9999999999}
+
+    def actor_for(self, user, claims):
+        """在带 Authorization 头的请求上下文里解析 actor。"""
+        from flask_jwt_extended import create_access_token
+        token = create_access_token(identity=user.email, additional_claims=claims)
+        from services.auth_context import resolve_actor, AuthRejected
+        with self.app.test_request_context(
+                '/anything', headers={'Authorization': f'Bearer {token}'}):
+            try:
+                return resolve_actor(required=True), None
+            except AuthRejected as exc:
+                return None, exc
+
+
+class ResolveActorMatrixTest(ResolveActorTestBase):
+    """B3：v2/legacy/生命周期/版本漂移矩阵（规格 6.1）。"""
+
+    def test_v2_valid_token_resolves_with_session(self):
+        user = self.make_user()
+        session = self.make_session(user)
+        actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertIsNone(rejected)
+        self.assertFalse(actor.is_legacy)
+        self.assertEqual(actor.session.sid, session.sid)
+        self.assertEqual(actor.amr, 'pwd')
+        self.assertIsNotNone(actor.auth_time)
+
+    def test_v2_revoked_session_rejected(self):
+        user = self.make_user()
+        session = self.make_session(user)
+        session.revoked_at = datetime.now()
+        db.session.commit()
+        _actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertEqual(rejected.machine, 'SESSION_REVOKED')
+
+    def test_v2_expired_session_rejected(self):
+        user = self.make_user()
+        session = self.make_session(user, expires_at=datetime.now() - timedelta(seconds=1))
+        _actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertEqual(rejected.machine, 'SESSION_EXPIRED')
+
+    def test_v2_unknown_sid_rejected(self):
+        user = self.make_user()
+        claims = {"sid": "nonexistent-sid", "security_version": 0, "token_schema": "v2"}
+        _actor, rejected = self.actor_for(user, claims)
+        self.assertEqual(rejected.machine, 'SESSION_REVOKED')
+
+    def test_v2_security_version_drift_rejected(self):
+        """bump 后旧 token（版本快照）必须立即失效。"""
+        user = self.make_user()
+        session = self.make_session(user)  # security_version=0
+        user.security_version = 1
+        db.session.commit()
+        _actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertEqual(rejected.machine, 'SESSION_REVOKED')
+
+    def test_legacy_token_allowed_in_window(self):
+        user = self.make_user()
+        _actor, rejected = self.actor_for(user, {"jti": "legacy-jti", "exp": 9999999999})
+        self.assertIsNone(rejected)
+        actor = _actor
+        self.assertTrue(actor.is_legacy)
+        self.assertEqual(actor.amr, 'unknown')
+        self.assertIsNone(actor.auth_time)
+
+    def test_legacy_token_rejected_when_version_required(self):
+        user = self.make_user()
+        user.require_versioned_tokens = True
+        db.session.commit()
+        _actor, rejected = self.actor_for(user, {"jti": "legacy-jti", "exp": 9999999999})
+        self.assertEqual(rejected.machine, 'TOKEN_SCHEMA_REQUIRED')
+
+    def test_banned_rejected_before_lifecycle(self):
+        user = self.make_user()
+        user.status = 'banned'
+        user.lifecycle = 'merged'
+        db.session.commit()
+        session = self.make_session(user)
+        _actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertEqual((rejected.status, rejected.machine), (403, 'ACCOUNT_BANNED'))
+
+    def test_merged_lifecycle_rejected(self):
+        user = self.make_user()
+        user.lifecycle = 'merged'
+        db.session.commit()
+        session = self.make_session(user)
+        _actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertEqual((rejected.status, rejected.machine), (401, 'ACCOUNT_MERGED'))
+
+    def test_disabled_lifecycle_rejected(self):
+        user = self.make_user()
+        user.lifecycle = 'disabled'
+        db.session.commit()
+        session = self.make_session(user)
+        _actor, rejected = self.actor_for(user, self.v2_claims(session))
+        self.assertEqual((rejected.status, rejected.machine), (403, 'ACCOUNT_DISABLED'))
+
+
+class RequireRecentAuthTest(ResolveActorTestBase):
+    """B3：近期认证窗口与因子强度（legacy 恒不通过）。"""
+
+    def actor_ctx(self, **session_kw):
+        from services.auth_context import ActorContext
+        user = self.make_user()
+        session = self.make_session(user, **session_kw)
+        return ActorContext(user, session, {}, is_legacy=False)
+
+    def test_legacy_actor_always_rejected(self):
+        from services.auth_context import ActorContext, AuthRejected, require_recent_auth
+        user = self.make_user()
+        actor = ActorContext(user, None, {}, is_legacy=True)
+        with self.assertRaises(AuthRejected) as ctx:
+            require_recent_auth(actor)
+        self.assertEqual(ctx.exception.machine, 'REAUTH_REQUIRED')
+
+    def test_fresh_pwd_session_passes(self):
+        from services.auth_context import require_recent_auth
+        actor = self.actor_ctx(auth_time=datetime.now())
+        require_recent_auth(actor)  # 不抛即通过
+
+    def test_stale_auth_time_rejected(self):
+        from services.auth_context import AuthRejected, require_recent_auth
+        actor = self.actor_ctx(auth_time=datetime.now() - timedelta(seconds=301))
+        with self.assertRaises(AuthRejected) as ctx:
+            require_recent_auth(actor, max_age_seconds=300)
+        self.assertEqual(ctx.exception.machine, 'REAUTH_REQUIRED')
+
+    def test_missing_totp_factor_rejected(self):
+        from services.auth_context import AuthRejected, require_recent_auth
+        actor = self.actor_ctx(auth_time=datetime.now(), amr='pwd')
+        with self.assertRaises(AuthRejected) as ctx:
+            require_recent_auth(actor, factors=('pwd', 'totp'))
+        self.assertEqual(ctx.exception.machine, 'MFA_REQUIRED')
+
+    def test_totp_session_passes_factor_check(self):
+        from services.auth_context import require_recent_auth
+        actor = self.actor_ctx(auth_time=datetime.now(), amr='pwd+totp')
+        require_recent_auth(actor, factors=('pwd', 'totp'))
+
+
+class RequestGuardClassificationTest(AuthFoundationTestBase):
+    """B3：/auth/* 按端点分类 + 带无效 Bearer 一律明确拒绝（规格 6.1）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.app.before_request(enforce_request_access)
+
+    def guard(self, path, token=None, method='POST'):
+        headers = {'Authorization': f'Bearer {token}'} if token else {}
+        with self.app.test_request_context(path, method=method, headers=headers):
+            return enforce_request_access()
+
+    def v2_access(self, user, session):
+        from flask_jwt_extended import create_access_token
+        claims = {"sid": session.sid, "security_version": session.security_version,
+                  "token_schema": "v2"}
+        return create_access_token(identity=user.email, additional_claims=claims)
+
+    def test_public_auth_paths_skip_guard(self):
+        for path, method in [('/auth/login', 'POST'), ('/auth/register', 'POST'),
+                             ('/auth/captcha/email', 'POST'), ('/auth/find_password', 'POST'),
+                             ('/auth/dev_accounts', 'GET'), ('/auth/session/config', 'GET'),
+                             ('/auth/refresh', 'POST'), ('/auth/logout', 'POST'),
+                             ('/auth/user/refresh', 'POST'), ('/auth/admin/logout', 'POST')]:
+            self.assertIsNone(self.guard(path, method=method), path)
+
+    def test_invalid_bearer_on_business_path_rejected(self):
+        result = self.guard('/course/list', token='not-a-jwt')
+        self.assertIsNotNone(result)
+        body, status = result
+        self.assertEqual(status, 401)
+        self.assertEqual(body.get_json()['machine'], 'INVALID_TOKEN')
+
+    def test_no_bearer_business_path_passes(self):
+        self.assertIsNone(self.guard('/course/list', token=None))
+
+    def test_no_bearer_admin_path_rejected(self):
+        result = self.guard('/admin/users', token=None)
+        self.assertEqual(result[1], 401)
+
+    def test_valid_v2_token_passes(self):
+        user = self.make_user()
+        session = self.make_session(user)
+        self.assertIsNone(self.guard('/course/list', token=self.v2_access(user, session)))
+
+    def test_banned_user_rejected_with_machine(self):
+        user = self.make_user()
+        user.status = 'banned'
+        db.session.commit()
+        session = self.make_session(user)
+        result = self.guard('/course/list', token=self.v2_access(user, session))
+        self.assertEqual(result[1], 403)
+        self.assertEqual(result[0].get_json()['machine'], 'ACCOUNT_BANNED')
+
+    def test_non_admin_rejected_on_admin_path(self):
+        user = self.make_user()
+        session = self.make_session(user)
+        result = self.guard('/admin/users', token=self.v2_access(user, session))
+        self.assertEqual(result[1], 403)
+
+
+class AuditRedactionTest(AuthFoundationTestBase):
+    """B3：审计脱敏——响应令牌与短签查询参数落库前打码（规格第 15 章）。"""
+
+    def test_token_keys_redacted_code_preserved(self):
+        from blueprints import _audit_redact
+        out = _audit_redact({
+            'code': 200, 'message': '登录成功', 'token': 'eyJhbGci.x.y',
+            'refresh_token': 'eyJ.r.z', 'nested': {'User_Password': 'md5hash', 'ok': 1},
+        })
+        self.assertEqual(out['token'], '[REDACTED]')
+        self.assertEqual(out['refresh_token'], '[REDACTED]')
+        self.assertEqual(out['nested']['User_Password'], '[REDACTED]')
+        self.assertEqual(out['code'], 200)
+        self.assertEqual(out['nested']['ok'], 1)
+
+    def test_mfa_fields_redacted(self):
+        from blueprints import _audit_redact
+        out = _audit_redact({'otpauth': 'otpauth://totp/x', 'recovery_code': 'AB12CD34',
+                             'mfa_token': 't-1', 'secret': 's'})
+        for k in ('otpauth', 'recovery_code', 'mfa_token', 'secret'):
+            self.assertEqual(out[k], '[REDACTED]')
+
+    def test_query_params_redacted(self):
+        from blueprints import _redact_query_params
+        out = _redact_query_params('http://x/media/1?u=12&e=1790&st=abc123&foo=bar')
+        self.assertIn('u=[REDACTED]', out)
+        self.assertIn('e=[REDACTED]', out)
+        self.assertIn('st=[REDACTED]', out)
+        self.assertIn('foo=bar', out)
+
+    def test_plain_url_untouched(self):
+        from blueprints import _redact_query_params
+        url = 'http://x/api/v2/article/3'
+        self.assertEqual(_redact_query_params(url), url)
+
+
+class SessionConfigEndpointTest(AuthFoundationTestBase):
+    """B3：/auth/session/config 模式发现端点。"""
+
+    def test_config_defaults(self):
+        from blueprints.auth import session_config
+        with self.app.test_request_context('/auth/session/config'):
+            resp = session_config()
+        data = resp.get_json()
+        self.assertEqual(data['code'], 200)
+        self.assertFalse(data['refresh_cookie_enabled'])
+        self.assertIn('legacy_deadline', data)
+        self.assertEqual(resp.headers['Cache-Control'], 'no-store')
 
 
 if __name__ == '__main__':

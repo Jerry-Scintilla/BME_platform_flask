@@ -22,6 +22,51 @@ def _audit_truncate(value, limit):
     return s[:limit] + f"...(truncated {len(s) - limit} chars)"
 
 
+# ── 审计脱敏（D1 安全地基，规格第 15 章）──
+# 停止原样记录敏感响应：登录/注册/续期响应含完整 JWT（D0 盘点实测 dev 库 478 行），
+# 任何具备 audit_log 读权限的角色都能拿到近 14 天的活性 refresh——落库前按键名打码。
+_REDACT_EXACT_KEYS = {
+    "token", "refresh_token", "access_token", "password", "user_password",
+    "captcha", "user_captcha", "otp", "mfa_token", "recovery_code",
+    "secret", "authorization", "cookie", "otpauth",
+}
+_REDACT_KEY_SUBSTR = ("password", "secret", "captcha", "otpauth", "recovery_code")
+
+
+def _audit_redact(value, _depth=0):
+    """递归按键名打码：命中规则即替换为 [REDACTED]；不碰业务状态字段（code 等）。"""
+    if _depth > 8:
+        return "..."
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = str(k).lower()
+            if key in _REDACT_EXACT_KEYS or key.endswith("_token") or any(s in key for s in _REDACT_KEY_SUBSTR):
+                out[k] = "[REDACTED]"
+            else:
+                out[k] = _audit_redact(v, _depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_audit_redact(v, _depth + 1) for v in value]
+    return value
+
+
+# 媒体短签/下载链的敏感查询参数（规格 6.4：请求日志过滤签名参数）
+_REDACT_QUERY_PARAMS = ("st", "u", "e", "sv", "sign", "token", "down_code")
+
+
+def _redact_query_params(url):
+    """URL 中敏感查询参数的值替换为 [REDACTED]（无查询串原样返回）。"""
+    if not url or "?" not in url:
+        return url
+    base, _, qs = url.partition("?")
+    kept = []
+    for part in qs.split("&"):
+        key = part.split("=", 1)[0]
+        kept.append(f"{key}=[REDACTED]" if key in _REDACT_QUERY_PARAMS and "=" in part else part)
+    return f"{base}?{'&'.join(kept)}"
+
+
 def _audit_write(log_entry):
     """审计落库 best-effort：失败只回滚并打日志——绝不把成功的业务响应变成 500，
     也不让失败的 flush 悬在 session 里污染后续请求。"""
@@ -108,8 +153,8 @@ def audit_log(operation=None, is_login=False):
                         ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
-                        operation_url=_audit_truncate(request.url, AUDIT_URL_MAX_CHARS),
-                        operation_data=_audit_truncate(operation_data, AUDIT_DATA_MAX_CHARS),
+                        operation_url=_audit_truncate(_redact_query_params(request.url), AUDIT_URL_MAX_CHARS),
+                        operation_data=_audit_truncate(_audit_redact(operation_data), AUDIT_DATA_MAX_CHARS),
                         result=result,
                         timestamp=start_time
                     ))
@@ -133,8 +178,8 @@ def audit_log(operation=None, is_login=False):
                         ip_address=client_ip,
                         user_agent=request.headers.get('User-Agent', ''),
                         operation=operation or func.__name__,
-                        operation_url=_audit_truncate(request.url, AUDIT_URL_MAX_CHARS),
-                        operation_data=_audit_truncate({'error': str(e)}, AUDIT_DATA_MAX_CHARS),
+                        operation_url=_audit_truncate(_redact_query_params(request.url), AUDIT_URL_MAX_CHARS),
+                        operation_data=_audit_truncate(_audit_redact({'error': str(e)}), AUDIT_DATA_MAX_CHARS),
                         result='失败',
                         timestamp=start_time
                     ))
@@ -198,11 +243,16 @@ def build_result(dates, date_info, today, now, is_current_month, format_duration
 
 
 def _current_user():
-    """从 JWT 取当前用户，无则返回 None。"""
-    user_email = get_jwt_identity()
-    if not user_email:
-        return None
-    return UserModel.query.filter_by(email=user_email).first()
+    """从 JWT 取当前用户，无则返回 None。
+
+    D1 安全地基起收口到 services.auth_context.resolve_actor：与入口守卫共用
+    一次解析（flask.g 缓存），自动获得账号生命周期与 v2 会话校验——
+    check_permission/camp_role 等约 180 处调用点零改动升级。
+    解析失败（无 token/无效/被撤）返回 None，具体拒绝响应由守卫或装饰器给出。
+    """
+    from services.auth_context import current_actor
+    actor = current_actor()
+    return actor.user if actor else None
 
 
 def get_user_permissions(user_id):
