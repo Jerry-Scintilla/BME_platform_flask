@@ -46,6 +46,8 @@ for n in 13_level 14_mentor_review 15_camp_policy 16_join_tag 17_email_notify \
   run scripts/migrate/migrate_${n}.py
 done
 run init_seats.py
+# D1 身份安全地基（2026-10-01）：34-61 号迁移按历次发布 SOP 手工执行，此处从 62 起续链
+run scripts/migrate/migrate_62_auth_foundation.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else
