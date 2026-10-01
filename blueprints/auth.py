@@ -26,6 +26,8 @@ from services.auth_challenges import issue_captcha, verify_captcha
 from services.auth_context import (
     AuthRejected, challenge_digest, constant_time_eq, validate_account_lifecycle,
 )
+from services.identity import events as identity_events
+from services.identity import person as identity_person
 from . import check_permission, get_user_permissions
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -74,7 +76,23 @@ def register():
             user = UserModel(email=email, username=username, study_stage="未分流")
             user.set_password(password)
             db.session.add(user)
-            db.session.commit()
+            # D2：一次事务建 User+Person+primary 映射（规格 3.4「不留下无主普通
+            # 账号」）并记只追加账本——账本写不进即整体回滚（S09），不吞错当成功
+            try:
+                person, _created = identity_person.create_provisional(user)
+                identity_events.record_event(
+                    'person.create_provisional',
+                    actor_user_id=user.id,
+                    target_ids={'user_id': user.id, 'person_id': person.id},
+                    after={'person_id': person.id, 'verification_status': 'unverified',
+                           'record_status': 'active'},
+                    reason='注册建立 provisional 人员档案',
+                )
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                data = {"code": 500, "message": "注册失败，请稍后重试"}
+                return jsonify(data), 500
             # D1：注册即签发 v2 会话（sid+版本声明；auth_time=注册认证时刻）
             data = {
                 "code": 200,
