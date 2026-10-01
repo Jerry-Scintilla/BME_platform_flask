@@ -420,6 +420,110 @@ class IdentityChallengeModel(db.Model):
     )
 
 
+# ── D3b 双账号认领与归并（migrate_65）：案例/证明/授权/占位/审批 ──
+# 设计依据：规格 7 章（自助流程/空壳归并/双数据/丢失争议）、8.2.3（锁下验证证明）。
+
+class AccountLinkCaseModel(db.Model):
+    """双账号关联案例：A（发起、证明所有权）认领 B（空壳副号/老号）。
+
+    状态机（规格第 4 章）：collecting → proof_ready → preview_ready →
+    awaiting_review → approved_waiting_confirmation → prepared → applied；
+    任一收集期可 cancelled；collecting 24h 未提交过期；prepared 后先查事务
+    结果、applied 只能补偿恢复。version 乐观锁随状态推进。
+    """
+    __tablename__ = 'account_link_case'
+    id = db.Column(db.String(64), primary_key=True)          # uuid4().hex
+    account_a = db.Column(db.Integer, nullable=False)        # 发起方
+    account_b = db.Column(db.Integer, nullable=False)        # 被认领方
+    surviving_person_id = db.Column(db.Integer)              # 批准后确定的存续人员
+    selected_primary_user_id = db.Column(db.Integer)         # 主参与号（推荐+人工改选）
+    state = db.Column(db.String(40), nullable=False, server_default='collecting')
+    preview_digest = db.Column(db.String(64))
+    policy_version = db.Column(db.Integer, nullable=False, server_default='1')
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    collection_expires_at = db.Column(db.DateTime)
+    approval_expires_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_alc_a', 'account_a', 'state'),
+        db.Index('idx_alc_b', 'account_b', 'state'),
+        db.Index('idx_alc_state', 'state', 'updated_at'),
+    )
+
+
+class IdentityAttestationModel(db.Model):
+    """一次性归属证明（5 分钟、用途限定）：A 端绑定实际 sid（版本快照，变化即作废）；
+    B 端用独立凭据（挑战/密码重验）证明，无需创建 B 普通会话（规格 6.2/8.2.3）。"""
+    __tablename__ = 'identity_attestation'
+    id = db.Column(db.String(64), primary_key=True)
+    proven_user_id = db.Column(db.Integer, nullable=False)
+    security_version_snapshot = db.Column(db.Integer, nullable=False)
+    actor_sid = db.Column(db.String(36))
+    case_id = db.Column(db.String(64), nullable=False)
+    purpose = db.Column(db.String(30), nullable=False)       # link_side_a / link_side_b
+    auth_time = db.Column(db.DateTime, nullable=False)
+    amr = db.Column(db.String(50), nullable=False)
+    evidence_ref = db.Column(db.String(191))
+    expires_at = db.Column(db.DateTime, nullable=False)
+    consumed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_att_case', 'case_id', 'purpose'),
+        db.Index('idx_att_user', 'proven_user_id', 'created_at'),
+    )
+
+
+class IdentityTransactionAuthorizationModel(db.Model):
+    """最终预览的事务授权：preview_digest 绑定双方证明与具体变更摘要；
+    有效期不超过两端实际认证的剩余窗口（规格 3.2）。"""
+    __tablename__ = 'identity_transaction_authorization'
+    id = db.Column(db.String(64), primary_key=True)
+    case_id = db.Column(db.String(64), nullable=False)
+    preview_digest = db.Column(db.String(64), nullable=False)
+    attestation_a = db.Column(db.String(64), nullable=False)
+    attestation_b = db.Column(db.String(64), nullable=False)
+    policy_version = db.Column(db.Integer, nullable=False, server_default='1')
+    expires_at = db.Column(db.DateTime, nullable=False)
+    consumed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (db.Index('idx_txa_case', 'case_id'),)
+
+
+class IdentityCaseAccountLockModel(db.Model):
+    """归并互斥占位：PK(user_id)——一账号同时只在一个活跃案例；到期释放必须
+    经服务端校验确认（证明前不能锁目标用户，规格 8.2）。"""
+    __tablename__ = 'identity_case_account_lock'
+    user_id = db.Column(db.Integer, primary_key=True)
+    case_id = db.Column(db.String(64), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class IdentityReviewDecisionModel(db.Model):
+    """案例审核决策：每名审核人只计一份有效批准（同 case 同人最新 version 生效）；
+    计划变化（plan_digest 不同）或审核资格撤销后不能沿用旧批准（规格 3.2）。"""
+    __tablename__ = 'identity_review_decision'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    case_id = db.Column(db.String(64), nullable=False)
+    reviewer_user_id = db.Column(db.Integer, nullable=False)
+    plan_digest = db.Column(db.String(64), nullable=False)
+    decision = db.Column(db.String(20), nullable=False)      # approved/rejected
+    scope = db.Column(db.String(100))
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    decided_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    valid_until = db.Column(db.DateTime, nullable=False)     # 7 天
+
+    __table_args__ = (
+        db.UniqueConstraint('case_id', 'reviewer_user_id', 'version',
+                            name='uq_review_one'),
+        db.Index('idx_review_case', 'case_id', 'decision'),
+    )
+
+
 # 已弃用，改用redis存储
 # class EmailCaptchaModel(db.Model):
 #     __tablename__ = 'email_captcha'

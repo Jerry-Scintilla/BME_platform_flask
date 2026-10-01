@@ -52,6 +52,8 @@ run scripts/migrate/migrate_62_auth_foundation.py
 run scripts/migrate/migrate_63_person_layer.py
 # D3a 核验与审批（2026-10-01）：学校配置/申请/挑战三表 + sysu 种子（幂等；索引兜底补齐）
 run scripts/migrate/migrate_64_identity_verification.py
+# D3b 认领与归并（2026-10-01）：案例/证明/授权/占位/审批五表（零行为变化）
+run scripts/migrate/migrate_65_identity_link.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else
