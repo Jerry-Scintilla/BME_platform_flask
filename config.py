@@ -1,6 +1,6 @@
 # 数据库配置信息
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -107,3 +107,32 @@ AI_TOPIC_FEED_URLS = [
         "https://36kr.com/feed"
     ).split(",") if u.strip()
 ]
+# ── D1 身份安全地基（migrate_62，成员身份确认与重复账号安全迁移）──
+# refresh 迁 HttpOnly cookie 总开关：默认关=兼容模式（响应体仍返回 refresh_token，
+# 前端 facade 自动探测 /auth/session/config 落兼容分支）。开启后 body 不再返回 refresh。
+AUTH_REFRESH_COOKIE_ENABLED = os.getenv("AUTH_REFRESH_COOKIE_ENABLED", "false").lower() in ("1", "on", "true")
+# cookie Secure 属性：生产 https 置 true；dev http://127.0.0.1 下 Chrome 可用但 Safari 拒收，默认关
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "false").lower() in ("1", "on", "true")
+# 旧协议 token（无 sid/版本声明）兼容截止（ISO 日期时间，Asia/Shanghai）：
+# 未显式设置时按「本次启动 + 14 天」取值并打告警——重启会顺延窗口，上线 SOP 要求显式固定。
+_raw_deadline = os.getenv("AUTH_LEGACY_TOKEN_DEADLINE")
+if _raw_deadline:
+    AUTH_LEGACY_TOKEN_DEADLINE = datetime.fromisoformat(_raw_deadline)
+else:
+    AUTH_LEGACY_TOKEN_DEADLINE = datetime.now() + timedelta(days=14)
+    print("[warn] AUTH_LEGACY_TOKEN_DEADLINE 未显式设置，旧 token 兼容截止取本次启动+14 天"
+          f"（{AUTH_LEGACY_TOKEN_DEADLINE:%Y-%m-%d %H:%M}）——生产必须在 .env 固定该值")
+# 高风险操作的近期认证窗口（秒）：MFA 停用/恢复码重发等，D3 高风险端点复用
+AUTH_RECENT_AUTH_SECONDS = int(os.getenv("AUTH_RECENT_AUTH_SECONDS", "300"))
+# 挑战摘要密钥（验证码/恢复码/refresh 的 HMAC）：未设时由 JWT_SECRET 派生（服务端持有，不外发）
+CHALLENGE_HMAC_SECRET = os.getenv("CHALLENGE_HMAC_SECRET")
+# 媒体短签独立密钥：未设回退 JWT_SECRET_KEY 并告警（runbook 要求独立设置）
+MEDIA_SIGN_SECRET = os.getenv("MEDIA_SIGN_SECRET") or JWT_SECRET_KEY
+if not os.getenv("MEDIA_SIGN_SECRET"):
+    print("[warn] MEDIA_SIGN_SECRET 未设置，媒体短签回退 JWT_SECRET_KEY——生产建议独立密钥")
+# MFA 因子加密密钥（Fernet key，python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"）
+MFA_ENC_SECRET = os.getenv("MFA_ENC_SECRET")
+# 管理端 MFA 强制开关：默认关（D1 只交钩子）；置 true 时 /admin/* 会话须含 totp 因子
+MFA_ENFORCE_FOR_ADMIN = os.getenv("MFA_ENFORCE_FOR_ADMIN", "false").lower() in ("1", "on", "true")
+if MFA_ENFORCE_FOR_ADMIN and not MFA_ENC_SECRET:
+    raise RuntimeError("MFA_ENFORCE_FOR_ADMIN=true 但 MFA_ENC_SECRET 未配置，拒绝启动")

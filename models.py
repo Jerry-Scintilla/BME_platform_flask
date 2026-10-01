@@ -50,6 +50,18 @@ class UserModel(db.Model):
     # scripts/migrate/migrate_17_email_notify.py 添加（create_all 不补已存在表的列）。
     email_notify_enabled = db.Column(db.Boolean, nullable=False, server_default='1')
 
+    # ── D1 安全地基（scripts/migrate/migrate_62_auth_foundation.py）──
+    # security_version：任何安全变更（重置密码/封禁/MFA 变更，D2+ 归并等）+1，
+    #   旧 access/refresh/媒体短签即时失效（token/短签声明与库值比对）。
+    # require_versioned_tokens：置位后拒收无 sid/版本声明的旧协议 token。
+    # lifecycle：active/merged/disabled，与 status 的 banned 正交（banned 优先）；
+    #   D1 只落列与校验钩子，merged 值由 D2 归并流程写入。
+    # account_kind：standard/management_aux/test/service；D0 盘点标注服务号，D2 回填。
+    security_version = db.Column(db.Integer, nullable=False, server_default='0')
+    require_versioned_tokens = db.Column(db.Boolean, nullable=False, server_default='0')
+    lifecycle = db.Column(db.String(20), nullable=False, server_default='active')
+    account_kind = db.Column(db.String(20), nullable=False, server_default='standard')
+
     # down_code = db.Column(db.String(100))
     # down_id = db.Column(db.Integer)
 
@@ -101,6 +113,78 @@ class UserModel(db.Model):
     def is_admin_like(self):
         """deprecated：is_admin() 的旧名，保留别名避免散落改动"""
         return self.role == 'super_admin'
+
+
+# ── D1 安全地基（migrate_62）：会话真相源 / MFA / 旧令牌兑换 ──
+# 设计依据：docs/计划/成员身份确认与重复账号安全迁移-开发详细计划-2026-10-01.md 第 6 章。
+# Redis blocklist 降级为补充机制，本组表是撤权判定的真相源。
+
+class AuthSessionModel(db.Model):
+    """数据库会话真相源：v2 token 的 sid 指向本表；撤会话/安全版本即时生效。
+
+    refresh_digest 存当前 refresh token 的 HMAC 摘要（专用密钥，见 services/auth_context）；
+    轮换=同 sid 覆写 digest、generation+1（auth_time/amr 原值不动，不用刷新时间推导认证强度）。
+    """
+    __tablename__ = 'auth_session'
+    sid = db.Column(db.String(36), primary_key=True)  # uuid4，token 声明与 cookie 共用
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    client_type = db.Column(db.String(10), nullable=False, server_default='user')  # user/admin，续期端点核对
+    security_version = db.Column(db.Integer, nullable=False, server_default='0')   # 签发时账号版本快照
+    refresh_digest = db.Column(db.String(64), nullable=False)
+    generation = db.Column(db.Integer, nullable=False, server_default='1')
+    auth_time = db.Column(db.DateTime, nullable=False)   # 最近实际认证时间（naive 本地时间）
+    amr = db.Column(db.String(50), nullable=False, server_default='pwd')  # pwd/pwd+totp/unknown(legacy 兑换)
+    revoked_at = db.Column(db.DateTime)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    last_used_at = db.Column(db.DateTime)
+    user_agent = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    user = db.relationship('UserModel', backref=db.backref('auth_sessions', lazy='dynamic'))
+
+    @property
+    def is_live(self):
+        return self.revoked_at is None and self.expires_at > datetime.now()
+
+
+class AuthFactorModel(db.Model):
+    """MFA 因子（首期 TOTP，仅管理端）。secret 经 Fernet(MFA_ENC_SECRET) 加密存储，
+    last_accepted_counter 拒绝同一时间步重放。"""
+    __tablename__ = 'auth_factor'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    factor_type = db.Column(db.String(20), nullable=False, server_default='totp')
+    encrypted_secret = db.Column(db.Text, nullable=False)
+    key_version = db.Column(db.Integer, nullable=False, server_default='1')
+    state = db.Column(db.String(20), nullable=False, server_default='pending')  # pending/active/revoked
+    last_accepted_counter = db.Column(db.BigInteger)
+    confirmed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    user = db.relationship('UserModel', backref=db.backref('auth_factors', lazy='dynamic'))
+
+
+class AuthRecoveryCodeModel(db.Model):
+    """MFA 恢复码：只存 HMAC 摘要，一次性消费（used_at 非空即作废）。"""
+    __tablename__ = 'auth_recovery_code'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    code_digest = db.Column(db.String(64), nullable=False, unique=True)
+    used_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    user = db.relationship('UserModel', backref=db.backref('auth_recovery_codes', lazy='dynamic'))
+
+
+class AuthLegacyRefreshConsumptionModel(db.Model):
+    """旧协议 refresh 的一次性兑换记录：UNIQUE(old_jti_digest) 兜底防重放，
+    兑换产物是 amr=unknown 的新会话（敏感操作须重新认证）。"""
+    __tablename__ = 'auth_legacy_refresh_consumption'
+    old_jti_digest = db.Column(db.String(64), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    new_sid = db.Column(db.String(36), nullable=False)
+    consumed_at = db.Column(db.DateTime, default=datetime.now)
+    expires_at = db.Column(db.DateTime, nullable=False)  # 记录时间+14d，兼容期后清理窗口
 
 
 # 已弃用，改用redis存储
