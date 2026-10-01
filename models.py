@@ -62,6 +62,15 @@ class UserModel(db.Model):
     lifecycle = db.Column(db.String(20), nullable=False, server_default='active')
     account_kind = db.Column(db.String(20), nullable=False, server_default='standard')
 
+    # ── D2 人员层（scripts/migrate/migrate_63_person_layer.py）──
+    # 指向人员档案；回填/注册路径建立（规格 3.4「不留下无主普通账号」）。
+    # UNIQUE(id,person_id) 是主账号复合外键的引用目标（规格 3.3 可执行约束）。
+    person_id = db.Column(db.Integer, db.ForeignKey('person.id'))
+
+    __table_args__ = (
+        db.UniqueConstraint('id', 'person_id', name='uq_user_id_person'),
+    )
+
     # down_code = db.Column(db.String(100))
     # down_id = db.Column(db.Integer)
 
@@ -185,6 +194,138 @@ class AuthLegacyRefreshConsumptionModel(db.Model):
     new_sid = db.Column(db.String(36), nullable=False)
     consumed_at = db.Column(db.DateTime, default=datetime.now)
     expires_at = db.Column(db.DateTime, nullable=False)  # 记录时间+14d，兼容期后清理窗口
+
+
+# ── D2 人员层（migrate_63）：Person / 身份登记 / 主参与 / 账本 / 幂等 outbox ──
+# 设计依据：docs/计划/成员身份确认与重复账号安全迁移-开发详细计划-2026-10-01.md 第 3 章。
+# D2 零行为变化：只加表与服务，不改任何业务入口判定（enforcement 属 D5）。
+
+class PersonModel(db.Model):
+    """人员档案：一个自然人在平台内的锚点。
+
+    存量普通账号回填/新注册各建 provisional（全部 unverified，自填姓名/学号不构成
+    核验依据）；D3 归并时 record_status='merged' 并 merged_to_person_id 指向存续者，
+    禁止多级环（服务层持锁校验，规格 3.4）。人员合并不是历史业务数据合并。
+    """
+    __tablename__ = 'person'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(db.String(32), nullable=False, unique=True)  # 随机不透明人员编号
+    verified_name = db.Column(db.String(100))   # 核验姓名（不唯一；核验通过后回填）
+    verification_status = db.Column(db.String(20), nullable=False, server_default='unverified')
+    record_status = db.Column(db.String(20), nullable=False, server_default='active')  # active/merged
+    merged_to_person_id = db.Column(db.Integer, db.ForeignKey('person.id'))
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    merged_to = db.relationship('PersonModel', remote_side=[id])
+
+
+class PersonIdentityModel(db.Model):
+    """已核验身份登记：UNIQUE(issuer, kind, canonical_key) 是学校 key 唯一登记的
+    数据库裁决点（首插成功，冲突不覆盖转可恢复冲突，规格 8.2.4）。
+
+    只有核验通过才写入本表（D3 调用 services/identity/registry.py；D2 只建表不写入）；
+    待提交的声明值存在申请表。历史撤销也不自动释放给别人。
+    canonical_key 只按机构文档归一化，禁止通用删点号/加号后缀等猜测（规格 3.3）。
+    """
+    __tablename__ = 'person_identity'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    issuer = db.Column(db.String(50), nullable=False)        # sysu / external:<school>
+    kind = db.Column(db.String(20), nullable=False)          # netid/email/roster_ref
+    canonical_key = db.Column(db.String(191), nullable=False)
+    person_id = db.Column(db.Integer, db.ForeignKey('person.id'), nullable=False)
+    proof_status = db.Column(db.String(20), nullable=False, server_default='verified')
+    assurance_method = db.Column(db.String(50), nullable=False)  # school_email/roster/manual
+    proof_ref = db.Column(db.String(191))
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    person = db.relationship('PersonModel', backref=db.backref('identities', lazy='dynamic'))
+
+    __table_args__ = (
+        db.UniqueConstraint('issuer', 'kind', 'canonical_key', name='uq_person_identity_key'),
+    )
+
+
+class PersonPrimaryAccountModel(db.Model):
+    """人员主参与账号：PK(person_id) + UNIQUE(user_id)——一个人员唯一正式参与账号。
+
+    复合外键 (user_id, person_id) → user(id, person_id) 保障主账号确实属于该人员；
+    避免把主账号指针放到 Person 后造成初始化时相互必须存在的循环依赖（规格 3.3）。
+    「只允许 active standard 账号」这类跨表规则由服务函数持锁校验，不声称 CHECK 覆盖。
+    """
+    __tablename__ = 'person_primary_account'
+    person_id = db.Column(db.Integer, db.ForeignKey('person.id'), primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False, unique=True)
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    person = db.relationship('PersonModel', backref=db.backref('primary_account', uselist=False))
+
+    __table_args__ = (
+        db.ForeignKeyConstraint(['user_id', 'person_id'], ['user.id', 'user.person_id']),
+        {},
+    )
+
+
+class IdentityEventModel(db.Model):
+    """身份只追加账本：与业务写同事务（写不进即回滚，S09），无 UPDATE/DELETE 路径。
+
+    before/after 只记脱敏白名单字段（services/identity/events.py 过滤），
+    禁止口令/OTP/JWT/OIDC code/完整响应入库（规格 15 章）。
+    """
+    __tablename__ = 'identity_event'
+    event_id = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    operation_id = db.Column(db.String(64))
+    case_id = db.Column(db.String(64))
+    actor_user_id = db.Column(db.Integer)
+    actor_person_id = db.Column(db.Integer)
+    target_ids = db.Column(db.JSON)      # {user_id/person_id/...}
+    action = db.Column(db.String(50), nullable=False)
+    before = db.Column(db.JSON)          # 脱敏白名单字段快照
+    after = db.Column(db.JSON)
+    evidence_refs = db.Column(db.JSON)   # challenge/名册批次/审批单引用
+    reason = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+
+class IdentityOperationModel(db.Model):
+    """身份操作幂等登记：UNIQUE(actor_user_id, operation_type, idempotency_key)。
+
+    同 actor、同 key、同 request_digest 返回既有结果；同 key 不同内容返回冲突
+    （规格 8.2.6）。actor_user_id 用 0 表示系统动作——NOT NULL 使唯一键对系统操作
+    也生效（MySQL UNIQUE 对 NULL 不去重）。
+    """
+    __tablename__ = 'identity_operation'
+    operation_id = db.Column(db.String(64), primary_key=True)  # uuid4().hex
+    actor_user_id = db.Column(db.Integer, nullable=False, server_default='0')
+    operation_type = db.Column(db.String(50), nullable=False)
+    idempotency_key = db.Column(db.String(191), nullable=False)
+    request_digest = db.Column(db.String(64))
+    state = db.Column(db.String(20), nullable=False, server_default='running')  # running/completed/failed
+    result_ref = db.Column(db.String(191))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('actor_user_id', 'operation_type', 'idempotency_key',
+                            name='uq_identity_operation'),
+    )
+
+
+class IdentityOutboxModel(db.Model):
+    """身份通知发件箱：核心提交成功与发送成功分离（S14）；失败退避重试，
+    超过 24 小时告警（规格 14 章）。payload 只存脱敏内容。"""
+    __tablename__ = 'identity_outbox'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    event_id = db.Column(db.BigInteger, nullable=False)
+    channel = db.Column(db.String(50), nullable=False)       # notification/email/...
+    payload = db.Column(db.JSON)
+    delivery_state = db.Column(db.String(20), nullable=False, server_default='pending')
+    attempts = db.Column(db.Integer, nullable=False, server_default='0')
+    last_error = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    sent_at = db.Column(db.DateTime)
 
 
 # 已弃用，改用redis存储
