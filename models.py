@@ -331,6 +331,95 @@ class IdentityOutboxModel(db.Model):
     sent_at = db.Column(db.DateTime)
 
 
+# ── D3a 核验与审批（migrate_64）：学校配置 / 申请 / 挑战 ──
+# 设计依据：规格 5.1（本校个人校园邮箱路径）、3.2、第 4 章状态机。
+
+class IdentitySchoolConfigModel(db.Model):
+    """学校核验配置（含核验负责人=审核人）。域名精确匹配、共享域排除、
+    NetID-邮箱映射规则；变更不追溯改写旧记录（config_version 递增）。
+
+    reviewer_user_ids ≥ 2 名才算运营就绪（规格 §18）——生产由管理端补齐真人，
+    dev 以 seed 超管占位。审核人就这存这里，不另设全局表。
+    """
+    __tablename__ = 'identity_school_config'
+    school_id = db.Column(db.String(32), primary_key=True)   # sysu / external:<code>
+    name = db.Column(db.String(100), nullable=False)
+    personal_email_domains = db.Column(db.JSON, nullable=False)
+    excluded_email_domains = db.Column(db.JSON)
+    email_local_matches_identifier = db.Column(db.Boolean, nullable=False, server_default='1')
+    reviewer_user_ids = db.Column(db.JSON, nullable=False)
+    config_version = db.Column(db.Integer, nullable=False, server_default='1')
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    @property
+    def reviewers_ready(self):
+        """运营就绪：≥2 名审核人（规格 §18 硬前置；不足不拦功能，只标未就绪）。"""
+        return len(self.reviewer_user_ids or []) >= 2
+
+    def is_reviewer(self, user_id):
+        return user_id in (self.reviewer_user_ids or [])
+
+
+class IdentityApplicationModel(db.Model):
+    """身份核验申请：claimed_* 只是声明，不占用唯一身份标识（占位只发生在
+    审批通过写 person_identity 那一刻，规格 3.2）。
+
+    状态机（规格第 4 章）：draft →(challenge 验证后可提交) submitted →
+    approved / rejected（保留原因，支持补交新版本）；reviewing 预留给 D3b
+    分配复核；withdrawn 仅申请人本人、终态前可撤。
+    """
+    __tablename__ = 'identity_application'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    school_id = db.Column(db.String(32), nullable=False)
+    applicant_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    applicant_person_id = db.Column(db.Integer)
+    claimed_name = db.Column(db.String(100), nullable=False)
+    claimed_identifier = db.Column(db.String(191), nullable=False)   # NetID 声明
+    contact_email = db.Column(db.String(191), nullable=False)        # 归一化后
+    method = db.Column(db.String(30), nullable=False, server_default='school_email')
+    status = db.Column(db.String(20), nullable=False, server_default='draft')
+    challenge_verified_at = db.Column(db.DateTime)
+    reviewed_by = db.Column(db.Integer)
+    reviewed_at = db.Column(db.DateTime)
+    reject_reason = db.Column(db.String(255))
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    TERMINAL = ('approved', 'rejected', 'withdrawn')
+
+    __table_args__ = (
+        db.Index('idx_idapp_applicant', 'applicant_user_id', 'status'),
+        db.Index('idx_idapp_school_status', 'school_id', 'status'),
+    )
+
+
+class IdentityChallengeModel(db.Model):
+    """身份挑战：服务器生成随机 ID；短码只存专用密钥 HMAC 摘要（裸 SHA 的
+    6 位码可离线枚举，规格 8.1）；payload_digest 绑定申请防跨申请挪用；
+    消费后不可再用（consumed_at）。"""
+    __tablename__ = 'identity_challenge'
+    id = db.Column(db.String(64), primary_key=True)          # uuid4().hex
+    purpose = db.Column(db.String(30), nullable=False)       # school_identity
+    application_id = db.Column(db.Integer)
+    case_id = db.Column(db.String(64))
+    actor_user_id = db.Column(db.Integer, nullable=False)
+    target_user_id = db.Column(db.Integer)
+    destination_digest = db.Column(db.String(64), nullable=False)
+    secret_digest = db.Column(db.String(64), nullable=False)
+    payload_digest = db.Column(db.String(64), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    attempts = db.Column(db.Integer, nullable=False, server_default='0')
+    consumed_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_idch_app', 'application_id', 'consumed_at'),
+        db.Index('idx_idch_actor', 'actor_user_id', 'created_at'),
+    )
+
+
 # 已弃用，改用redis存储
 # class EmailCaptchaModel(db.Model):
 #     __tablename__ = 'email_captcha'
