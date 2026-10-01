@@ -51,7 +51,9 @@ class RegisterForm(wtforms.Form):
             super(RegisterForm, self).__init__(data=data, **args)
 
     User_Name = wtforms.StringField('User_Name')
-    User_Password = wtforms.StringField(validators=[length(min=6, max=100, message='Invalid password')])
+    # 门槛与登录统一为 8 位（D1.5 收尾 #8；传输值为前端 MD5 定长 32 位，此校验
+    # 只拦协议异常，真实密码强度由前端规则约束）
+    User_Password = wtforms.StringField(validators=[length(min=8, max=100, message='密码长度需为 8-100 位')])
     User_Email = wtforms.StringField(validators=[Email(message='邮箱格式错误')])
     User_Captcha = wtforms.StringField(validators=[length(min=6, max=6, message='验证码为6位')])
 

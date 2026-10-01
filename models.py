@@ -275,7 +275,10 @@ class IdentityEventModel(db.Model):
     禁止口令/OTP/JWT/OIDC code/完整响应入库（规格 15 章）。
     """
     __tablename__ = 'identity_event'
-    event_id = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    # SQLite 下 BIGINT 主键不享受 rowid 别名（不自增），用 with_variant 兜底单测栈
+    event_id = db.Column(
+        db.BigInteger().with_variant(db.Integer, 'sqlite'),
+        primary_key=True, autoincrement=True)
     operation_id = db.Column(db.String(64))
     case_id = db.Column(db.String(64))
     actor_user_id = db.Column(db.Integer)

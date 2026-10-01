@@ -644,6 +644,25 @@ class CaptchaChallengeTest(AuthFoundationTestBase):
         self.assertEqual(ctx.exception.machine, "CHALLENGE_LIMIT")
 
 
+class RegisterPasswordThresholdTest(AuthFoundationTestBase):
+    """D1.5 收尾 #8：注册/登录密码门槛统一为 8 位。"""
+
+    def _form_errors(self, password):
+        from blueprints.forms import RegisterForm
+        with self.app.test_request_context(
+                '/auth/register', method='POST', content_type='application/json',
+                json={'User_Email': 'a@x.dev', 'User_Name': '甲', 'User_Captcha': '123456'}):
+            form = RegisterForm()
+            # 直接注入待测值（其余字段各自校验，不掺入断言）
+            form.User_Password.data = password
+            form.validate()
+            return form.errors.get('User_Password')
+
+    def test_register_password_min_eight(self):
+        self.assertTrue(self._form_errors('x' * 7))    # 7 位：拒绝（旧门槛是 6）
+        self.assertFalse(self._form_errors('x' * 8))   # 8 位：过
+
+
 class FindPasswordResetTest(AuthFoundationTestBase):
     """B4：找回密码重置撤会话（此前存量 token 可活 14 天）。"""
 
