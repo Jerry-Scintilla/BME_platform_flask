@@ -2392,6 +2392,8 @@ class WorkWorkspace(db.Model):
         # group=组工作区 / club=社团工作区（X3）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)
         # active / disabled（停用=入口只读关闸，数据与授权记录保留，D04）
+    auto_grant = db.Column(db.Boolean, nullable=False, default=True)
+        # 入职自动授（2026-10-01 授权自动化）：归属/任职写入即派生授权（provisioning.py）
     default_reviewer_user_id = db.Column(db.Integer)             # 默认验收人建议（选填）
     config_json = db.Column(db.Text)                             # 值班时段/提醒窗口/配额覆盖
     created_at = db.Column(db.DateTime, default=datetime.now)
@@ -2417,10 +2419,12 @@ class WorkAccessGrant(db.Model):
     valid_from = db.Column(db.Date, nullable=True)               # 空=即时生效
     valid_until = db.Column(db.Date, nullable=True)              # 空=不限期（覆盖任期判断）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)
-        # active / revoked
+        # active / revoked / vetoed（vetoed=治理否决：本 (user, workspace) 不再自动重授）
     subtree = db.Column(db.Boolean, nullable=False, default=False)
         # 子树汇总（跨组方案 §4.1）：coordinator 授权勾选后，额外可见本组子孙组
         # 工作区事项的「摘要」（标题/负责人/状态/截止，无正文）；正文仍走参与/邀请
+    origin = db.Column(db.String(10), nullable=False, default='manual')
+        # auto=随组织事实派生（provisioning.py）/ manual=治理手动开通
     revoke_reason = db.Column(db.String(200))
     granted_by = db.Column(db.Integer, nullable=False)           # 操作人留痕（非 FK）
     grant_reason = db.Column(db.String(200), nullable=False)     # 授权原因（方案 §5.4 必填）

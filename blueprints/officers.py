@@ -21,6 +21,7 @@ from exts import db
 from models import UserModel, ClubOfficer, ClubPosition, ClubGroup, ClubMembership
 from . import check_permission, audit_log, _current_user
 from services.work.events import record_org_event
+from services.work import provisioning
 
 bp = Blueprint("officers", __name__, url_prefix="/admin/officers")
 
@@ -343,6 +344,9 @@ def appoint_officer():
                      to_group_id=officer.group_id,
                      operator_id=current.id if current else None,
                      detail={'title': pos.name})
+    # 授权自动化：任命即按组长类/分管规则派生工作区授权（同事务，方案 §3.2）
+    provisioning.sync_after_officer(user.id, None, officer.group_id,
+                                    current.id if current else None, event='任命')
     db.session.commit()
     return jsonify({"code": 200, "message": f"已任命 {user.username} 为 {pos.name}",
                     "data": _officer_dict(officer, user)})
@@ -419,6 +423,8 @@ def batch_appoint():
         )
         db.session.add(row)
         db.session.flush()          # 拿 id，同时让同批后续项能读到
+        provisioning.sync_after_officer(user.id, None, row.group_id,
+                                        current.id if current else None, event='批量任命')
         results.append({"index": idx, "ok": True, "officer_id": row.id, "username": user.username,
                         "title": pos.name, "department": group.name if group else None})
         added += 1
@@ -503,6 +509,9 @@ def edit_officer(officer_id):
                          from_group_id=before['group_id'], to_group_id=officer.group_id,
                          operator_id=current.id if current else None,
                          detail={'changes': changed})
+    # 授权自动化：换组/换职（组长类⇄分管）旧组新组各重算（同事务）
+    provisioning.sync_after_officer(officer.user_id, before['group_id'], officer.group_id,
+                                    current.id if current else None, event='任职编辑')
     db.session.commit()
     user = UserModel.query.get(officer.user_id)
     return jsonify({"code": 200, "message": "任职信息已更新", "data": _officer_dict(officer, user)})
@@ -543,6 +552,9 @@ def end_officer(officer_id):
                      from_group_id=officer.group_id,
                      operator_id=current.id if current else None,
                      detail={'term_end': str(term_end), 'reason': reason})
+    # 授权自动化：卸任后按剩余组织事实重算（有归属则降级 member，否则撤销）
+    provisioning.sync_after_officer(officer.user_id, officer.group_id, None,
+                                    current.id if current else None, event='卸任')
     db.session.commit()
     user = UserModel.query.get(officer.user_id)
     return jsonify({"code": 200, "message": "已卸任（记录保留）", "data": _officer_dict(officer, user)})

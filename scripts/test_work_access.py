@@ -98,10 +98,10 @@ class WorkAccessTest(unittest.TestCase):
     def _auth(self, user):
         return {'Authorization': f'Bearer {create_access_token(identity=user.email)}'}
 
-    def _open_workspace(self, group):
+    def _open_workspace(self, group, auto_grant=False):
         resp = self.client.post('/work/governance/workspaces',
                                 headers=self._auth(self.super_admin),
-                                json={'club_group_id': group.id})
+                                json={'club_group_id': group.id, 'auto_grant': auto_grant})
         assert resp.status_code == 200, resp.get_json()
         return WorkWorkspace.query.filter_by(club_group_id=group.id).first()
 
@@ -407,6 +407,162 @@ class WorkAccessTest(unittest.TestCase):
         ev = ClubOrgEvent.query.filter_by(kind='officer_appointed').one()
         self.assertEqual(ev.user_id, self.member_user.id)
         self.assertEqual(ev.to_group_id, self.g_hard.id)
+
+    # ── 授权自动化（2026-10-01 方案 §3.2/§3.3 派生矩阵）────
+
+    def _open_auto_ws(self, group):
+        """开自动授工作区；干跑断言现任组长/组员都被补授。"""
+        resp = self.client.post('/work/governance/workspaces',
+                                headers=self._auth(self.super_admin),
+                                json={'club_group_id': group.id, 'auto_grant': True})
+        assert resp.status_code == 200, resp.get_json()
+        counts = resp.get_json()['data']['backfill']
+        return WorkWorkspace.query.filter_by(club_group_id=group.id).first(), counts
+
+    def _auto_grant_of(self, user_id, ws_id, status='active'):
+        return WorkAccessGrant.query.filter_by(
+            user_id=user_id, workspace_id=ws_id, origin='auto', status=status).first()
+
+    def test_auto_backfill_on_workspace_open(self):
+        """建区即补授：组长类→coordinator、归属→member（含 secondary 槽，D3）。"""
+        ws, counts = self._open_auto_ws(self.g_soft)
+        self.assertGreaterEqual(counts.get('granted', 0), 2)
+        g_off = self._auto_grant_of(self.officer_user.id, ws.id)
+        g_mem = self._auto_grant_of(self.member_user.id, ws.id)
+        self.assertEqual(g_off.role, 'coordinator')       # 组长职位 rank=99 ≥ 10
+        self.assertEqual(g_mem.role, 'member')
+        self.assertEqual(g_mem.source_type, 'membership')
+        self.assertEqual(g_mem.group_id_snapshot, self.g_soft.id)
+        # 探测面立即可见
+        me = self._me(self.member_user)
+        self.assertEqual([w['id'] for w in me['workspaces']], [ws.id])
+
+    def test_auto_grant_on_membership_create_and_group_change(self):
+        """入职自动授 + 原地改组迁移（旧组撤、新组建）。"""
+        ws_soft, _ = self._open_auto_ws(self.g_soft)
+        ws_hard, _ = self._open_auto_ws(self.g_hard)
+        resp = self.client.put(f"/admin/club/membership/{self.plain_user.id}",
+                               headers=self._auth(self.super_admin),
+                               json={'primary': self.g_soft.id})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertIsNotNone(self._auto_grant_of(self.plain_user.id, ws_soft.id))
+        # 改组：旧授权撤销、新组自动授
+        resp = self.client.put(f"/admin/club/membership/{self.plain_user.id}",
+                               headers=self._auth(self.super_admin),
+                               json={'primary': self.g_hard.id})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertIsNone(self._auto_grant_of(self.plain_user.id, ws_soft.id))
+        self.assertIsNotNone(self._auto_grant_of(self.plain_user.id, ws_hard.id))
+        # 退组：授权撤销
+        resp = self.client.put(f"/admin/club/membership/{self.plain_user.id}",
+                               headers=self._auth(self.super_admin),
+                               json={'primary': None})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertIsNone(self._auto_grant_of(self.plain_user.id, ws_hard.id))
+        revoked = WorkAccessGrant.query.filter_by(
+            user_id=self.plain_user.id, workspace_id=ws_hard.id,
+            origin='auto', status='revoked').all()
+        self.assertTrue(revoked)
+
+    def test_auto_grant_officer_leader_and_demotion(self):
+        """任命组长类→coordinator；卸任后有归属降级 member、无归属撤销。
+        （用硬件组：软件组组长位已被干事甲占用，per_group_limit=1）"""
+        ws, _ = self._open_auto_ws(self.g_hard)
+        resp = self.client.post('/admin/officers', headers=self._auth(self.super_admin),
+                                json={'user_id': self.plain_user.id, 'title_id': self.position.id,
+                                      'group_id': self.g_hard.id})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(self._auto_grant_of(self.plain_user.id, ws.id).role, 'coordinator')
+        # 给归属再卸任 → 降级 member（来源换 membership）
+        ms = ClubMembership(user_id=self.plain_user.id, group_id=self.g_hard.id,
+                            slot='primary', joined_at=date.today())
+        db.session.add(ms)
+        db.session.commit()
+        off = ClubOfficer.query.filter_by(user_id=self.plain_user.id).one()
+        resp = self.client.post(f"/admin/officers/{off.id}/end",
+                                headers=self._auth(self.super_admin), json={})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        g = self._auto_grant_of(self.plain_user.id, ws.id)
+        self.assertEqual(g.role, 'member')
+        self.assertEqual(g.source_type, 'membership')
+        # 删归属 → 全撤
+        ClubMembership.query.filter_by(user_id=self.plain_user.id).delete()
+        from services.work import provisioning
+        provisioning.sync_user_workspace(self.plain_user.id, ws.id, event='测试直调')
+        db.session.commit()
+        self.assertIsNone(self._auto_grant_of(self.plain_user.id, ws.id))
+
+    def test_veto_blocks_auto_regrant_and_unveto_restores(self):
+        """否决位：退社再入社不复活；解除否决当场按事实重授（§3.3）。"""
+        ws, _ = self._open_auto_ws(self.g_soft)
+        g = self._auto_grant_of(self.member_user.id, ws.id)
+        resp = self.client.post(f"/work/governance/grants/{g.id}/revoke",
+                                headers=self._auth(self.super_admin),
+                                json={'reason': '泄露风波', 'veto': True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(WorkAccessGrant.query.get(g.id).status, 'vetoed')
+        # 退社再入社（新归属行新 id）——veto 按 (user, workspace) 拦住
+        ClubMembership.query.filter_by(user_id=self.member_user.id).delete()
+        db.session.commit()
+        resp = self.client.put(f"/admin/club/membership/{self.member_user.id}",
+                               headers=self._auth(self.super_admin),
+                               json={'primary': self.g_soft.id})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertIsNone(self._auto_grant_of(self.member_user.id, ws.id))
+        # 手动直授仍是例外通道（不受 veto 影响）
+        ms = ClubMembership.query.filter_by(user_id=self.member_user.id).one()
+        self._grant(self.super_admin, self.member_user, ws, 'member',
+                    'membership', ms, expect=200)
+        # 解除否决：按当前事实重算（manual 在→自动行让位，不叠加）
+        resp = self.client.post(f"/work/governance/grants/{g.id}/unveto",
+                                headers=self._auth(self.super_admin), json={})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(WorkAccessGrant.query.get(g.id).status, 'revoked')
+        self.assertIsNone(self._auto_grant_of(self.member_user.id, ws.id))
+        active_all = WorkAccessGrant.query.filter_by(
+            user_id=self.member_user.id, workspace_id=ws.id, status='active').all()
+        self.assertEqual(len(active_all), 1)             # 只剩手动行
+
+    def test_auto_grant_toggle_and_manual_precedence(self):
+        """auto_grant 关→开补授；治理手动授过的用户自动行让位。"""
+        ws, _ = self._open_auto_ws(self.g_soft)
+        resp = self.client.post(f"/work/governance/workspaces/{ws.id}/auto-grant",
+                                headers=self._auth(self.super_admin),
+                                json={'enabled': False})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertFalse(WorkWorkspace.query.get(ws.id).auto_grant)
+        # 关停期新归属不授
+        resp = self.client.put(f"/admin/club/membership/{self.plain_user.id}",
+                               headers=self._auth(self.super_admin),
+                               json={'primary': self.g_soft.id})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertIsNone(self._auto_grant_of(self.plain_user.id, ws.id))
+        # 手动授（manual 优先），再开自动——手动让位规则不自动叠加
+        ms = ClubMembership.query.filter_by(user_id=self.plain_user.id).one()
+        self._grant(self.super_admin, self.plain_user, ws, 'member',
+                    'membership', ms, expect=200)
+        resp = self.client.post(f"/work/governance/workspaces/{ws.id}/auto-grant",
+                                headers=self._auth(self.super_admin),
+                                json={'enabled': True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertIsNone(self._auto_grant_of(self.plain_user.id, ws.id))
+        self.assertEqual(WorkAccessGrant.query.filter_by(
+            user_id=self.plain_user.id, workspace_id=ws.id, status='active').count(), 1)
+        # 存量自动行（组长）不受开关影响仍有效
+        self.assertIsNotNone(self._auto_grant_of(self.officer_user.id, ws.id))
+
+    def test_backfill_idempotent(self):
+        """回填幂等：二次跑无新增（unchanged），漂移行（无组织事实）被清理。"""
+        from services.work import provisioning
+        ws, _ = self._open_auto_ws(self.g_soft)
+        counts2 = provisioning.backfill_workspace(ws, event='二次回填')
+        self.assertEqual(counts2.get('granted', 0), 0)
+        # 制造漂移：把 member 的归属挪到无工作区的组但绕过钩子（模拟历史遗留）
+        ClubMembership.query.filter_by(user_id=self.member_user.id).delete()
+        counts3 = provisioning.backfill_workspace(ws, event='漂移清理')
+        db.session.commit()
+        self.assertGreaterEqual(counts3.get('revoked', 0), 1)
+        self.assertIsNone(self._auto_grant_of(self.member_user.id, ws.id))
 
 
 class _WorkItemsBase(unittest.TestCase):

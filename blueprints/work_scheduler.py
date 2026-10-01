@@ -113,6 +113,24 @@ def _job_expiration_scan(app):
             app.logger.exception("[work_scheduler] 交付过期扫描失败")
 
 
+def _job_provision_sync(app):
+    """授权自动化日巡检（方案 §3.2 兜底）：全量重算自动授权。
+    覆盖无端点事件的漂移——任期自然到界无人点卸任（实时判定已拦，此处补行）、
+    手动改库、历史遗留行。"""
+    with app.app_context():
+        from services.work import provisioning
+        try:
+            result = provisioning.backfill_all()
+            db.session.commit()
+            granted = sum(c.get('granted', 0) for c in result.values())
+            revoked = sum(c.get('revoked', 0) for c in result.values())
+            if granted or revoked:
+                app.logger.info("[work_scheduler] 授权重算：授 %d / 撤 %d", granted, revoked)
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("[work_scheduler] 授权日巡检失败")
+
+
 def init_work_scheduler(app):
     global _scheduler
     if _scheduler is not None:
@@ -130,9 +148,13 @@ def init_work_scheduler(app):
         args=[app], id="work_reminder_scan",
         coalesce=True, max_instances=1, misfire_grace_time=300, replace_existing=True)
     sched.add_job(
-        _job_transfer_expire, trigger=IntervalTrigger(minutes=5, timezone=tz_name),
+        _job_expiration_scan, trigger=IntervalTrigger(minutes=5, timezone=tz_name),
         args=[app], id="work_expiration_scan",
         coalesce=True, max_instances=1, misfire_grace_time=600, replace_existing=True)
+    sched.add_job(
+        _job_provision_sync, trigger=IntervalTrigger(hours=24, timezone=tz_name),
+        args=[app], id="work_provision_sync",
+        coalesce=True, max_instances=1, misfire_grace_time=3600, replace_existing=True)
     sched.start()
     _scheduler = sched
-    app.logger.info("[work_scheduler] 已启动：到期提醒（1 分钟扫描）+ 转交过期（5 分钟扫描）")
+    app.logger.info("[work_scheduler] 已启动：到期提醒（1 分钟）+ 转交过期（5 分钟）+ 授权日巡检（24 小时）")

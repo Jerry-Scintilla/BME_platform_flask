@@ -15,6 +15,7 @@ from flask_jwt_extended import jwt_required
 
 from exts import db
 from models import UserModel, ClubGroup, ClubPosition, ClubOfficer, ClubMembership
+from services.work import provisioning
 from . import check_permission, audit_log, _current_user
 from services.work.events import record_org_event
 
@@ -468,6 +469,10 @@ def set_membership(user_id):
                          to_group_id=first['to_group_id'],
                          operator_id=current.id if current else None,
                          detail={'changes': org_changes})
+        # 授权自动化：归属变更即派生/迁移授权（旧组新组各重算，同事务，方案 §3.2）
+        gids = [c[k] for c in org_changes for k in ('from_group_id', 'to_group_id')]
+        provisioning.sync_after_membership(user_id, gids,
+                                           current.id if current else None, event='归属变更')
     db.session.commit()
     return jsonify({"code": 200, "message": f"已更新 {user.username} 的组归属"})
 
@@ -562,6 +567,11 @@ def batch_membership():
         record_org_event('membership_batch',
                          operator_id=current.id if current else None,
                          detail={'items': org_changes})
+        # 授权自动化：批量归属逐人重算（同事务）
+        for item in org_changes:
+            gids = [c[k] for c in item['changes'] for k in ('from_group_id', 'to_group_id')]
+            provisioning.sync_after_membership(item['user_id'], gids,
+                                               current.id if current else None, event='批量归属')
     db.session.commit()
     return jsonify({"code": 200, "message": f"批量归属完成：{ok} 成功 / {rejected} 拒绝",
                     "data": {"results": results, "ok": ok, "rejected": rejected}})

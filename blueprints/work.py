@@ -22,7 +22,8 @@ from . import _current_user, audit_log
 from .notification import create_notification
 from services.work import access, governance as governance_service, handoffs as handoffs_service, \
     boards as boards_service, projections as projections_service, \
-    items as items_service, tasks as tasks_service, integrations as integrations_service
+    items as items_service, tasks as tasks_service, integrations as integrations_service, \
+    provisioning as provisioning_service
 from services.work.access import WorkApiError
 
 bp = Blueprint("work", __name__, url_prefix="/work")
@@ -36,7 +37,7 @@ def _handle_work_api_error(err):
 def _ws_dict(ws, group_name, role=None):
     return {
         "id": ws.id, "club_group_id": ws.club_group_id, "group_name": group_name,
-        "status": ws.status, "role": role,
+        "status": ws.status, "role": role, "auto_grant": bool(ws.auto_grant),
     }
 
 
@@ -406,7 +407,8 @@ def governance_list_workspaces():
 @jwt_required()
 @audit_log(operation="开通组工作区")
 def governance_create_workspace():
-    """为启用组别开通工作区（一组最多一个，§4.2）。body {club_group_id}"""
+    """为启用组别开通工作区（一组最多一个，§4.2）。body {club_group_id, auto_grant?=true}
+    auto_grant=true（默认）时建区即按现任归属/任职批量补授（授权自动化方案 §3.2）。"""
     user = _current_user()
     access.require_governance(user)
     data = request.get_json(silent=True) or {}
@@ -421,11 +423,50 @@ def governance_create_workspace():
         return jsonify({"code": 400, "message": "组已归档，不能开通工作区"}), 400
     if WorkWorkspace.query.filter_by(club_group_id=gid).first():
         return jsonify({"code": 409, "message": "该组已开通工作区"}), 409
-    ws = WorkWorkspace(club_group_id=gid, status='active')
+    ws = WorkWorkspace(club_group_id=gid, status='active',
+                       auto_grant=bool(data.get("auto_grant", True)))
     db.session.add(ws)
+    db.session.flush()          # 拿 ws.id 供补授
+    counts = {}
+    if ws.auto_grant:
+        counts = provisioning_service.backfill_workspace(ws, user.id, event='开通工作区')
     db.session.commit()
-    return jsonify({"code": 200, "message": f"已为「{g.name}」开通工作区",
-                    "data": _ws_dict(ws, g.name)})
+    return jsonify({"code": 200,
+                    "message": f"已为「{g.name}」开通工作区" + (
+                        f"（自动授权 {counts.get('granted', 0)} 人）" if ws.auto_grant else ""),
+                    "data": {**_ws_dict(ws, g.name), "backfill": counts}})
+
+
+@bp.route("/governance/workspaces/<int:wid>/auto-grant", methods=["POST"])
+@jwt_required()
+@audit_log(operation="调整工作区自动授权")
+def governance_set_auto_grant(wid):
+    """开/关入职自动授（授权自动化方案 §3.4）。body {enabled: bool}
+    关=只停新增（存量自动行不动）；开=按现任组织行批量补授。"""
+    user = _current_user()
+    access.require_governance(user)
+    ws = WorkWorkspace.query.get(wid)
+    if not ws:
+        return jsonify({"code": 404, "message": "工作区不存在"}), 404
+    if ws.scope != 'group':
+        return jsonify({"code": 400, "message": "仅组工作区支持自动授"}), 400
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"code": 400, "message": "enabled 必须为布尔值"}), 400
+    old = ws.auto_grant
+    ws.auto_grant = enabled
+    counts = {}
+    if enabled and not old:
+        counts = provisioning_service.backfill_workspace(ws, user.id, event='开启自动授')
+    db.session.commit()
+    g = ClubGroup.query.get(ws.club_group_id)
+    msg = (f"已开启「{g.name if g else ''}」入职自动授"
+           + (f"（补授 {counts.get('granted', 0)} 人）" if counts else "")
+           ) if enabled and not old else (
+           f"已关闭自动授（存量授权保留）" if not enabled else "自动授本已开启")
+    return jsonify({"code": 200, "message": msg,
+                    "data": {**_ws_dict(ws, g.name if g else None), "backfill": counts}})
 
 
 @bp.route("/governance/workspaces/<int:wid>/status", methods=["POST"])
@@ -470,6 +511,7 @@ def _grant_dict(g, user_map, ws_rows, gnames):
         "valid_from": g.valid_from.isoformat() if g.valid_from else None,
         "valid_until": g.valid_until.isoformat() if g.valid_until else None,
         "status": g.status,
+        "origin": g.origin,
         "revoke_reason": g.revoke_reason,
         "granted_by": g.granted_by,
         "grant_reason": g.grant_reason,
@@ -482,7 +524,7 @@ def _grant_dict(g, user_map, ws_rows, gnames):
 @bp.route("/governance/grants", methods=["GET"])
 @jwt_required()
 def governance_list_grants():
-    """授权清单（分页）：status=active/revoked/all（默认 all），
+    """授权清单（分页）：status=active/revoked/vetoed/all（默认 all），
     可按 user_id / workspace_id 过滤。含实时有效性判定与失效原因。"""
     user = _current_user()
     access.require_governance(user)
@@ -493,7 +535,7 @@ def governance_list_grants():
     status = request.args.get("status", "all")
 
     query = WorkAccessGrant.query
-    if status in ('active', 'revoked'):
+    if status in ('active', 'revoked', 'vetoed'):
         query = query.filter(WorkAccessGrant.status == status)
     if request.args.get("user_id"):
         query = query.filter(WorkAccessGrant.user_id == access.int_or_400(
@@ -544,26 +586,66 @@ def governance_create_grant():
 @jwt_required()
 @audit_log(operation="撤销内部协作授权")
 def governance_revoke_grant(gid):
-    """撤销授权：即时生效（下一请求即失效，A05）；governance 岗位撤销仅超管。"""
+    """撤销授权：即时生效（下一请求即失效，A05）；governance 岗位撤销仅超管。
+    body {reason, veto?=bool}——veto=true 撤销并否决：该用户本工作区不再自动重授
+    （授权自动化方案 §3.3，防退社再入社自动复活）。"""
     user = _current_user()
     access.require_governance(user)
     grant = WorkAccessGrant.query.get(gid)
     if not grant:
         return jsonify({"code": 404, "message": "授权不存在"}), 404
     if grant.status != 'active':
-        return jsonify({"code": 409, "message": "该授权已撤销"}), 409
+        return jsonify({"code": 409, "message": "该授权已撤销"}), 404
     if grant.role == 'governance' and not user.is_admin():
         return jsonify({"code": 403, "message": "治理岗位撤销仅超级管理员可以操作"}), 403
     data = request.get_json(silent=True) or {}
     reason = (str(data.get("reason") or "").strip())
     if not reason or len(reason) > 200:
         return jsonify({"code": 400, "message": "撤销原因必填且 ≤200 字"}), 400
-    grant.status = 'revoked'
+    veto = bool(data.get("veto"))
+    grant.status = 'vetoed' if veto else 'revoked'
     grant.revoke_reason = reason
+    # 否决联动：同 (user, workspace) 其余在授自动行一并撤销（人被否决，不是某一行被否决）
+    linked = 0
+    if veto and grant.workspace_id:
+        for g2 in WorkAccessGrant.query.filter(
+                WorkAccessGrant.user_id == grant.user_id,
+                WorkAccessGrant.workspace_id == grant.workspace_id,
+                WorkAccessGrant.status == 'active',
+                WorkAccessGrant.id != grant.id).all():
+            g2.status = 'revoked'
+            g2.revoke_reason = f"否决联动：{reason}"
+            linked += 1
     create_notification(grant.user_id, "内部工作台",
                         "你的内部工作台协作权限已被撤销", category='work')
     db.session.commit()
-    return jsonify({"code": 200, "message": "授权已撤销（下一请求即失效）"})
+    return jsonify({"code": 200, "message": (
+        "已撤销并否决：该用户本工作区不会再自动获得授权" if veto
+        else "授权已撤销（下一请求即失效）") + (f"；联动撤销自动授权 {linked} 条" if linked else "")})
+
+
+@bp.route("/governance/grants/<int:gid>/unveto", methods=["POST"])
+@jwt_required()
+@audit_log(operation="解除授权否决")
+def governance_unveto_grant(gid):
+    """解除否决（授权自动化方案 §3.3）：vetoed → revoked，此后组织事实命中会再自动授；
+    解除后立即按当前组织事实重算一次（人还在组里则当场恢复权限）。"""
+    user = _current_user()
+    access.require_governance(user)
+    grant = WorkAccessGrant.query.get(gid)
+    if not grant:
+        return jsonify({"code": 404, "message": "授权不存在"}), 404
+    if grant.status != 'vetoed':
+        return jsonify({"code": 409, "message": "该授权不处于否决状态"}), 409
+    grant.status = 'revoked'
+    grant.revoke_reason = (grant.revoke_reason or '') + '；已解除否决'
+    action = None
+    if grant.workspace_id:
+        action = provisioning_service.sync_user_workspace(
+            grant.user_id, grant.workspace_id, user.id, event='解除否决')
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已解除否决" + (
+        "，并按当前组织事实重算" if action in ('granted', 'changed') else "（当前无组织事实命中，不自动恢复）")})
 
 
 # ────────────────────────────────
