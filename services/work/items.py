@@ -17,7 +17,7 @@ from exts import db
 from models import (UserModel, WorkItem, WorkItemParticipant, WorkReadState,
                     WorkReply, WorkResponseRequest, WorkTask, WorkEvent)
 from services.work import access, reminders
-from services.work.access import ItemAccess, WorkApiError
+from services.work.access import ItemAccess, WorkApiError, _active_ws_ids_subquery
 from services.work.events import record_event, fan_out
 
 MAX_TITLE_LEN = 200
@@ -204,7 +204,9 @@ def list_items(user, *, kind=None, status=None, workspace_id=None, mine=False,
     if kind:
         query = query.filter(WorkItem.kind == kind)
     if status:
-        query = query.filter(WorkItem.status == status)
+        # 统一显示词表支持多状态（如「进行中」= open,todo,in_progress）：逗号分隔
+        status_set = [x for x in str(status).split(',') if x]
+        query = query.filter(WorkItem.status.in_(status_set))
     if mine:
         query = query.filter((WorkItem.created_by == user.id)
                              | WorkItem.id.in_(
@@ -254,6 +256,71 @@ def list_items(user, *, kind=None, status=None, workspace_id=None, mine=False,
 
 
 # ── 详情与动作集 ─────────────────────────────────────────────
+
+# 摘要层「活跃」口径：话题进行中 + 任务未完结（逾期判定只对活跃事项有意义）
+ACTIVE_SUMMARY_STATUSES = ('open', 'todo', 'in_progress', 'blocked', 'review')
+
+
+def summary_list_items(user, *, page=1, page_size=DEFAULT_PAGE_SIZE, q=None):
+    """子组摘要列表（跨组方案 §4.1，X1）：subtree 授权者查看子孙组事项态势。
+
+    摘要字段=标题/类型/状态/负责人/截止/组名——无正文无回复计数；受限事项
+    （participants 档且非本人参与）只显示「一项受限事项」占位，不查标题；
+    仅统计活跃事项（draft 除外——草稿本就组内不可见）。"""
+    page = max(1, access.int_or_400(page, 'page', default=1))
+    page_size = min(MAX_PAGE_SIZE, max(1, access.int_or_400(
+        page_size, 'page_size', default=DEFAULT_PAGE_SIZE)))
+    own = access.workspace_access(user)
+    query = db.session.query(WorkItem).filter(
+        WorkItem.status != 'draft',
+        WorkItem.workspace_id.in_(_active_ws_ids_subquery()))
+    query = access.filter_items_summary_query(query, user)
+    if q:
+        like, escape_char = _like_pattern(q)
+        # 摘要层检索只匹配标题（不碰正文）；受限事项本就不返回标题
+        query = query.filter(WorkItem.title.like(like, escape=escape_char))
+    total = query.count()
+    rows = (query.order_by(WorkItem.last_activity_at.desc(), WorkItem.id.desc())
+            .offset((page - 1) * page_size).limit(page_size).all())
+    from models import WorkWorkspace, ClubGroup
+    ws_rows = (WorkWorkspace.query.filter(
+        WorkWorkspace.id.in_([r.workspace_id for r in rows])).all() if rows else [])
+    gnames = {}
+    if ws_rows:
+        gids = [w.club_group_id for w in ws_rows if w.club_group_id]
+        gnames = {g.id: g.name for g in ClubGroup.query.filter(ClubGroup.id.in_(gids)).all()}
+    ws_group = {w.id: gnames.get(w.club_group_id) for w in ws_rows}
+    task_rows = {t.item_id: t for t in WorkTask.query.filter(
+        WorkTask.item_id.in_([r.id for r in rows])).all()} if rows else {}
+    names = _usernames([t.assignee_user_id for t in task_rows.values()
+                        if t.assignee_user_id])
+    part_ids = {p.item_id for p in WorkItemParticipant.query.filter(
+        WorkItemParticipant.user_id == user.id,
+        WorkItemParticipant.removed_at.is_(None),
+        WorkItemParticipant.item_id.in_([r.id for r in rows])).all()} if rows else set()
+    now = datetime.now()
+    items = []
+    for r in rows:
+        if r.visibility == 'participants' and r.id not in part_ids \
+                and r.workspace_id not in own:
+            items.append({'id': r.id, 'restricted': True,
+                          'group_name': ws_group.get(r.workspace_id),
+                          'kind': r.kind, 'status': r.status})
+            continue
+        task = task_rows.get(r.id)
+        items.append({
+            'id': r.id, 'restricted': False,
+            'group_name': ws_group.get(r.workspace_id), 'kind': r.kind,
+            'title': r.title, 'status': r.status,
+            'assignee_name': names.get(task.assignee_user_id) if task else None,
+            'due_at': task.due_at.strftime('%Y-%m-%d %H:%M') if task and task.due_at else None,
+            'overdue': bool(task and task.due_at and task.due_at < now
+                            and r.status in ACTIVE_SUMMARY_STATUSES),
+            'last_activity_at': (r.last_activity_at.strftime('%Y-%m-%d %H:%M')
+                                 if r.last_activity_at else None),
+        })
+    return {'items': items, 'total': total, 'page': page, 'page_size': page_size}
+
 
 def allowed_actions(user, item, item_access):
     """详情返回 allowed_actions 供界面渲染；后端每次操作仍重新授权（§13）。"""

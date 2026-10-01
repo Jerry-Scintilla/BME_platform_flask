@@ -2386,7 +2386,10 @@ class WorkWorkspace(db.Model):
     __tablename__ = 'work_workspace'
     id = db.Column(db.Integer, primary_key=True)
     club_group_id = db.Column(db.Integer, db.ForeignKey('club_group.id'),
-                              nullable=False, unique=True, index=True)
+                              nullable=True, unique=True, index=True)
+        # club 工作区（scope=club）为 NULL=社团级（跨组方案 §4.4，不新增组织节点）
+    scope = db.Column(db.String(10), nullable=False, default='group')
+        # group=组工作区 / club=社团工作区（X3）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)
         # active / disabled（停用=入口只读关闸，数据与授权记录保留，D04）
     default_reviewer_user_id = db.Column(db.Integer)             # 默认验收人建议（选填）
@@ -2415,6 +2418,9 @@ class WorkAccessGrant(db.Model):
     valid_until = db.Column(db.Date, nullable=True)              # 空=不限期（覆盖任期判断）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)
         # active / revoked
+    subtree = db.Column(db.Boolean, nullable=False, default=False)
+        # 子树汇总（跨组方案 §4.1）：coordinator 授权勾选后，额外可见本组子孙组
+        # 工作区事项的「摘要」（标题/负责人/状态/截止，无正文）；正文仍走参与/邀请
     revoke_reason = db.Column(db.String(200))
     granted_by = db.Column(db.Integer, nullable=False)           # 操作人留痕（非 FK）
     grant_reason = db.Column(db.String(200), nullable=False)     # 授权原因（方案 §5.4 必填）
@@ -2562,6 +2568,36 @@ class WorkTransferRequest(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
 
 
+class WorkHandoff(db.Model):
+    """跨组交付（跨组方案 §4.2，migrate_59）：组对组的显式交接，事项所有权不动。
+    发起=源事项协调员∨作者（kind 为用途自由填写，不承担流程语义）；目标组协调员
+    接单后同事务在本组工作区生成关联任务，任务完成时回填源事项。交付包（说明+
+    固定版本文件）对接单组只读，源事项正文不自动放开（与 §9.5 授权转交同构）。"""
+    __tablename__ = 'work_handoff'
+    id = db.Column(db.Integer, primary_key=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('work_item.id'), nullable=False, index=True)
+    from_workspace_id = db.Column(db.Integer, db.ForeignKey('work_workspace.id'),
+                                  nullable=False, index=True)
+    to_workspace_id = db.Column(db.Integer, db.ForeignKey('work_workspace.id'),
+                                nullable=False, index=True)
+    kind = db.Column(db.String(30), nullable=False)              # 用途：自由填写 ≤30 字（UI 给快捷建议）
+    note = db.Column(db.Text)                                    # 交付说明（给目标组的上下文）
+    deadline = db.Column(db.DateTime, nullable=True)             # 期望完成时间
+    status = db.Column(db.String(20), nullable=False, default='offered', index=True)
+        # offered / accepted / declined / withdrawn / expired / done
+    accepted_item_id = db.Column(db.Integer, nullable=True)      # 接单时在目标组生成的关联任务
+    result_note = db.Column(db.Text)                             # 目标组回填的执行结果
+    created_by = db.Column(db.Integer, nullable=False)
+    decided_by = db.Column(db.Integer, nullable=True)
+    decided_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, index=True)
+    __table_args__ = (
+        # 在途唯一（offered 态）由应用层校验 + 源事项行锁串行化保证；
+        # 不建数据库唯一索引——终态（done/declined/expired）后允许同用途再发起
+        db.Index('ix_work_handoff_item_to_kind', 'item_id', 'to_workspace_id', 'kind'),
+    )
+
+
 class WorkSubmission(db.Model):
     """任务交付提交：每次提交不可覆盖；验收决策绑定具体提交行（B05——交付文件
     经 work_file_link(purpose=submission_result) 固定版本，验收后内容不可被悄悄替换）。"""
@@ -2602,6 +2638,7 @@ class WorkEvent(db.Model):
     __table_args__ = (
         db.UniqueConstraint('item_id', 'seq', name='uq_work_event_item_seq'),
     )
+        # handoff_offered/handoff_accepted/handoff_completed/handoff_declined（跨组交付，方案 §4.2）
 
 
 class WorkReadState(db.Model):
@@ -2734,6 +2771,24 @@ class ClubOrgEvent(db.Model):
     operator_id = db.Column(db.Integer, nullable=True)
     detail_json = db.Column(db.Text)
     occurred_at = db.Column(db.DateTime, default=datetime.now, index=True)
+
+
+class WorkObjectClaim(db.Model):
+    """对象认领（跨组方案 §4.3 通用化，X2）：工作区对任意可关联对象的「维护
+    责任」登记——组织约定的登记，不是权限（读原对象仍按其业务模块规则）。
+    仅投影适配器 stewardable=True 的类型可认领（首期=课程；流程性对象关闭）。"""
+    __tablename__ = 'work_object_claim'
+    id = db.Column(db.Integer, primary_key=True)
+    source_type = db.Column(db.String(30), nullable=False, index=True)
+    source_id = db.Column(db.Integer, nullable=False, index=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey('work_workspace.id'),
+                             nullable=False, index=True)
+    claimed_by = db.Column(db.Integer, nullable=False)
+    claimed_at = db.Column(db.DateTime, default=datetime.now)
+    __table_args__ = (
+        db.UniqueConstraint('source_type', 'source_id', 'workspace_id',
+                            name='uq_work_object_claim'),
+    )
 
 
 class WorkBusinessLink(db.Model):

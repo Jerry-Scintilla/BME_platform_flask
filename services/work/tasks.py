@@ -228,6 +228,8 @@ def _cmd_complete(user, item, task, access_, payload):
                  diff={'status': {'from': 'in_progress', 'to': 'done'}})
     reminders.cancel_for_item(item.id)
     _notify_item_audience(item, user.id, 'status_changed')
+    from services.work import handoffs as handoffs_service
+    handoffs_service.on_item_done(item, user)      # 跨组交付回填（X1）
     return item
 
 
@@ -260,6 +262,8 @@ def _cmd_review_accept(user, item, task, access_, payload):
     bump_version(item, payload.get('expected_version'), user.id, 'reviewed', diff=diff)
     reminders.cancel_for_item(item.id)
     _notify_item_audience(item, user.id, 'status_changed')
+    from services.work import handoffs as handoffs_service
+    handoffs_service.on_item_done(item, user)      # 跨组交付回填（X1）
     return item
 
 
@@ -431,6 +435,8 @@ def task_allowed_actions(user, item, task, item_access):
     if item.status in TERMINAL_STATUSES:
         if item.status == 'done' and item_access.is_coordinator:
             actions.add('reopen')
+        if item_access.is_coordinator or item.created_by == user.id:
+            actions.add('invite')                # 终态仍可邀请查看（归档分享口径）
         return list(actions)
     is_assignee = task.assignee_user_id == user.id
     is_participant = _is_participant(item, user.id)
@@ -453,6 +459,12 @@ def task_allowed_actions(user, item, task, item_access):
         actions.add('cancel')
     if item_access.is_coordinator or is_assignee:
         actions.add('transfer')
+    if item_access.is_coordinator or item.created_by == user.id:
+        actions.add('invite')                    # 参与者邀请（与话题口径一致）
+    # 跨组交付（X1）：协调员∨作者可发起；草稿/终态不加（服务层还有校验兜底）
+    if (item_access.is_coordinator or item.created_by == user.id) \
+            and item.status not in ('draft', 'done', 'cancelled'):
+        actions.add('handoff')
     return list(actions)
 
 
@@ -685,4 +697,7 @@ def my_todos(user):
         'due_at': task.due_at.strftime('%Y-%m-%d %H:%M'),
         'overdue': task.due_at < now,
     } for task, item in due_rows]
+    # 待接单：我任协调员的工作区的 offered 跨组交付（X1）
+    from services.work import handoffs as handoffs_service
+    data['handoffs'] = handoffs_service.my_handoff_queue(user)
     return data

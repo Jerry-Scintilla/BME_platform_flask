@@ -1469,10 +1469,12 @@ class WorkGovernanceTest(_WorkItemsBase):
         r = self.client.get(f'/work/items/{item}', headers=self._auth(self.member1))
         links = r.get_json()['data']['business_links']
         by_type = {l['source_type']: l for l in links}
-        self.assertEqual(by_type['course']['title'], '解剖学入门')
+        # X2 新投影结构：label + fields 字典（盲渲染）；不可访问无 fields
+        self.assertEqual(by_type['course']['fields']['title'], '解剖学入门')
+        self.assertEqual(by_type['course']['label'], '课程')
         self.assertTrue(by_type['course']['accessible'])
         self.assertFalse(by_type['camp_session']['accessible'])
-        self.assertIsNone(by_type['camp_session']['title'])
+        self.assertIsNone(by_type['camp_session']['fields'])
         # 营期成员可见标题
         from models import CampMember
         db.session.add(CampMember(camp_session_id=self.session.id,
@@ -1481,6 +1483,7 @@ class WorkGovernanceTest(_WorkItemsBase):
         r = self.client.get(f'/work/items/{item}', headers=self._auth(self.member1))
         by_type = {l['source_type']: l for l in r.get_json()['data']['business_links']}
         self.assertTrue(by_type['camp_session']['accessible'])
+        self.assertIn('title', by_type['camp_session']['fields'])
         # 普通成员不能建关联
         r = self.client.post(f'/work/items/{item}/links', headers=self._auth(self.member1),
                              json={'source_type': 'course', 'source_id': self.course.id})
@@ -1608,6 +1611,369 @@ class WorkGovernanceTest(_WorkItemsBase):
         self.assertEqual(r.status_code, 200, r.get_json())
 
 
+
+class WorkCrossGroupTest(_WorkItemsBase):
+    """X1 跨组协作：摘要层（subtree）与交付闭环。
+
+    fixture 在基类之上加一层父子组：父组（培训组）> 软件组（子），
+    硬件组仍为独立组（跨顶级交付对象）。协调员在父组持 subtree 授权。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 假存储（交付包文件测试用；照 WorkFilesTest）
+        import io as _io
+        from unittest.mock import patch
+        import storage as storage_module
+
+        class _Stat:
+            def __init__(self, size):
+                self.size = size
+
+        class _FakeStorage:
+            def __init__(self):
+                self.objects = {}
+
+            def put_object(self, key, stream, length=None, content_type=None):
+                self.objects[key] = stream.read()
+
+            def stat_object(self, key):
+                if key not in self.objects:
+                    raise KeyError(key)
+                return _Stat(len(self.objects[key]))
+
+            def get_object(self, key, offset=None, length=None):
+                data = self.objects[key]
+                if offset is not None:
+                    data = data[offset:offset + (length or len(data))]
+                return _io.BytesIO(data)
+
+            def remove_object(self, key):
+                self.objects.pop(key, None)
+
+        self.fake_storage = _FakeStorage()
+        self._patcher = patch.object(storage_module, 'storage', self.fake_storage)
+        self._patcher.start()
+        # 父组（培训组）+ 工作区；软件组挂为其子组
+        self.g_parent = ClubGroup(name='培训组', parent_id=None)
+        db.session.add(self.g_parent)
+        db.session.flush()
+        self.g_hard.parent_id = self.g_parent.id     # 硬件组挂为培训组子组：
+        # coord 对硬件组无直接授权——正好验证「摘要可见、正文仍拒」
+        self.ws_parent = WorkWorkspace(club_group_id=self.g_parent.id, status='active')
+        db.session.add(self.ws_parent)
+        db.session.flush()
+        # 父组协调员授权（membership 来源）+ subtree
+        # coord 基类 fixture 已占 primary（软件组），父组走 secondary 槽
+        m_parent = ClubMembership(user_id=self.coord.id, group_id=self.g_parent.id,
+                                  slot='secondary', joined_at=date.today())
+        db.session.add(m_parent)
+        db.session.flush()
+        self.subtree_grant = WorkAccessGrant(
+            user_id=self.coord.id, role='coordinator', workspace_id=self.ws_parent.id,
+            source_type='membership', source_id=m_parent.id,
+            group_id_snapshot=self.g_parent.id, subtree=True,
+            granted_by=self.super_admin().id, grant_reason='t')
+        db.session.add(self.subtree_grant)
+        db.session.commit()
+
+    def tearDown(self):
+        self._patcher.stop()
+        super().tearDown()
+
+    def super_admin(self):
+        u = UserModel.query.filter_by(role='super_admin').first()
+        if not u:
+            u = UserModel(username='超管', email='cg-super@t.dev', role='super_admin')
+            u.set_password('a' * 32)
+            db.session.add(u)
+            db.session.commit()
+        return u
+
+    # ── 摘要层 ────────────────────────────────────────────
+
+    def test_summary_tier_visible_but_detail_blocked(self):
+        # 硬件组（子组，coord 无直接授权）建活跃任务；摘要可见、详情 404
+        item_id, _v = self._create_task(self.member2, self.member2, ws_id=self.ws_hard.id)
+        r = self.client.get('/work/items?rollup=subtree', headers=self._auth(self.coord))
+        self.assertEqual(r.status_code, 200, r.get_json())
+        data = r.get_json()['data']
+        self.assertGreaterEqual(data['total'], 1)
+        row = next(x for x in data['items'] if x['id'] == item_id)
+        self.assertEqual(row['group_name'], '硬件组')
+        self.assertIn('title', row)                     # 摘要有标题
+        r = self.client.get(f'/work/items/{item_id}', headers=self._auth(self.coord))
+        self.assertEqual(r.status_code, 404)            # 正文仍拒
+
+    def test_summary_restricted_placeholder_no_title_leak(self):
+        # 受限事项在摘要层只显示占位，不泄露标题
+        item = self._create_item(self.member2, self.ws_hard.id,
+                                 visibility='participants', title='绝密排期')
+        r = self.client.get('/work/items?rollup=subtree', headers=self._auth(self.coord))
+        rows = {x['id']: x for x in r.get_json()['data']['items']}
+        self.assertIn(item, rows)
+        self.assertTrue(rows[item]['restricted'])
+        self.assertNotIn('title', rows[item])
+
+    def test_summary_requires_subtree_grant(self):
+        r = self.client.get('/work/items?rollup=subtree', headers=self._auth(self.member1))
+        self.assertEqual(r.status_code, 403)
+
+    # ── 交付闭环 ──────────────────────────────────────────
+
+    def _offer(self, actor, item_id, to_ws, kind='上架', **extra):
+        payload = {'to_workspace_id': to_ws.id, 'kind': kind,
+                   'note': '请上架该课程', **extra}
+        return self.client.post(f'/work/items/{item_id}/handoffs',
+                                headers=self._auth(actor), json=payload)
+
+    def test_handoff_full_cycle_with_backfill(self):
+        from models import WorkBusinessLink, WorkHandoff, NotificationModel
+        item_id, _v = self._create_task(self.member1, self.member1)
+        # 关联课程上下文（接单后应复制到目标任务）
+        db.session.add(WorkBusinessLink(item_id=item_id, source_type='course',
+                                        source_id=12, created_by=self.member1.id))
+        db.session.commit()
+        # 局外人不能发起；作者（member1 建的任务本人即作者）与协调员都可以
+        r = self._offer(self.plain, item_id, self.ws_hard)
+        self.assertEqual(r.status_code, 404)          # 无读取权统一 404
+        r = self._offer(self.member1, item_id, self.ws_hard)
+        self.assertEqual(r.status_code, 200)
+        hid_author = r.get_json()['data']['handoff_id']
+        self.client.post(f'/work/handoffs/{hid_author}/withdraw',
+                         headers=self._auth(self.member1))
+        r = self._offer(self.coord, item_id, self.ws_hard)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        hid = r.get_json()['data']['handoff_id']
+
+        # 在途唯一：同用途再发 409；不同用途可并行
+        r = self._offer(self.coord, item_id, self.ws_hard, kind='上架')
+        self.assertEqual(r.status_code, 409)
+        r = self._offer(self.coord, item_id, self.ws_hard, kind='审核')
+        self.assertEqual(r.status_code, 200)
+
+        # 硬件组协调员（member2 是 member——用治理直接给 member2 升协调员）
+        WorkAccessGrant.query.filter_by(user_id=self.member2.id).update(
+            {'role': 'coordinator'})
+        db.session.commit()
+        # 待接单桶
+        r = self.client.get('/work/me/todos', headers=self._auth(self.member2))
+        bucket = r.get_json()['data']['handoffs']
+        self.assertEqual(len(bucket), 2)
+        # 非目标组协调员不能接单（无目标工作区权限 → 统一 404 防探测）
+        r = self.client.post(f'/work/handoffs/{hid}/accept', headers=self._auth(self.coord))
+        self.assertEqual(r.status_code, 404)
+        # 接单：目标组生成关联任务 + 业务关联复制
+        r = self.client.post(f'/work/handoffs/{hid}/accept', headers=self._auth(self.member2))
+        self.assertEqual(r.status_code, 200, r.get_json())
+        target_id = r.get_json()['data']['accepted_item_id']
+        self.assertIsNotNone(target_id)
+        self.assertIsNotNone(WorkBusinessLink.query.filter_by(
+            item_id=target_id, source_type='course', source_id=12).first())
+        # 目标任务开始并完成 → 回填源事项
+        db.session.expire_all()
+        v = WorkItem.query.get(target_id).version
+        self._cmd(self.member2, target_id, 'start', v)
+        db.session.expire_all()
+        r = self._cmd(self.member2, target_id, 'complete', WorkItem.query.get(target_id).version,
+                      completion_note='已上架 course#12')
+        self.assertEqual(r.status_code, 200, r.get_json())
+        db.session.expire_all()
+        self.assertEqual(WorkHandoff.query.get(hid).status, 'done')
+        self.assertIn('已上架', WorkHandoff.query.get(hid).result_note)
+        # 源事项有 handoff_completed 事件
+        r = self.client.get(f'/work/items/{item_id}/events', headers=self._auth(self.member1))
+        types = [e['event_type'] for e in r.get_json()['data']['events']]
+        self.assertIn('handoff_completed', types)
+
+    def test_handoff_decline_and_expiry(self):
+        from models import WorkHandoff
+        item_id, _v = self._create_task(self.member1, self.member1)
+        r = self._offer(self.coord, item_id, self.ws_hard)
+        hid = r.get_json()['data']['handoff_id']
+        # member2 升协调员后拒绝（原因必填）
+        WorkAccessGrant.query.filter_by(user_id=self.member2.id).update(
+            {'role': 'coordinator'})
+        db.session.commit()
+        r = self.client.post(f'/work/handoffs/{hid}/decline',
+                             headers=self._auth(self.member2), json={})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(f'/work/handoffs/{hid}/decline',
+                             headers=self._auth(self.member2),
+                             json={'reason': '本周发版窗口已满'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(WorkHandoff.query.get(hid).status, 'declined')
+        # 拒绝后可重新发起（终态不占在途唯一）
+        r = self._offer(self.coord, item_id, self.ws_hard)
+        self.assertEqual(r.status_code, 200)
+        hid2 = r.get_json()['data']['handoff_id']
+        # 过期扫描
+        WorkHandoff.query.filter_by(id=hid2).update(
+            {'deadline': datetime.now() - timedelta(hours=1)})
+        db.session.commit()
+        from services.work import handoffs as handoffs_service
+        with self.app.test_request_context():
+            n = handoffs_service.expire_handoffs()
+            db.session.commit()
+        self.assertEqual(n, 1)
+        self.assertEqual(WorkHandoff.query.get(hid2).status, 'expired')
+
+    def test_handoff_payload_file_target_group_download(self):
+        from models import WorkFileLink
+        from services.work import files as files_service
+        from werkzeug.datastructures import FileStorage
+        item_id, v = self._create_task(self.member1, self.member1)
+        # 上传附件（member1 是软件组成员可传）
+        fs = FileStorage(stream=io.BytesIO('课程包内容'.encode()), filename='课程包.txt',
+                         content_type='text/plain')
+        r = self.client.post(f'/work/items/{item_id}/files', headers=self._auth(self.member1),
+                             data={'file': fs}, content_type='multipart/form-data')
+        self.assertEqual(r.status_code, 200, r.get_json())
+        version_id = r.get_json()['data']['version_id']
+        # 协调员交付并绑定该版本
+        r = self._offer(self.coord, item_id, self.ws_hard,
+                        file_version_ids=[version_id])
+        self.assertEqual(r.status_code, 200, r.get_json())
+        link = WorkFileLink.query.filter_by(target_type='handoff').first()
+        self.assertIsNotNone(link)
+        # offered 未接单：目标组成员尚不可下载
+        file_id = link.file_id
+        r = self.client.get(f'/work/files/{file_id}/download?link_id={link.id}',
+                            headers=self._auth(self.member2))
+        self.assertEqual(r.status_code, 404)
+        # 接单后可下载
+        WorkAccessGrant.query.filter_by(user_id=self.member2.id).update(
+            {'role': 'coordinator'})
+        db.session.commit()
+        hid = link.target_id
+        self.client.post(f'/work/handoffs/{hid}/accept', headers=self._auth(self.member2))
+        r = self.client.get(f'/work/files/{file_id}/download?link_id={link.id}',
+                            headers=self._auth(self.member2))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('课程包内容', r.get_data(as_text=True))
+        # 无关人员（局外 plain）不可下载
+        r = self.client.get(f'/work/files/{file_id}/download?link_id={link.id}',
+                            headers=self._auth(self.plain))
+        self.assertEqual(r.status_code, 404)
+
+    def test_candidates_carry_identity(self):
+        r = self.client.get('/work/candidates', headers=self._auth(self.member1))
+        rows = r.get_json()['data']['candidates']
+        self.assertTrue(rows)
+        coord_row = next(x for x in rows if x['user_id'] == self.coord.id)
+        self.assertEqual(coord_row['group_name'], '软件组')  # primary 槽优先
+        # title 仅在任干事有（coord 走 membership 授权，无任职行 → None 合法）
+        self.assertIn('title', coord_row)
+
+
+class WorkProjectionTest(_WorkItemsBase):
+    """X2 通用投影架构：注册表 / 适配器口径 / 看板聚合 / 认领。"""
+
+    def setUp(self):
+        super().setUp()
+        from models import CourseModel, CampSession, CampMember
+        from services.work import projections
+        import services.work.adapters  # noqa: F401  组装
+        self.projections = projections
+        self.course = CourseModel(title='解剖学入门', introduction='x',
+                                  status=CourseModel.STATUS_NORMAL)
+        self.course_deleted = CourseModel(title='已删课程', introduction='x',
+                                          status=CourseModel.STATUS_DELETED)
+        db.session.add_all([self.course, self.course_deleted])
+        self.session = CampSession(name='投影测试营', category='learning', status='running',
+                                   start_date=date.today() - timedelta(days=1),
+                                   end_date=date.today() + timedelta(days=30))
+        db.session.add(self.session)
+        db.session.commit()
+
+    def test_registry_and_duplicate(self):
+        from services.work.projections import WorkProjectionProvider, register_projection
+        self.assertIn('course', self.projections.registered_types())
+        class Dup(WorkProjectionProvider):
+            source_type = 'course'
+            label = '冲突'
+            def exists(self, sid): return True
+            def summarize(self, user, sid): return None
+        with self.assertRaises(ValueError):
+            register_projection(Dup())
+
+    def test_adapters_permission_matrix(self):
+        course_p = self.projections.get_provider('course')
+        camp_p = self.projections.get_provider('camp_session')
+        # 课程：公开目录（登录可见）；删除课程不可访问
+        self.assertTrue(course_p.stewardable)
+        self.assertEqual(course_p.summarize(self.plain, self.course.id)['title'], '解剖学入门')
+        self.assertFalse(course_p.exists(self.course_deleted.id))
+        self.assertIsNone(course_p.summarize(self.plain, self.course_deleted.id))
+        # 营期：非成员不可访问；成员可见
+        self.assertFalse(camp_p.stewardable)
+        self.assertIsNone(camp_p.summarize(self.plain, self.session.id))
+        from models import CampMember
+        db.session.add(CampMember(camp_session_id=self.session.id,
+                                  user_id=self.plain.id, role='student'))
+        db.session.commit()
+        fields = camp_p.summarize(self.plain, self.session.id)
+        self.assertEqual(fields['title'], '投影测试营')
+
+    def test_link_whitelist_follows_registry(self):
+        item = self._create_item(self.coord, self.ws_soft.id)
+        r = self.client.post(f'/work/items/{item}/links', headers=self._auth(self.coord),
+                             json={'source_type': 'nonexistent_domain', 'source_id': 1})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(f'/work/items/{item}/links', headers=self._auth(self.coord),
+                             json={'source_type': 'course', 'source_id': 99999})
+        self.assertEqual(r.status_code, 404)
+
+    def test_board_aggregation_and_claim(self):
+        item_id, _v = self._create_task(self.member1, self.member1,
+                                        due_offset_days=-1)      # 已逾期
+        self._cmd(self.member1, item_id, 'start', 2)
+        db.session.commit()
+        r = self.client.post(f'/work/items/{item_id}/links', headers=self._auth(self.coord),
+                             json={'source_type': 'course', 'source_id': self.course.id})
+        self.assertEqual(r.status_code, 200)
+        # 看板：未认领行 + 态势（active=1, overdue=1）
+        r = self.client.get(f'/work/objects/board?ws={self.ws_soft.id}',
+                            headers=self._auth(self.member1))
+        board = r.get_json()['data']['objects']
+        row = next(x for x in board if x['source_id'] == self.course.id)
+        self.assertFalse(row['claimed'])
+        self.assertEqual(row['active_items'], 1)
+        self.assertEqual(row['overdue_items'], 1)
+        self.assertEqual(row['fields']['title'], '解剖学入门')
+        # 普通成员不能认领；协调员认领幂等
+        r = self.client.post('/work/objects/claim', headers=self._auth(self.member1),
+                             json={'source_type': 'course', 'source_id': self.course.id,
+                                   'ws_id': self.ws_soft.id, 'action': 'claim'})
+        self.assertEqual(r.status_code, 403)
+        for expect_changed in (True, False):
+            r = self.client.post('/work/objects/claim', headers=self._auth(self.coord),
+                                 json={'source_type': 'course', 'source_id': self.course.id,
+                                       'ws_id': self.ws_soft.id, 'action': 'claim'})
+            self.assertEqual(r.status_code, 200)
+        r = self.client.get(f'/work/objects/board?ws={self.ws_soft.id}',
+                            headers=self._auth(self.member1))
+        row = next(x for x in r.get_json()['data']['objects'] if x['source_id'] == self.course.id)
+        self.assertTrue(row['claimed'])
+        # 非 stewardable 类型（营期）不能认领
+        r = self.client.post('/work/objects/claim', headers=self._auth(self.coord),
+                             json={'source_type': 'camp_session', 'source_id': self.session.id,
+                                   'ws_id': self.ws_soft.id, 'action': 'claim'})
+        self.assertEqual(r.status_code, 400)
+        # 事项完成后态势归零
+        db.session.expire_all()
+        self._cmd(self.member1, item_id, 'complete',
+                  WorkItem.query.get(item_id).version, completion_note='完成')
+        db.session.expire_all()
+        r = self.client.get(f'/work/objects/board?ws={self.ws_soft.id}',
+                            headers=self._auth(self.member1))
+        row = next(x for x in r.get_json()['data']['objects'] if x['source_id'] == self.course.id)
+        self.assertEqual(row['active_items'], 0)
+        # 取消认领
+        r = self.client.post('/work/objects/claim', headers=self._auth(self.coord),
+                             json={'source_type': 'course', 'source_id': self.course.id,
+                                   'ws_id': self.ws_soft.id, 'action': 'unclaim'})
+        self.assertEqual(r.status_code, 200)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

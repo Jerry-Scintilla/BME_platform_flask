@@ -82,7 +82,17 @@ def list_candidates(user):
     if uids:
         names = {u.id: u.username for u in
                  UserModel.query.filter(UserModel.id.in_(list(uids))).all()}
-        rows = [{'user_id': uid, 'username': names.get(uid)} for uid in sorted(uids)]
+        # 身份标注（X1）：主要组 + 在任职位——邀请/转交/点名/交付的候选下拉可用性前提
+        from models import ClubGroup, ClubMembership
+        groups = {g.id: g.name for g in ClubGroup.query.all()}
+        primary = {m.user_id: groups.get(m.group_id)
+                   for m in ClubMembership.query.filter_by(slot='primary').all()}
+        titles = {}
+        for o in ClubOfficer.query.filter_by(status='active').all():
+            titles.setdefault(o.user_id, o.title)
+        rows = [{'user_id': uid, 'username': names.get(uid),
+                 'group_name': primary.get(uid), 'title': titles.get(uid)}
+                for uid in sorted(uids)]
     return rows
 
 
@@ -188,6 +198,9 @@ def validate_grant_payload(actor, data):
     if valid_from and valid_until and valid_until < valid_from:
         raise WorkApiError(400, "valid_until 不能早于 valid_from")
 
+    # 子树汇总（跨组方案 §4.1，X1）：仅 coordinator 可勾，摘要级（无正文）
+    subtree = bool(data.get("subtree")) and role == 'coordinator'
+
     dup = WorkAccessGrant.query.filter_by(
         user_id=uid, role=role, workspace_id=workspace_id,
         source_type=source_type, source_id=source_id, status='active').first()
@@ -198,6 +211,7 @@ def validate_grant_payload(actor, data):
         "user_id": uid, "role": role, "workspace_id": workspace_id,
         "source_type": source_type, "source_id": source_id,
         "group_id_snapshot": group_snapshot,
+        "subtree": subtree,
         "valid_from": valid_from, "valid_until": valid_until,
         "grant_reason": grant_reason,
     }

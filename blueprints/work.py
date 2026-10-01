@@ -20,7 +20,8 @@ from exts import db
 from models import UserModel, ClubGroup, WorkAccessGrant, WorkItem, WorkWorkspace
 from . import _current_user, audit_log
 from .notification import create_notification
-from services.work import access, governance as governance_service, \
+from services.work import access, governance as governance_service, handoffs as handoffs_service, \
+    boards as boards_service, projections as projections_service, \
     items as items_service, tasks as tasks_service, integrations as integrations_service
 from services.work.access import WorkApiError
 
@@ -52,16 +53,27 @@ def work_me():
     if not user:
         return jsonify({"code": 401, "message": "用户未认证"}), 401
     ws_map = access.workspace_access(user)
+    subtree_roots = access.subtree_workspaces(user)
     workspaces = []
     if ws_map:
         rows = WorkWorkspace.query.filter(WorkWorkspace.id.in_(list(ws_map))).all()
         gids = [r.club_group_id for r in rows]
         gnames = {g.id: g.name for g in ClubGroup.query.filter(ClubGroup.id.in_(gids)).all()} if gids else {}
-        workspaces = [_ws_dict(r, gnames.get(r.club_group_id), ws_map[r.id]) for r in rows]
+        for r in rows:
+            d = _ws_dict(r, gnames.get(r.club_group_id), ws_map[r.id])
+            d["subtree"] = r.id in subtree_roots      # 子组汇总入口显隐（X1）
+            workspaces.append(d)
+    # 跨组交付目标目录（组名本就公开于组织架构页；不含社团区/停用区）
+    target_rows = WorkWorkspace.query.filter_by(status='active', scope='group').all()
+    t_gids = [r.club_group_id for r in target_rows if r.club_group_id]
+    t_gnames = {g.id: g.name for g in ClubGroup.query.filter(ClubGroup.id.in_(t_gids)).all()} if t_gids else {}
+    available_targets = [{"ws_id": r.id, "group_name": t_gnames.get(r.club_group_id)}
+                         for r in target_rows if r.club_group_id]
     return jsonify({"code": 200, "message": "ok", "data": {
         "eligibility": access.eligibility(user),
         "is_governance": access.is_governance(user),
         "workspaces": workspaces,
+        "available_targets": available_targets,
         "todo": governance_service.todo_counts(user),
     }})
 
@@ -108,8 +120,17 @@ def _require_user():
 @bp.route("/items", methods=["GET"])
 @jwt_required()
 def list_items():
-    """事项列表：kind/status/workspace/mine/q 筛选；列表与计数同一授权条件（§13）。"""
+    """事项列表：kind/status/workspace/mine/q 筛选；列表与计数同一授权条件（§13）。
+    rollup=subtree 时走摘要层（跨组方案 §4.1：仅标题/状态/负责人/截止，无正文）。"""
     user = _require_user()
+    if request.args.get("rollup") == "subtree":
+        if not access.subtree_workspaces(user):
+            return jsonify({"code": 403, "message": "需要子组汇总授权"}), 403
+        data = items_service.summary_list_items(
+            user, q=request.args.get("q"),
+            page=request.args.get("page", 1),
+            page_size=request.args.get("page_size", 20))
+        return jsonify({"code": 200, "message": "ok", "data": data})
     data = items_service.list_items(
         user,
         kind=request.args.get("kind"),
@@ -286,6 +307,78 @@ def create_business_link(item_id):
     integrations_service.create_link(user, item_id, request.get_json(silent=True) or {})
     db.session.commit()
     return jsonify({"code": 200, "message": "已建立关联"})
+
+
+@bp.route("/items/<int:item_id>/links", methods=["DELETE"])
+@jwt_required()
+def remove_business_link(item_id):
+    """移除业务关联（作者∨协调员）。"""
+    user = _require_user()
+    integrations_service.remove_link(user, item_id, request.get_json(silent=True) or {})
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已移除关联"})
+
+
+@bp.route("/items/<int:item_id>/handoffs", methods=["POST"])
+@jwt_required()
+def create_handoff(item_id):
+    """发起跨组交付（跨组方案 §4.2）：源组协调员∨作者；用途自由填写。"""
+    user = _require_user()
+    req = handoffs_service.create_handoff(user, item_id, request.get_json(silent=True) or {})
+    db.session.commit()
+    return jsonify({"code": 200, "message": "交付已发起，等待对方组接单",
+                    "data": {"handoff_id": req.id}})
+
+
+@bp.route("/handoffs/<int:handoff_id>/<action>", methods=["POST"])
+@jwt_required()
+def decide_handoff(handoff_id, action):
+    """接单/拒绝/撤回跨组交付（accept=同事务在目标组建关联任务）。"""
+    user = _require_user()
+    if action not in ("accept", "decline", "withdraw"):
+        return jsonify({"code": 400, "message": "action 仅支持 accept/decline/withdraw"}), 400
+    req = handoffs_service.decide_handoff(user, handoff_id, action,
+                                          request.get_json(silent=True) or {})
+    db.session.commit()
+    messages = {"accept": "已接单，任务已建到本组工作区",
+                "decline": "已拒绝，源组会收到通知",
+                "withdraw": "已撤回交付"}
+    return jsonify({"code": 200, "message": messages[action],
+                    "data": {"handoff_id": req.id, "status": req.status,
+                             "accepted_item_id": req.accepted_item_id}})
+
+
+@bp.route("/objects/board", methods=["GET"])
+@jwt_required()
+def objects_board():
+    """工作区看板：按关联对象聚合本组事项态势（X2 通用架构，组成员可见）。"""
+    user = _require_user()
+    data = boards_service.workspace_board(user, request.args.get("ws"))
+    return jsonify({"code": 200, "message": "ok", "data": data})
+
+
+@bp.route("/objects/claim", methods=["POST"])
+@jwt_required()
+def objects_claim():
+    """认领/取消认领对象维护责任（协调员；仅 stewardable 类型；幂等）。"""
+    user = _require_user()
+    payload = request.get_json(silent=True) or {}
+    row, changed = boards_service.claim_object(user, payload)
+    db.session.commit()
+    action = payload.get("action", "claim")
+    msg = ("已认领" if changed else "已认领（幂等）") if action == "claim" else (
+        "已取消认领" if changed else "本就未认领")
+    return jsonify({"code": 200, "message": msg})
+
+
+@bp.route("/objects/types", methods=["GET"])
+@jwt_required()
+def objects_types():
+    """可关联类型目录（注册表驱动：label + stewardable，供前端下拉）。"""
+    user = _require_user()
+    return jsonify({"code": 200, "message": "ok", "data": {
+        "types": [{"source_type": t, "label": p.label, "stewardable": p.stewardable}
+                  for t, p in projections_service.PROVIDERS.items()]}})
 
 
 @bp.route("/me/todos", methods=["GET"])

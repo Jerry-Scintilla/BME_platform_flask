@@ -247,6 +247,82 @@ def workspace_access(user):
     return result
 
 
+def subtree_workspaces(user):
+    """本人持有 subtree 授权的工作区集合 {workspace_id}（跨组方案 §4.1）。
+    仅 coordinator 授权可带 subtree；返回的是「被授权的组」自身工作区 id。"""
+    out = set()
+    for g in _grants_raw(user):
+        if g.role != 'coordinator' or not g.subtree or g.workspace_id is None:
+            continue
+        if not _grant_effective(g):
+            continue
+        ws = WorkWorkspace.query.get(g.workspace_id)
+        if ws and ws.status == 'active':
+            out.add(ws.id)
+    return out
+
+
+def summary_access(user):
+    """摘要级可见工作区 {workspace_id: role}（跨组方案 §4.1）：本人工作区 ∪
+    subtree 授权组的**子孙组**工作区。摘要=标题/负责人/状态/截止（无正文）；
+    受限事项（participants 档）在摘要层只显示占位不显示标题。"""
+    from models import ClubGroup
+    result = dict(workspace_access(user))
+    subtree_roots = subtree_workspaces(user)
+    if not subtree_roots:
+        return result
+    ws_rows = WorkWorkspace.query.filter(
+        WorkWorkspace.id.in_(list(subtree_roots)), WorkWorkspace.status == 'active').all()
+    root_group_ids = {w.club_group_id for w in ws_rows if w.club_group_id}
+    if not root_group_ids:
+        return result
+    # 沿 parent_id 下行收集子孙组（应用层遍历，组数量级小）
+    descendants = set()
+    frontier = set(root_group_ids)
+    while frontier:
+        children = ClubGroup.query.filter(
+            ClubGroup.parent_id.in_(list(frontier)),
+            ClubGroup.status == 'active').all()
+        next_frontier = set()
+        for c in children:
+            if c.id not in descendants:
+                descendants.add(c.id)
+                next_frontier.add(c.id)
+        frontier = next_frontier - descendants
+    if not descendants:
+        return result
+    child_ws = WorkWorkspace.query.filter(
+        WorkWorkspace.club_group_id.in_(list(descendants)),
+        WorkWorkspace.status == 'active').all()
+    for w in child_ws:
+        result.setdefault(w.id, 'summary')      # 本人授权优先于 summary 级
+    return result
+
+
+def filter_items_summary_query(query, user):
+    """摘要列表过滤（跨组方案 §4.1）：workspace 档（含子树子孙组）∪ 参与档占位
+    ∪ 本人草稿。与正文层不同：子孙组的 workspace 档事项可见「摘要行」，
+    participants 档返回 restricted 占位（不查标题）。"""
+    ws_map = summary_access(user)
+    conds = []
+    if ws_map:
+        conds.append(WorkItem.workspace_id.in_(list(ws_map.keys())))
+    conds.append(and_(
+        WorkItem.id.in_(
+            db.session.query(WorkItemParticipant.item_id).filter(
+                WorkItemParticipant.user_id == user.id,
+                WorkItemParticipant.removed_at.is_(None))),
+        WorkItem.status != 'draft',
+        WorkItem.workspace_id.in_(_active_ws_ids_subquery()),
+    ))
+    conds.append(and_(
+        WorkItem.created_by == user.id,
+        WorkItem.status == 'draft',
+        WorkItem.workspace_id.in_(_active_ws_ids_subquery()),
+    ))
+    return query.filter(or_(*conds))
+
+
 # ── 对象级判定与查询过滤（§5.3）───────────────────────────────
 
 def _active_ws_ids_subquery():

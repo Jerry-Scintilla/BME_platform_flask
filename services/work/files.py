@@ -307,11 +307,32 @@ def download(user, file_id, link_id):
     下载同样以 emergency_access 事件留痕（purpose=file_download）。"""
     from storage import storage as _storage  # noqa: F401  供蓝图流式读取
 
-    wf = require_file_read(user, file_id, emergency_ok=True)
     try:
         link_id = int(link_id)
     except (TypeError, ValueError):
         raise WorkApiError(404, '文件不存在')   # link_id 沿 404 统一形态防探测
+    link = WorkFileLink.query.filter_by(id=link_id).first()
+
+    # 跨组交付包分支（跨组方案 §4.2，X1）：目标组成员可下载被交付的固定版本，
+    # 判权=handoff 已接单/完成 且 目标工作区在本人授权内——与源事项正文无关
+    if link and link.target_type == 'handoff':
+        from models import WorkHandoff
+        handoff = WorkHandoff.query.get(link.target_id)
+        if not handoff or handoff.status not in ('accepted', 'done'):
+            raise WorkApiError(404, '文件不存在')
+        if handoff.to_workspace_id not in access.workspace_access(user):
+            raise WorkApiError(404, '文件不存在')
+        wf = WorkFile.query.filter_by(id=link.file_id).first()
+        if not wf:
+            raise WorkApiError(404, '文件不存在')
+        version = (WorkFileVersion.query.get(link.version_id)
+                   if link.version_id else None) or \
+            WorkFileVersion.query.get(wf.current_version_id)
+        if not version or version.format_check != 'passed':
+            raise WorkApiError(404, '文件不存在')
+        return wf, version
+
+    wf = require_file_read(user, file_id, emergency_ok=True)
     link = WorkFileLink.query.filter_by(id=link_id, file_id=wf.id).first()
     if not link:
         raise WorkApiError(404, '文件不存在')

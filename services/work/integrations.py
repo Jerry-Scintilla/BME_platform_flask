@@ -5,12 +5,12 @@
 目标存在；无原对象访问权时只回「不可访问」占位，不复制标题（防越权泄露）。
 """
 from exts import db
-from models import (CampMember, CampSession, CourseModel, FeedbackTicket,
-                    WorkBusinessLink, WorkItem)
-from services.work import access
+from models import WorkBusinessLink, WorkItem
+from services.work import access, projections
 from services.work.access import WorkApiError
 
-ALLOWED_SOURCES = ('course', 'camp_session', 'feedback_ticket')
+# 适配器组装保证注册表就绪（blueprints/__init__ 全量加载链）
+import services.work.adapters  # noqa: F401
 
 
 def create_link(user, item_id, payload):
@@ -20,13 +20,14 @@ def create_link(user, item_id, payload):
     if not (item.created_by == user.id or item_access.is_coordinator):
         raise WorkApiError(403, '仅作者或本组协调员可以建立业务关联')
     source_type = payload.get('source_type')
-    if source_type not in ALLOWED_SOURCES:
-        raise WorkApiError(400, f"source_type 仅支持 {'/'.join(ALLOWED_SOURCES)}")
+    provider = projections.get_provider(source_type)
+    if provider is None:
+        raise projections.unknown_source_error()
     try:
         source_id = int(payload.get('source_id'))
     except (TypeError, ValueError):
         raise WorkApiError(400, '缺少 source_id')
-    if not _target_exists(source_type, source_id):
+    if not provider.exists(source_id):
         raise WorkApiError(404, '关联对象不存在')
     existed = WorkBusinessLink.query.filter_by(
         item_id=item.id, source_type=source_type, source_id=source_id).first()
@@ -38,41 +39,43 @@ def create_link(user, item_id, payload):
     return link
 
 
-def _target_exists(source_type, source_id):
-    if source_type == 'course':
-        course = CourseModel.query.get(source_id)
-        return course is not None and course.status != CourseModel.STATUS_DELETED
-    if source_type == 'camp_session':
-        return CampSession.query.get(source_id) is not None
-    if source_type == 'feedback_ticket':
-        return FeedbackTicket.query.get(source_id) is not None
-    return False
+def remove_link(user, item_id, payload):
+    """移除业务关联（作者∨协调员）。"""
+    item = WorkItem.query.filter_by(id=item_id).first()
+    item, item_access = access.require_read(user, item)
+    if not (item.created_by == user.id or item_access.is_coordinator):
+        raise WorkApiError(403, '仅作者或本组协调员可以移除业务关联')
+    source_type = payload.get('source_type')
+    try:
+        source_id = int(payload.get('source_id'))
+    except (TypeError, ValueError):
+        raise WorkApiError(400, '缺少 source_id')
+    link = WorkBusinessLink.query.filter_by(
+        item_id=item.id, source_type=source_type, source_id=source_id).first()
+    if not link:
+        raise WorkApiError(404, '该关联不存在')
+    db.session.delete(link)
+    return link
 
 
 def project_for(user, item_id):
-    """事项的业务关联安全投影：逐域按访问权决定是否回标题。"""
+    """事项的业务关联安全投影（注册表驱动，X2 通用化）。
+
+    输出 {source_type, source_id, label, accessible, fields}：fields 为适配器
+    summarize 的安全字段字典（盲渲染，核心不懂语义）；不可访问回 accessible=False
+    且不带任何字段。无 provider 的历史类型按不可访问处理（防泄露）。"""
     links = WorkBusinessLink.query.filter_by(item_id=item_id).all()
     out = []
     for link in links:
+        provider = projections.get_provider(link.source_type)
         entry = {'source_type': link.source_type, 'source_id': link.source_id,
-                 'relation': link.relation, 'title': None, 'accessible': False}
-        if link.source_type == 'course':
-            course = CourseModel.query.get(link.source_id)
-            # 课程为平台公开目录对象，标题对登录用户可见（已删除的除外）
-            if course and course.status != CourseModel.STATUS_DELETED:
-                entry.update(title=course.title, accessible=True)
-        elif link.source_type == 'camp_session':
-            session = CampSession.query.get(link.source_id)
-            if session:
-                member = CampMember.query.filter_by(
-                    camp_session_id=session.id, user_id=user.id).first()
-                if member or user.is_admin():
-                    entry.update(title=session.name, accessible=True)
-        elif link.source_type == 'feedback_ticket':
-            ticket = FeedbackTicket.query.get(link.source_id)
-            if ticket:
-                if user.id in (ticket.reporter_user_id, ticket.assignee_user_id) or user.is_admin():
-                    entry.update(title=ticket.title, accessible=True)
+                 'relation': link.relation, 'label': provider.label if provider else link.source_type,
+                 'accessible': False, 'fields': None}
+        if provider is not None:
+            fields = provider.summarize(user, link.source_id)
+            if fields is not None:
+                entry['accessible'] = True
+                entry['fields'] = fields
         out.append(entry)
     return out
 

@@ -92,9 +92,9 @@ def _job_reminder_scan(app):
             app.logger.exception("[work_scheduler] 提醒扫描失败")
 
 
-def _job_transfer_expire(app):
+def _job_expiration_scan(app):
     with app.app_context():
-        from services.work import tasks
+        from services.work import tasks, handoffs
         try:
             n = tasks.expire_transfers()
             db.session.commit()
@@ -103,6 +103,14 @@ def _job_transfer_expire(app):
         except Exception:
             db.session.rollback()
             app.logger.exception("[work_scheduler] 转交过期扫描失败")
+        try:
+            m = handoffs.expire_handoffs()
+            db.session.commit()
+            if m:
+                app.logger.info("[work_scheduler] %d 条跨组交付已过期", m)
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("[work_scheduler] 交付过期扫描失败")
 
 
 def init_work_scheduler(app):
@@ -123,7 +131,7 @@ def init_work_scheduler(app):
         coalesce=True, max_instances=1, misfire_grace_time=300, replace_existing=True)
     sched.add_job(
         _job_transfer_expire, trigger=IntervalTrigger(minutes=5, timezone=tz_name),
-        args=[app], id="work_transfer_expire_scan",
+        args=[app], id="work_expiration_scan",
         coalesce=True, max_instances=1, misfire_grace_time=600, replace_existing=True)
     sched.start()
     _scheduler = sched
