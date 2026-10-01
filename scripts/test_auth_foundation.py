@@ -664,5 +664,75 @@ class FindPasswordResetTest(AuthFoundationTestBase):
         self.assertIsNotNone(session.revoked_at)
 
 
+class MediaSignV2Test(AuthFoundationTestBase):
+    """B5：媒体短签 v2（版本绑定 + 生命周期 + v1 兼容窗口，规格 6.4）。"""
+
+    def signed_url(self, user, kind='resource', oid=1, path=None, sv='auto', exp=None):
+        import time as _time
+        from blueprints.media_sign import sign_media_token, MEDIA_PATHS
+        if sv == 'auto':
+            sv = user.security_version or 0
+        exp = exp or int(_time.time()) + 600
+        sv_arg = '' if sv is None else f"&sv={sv}"
+        sig = sign_media_token(kind, oid, user.id, exp, sv=sv)
+        base = path if path is not None else f"{MEDIA_PATHS[kind]}/{oid}"
+        return f"{base}?u={user.id}&e={exp}{sv_arg}&st={sig}"
+
+    def resolve(self, user, url):
+        from blueprints.media_sign import resolve_media_request
+        from urllib.parse import urlparse, parse_qsl
+        qs = dict(parse_qsl(urlparse(url).query))
+        with self.app.test_request_context(url):  # 查询串已含在 path 里
+            return resolve_media_request(qs_kind(url), 1)
+
+    def test_v2_sign_resolves(self):
+        from blueprints.media_sign import media_signed_url
+        user = self.make_user()
+        with self.app.test_request_context('/x'):
+            url = media_signed_url('resource', 1, user.id)
+        self.assertIn('sv=0', url)
+        resolved, err = self.resolve(user, url)
+        self.assertIsNone(err)
+        self.assertEqual(resolved.id, user.id)
+
+    def test_v2_version_drift_rejected(self):
+        user = self.make_user()
+        user.security_version = 2
+        db.session.commit()
+        url = self.signed_url(user, sv=0)  # 旧版本快照的签名
+        resolved, err = self.resolve(user, url)
+        self.assertIsNone(resolved)
+        self.assertEqual(err[1], 403)
+
+    def test_banned_rejected_via_lifecycle(self):
+        user = self.make_user()
+        user.status = 'banned'
+        db.session.commit()
+        url = self.signed_url(user)
+        resolved, err = self.resolve(user, url)
+        self.assertIsNone(resolved)
+        self.assertEqual(err[1], 403)
+
+    def test_v1_sign_still_works_in_window(self):
+        user = self.make_user()
+        url = self.signed_url(user, sv=None)  # 无 sv 参数 = v1 形态
+        resolved, err = self.resolve(user, url)
+        self.assertIsNone(err)
+        self.assertEqual(resolved.id, user.id)
+
+    def test_v1_rejected_after_security_change(self):
+        user = self.make_user()
+        user.require_versioned_tokens = True  # 重置密码/封禁后的置位
+        db.session.commit()
+        url = self.signed_url(user, sv=None)
+        resolved, err = self.resolve(user, url)
+        self.assertIsNone(resolved)
+        self.assertEqual(err[1], 403)
+
+
+def qs_kind(url):
+    return 'resource'
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
