@@ -571,6 +571,10 @@ class _FakeRedis:
         if key in self.store:
             self.store[key] = (self.store[key][0], window)
 
+    def getdel(self, key):
+        v = self.store.pop(key, None)
+        return v[0] if v else None
+
 
 class CaptchaChallengeTest(AuthFoundationTestBase):
     """B4：验证码用途限定/一次性/限次/冷却（规格 8.1）。"""
@@ -732,6 +736,184 @@ class MediaSignV2Test(AuthFoundationTestBase):
 
 def qs_kind(url):
     return 'resource'
+
+
+class MfaFoundationTest(AuthFoundationTestBase):
+    """B6：TOTP 绑定/二步登录/恢复码/防重放/停用（规格 6.5）。"""
+
+    def setUp(self):
+        super().setUp()
+        # MFA 服务读全局 config 与 redis：测试内打补丁，tearDown 恢复
+        import config as real_config
+        from cryptography.fernet import Fernet
+        self._orig_enc = real_config.MFA_ENC_SECRET
+        real_config.MFA_ENC_SECRET = Fernet.generate_key().decode()
+        import services.auth_mfa as mfa_module
+        self._mfa = mfa_module
+        self._orig_mfa_redis = mfa_module.redis_client
+        mfa_module.redis_client = _FakeRedis()
+
+    def tearDown(self):
+        import config as real_config
+        real_config.MFA_ENC_SECRET = self._orig_enc
+        self._mfa.redis_client = self._orig_mfa_redis
+        super().tearDown()
+
+    def auth_header(self, user, session):
+        from flask_jwt_extended import create_access_token
+        claims = {"sid": session.sid, "security_version": session.security_version,
+                  "token_schema": "v2"}
+        token = create_access_token(identity=user.email, additional_claims=claims)
+        return {"Authorization": f"Bearer {token}"}
+
+    @staticmethod
+    def outcome(resp):
+        """端点直调统一取 (body, status)：tuple 的 Response 对象自身 status_code
+        恒 200（Flask 以 tuple 第二位为准），不能直接读 .status_code。"""
+        if isinstance(resp, tuple):
+            return resp[0].get_json(), resp[1]
+        return resp.get_json(), resp.status_code
+
+    def enroll(self, admin):
+        """走完 start+confirm，返回 (secret, recovery_codes, session, admin)。"""
+        import pyotp
+        from blueprints import auth_mfa as mfa_bp
+        from services import auth_sessions
+        with self.app.test_request_context('/x'):
+            _a, _r, session = auth_sessions.issue_session(
+                admin, client_type="admin", amr="pwd")
+        db.session.commit()
+        headers = self.auth_header(admin, session)
+        with self.app.test_request_context('/auth/mfa/totp/enroll/start',
+                                           method='POST', headers=headers):
+            resp = mfa_bp.totp_enroll_start()
+        secret = resp.get_json()['secret']
+        with self.app.test_request_context('/auth/mfa/totp/enroll/confirm',
+                                           method='POST', headers=headers,
+                                           json={"code": pyotp.TOTP(secret).now()}):
+            resp2 = mfa_bp.totp_enroll_confirm()
+        return secret, resp2.get_json(), session
+
+    def test_enroll_confirm_yields_active_factor_and_recovery_codes(self):
+        admin = self.make_user(role='super_admin')
+        secret, data, session = self.enroll(admin)
+        self.assertEqual(data['code'], 200)
+        self.assertEqual(len(data['recovery_codes']), 10)
+        self.assertIn('token', data)  # bump 后换发的新 access
+        factor = self._mfa.active_totp_factor(admin)
+        self.assertEqual(factor.state, 'active')
+        db.session.refresh(admin)
+        db.session.refresh(session)
+        self.assertEqual(admin.security_version, 1)
+        self.assertTrue(admin.require_versioned_tokens)
+        self.assertIsNone(session.revoked_at)          # except_sid 保留当前会话
+        self.assertEqual(session.security_version, 1)  # 并同步新版本
+
+    def test_login_two_step_and_totp_replay_rejected(self):
+        import pyotp
+        from blueprints import auth as auth_module
+        from services import auth_sessions
+        admin = self.make_user(role='super_admin')
+        secret, _data, _session = self.enroll(admin)
+        with self.app.test_request_context(
+                '/auth/login', method='POST',
+                json={'User_Email': admin.email, 'User_Password': 'a' * 32}):
+            body, status = self.outcome(auth_module.login())
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get('mfa_required'))
+        self.assertIn('mfa_token', body)
+        code = pyotp.TOTP(secret).now()
+        with self.app.test_request_context(
+                '/auth/login/mfa', method='POST',
+                json={'mfa_token': body['mfa_token'], 'code': code}):
+            _body_rej, status_rej = self.outcome(auth_module.login_mfa())
+        # enroll confirm 已消耗当前时间步：同码立即重用 = 重放，应被拒
+        self.assertEqual(status_rej, 402)
+        # 重置计数模拟下一时间步，用新票据正常通过
+        factor = self._mfa.active_totp_factor(admin)
+        factor.last_accepted_counter = None
+        db.session.commit()
+        with self.app.test_request_context(
+                '/auth/login', method='POST',
+                json={'User_Email': admin.email, 'User_Password': 'a' * 32}):
+            body2, _s = self.outcome(auth_module.login())
+        with self.app.test_request_context(
+                '/auth/login/mfa', method='POST',
+                json={'mfa_token': body2['mfa_token'], 'code': code}):
+            d2, status2 = self.outcome(auth_module.login_mfa())
+        self.assertEqual(status2, 200)
+        self.assertIn('token', d2)
+        # amr=pwd+totp
+        from flask_jwt_extended import decode_token
+        sid = decode_token(d2['token'])['sid']
+        session = db.session.get(AuthSessionModel, sid)
+        self.assertEqual(session.amr, 'pwd+totp')
+
+    def test_totp_same_timestep_replay_rejected(self):
+        import pyotp
+        admin = self.make_user(role='super_admin')
+        secret, _data, _session = self.enroll(admin)
+        code = pyotp.TOTP(secret).now()
+        factor = self._mfa.active_totp_factor(admin)
+        factor.last_accepted_counter = None  # enroll confirm 已消耗当前时间步，重置后单独测重放
+        db.session.commit()
+        self.assertTrue(self._mfa.verify_totp_code(factor, code))
+        db.session.commit()
+        self.assertFalse(self._mfa.verify_totp_code(factor, code))  # 同时间步重放
+
+    def test_recovery_code_one_time_and_ticket_one_time(self):
+        from blueprints import auth as auth_module
+        admin = self.make_user(role='super_admin')
+        _secret, data, _session = self.enroll(admin)
+        code = data['recovery_codes'][0]
+        with self.app.test_request_context(
+                '/auth/admin_login', method='POST',
+                json={'User_Email': admin.email, 'User_Password': 'a' * 32}):
+            login_body, _s = self.outcome(auth_module.admin_login())
+        ticket = login_body['mfa_token']
+        with self.app.test_request_context(
+                '/auth/admin_login/mfa', method='POST',
+                json={'mfa_token': ticket, 'recovery_code': code}):
+            body2, status2 = self.outcome(auth_module.admin_login_mfa())
+        self.assertEqual(status2, 200)
+        # 票据一次性：再用 → 拒绝
+        with self.app.test_request_context(
+                '/auth/admin_login/mfa', method='POST',
+                json={'mfa_token': ticket, 'recovery_code': code}):
+            _b3, status3 = self.outcome(auth_module.admin_login_mfa())
+        self.assertEqual(status3, 401)
+
+    def test_disable_requires_recent_auth_and_proof(self):
+        from blueprints import auth_mfa as mfa_bp
+        from datetime import timedelta
+        from services import auth_sessions
+        admin = self.make_user(role='super_admin')
+        secret, _data, _session = self.enroll(admin)
+        # 旧 auth_time 的会话 → REAUTH_REQUIRED
+        with self.app.test_request_context('/x'):
+            _a, _r, old_session = auth_sessions.issue_session(
+                admin, client_type="admin", amr="pwd",
+                auth_time=datetime.now() - timedelta(hours=2))
+        db.session.commit()
+        headers = self.auth_header(admin, old_session)
+        with self.app.test_request_context('/auth/mfa/totp/disable',
+                                           method='POST', headers=headers, json={}):
+            body, status = self.outcome(mfa_bp.totp_disable())
+        self.assertEqual((status, body.get('machine')), (403, 'REAUTH_REQUIRED'))
+
+    def test_normal_user_cannot_enroll(self):
+        from blueprints import auth_mfa as mfa_bp
+        user = self.make_user(role='user')
+        with self.app.test_request_context('/x'):
+            from services import auth_sessions
+            _a, _r, session = auth_sessions.issue_session(
+                user, client_type="user", amr="pwd")
+        db.session.commit()
+        headers = self.auth_header(user, session)
+        with self.app.test_request_context('/auth/mfa/totp/enroll/start',
+                                           method='POST', headers=headers):
+            _b, status = self.outcome(mfa_bp.totp_enroll_start())
+        self.assertEqual(status, 403)
 
 
 if __name__ == '__main__':

@@ -95,6 +95,7 @@ storage.init_app(app)
 
 # 蓝图注册
 app.register_blueprint(auth_bp)
+app.register_blueprint(auth_mfa_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(article_bp)
 app.register_blueprint(article_v2_bp)

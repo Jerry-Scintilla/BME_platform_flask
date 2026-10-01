@@ -411,6 +411,7 @@ def check_multiple_permissions(permission_names, require_all=False):
 
 # 确保所有蓝图模块都被导入
 from .auth import bp as auth_bp
+from .auth_mfa import bp as auth_mfa_bp
 from .user import bp as user_bp
 from .course import bp as course_bp
 from .course_group import bp as course_group_bp
@@ -453,6 +454,7 @@ from .work_files import bp as work_files_bp
 
 __all__ = [
     'auth_bp',
+    'auth_mfa_bp',
     'user_bp',
     'course_bp',
     'course_group_bp',

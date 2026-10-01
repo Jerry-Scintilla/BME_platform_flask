@@ -10,6 +10,7 @@
 会话/安全版本的实时真相源在数据库（auth_session + user.security_version），
 Redis blocklist 只是补充——这里不再依赖它做准入判断。
 """
+import config
 from sqlalchemy.exc import OperationalError
 
 from flask import jsonify, request
@@ -65,4 +66,9 @@ def enforce_request_access():
 
     if is_admin_api and not actor.user.is_admin():
         return jsonify({"code": 403, "message": "无管理端访问权限"}), 403
+    # D1 管理端 MFA 强制开关（默认关）：/admin/* 会话须含 totp 因子；
+    # legacy 会话 amr=unknown 不含 totp，开关开启时同样被拦（不能绕过，规格 6.5）
+    if is_admin_api and config.MFA_ENFORCE_FOR_ADMIN and not actor.has_factor("totp"):
+        return jsonify({"code": 403, "message": "请先完成多因素认证后再访问管理端",
+                        "machine": "MFA_REQUIRED"}), 403
     return None

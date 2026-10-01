@@ -21,7 +21,7 @@ import secrets
 
 import config
 from models import AuditLog
-from services import auth_sessions
+from services import auth_mfa, auth_sessions
 from services.auth_challenges import issue_captcha, verify_captcha
 from services.auth_context import (
     AuthRejected, challenge_digest, constant_time_eq, validate_account_lifecycle,
@@ -132,6 +132,10 @@ def login():
                 if not user.password_is_hashed:
                     user.set_password(password)
                     db.session.commit()
+                # D1：账号已绑定 TOTP → 一律走二步验证（不发 token，5 分钟一次性票据）
+                mfa_gate = _mfa_gate(user, "user-login-mfa")
+                if mfa_gate is not None:
+                    return mfa_gate
                 code = 200
                 msg = "登录成功"
                 User_Name = user.username
@@ -160,6 +164,10 @@ def login():
                 issued, refresh, csrf_token = _issue_with_optional_cookie(
                     user, client_type="user", amr="pwd")
                 data.update(issued)
+                if user.is_staff() and config.MFA_ENFORCE_FOR_ADMIN:
+                    # 强制开关开启但未绑定：发 token 但管理端会被 MFA_REQUIRED 拦，
+                    # 提示前端引导先到用户端完成绑定（无公开 bootstrap 后门，规格 6.5）
+                    data["mfa_enrollment_required"] = True
                 return _finalize_auth_response(data, "user", refresh, csrf_token)
 
             else:
@@ -258,6 +266,10 @@ def admin_login():
                 if not admin.password_is_hashed:
                     admin.set_password(password)
                     db.session.commit()
+                # D1：已绑定 TOTP → 二步验证（票据 purpose 区分两端）
+                mfa_gate = _mfa_gate(admin, "admin-login-mfa")
+                if mfa_gate is not None:
+                    return mfa_gate
                 data = {
                     'code': 200,
                     'msg': "登录成功",
@@ -266,6 +278,8 @@ def admin_login():
                     'role_rank': admin.role_rank,
                     'permissions': get_user_permissions(admin.id),
                 }
+                if config.MFA_ENFORCE_FOR_ADMIN and not auth_mfa.has_active_totp(admin):
+                    data['mfa_enrollment_required'] = True
                 # D1：v2 会话签发（client_type=admin，续期端点核对双端隔离）
                 issued, refresh, csrf_token = _issue_with_optional_cookie(
                     admin, client_type="admin", amr="pwd")
@@ -542,6 +556,71 @@ def session_config():
     })
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+def _mfa_gate(user, ticket_purpose):
+    """已绑定 TOTP 的账号：登录第一步只发 5 分钟一次性票据，不发 token。
+
+    返回 None 表示无 MFA 门槛（继续正常签发）；否则返回二步响应。
+    密码已经验过——票据即「凭据已证明」的短期凭证；Redis 故障 503（fail-closed）。
+    """
+    if not auth_mfa.has_active_totp(user):
+        return None
+    try:
+        ticket = auth_mfa.issue_login_ticket(user, ticket_purpose)
+    except AuthRejected as exc:
+        resp, status = exc.to_response()
+        return resp, status
+    return jsonify({"code": 200, "mfa_required": True, "mfa_token": ticket,
+                    "message": "请输入动态验证码"}), 200
+
+
+def _login_mfa_verify(client_type):
+    """/auth/{login,admin_login}/mfa：票据 + TOTP 或恢复码 → 签 amr=pwd+totp 会话。"""
+    body = request.get_json(silent=True) or {}
+    try:
+        uid = auth_mfa.verify_login_ticket(body.get("mfa_token") or "",
+                                           f"{client_type}-login-mfa")
+    except AuthRejected as exc:
+        return exc.to_response()
+    user = UserModel.query.get(uid)
+    if not user:
+        return jsonify({"code": 401, "message": "账号不存在"}), 401
+    try:
+        validate_account_lifecycle(user)
+    except AuthRejected as exc:
+        return exc.to_response()
+    proved = False
+    factor = auth_mfa.active_totp_factor(user)
+    if factor and body.get("code"):
+        proved = auth_mfa.verify_totp_code(factor, body["code"])
+    if not proved and body.get("recovery_code"):
+        proved = auth_mfa.consume_recovery_code(user, body["recovery_code"])
+    if not proved:
+        db.session.rollback()
+        return jsonify({"code": 402, "message": "验证码错误",
+                        "machine": "MFA_CODE_INVALID"}), 402
+    data = {"code": 200, "User_Name": user.username, "role": user.role,
+            "role_rank": user.role_rank, "level": user.level,
+            "permissions": get_user_permissions(user.id)}
+    issued, refresh, csrf_token = _issue_with_optional_cookie(
+        user, client_type=client_type, amr="pwd+totp")
+    data.update(issued)
+    return _finalize_auth_response(data, client_type, refresh, csrf_token), 200
+
+
+@bp.route("/login/mfa", methods=["POST"])
+@limiter.limit("10/minute")
+@audit_log(operation="用户登录二步验证", is_login=True)
+def login_mfa():
+    return _login_mfa_verify("user")
+
+
+@bp.route("/admin_login/mfa", methods=["POST"])
+@limiter.limit("10/minute")
+@audit_log(operation="管理员登录二步验证", is_login=True)
+def admin_login_mfa():
+    return _login_mfa_verify("admin")
 
 
 @bp.route("/user/refresh", methods=["POST"])
