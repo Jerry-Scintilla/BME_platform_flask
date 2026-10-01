@@ -114,6 +114,15 @@ def sync_user_workspace(user_id, workspace_id, operator_id=None, event='同步')
         return 'skipped'          # 停自动：只停新增，存量自动行不动（方案 §3.2 末行）
     if _has_veto(user_id, workspace_id):
         return 'vetoed'
+    # D5 防授权复活（规格 9.4，硬约束不随 enforcement 模式灰度）：merged 账号/
+    # 人员级 veto（换主号不得绕过账号级否决）不重建自动授权。
+    from services.identity import enforcement as identity_enforcement
+    from models import UserModel as _UserModel
+    _target = db.session.get(_UserModel, user_id)
+    if _target is not None:
+        _denied, _why = identity_enforcement.workspace_denied(_target, workspace_id)
+        if _denied:
+            return 'identity_denied'
     desired = _desired(user_id, ws)
     current = _active_auto_grant(user_id, workspace_id)
 

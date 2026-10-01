@@ -1010,6 +1010,12 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
         return None, ("教师/超管通过营期管理入口操作，不作为营期成员加入", 400)
     if role not in ('student', 'mentor', 'member'):
         return None, ("营内角色仅支持 student/mentor/member", 400)
+    # D5 人员规则（规格 9.1）：同 Person 同营唯一 + 主参与号——shadow 记录、
+    # enforce 拒绝；宽限经 identity_exception_grant。身份门槛不替代对象权限。
+    from services.identity import enforcement as identity_enforcement
+    allowed, rule_reason = identity_enforcement.check_camp_join(sid, user)
+    if not allowed:
+        return None, (rule_reason, 409)
     from models import member_history_scope
     with member_history_scope():          # 复职判定须看到历史行
         existing = CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first()
@@ -1047,6 +1053,8 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
     # 方向制继承（09-12）：学员归属导生 → 自动入读该方向绑定的课程（不 commit，随调用方事务）
     if role == 'student' and team_mentor_id:
         _inherit_direction_course(camp, user_id, team_mentor_id)
+    # D5：参与锚点登记（同事务；冲突保留原锚点并记账本——回填/巡检报告口径）
+    identity_enforcement.register_camp_participation(m)
     return m, None
 
 

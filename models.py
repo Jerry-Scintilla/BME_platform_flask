@@ -524,6 +524,91 @@ class IdentityReviewDecisionModel(db.Model):
     )
 
 
+# ── D5 参与锚点与 enforcement（migrate_66，规格 3.2/9.2/9.4）──
+
+class CampPersonParticipationModel(db.Model):
+    """营期人员参与锚点：PK(camp_session_id, person_id)——「同一 Person 同营唯一」
+    的数据库裁决点；UNIQUE(camp_member_id) 防一成员行多点。复合外键核对
+    user 归属（user.person_id）与 camp_member 三元组一致（规格 3.3）。
+
+    新参与必须指向当前主号；经审批的续办例外可指向原成员账号（宽限表
+    identity_exception_grant），但不额外建立第二个当前参与锚点。
+    """
+    __tablename__ = 'camp_person_participation'
+    camp_session_id = db.Column(db.Integer, primary_key=True)
+    person_id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    camp_member_id = db.Column(db.Integer, nullable=False, unique=True)
+    state = db.Column(db.String(20), nullable=False, server_default='active')
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.ForeignKeyConstraint(['user_id', 'person_id'], ['user.id', 'user.person_id']),
+        db.ForeignKeyConstraint(
+            ['camp_member_id', 'camp_session_id', 'user_id'],
+            ['camp_member.id', 'camp_member.camp_session_id', 'camp_member.user_id']),
+        db.Index('idx_cpp_user', 'user_id'),
+    )
+
+
+class UnitPersonParticipationModel(db.Model):
+    """单元参与锚点（同营期锚点结构，规格 3.2）。"""
+    __tablename__ = 'unit_person_participation'
+    unit_id = db.Column(db.Integer, primary_key=True)
+    person_id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    unit_member_id = db.Column(db.Integer, nullable=False, unique=True)
+    state = db.Column(db.String(20), nullable=False, server_default='active')
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.ForeignKeyConstraint(['user_id', 'person_id'], ['user.id', 'user.person_id']),
+        db.ForeignKeyConstraint(
+            ['unit_member_id', 'unit_id', 'user_id'],
+            ['camp_unit_member.id', 'camp_unit_member.unit_id', 'camp_unit_member.user_id']),
+        db.Index('idx_upp_user', 'user_id'),
+    )
+
+
+class PersonWorkspaceRestrictionModel(db.Model):
+    """人员级工作区否决：账号级 veto 随人员走——换主账号不得绕过（规格 9.4）。
+    旧账号级 veto 有冲突按更严格结果处理并支持人工申诉（state=lifted 留痕）。"""
+    __tablename__ = 'person_workspace_restriction'
+    person_id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, primary_key=True)
+    state = db.Column(db.String(20), nullable=False, server_default='vetoed')  # vetoed/lifted
+    reason = db.Column(db.String(255), nullable=False)
+    source_event = db.Column(db.String(64))
+    version = db.Column(db.Integer, nullable=False, server_default='1')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+
+class IdentityExceptionGrantModel(db.Model):
+    """身份宽限/续办例外：按具体业务授权（camp_join/unit_join/work_access…）。
+    不能授予核验成功、管理权或跳过双端证明（规格 3.2/9.2）；期限每次实时检查。"""
+    __tablename__ = 'identity_exception_grant'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    person_id = db.Column(db.Integer, nullable=False)
+    user_id = db.Column(db.Integer, nullable=False)
+    operation_scope = db.Column(db.String(50), nullable=False)
+    scope_id = db.Column(db.Integer)
+    valid_until = db.Column(db.DateTime, nullable=False)
+    reason = db.Column(db.String(255), nullable=False)
+    approved_by = db.Column(db.Integer, nullable=False)
+    state = db.Column(db.String(20), nullable=False, server_default='active')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_ieg_lookup', 'operation_scope', 'scope_id', 'state', 'valid_until'),
+        db.Index('idx_ieg_person', 'person_id'),
+    )
+
+
 # 已弃用，改用redis存储
 # class EmailCaptchaModel(db.Model):
 #     __tablename__ = 'email_captcha'
@@ -1698,6 +1783,8 @@ class CampMember(db.Model):
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'user_id', name='uq_camp_member_camp_user'),
         db.Index('ix_camp_member_session_status', 'camp_session_id', 'status'),
+        # D5 参与锚点复合外键的引用目标（migrate_66；id 已 PK 故恒成立，仅为可引用）
+        db.UniqueConstraint('id', 'camp_session_id', 'user_id', name='uq_cm_triple'),
     )
 
 
@@ -2151,6 +2238,8 @@ class CampUnitMember(db.Model):
     ended_at = db.Column(db.DateTime, nullable=True)
     __table_args__ = (
         db.UniqueConstraint('unit_id', 'user_id', name='uq_unit_member'),
+        # D5 单元参与锚点复合外键的引用目标（migrate_66）
+        db.UniqueConstraint('id', 'unit_id', 'user_id', name='uq_cum_triple'),
     )
 
 

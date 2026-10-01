@@ -143,3 +143,9 @@ IDENTITY_UI_ENABLED = os.getenv("IDENTITY_UI_ENABLED", "false").lower() in ("1",
 IDENTITY_VERIFICATION_ENABLED = os.getenv("IDENTITY_VERIFICATION_ENABLED", "false").lower() in ("1", "on", "true")
 # 双账号认领提交通道（规格 13.1）：关=停新案例提交；已建案例可查询
 ACCOUNT_LINK_APPLY_ENABLED = os.getenv("ACCOUNT_LINK_APPLY_ENABLED", "false").lower() in ("1", "on", "true")
+# D5 enforcement 模式（规格 13.1）：off/shadow/enforce。shadow=违规只记账本不拦
+# （默认——上线即观测）；enforce=参与类违规拒绝。防复活类（merged/veto）为硬
+# 约束不随模式灰度。不能放开 merged/banned 会话。
+IDENTITY_ENFORCEMENT_MODE = os.getenv("IDENTITY_ENFORCEMENT_MODE", "shadow")
+if IDENTITY_ENFORCEMENT_MODE not in ("off", "shadow", "enforce"):
+    raise RuntimeError(f"IDENTITY_ENFORCEMENT_MODE 取值非法：{IDENTITY_ENFORCEMENT_MODE}（off/shadow/enforce）")

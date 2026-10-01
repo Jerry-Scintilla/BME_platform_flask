@@ -54,6 +54,9 @@ run scripts/migrate/migrate_63_person_layer.py
 run scripts/migrate/migrate_64_identity_verification.py
 # D3b 认领与归并（2026-10-01）：案例/证明/授权/占位/审批五表（零行为变化）
 run scripts/migrate/migrate_65_identity_link.py
+# D5 参与锚点（2026-10-02）：camp_member/camp_unit_member 三元组唯一键前置 + 锚点四表；
+# 影子登记与 veto 提升随后跑 scripts/backfill_person_participation.py --apply
+run scripts/migrate/migrate_66_person_participation.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else
