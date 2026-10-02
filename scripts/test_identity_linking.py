@@ -494,22 +494,22 @@ class ReviewPathTest(LinkingTestBase):
         self.r1 = self.make_user('rev1@x.dev', role='user')
         self.r2 = self.make_user('rev2@x.dev', role='user')
 
-    def test_blocked_case_needs_two_approvals(self):
+    def test_blocked_case_single_approval_by_operational_override(self):
+        """2026-10-02 运营决策（566a748）：阻断项单人批准即可推进——现行审核人
+        仅一名，双人门槛使案例永久滞留；审核人补足 >=2 后恢复双人制（删覆盖行）。"""
         from services.auth_context import AuthRejected
         self.assertEqual(self.case.state, 'awaiting_review')
         self.linking.review_case(self.case, self.r1, decision='approved')
         db.session.commit()
-        self.assertEqual(self.case.state, 'awaiting_review')  # 一名不够
-        self.linking.review_case(self.case, self.r2, decision='approved')
-        db.session.commit()
         self.assertEqual(self.case.state, 'approved_waiting_confirmation')
 
-    def test_same_reviewer_second_vote_not_double_counted(self):
+    def test_same_reviewer_second_vote_idempotent_no_crash(self):
+        """单人制下重复批准：状态已离开 awaiting_review，再投应 409 不炸。"""
+        from services.auth_context import AuthRejected
         self.linking.review_case(self.case, self.r1, decision='approved')
         db.session.commit()
-        self.linking.review_case(self.case, self.r1, decision='approved')
-        db.session.commit()
-        self.assertEqual(self.case.state, 'awaiting_review')
+        with self.assertRaises(AuthRejected):
+            self.linking.review_case(self.case, self.r1, decision='approved')
 
     def test_party_cannot_review(self):
         from services.auth_context import AuthRejected
@@ -529,9 +529,7 @@ class ReviewPathTest(LinkingTestBase):
         """7.3：有业务数据的 B 归并后保持 active（续办宽限 14 天），冻结动作才 merged。"""
         from models import IdentityExceptionGrantModel
         frz1 = self.make_user('frz1@x.dev')
-        frz2 = self.make_user('frz2@x.dev')
-        self.linking.review_case(self.case, frz1, decision='approved')
-        self.linking.review_case(self.case, frz2, decision='approved')
+        self.linking.review_case(self.case, frz1, decision='approved')  # 单人制（566a748）
         db.session.commit()
         result = self.linking.confirm_link(self.actor, self.case,
                                            preview_digest=self.out['digest'])
@@ -557,8 +555,7 @@ class ReviewPathTest(LinkingTestBase):
 
     def test_approved_then_confirm_applies(self):
         from models import PersonModel
-        self.linking.review_case(self.case, self.r1, decision='approved')
-        self.linking.review_case(self.case, self.r2, decision='approved')
+        self.linking.review_case(self.case, self.r1, decision='approved')  # 单人制（566a748）
         db.session.commit()
         result = self.linking.confirm_link(self.actor, self.case,
                                            preview_digest=self.out['digest'])
