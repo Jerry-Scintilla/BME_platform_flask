@@ -293,6 +293,7 @@ def user_list():
                   "level": user.level,
                   "status": user.status or 'active',
                   "join_time": user.join_time,
+                  "lifecycle": user.lifecycle or 'active',
                   "verification_status": person.verification_status if person else None,
                   "verified_name": person.verified_name if person else None,
                   }
