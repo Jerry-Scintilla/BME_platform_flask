@@ -50,7 +50,7 @@ NEW_TABLES = {
           KEY idx_roster_claim (claimed_person_id),
           CONSTRAINT fk_roster_school FOREIGN KEY (school_id)
             REFERENCES identity_school_config (school_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='外校名册（负责人导入）'
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='外校名册（负责人导入）'
     """,
     "identity_roster_invite": """
         CREATE TABLE identity_roster_invite (
