@@ -24,8 +24,8 @@ from . import NotFound, VersionConflict
 from .preferences import get_or_create_profile, parse_hhmm
 from .reminders import cancel_target, rematerialize_target
 
-AGENDA_MAX_DAYS = 31
-TASK_BUCKETS = ('all', 'unscheduled', 'overdue', 'scheduled', 'today_due', 'done', 'cancelled')
+AGENDA_MAX_DAYS = 42   # 月网格可见范围最多覆盖 6 周=42 天（W1 日历面板）
+TASK_BUCKETS = ('all', 'open', 'unscheduled', 'overdue', 'scheduled', 'today_due', 'done', 'cancelled')
 DEADLINE_PRECISIONS = ('none', 'datetime', 'date')
 PRIORITIES = ('low', 'medium', 'high')
 
@@ -268,7 +268,11 @@ def list_tasks(owner_id, *, page=1, per_page=20, bucket='all', q=''):
     if q:
         query = query.filter(ScheduleTask.title.like(_like(q), escape="\\"))
 
-    if bucket == 'done':
+    if bucket == 'all':
+        pass                                  # W1 任务中心：真·全部状态（此前 all 实际筛 open）
+    elif bucket == 'open':
+        query = query.filter(ScheduleTask.status == 'open')
+    elif bucket == 'done':
         query = query.filter(ScheduleTask.status == 'done')
     elif bucket == 'cancelled':
         query = query.filter(ScheduleTask.status == 'cancelled')
@@ -538,19 +542,29 @@ def get_agenda(owner_id, date_from, date_to, profile=None):
 
 def _day_stats(profile, events, blocks, date_from, date_to, *, conflict_count):
     """逐日净可用分钟：每日可安排窗口（profile 日窗口）扣除 busy 日程与
-    planned 块占用（对齐规划 §5.4：不能把全部日历空白视为可工作时间）。"""
+    planned 块占用（对齐规划 §5.4：不能把全部日历空白视为可工作时间）。
+    W1 起附加 days 逐日数组（日历负荷着色/容量卡用）；聚合键保留，
+    TodayPanel 等既有消费方不受影响。"""
     day_start = parse_hhmm(profile.day_start_time, '可安排开始时间')
     day_end = parse_hhmm(profile.day_end_time, '可安排结束时间')
-    busy_spans = [(e.start_at, e.end_at) for e in events if e.busy and not e.all_day]
-    busy_spans += [(b.start_at, b.end_at) for b in blocks if b.status == 'planned']
+    event_spans = [(e.start_at, e.end_at) for e in events if e.busy and not e.all_day]
+    block_spans = [(b.start_at, b.end_at) for b in blocks if b.status == 'planned']
 
     available = 0
+    days = []
     day = date_from
     while day <= date_to:
         w0 = datetime.combine(day, day_start)
         w1 = datetime.combine(day, day_end)
-        used = sum((min(t, w1) - max(s, w0)).total_seconds() / 60
-                   for s, t in busy_spans if t > w0 and s < w1)
-        available += max(0.0, (w1 - w0).total_seconds() / 60 - used)
+        event_min = sum((min(t, w1) - max(s, w0)).total_seconds() / 60
+                        for s, t in event_spans if t > w0 and s < w1)
+        block_min = sum((min(t, w1) - max(s, w0)).total_seconds() / 60
+                        for s, t in block_spans if t > w0 and s < w1)
+        day_avail = max(0.0, (w1 - w0).total_seconds() / 60 - event_min - block_min)
+        available += day_avail
+        days.append({'date': day.strftime('%Y-%m-%d'),
+                     'available_minutes': int(day_avail),
+                     'event_minutes': int(event_min), 'block_minutes': int(block_min)})
         day += timedelta(days=1)
-    return {'available_minutes': int(available), 'conflict_count': conflict_count}
+    return {'available_minutes': int(available), 'conflict_count': conflict_count,
+            'days': days}
