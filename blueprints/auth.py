@@ -186,6 +186,7 @@ def login():
                     # 强制开关开启但未绑定：发 token 但管理端会被 MFA_REQUIRED 拦，
                     # 提示前端引导先到用户端完成绑定（无公开 bootstrap 后门，规格 6.5）
                     data["mfa_enrollment_required"] = True
+                _maybe_remind_verification(user)  # P1：一次性核验提醒（12.1 单点调度）
                 return _finalize_auth_response(data, "user", refresh, csrf_token)
 
             else:
@@ -389,6 +390,36 @@ def _issue_with_optional_cookie(user, *, client_type, amr):
     data["_refresh_token_body"] = refresh  # cookie 开关关闭时提升为 refresh_token
     data["_csrf_token"] = csrf_token
     return data, refresh, csrf_token
+
+
+def _maybe_remind_verification(user):
+    """首登身份核验提醒（规格 12.1 单点调度，D5 收尾 P1）。
+
+    登录成功时一次性提醒未核验用户（去重键 source_type='identity_remind'）；
+    核验完成/已提醒/UI 闸未开均不再发。随 audit_log 装饰器的事务提交落库；
+    任何异常不影响登录（提醒是非关键路径）。深链：通知中心 identity_remind
+    → /user-center/identity。
+    """
+    if not config.IDENTITY_UI_ENABLED:
+        return
+    try:
+        from models import NotificationModel, PersonModel
+        if not user.person_id:
+            return
+        person = db.session.get(PersonModel, user.person_id)
+        if person is None or person.verification_status != 'unverified':
+            return
+        if NotificationModel.query.filter_by(
+                user_id=user.id, source_type='identity_remind').first():
+            return
+        db.session.add(NotificationModel(
+            user_id=user.id,
+            title='完成身份核验',
+            content='欢迎使用「身份与账号」中心：完成本校身份核验后，参与正式营期活动更有'
+                    '保障，还可以认领自己早期注册的其他账号。入口在「个人中心 - 身份与账号」。',
+            category='system', source_type='identity_remind'))
+    except Exception:
+        pass  # 提醒失败不影响登录
 
 
 def _finalize_auth_response(data, client_type, refresh, csrf_token):
