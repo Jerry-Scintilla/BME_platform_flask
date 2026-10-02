@@ -110,20 +110,42 @@ def mark_failed(capture_id, message, code):
         db.session.rollback()
 
 
-def lazy_recover(capture_id, now=None):
-    """GET 轮询时顺带恢复卡死行（worker 进程被杀/排队过久）。条件更新幂等。"""
+def lazy_recover(capture_id, user_id, now=None):
+    """GET 轮询时顺带恢复本人卡死行（worker 进程被杀/排队过久）。条件更新幂等。
+    S01 整改：user_id 必传——恢复条件同时带 owner 过滤，调用方必须先完成所有权
+    校验；后台批量兜底见 sweep_stale（不依赖用户读请求）。"""
     now = now or datetime.now()
     threshold = now - STALE_AFTER
     try:
         db.session.execute(
             update(ScheduleCapture)
             .where(ScheduleCapture.id == capture_id,
+                   ScheduleCapture.user_id == user_id,
                    ScheduleCapture.status.in_(('pending', 'processing')),
                    ScheduleCapture.updated_at < threshold)
             .values(status='failed', error='处理超时，请重试', error_code='stale_timeout'))
         db.session.commit()
     except Exception:
         db.session.rollback()
+
+
+def sweep_stale(now=None):
+    """后台批量兜底（S01 整改新增）：调度器周期调用，恢复所有超时的
+    pending/processing 行，使超时恢复不再依赖用户读请求触发（页面关掉也能
+    判死）。与 lazy_recover 同阈值同终态，条件更新幂等，返回恢复行数。"""
+    now = now or datetime.now()
+    threshold = now - STALE_AFTER
+    try:
+        result = db.session.execute(
+            update(ScheduleCapture)
+            .where(ScheduleCapture.status.in_(('pending', 'processing')),
+                   ScheduleCapture.updated_at < threshold)
+            .values(status='failed', error='处理超时，请重试', error_code='stale_timeout'))
+        db.session.commit()
+        return result.rowcount or 0
+    except Exception:
+        db.session.rollback()
+        return 0
 
 
 # ── 处理主体 ──────────────────────────────────────────────────────────────

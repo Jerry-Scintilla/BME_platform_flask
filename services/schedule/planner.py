@@ -44,8 +44,12 @@ def _cfg(name, default):
 
 
 def _align15_up(dt):
-    """向上对齐到 15 分钟粒度。"""
-    dt = dt.replace(second=0, microsecond=0)
+    """向上对齐到 15 分钟粒度（含秒向上：09:00:45 → 09:15:00）。
+    S02 整改：先截秒再对齐会把 09:00:45 对回 09:00:00，产出早于 now 的开始时间。"""
+    if dt.second or dt.microsecond:
+        dt = dt.replace(second=0, microsecond=0) + timedelta(minutes=GRID_MIN)
+    else:
+        dt = dt.replace(second=0, microsecond=0)
     if dt.minute % GRID_MIN:
         dt += timedelta(minutes=GRID_MIN - dt.minute % GRID_MIN)
     return dt
@@ -53,6 +57,11 @@ def _align15_up(dt):
 
 def _floor15(minutes):
     return int(minutes // GRID_MIN) * GRID_MIN
+
+
+def _ceil15(minutes):
+    """分钟数向上取整到粒度（不可拆分任务整段放置用：70 → 75）。"""
+    return (int(minutes) + GRID_MIN - 1) // GRID_MIN * GRID_MIN
 
 
 def planner_enabled():
@@ -218,7 +227,23 @@ def generate_ops(user_id, tasks, *, profile, now=None):
                 lo = _align15_up(max(gs, now if day == now.date() else gs))
                 while remaining > 0:
                     hi_limit = min(ge, deadline)
-                    want = min(remaining, MAX_BLOCK) if task.splittable else remaining
+                    if not task.splittable:
+                        # S02 整改：不可拆分任务必须整段放置——剩余时长按粒度
+                        # 向上取整作为需要的连续空间；空档/截止/当日容量任何
+                        # 一处放不下整段就换下一个空档，绝不出两截半块。
+                        need = _ceil15(remaining)
+                        if need > min((hi_limit - lo).total_seconds() / 60, cap_left):
+                            break
+                        start, end = lo, lo + timedelta(minutes=need)
+                        ops.append({'op': 'create_block', 'task_id': task.id,
+                                    'start_at': start, 'end_at': end, '_gap_end': ge})
+                        busy.add_block(day, start, end, with_buffer=True)
+                        total_placed += need
+                        placed_any = True
+                        cap_left -= need
+                        remaining = 0
+                        break
+                    want = min(remaining, MAX_BLOCK)
                     want = min(want, (hi_limit - lo).total_seconds() / 60, cap_left)
                     want = _floor15(want)
                     if want < MIN_BLOCK:
@@ -241,12 +266,13 @@ def generate_ops(user_id, tasks, *, profile, now=None):
                 break
 
         # 尾料 < MIN_BLOCK 且当日上一块同任务：直接并入（避免碎片）；
-        # 并入不得越出原空档（gap 边缘已含对邻居的缓冲，不能吃掉）
+        # 并入不得越出原空档（gap 边缘已含对邻居的缓冲，不能吃掉），
+        # 也不得越过截止（S02 整改：原先只看空档边缘，10:05 截止会并出 10:15）
         if 0 < remaining < MIN_BLOCK and ops:
             last = ops[-1]
             if (last['op'] == 'create_block' and last['task_id'] == task.id
                     and last.get('_gap_end')
-                    and last['end_at'] + timedelta(minutes=remaining) <= last['_gap_end']
+                    and last['end_at'] + timedelta(minutes=remaining) <= min(last['_gap_end'], deadline)
                     and (last['end_at'] - last['start_at']).total_seconds() / 60 + remaining <= MAX_BLOCK):
                 last['end_at'] = last['end_at'] + timedelta(minutes=remaining)
                 remaining = 0
@@ -393,8 +419,11 @@ def save_proposed(user_id, ops, *, trigger, capture_id=None, reason=''):
 
 
 def apply_proposed(user_id, plan_id, *, now=None):
-    """manual 方案的应用：逐实体复验生成时的版本基线，任一不符 409（整单拒绝，
-    重新生成比部分应用便宜——apply 是前瞻动作）。"""
+    """manual 方案的应用：逐实体复验生成时的版本基线，并按当前数据复验全部
+    放置约束（S04 整改），任一不符 409（整单拒绝，重新生成比部分应用便宜——
+    apply 是前瞻动作）。持有 profile 行锁（与 capture/自动排程同一序列锁），
+    复验与应用之间不会有并发写入插队。"""
+    from .preferences import lock_profile
     plan = (db.session.query(SchedulePlan)
             .filter(SchedulePlan.id == plan_id, SchedulePlan.user_id == user_id)
             .with_for_update().populate_existing().first())
@@ -403,6 +432,7 @@ def apply_proposed(user_id, plan_id, *, now=None):
     if plan.status != 'proposed':
         raise VersionConflict("方案已应用、过期或已撤销")
     now = now or datetime.now()
+    profile = lock_profile(user_id)               # 排程序列锁（锁序与 capture 一致）
     ops = _ops_with_baselines(plan)
     for op in ops:                              # 复验基线
         if op['op'] == 'create_block':
@@ -413,11 +443,51 @@ def apply_proposed(user_id, plan_id, *, now=None):
             block = ScheduleBlock.query.filter_by(id=op['block_id'], owner_id=user_id).first()
             if block is None or block.version != op.get('block_version'):
                 raise VersionConflict("时间安排已变化，请重新生成方案")
+    _revalidate_placement(user_id, ops, profile, now)
     executed = apply_ops(user_id, plan, ops, now=now)
     plan.status = 'applied'
     plan.applied_at = now
     db.session.flush()
     return {'plan': plan, 'changes_n': executed}
+
+
+def _revalidate_placement(user_id, ops, profile, now):
+    """应用前约束复验（S04 整改新增）：按当前 DB 忙闲、当前偏好、当前时钟
+    重放每个 create/move 放置，堵住「生成方案后新增固定日程/改作息/时钟
+    推进，旧方案仍可应用出冲突块」的漏洞。任一违规抛 VersionConflict。
+    本方案内 cancel/move 腾出的旧位置视为可用（exclude_blocks）。"""
+    placing = [op for op in ops if op['op'] in ('create_block', 'move_block')]
+    if not placing:
+        return
+    freed = {op['block_id'] for op in ops if op['op'] in ('cancel_block', 'move_block')}
+    days = sorted({_date_of(op['start_at']) for op in placing}
+                  | {_date_of(op['end_at']) for op in placing})
+    busy = BusyMap(profile, days, now).build(user_id, exclude_blocks=freed)
+    for op in placing:
+        start, end = op['start_at'], op['end_at']
+        day = _date_of(start)
+        minutes = (end - start).total_seconds() / 60
+        if start < now:
+            raise VersionConflict("方案已过期（开始时间早于当前时刻），请重新生成")
+        if day not in busy.spans or _date_of(end) != day or end <= start:
+            raise VersionConflict("方案涉及的时间已不在可安排范围，请重新生成")
+        ds = datetime.combine(day, busy.day_start)
+        de = datetime.combine(day, busy.day_end)
+        if start < ds or end > de:
+            raise VersionConflict("作息偏好已变化，方案不再匹配，请重新生成")
+        if not any(gs <= start and end <= ge for gs, ge in busy.free_gaps(day)):
+            raise VersionConflict("时间段已被占用，请重新生成方案")
+        if busy.day_cap_minutes(day) - busy.ai_minutes[day] < minutes:
+            raise VersionConflict("当日安排已达上限，请重新生成方案")
+        if op['op'] == 'create_block':
+            task = ScheduleTask.query.filter_by(id=op['task_id'], owner_id=user_id).first()
+            anchor = _task_due_anchor(task, profile) if task is not None else None
+        else:
+            block = ScheduleBlock.query.filter_by(id=op['block_id'], owner_id=user_id).first()
+            anchor = _task_due_anchor(block.task, profile) if block is not None and block.task else None
+        if anchor is not None and end > anchor:
+            raise VersionConflict("任务截止已变化，方案不再可行，请重新生成")
+        busy.add_block(day, start, end, with_buffer=True)
 
 
 def _ops_with_baselines(plan):
@@ -600,22 +670,24 @@ def replan_conflicts(user_id, event, *, profile, now=None):
 
 
 def _place_duration(busy, task, duration, deadline, now):
-    """给一段时长在忙闲图里找最早空位（重排用；不做拆分）。"""
+    """给一段时长在忙闲图里找最早空位（重排用；不做拆分）。
+    S03 整改：移动必须保持时长——当日容量或空档放不下完整 duration 就换
+    下一个，绝不返回缩短的区间（原先以 min(MIN_BLOCK, duration) 为接受
+    下限，90 分钟块在 45 分钟空档会被「移动」成 45 分钟，缺口既不回填
+    也不上报）。放不下时返回 None，由调用方 cancel_block 并计入 unsched。"""
     for day in busy.window_days:
         if datetime.combine(day, busy.day_start) >= deadline:
             break
         cap_left = _floor15(busy.day_cap_minutes(day) - busy.ai_minutes[day])
-        if cap_left < MIN_BLOCK:
+        if cap_left < duration:
             continue
         for gs, ge in busy.free_gaps(day):
             lo = _align15_up(max(gs, now if day == now.date() else gs))
             hi_limit = min(ge, deadline)
-            want = _floor15(min(duration, (hi_limit - lo).total_seconds() / 60, cap_left))
-            if want < min(MIN_BLOCK, duration):
-                continue
-            start, end = lo, lo + timedelta(minutes=want)
-            busy.add_block(day, start, end, with_buffer=True)
-            return start, end
+            if duration <= (hi_limit - lo).total_seconds() / 60:
+                start, end = lo, lo + timedelta(minutes=duration)
+                busy.add_block(day, start, end, with_buffer=True)
+                return start, end
     return None
 
 

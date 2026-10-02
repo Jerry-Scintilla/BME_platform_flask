@@ -56,6 +56,11 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 # 每日出勤报告（00:00 自动汇总昨日出勤并发邮件）
 # 收件人通过 RBAC 权限 attendance_report_recipient 管理（见 /permission/assign）
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
+
+# 营期调度器总开关。camp_scheduler 的守卫读的是 app.config 而非 os.environ，
+# 此前 config.py 未映射导致该开关形同虚设；映射后 dev 双实例（worktree 并行栈）
+# 可用它关掉第二实例的调度，避免共享 dev 库双发通知。
+CAMP_SCHEDULER_ENABLED = os.getenv("CAMP_SCHEDULER_ENABLED", "true").lower() == "true"
 ATTENDANCE_REPORT_TIMEZONE = os.getenv("ATTENDANCE_REPORT_TIMEZONE", "Asia/Shanghai")
 
 # 个人日程提醒扫描（AI 日程模块 Phase 1）：短周期扫表投递站内通知。

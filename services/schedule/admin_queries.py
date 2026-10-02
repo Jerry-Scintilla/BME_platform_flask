@@ -128,20 +128,29 @@ def metric_capture_status_today(day_start, day_end):
 
 def metric_reminder_backlog(now):
     """到期未生成通知（§4）：trigger_at≤now 且 status in (pending, failed)，
-    拆 pending / 可自动重试 / 重试耗尽三段。未来 pending 不算积压。"""
+    拆 pending / 等待重试 / 可自动重试 / 重试耗尽四段（互斥，total=四段之和）。
+    未来 pending 不算积压。S06 整改：原先 total 漏掉「已失败但未到
+    next_retry_at」的行（三段拼接不覆盖），等待重试窗口内的积压被低估为 0。"""
     base = [ScheduleReminder.trigger_at <= now,
             ScheduleReminder.status.in_(('pending', 'failed'))]
     pending = db.session.query(db.func.count(ScheduleReminder.id)).filter(
         *base, ScheduleReminder.status == 'pending').scalar()
+    retry_wait = db.session.query(db.func.count(ScheduleReminder.id)).filter(
+        *base, ScheduleReminder.status == 'failed',
+        ScheduleReminder.attempts < MAX_ATTEMPTS,
+        ScheduleReminder.next_retry_at.isnot(None),
+        ScheduleReminder.next_retry_at > now).scalar()
     retryable = db.session.query(db.func.count(ScheduleReminder.id)).filter(
         *base, ScheduleReminder.status == 'failed',
         ScheduleReminder.attempts < MAX_ATTEMPTS,
-        ScheduleReminder.next_retry_at <= now).scalar()
+        db.or_(ScheduleReminder.next_retry_at.is_(None),
+               ScheduleReminder.next_retry_at <= now)).scalar()
     exhausted = db.session.query(db.func.count(ScheduleReminder.id)).filter(
         *base, ScheduleReminder.status == 'failed',
         ScheduleReminder.attempts >= MAX_ATTEMPTS).scalar()
-    return {'pending': pending, 'retryable': retryable, 'exhausted': exhausted,
-            'total': pending + retryable + exhausted}
+    return {'pending': pending, 'retry_wait': retry_wait, 'retryable': retryable,
+            'exhausted': exhausted,
+            'total': pending + retry_wait + retryable + exhausted}
 
 
 def metric_manual_review(now):
@@ -200,24 +209,43 @@ def scan_service_status(now):
 
 
 def intent_service_status():
-    """AI 理解服务卡：请求驱动无心跳——观测=最近完成的 capture。
-    enabled 读在线配置（B3：DB 覆盖 > env/默认）。"""
+    """AI 理解服务卡：请求驱动无心跳——观测=最近一次完成（含失败）的 capture。
+    S07 整改：启用 ≠ 健康。disabled=开关关；unobserved=已启用但零完成记录
+    （长期无人使用不推断失联，也不冒充正常）；ok=最近一次完成是成功；
+    abnormal=最近一次完成是失败（供应商/额度故障会连续失败，正是要看的信号）。"""
     from .runtime_config import intent_enabled
     enabled = bool(intent_enabled())
-    last = db.session.query(db.func.max(ScheduleCapture.finished_at)).scalar()
-    return {'key': 'intent', 'enabled': enabled, 'state': 'ok' if enabled else 'disabled',
-            'last_finished_at': _fmt(last), 'observed': 'capture 表最近完成时刻'}
+    last = (db.session.query(ScheduleCapture)
+            .filter(ScheduleCapture.finished_at.isnot(None))
+            .order_by(ScheduleCapture.finished_at.desc(), ScheduleCapture.id.desc())
+            .first())
+    base = {'key': 'intent', 'enabled': enabled,
+            'last_finished_at': _fmt(last.finished_at if last else None),
+            'observed': 'capture 表最近完成时刻'}
+    if not enabled:
+        return {**base, 'state': 'disabled'}
+    if last is None:
+        return {**base, 'state': 'unobserved'}
+    if last.status == 'failed':
+        return {**base, 'state': 'abnormal', 'cause': 'last_capture_failed'}
+    return {**base, 'state': 'ok'}
 
 
 def planner_service_status():
     """自动排程服务卡：观测=最近 applied 方案（created_at 每次 capture 都建行，
-    证不了排程引擎，必须用 applied_at）。enabled 读在线配置（B3）。"""
+    证不了排程引擎，必须用 applied_at）。S07 整改：启用但从未应用过 =
+    unobserved，不冒充正常；关闭 = disabled。"""
     from .runtime_config import planner_enabled
     enabled = bool(planner_enabled())
     last = db.session.query(db.func.max(SchedulePlan.applied_at)) \
         .filter(SchedulePlan.status == 'applied').scalar()
-    return {'key': 'planner', 'enabled': enabled, 'state': 'ok' if enabled else 'disabled',
+    base = {'key': 'planner', 'enabled': enabled,
             'last_applied_at': _fmt(last), 'observed': '最近应用方案时刻'}
+    if not enabled:
+        return {**base, 'state': 'disabled'}
+    if last is None:
+        return {**base, 'state': 'unobserved'}
+    return {**base, 'state': 'ok'}
 
 
 def build_overview():

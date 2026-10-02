@@ -392,8 +392,8 @@ def captures_create():
     owner = _owner_id()
     if owner is None:
         return _error(401, "登录状态无效")
-    if not current_app.config.get("SCHEDULE_INTENT_ENABLED", True):
-        return _error(503, "智能录入暂未开放")
+    # S08 整改：门禁只走 runtime_config 单一真相（环境熔断与平台覆盖的优先级
+    # 在 effective() 内统一），显示与请求门禁不再各查各的。
     from services.schedule.runtime_config import intent_enabled
     if not intent_enabled():
         return _error(503, "智能录入暂未开放")
@@ -403,8 +403,19 @@ def captures_create():
         return _error(400, "请输入 1-2000 字的描述")
     request_id = str(payload.get("request_id") or "")[:64]
 
-    # 用户级日限（单位=提交次数；GET 预检 + 仅新建计数——同一 request_id 的
-    # 网络重试不重复消耗额度；Redis 故障降级放行，article_v2 同口径）
+    from services.schedule import capture as capture_svc
+
+    # ① 幂等查重最优先（S05 整改）：同 request_id 的网络重试必须能拿回既有
+    # 请求的结果——不能先撞额度墙回 429（额度用尽后重试即被拒，拿不到 202）。
+    if request_id:
+        existing = ScheduleCapture.query.filter_by(
+            user_id=owner, request_id=request_id).first()
+        if existing is not None:
+            return jsonify({"code": 200,
+                            "data": {"capture": existing.to_dict(), "submitted": False}})
+
+    # ② 用户级日限（单位=提交次数）：GET 预检快速失败；新建路径的原子扣额
+    # 在 ③（incr 越限即回退），Redis 故障降级放行（article_v2 同口径）
     from exts import redis_client
     from datetime import date as _date
     from services.schedule.runtime_config import intent_daily_limit
@@ -416,7 +427,8 @@ def captures_create():
     except Exception:
         pass
 
-    from services.schedule import capture as capture_svc
+    # ③ 建行 + 原子扣额：incr 越限回滚回退计数（并发不同键在边界也只放行
+    # N 个；同键并发撞唯一约束走幂等返回，仅胜者计数）
     row, created = capture_svc.create_capture(owner, text, request_id)
     if row is None:
         return _error(400, "录入创建失败")
@@ -425,6 +437,13 @@ def captures_create():
             used = redis_client.incr(redis_key)
             if used == 1:
                 redis_client.expire(redis_key, 86400)
+            if used > intent_daily_limit():
+                try:
+                    redis_client.decr(redis_key)
+                except Exception:
+                    pass
+                db.session.rollback()
+                return _error(429, "今日智能录入次数已用完，可手动创建任务")
         except Exception:
             pass
         db.session.commit()
@@ -437,15 +456,16 @@ def captures_create():
 @bp.route("/captures/<int:capture_id>", methods=["GET"])
 @jwt_required()
 def captures_detail(capture_id):
-    """轮询端点：顺带惰性恢复卡死行（worker 进程被杀/排队过久）。"""
+    """轮询端点：验权后顺带惰性恢复本人卡死行（后台兜底见调度器 sweep_stale）。
+    S01 整改：必须先按 owner 查到行才允许触发恢复，他人访问不产生任何写入。"""
     owner = _owner_id()
     if owner is None:
         return _error(401, "登录状态无效")
-    from services.schedule import capture as capture_svc
-    capture_svc.lazy_recover(capture_id)
     row = ScheduleCapture.query.filter_by(id=capture_id, user_id=owner).first()
     if row is None:
         return _error(404, "录入不存在")
+    from services.schedule import capture as capture_svc
+    capture_svc.lazy_recover(capture_id, owner)
     return jsonify({"code": 200, "data": row.to_dict(with_items=True)})
 
 

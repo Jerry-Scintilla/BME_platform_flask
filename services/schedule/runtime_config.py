@@ -61,19 +61,121 @@ def _default(key):
     return current_app.config.get(key)
 
 
+# ── 凭据加密存储（S09 整改）───────────────────────────────────────────────
+# secret 键的 value/previous_value 以 enc:v1:<Fernet token> 落库，主密钥取
+# env SCHEDULE_CREDENTIAL_KEY（推荐生产独立配置）> JWT_SECRET_KEY。历史明文行
+# 透明兼容读取，启动时 seal_legacy_plaintext() 幂等重封。
+# 轮换/撤销策略：换密钥=发布新值（旧值仅以密文留存于 previous_value）；清理
+# 历史=恢复默认同时清空 value/previous_value；主密钥丢失时解密失败安全回落
+# 环境变量配置（effective 返回默认），面板显示回落状态。
+_SEALED_PREFIX = 'enc:v1:'
+
+
+def _fernet():
+    import base64
+    import hashlib
+    import os
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:                           # 依赖缺失：退回明文（部署清单已含）
+        return None
+    material = os.getenv('SCHEDULE_CREDENTIAL_KEY') or current_app.config.get('JWT_SECRET_KEY')
+    if not material:
+        return None
+    digest = hashlib.sha256(str(material).encode('utf-8')).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _seal(plain):
+    f = _fernet()
+    if f is None:
+        return plain
+    return _SEALED_PREFIX + f.encrypt(str(plain).encode('utf-8')).decode('ascii')
+
+
+def _unseal(stored):
+    """读侧：enc:v1 前缀解密；历史明文原样返回（兼容）；解密失败返回 None
+    （主密钥变更场景安全回落 env/默认，不抛错打断请求路径）。"""
+    if stored is None:
+        return None
+    text = str(stored)
+    if not text.startswith(_SEALED_PREFIX):
+        return text
+    f = _fernet()
+    if f is None:
+        return None
+    try:
+        return f.decrypt(text[len(_SEALED_PREFIX):].encode('ascii')).decode('utf-8')
+    except Exception:
+        try:
+            current_app.logger.warning("[schedule_config] 凭据解密失败（主密钥变更？），已回落环境变量")
+        except Exception:
+            pass
+        return None
+
+
+def _seal_stored(key, plain):
+    """写侧：secret 键入库前密封；None（恢复默认）不入库变形。"""
+    if plain is None:
+        return None
+    if EDITABLE_KEYS.get(key, {}).get('type') == 'secret':
+        return _seal(plain)
+    return plain
+
+
+def seal_legacy_plaintext():
+    """启动时把历史明文凭据行加密（S09，幂等 best-effort）：已是 enc:v1 或
+    空值跳过；无主密钥/依赖/DB 故障时保持原样待下次启动。"""
+    try:
+        dirty = 0
+        for key, spec in EDITABLE_KEYS.items():
+            if spec['type'] != 'secret':
+                continue
+            row = _row(key)
+            if row is None or not row.value or str(row.value).startswith(_SEALED_PREFIX):
+                continue
+            row.value = _seal(str(row.value))
+            if row.previous_value and not str(row.previous_value).startswith(_SEALED_PREFIX):
+                row.previous_value = _seal(str(row.previous_value))
+            dirty += 1
+        if dirty:
+            db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+
+
 def effective(key):
-    """有效值：DB 覆盖（非空）> 环境变量/默认。bool 键以 'true'/'false' 文本存储，
-    str/secret 键按原文返回（secret 仅供 llm_api_key() 等内部消费方读取，
+    """有效值。S08 整改后的优先级（bool 能力开关）：
+    环境紧急熔断（config 为 False）> DB 平台覆盖 > env/默认；非 bool 键仍为
+    DB 覆盖 > 默认。门禁（captures 预检等）与面板显示都走本函数——单一真相。
+    bool 键读库失败时失败关闭（DB 既挂 captures 也写不进，关闭零代价；
+    否则可能把平台明确关闭的能力在 DB 抖动时悄悄重开）。
+    secret 键按解密原文返回（仅供 llm_api_key() 等内部消费方读取，
     管理端序列化层永不透出）。"""
     spec = EDITABLE_KEYS.get(key)
     if spec is None:
         return _default(key)
-    row = _row(key)
+    read_failed = False
+    try:
+        row = ScheduleSetting.query.filter_by(key=key).first()
+    except SQLAlchemyError:
+        db.session.rollback()
+        row = None
+        read_failed = True
+    if spec['type'] == 'bool':
+        if read_failed:
+            return False                         # S08：失败关闭，不重开被关能力
+        if current_app.config.get(key, True) is False:
+            return False                         # 环境紧急熔断 > 平台覆盖
+        if row is None or row.value is None:
+            return _default(key)
+        return str(row.value).lower() == 'true'
     if row is None or row.value is None:
         return _default(key)
-    if spec['type'] == 'bool':
-        return str(row.value).lower() == 'true'
-    if spec['type'] in ('str', 'secret'):
+    if spec['type'] == 'secret':
+        plain = _unseal(row.value)               # S09：密封存储，读侧解密
+        return plain if plain is not None else _default(key)
+    if spec['type'] == 'str':
         return str(row.value)
     try:
         return int(row.value)
@@ -174,12 +276,17 @@ def apply_updates(updates, admin_user):
             raise VersionConflict(f"{EDITABLE_KEYS[key]['label']} 已被他人修改，请刷新后重试")
         old_value = row.value if row is not None else None
         if row is None:
-            row = ScheduleSetting(key=key, value=new_value, version=1)
+            row = ScheduleSetting(key=key, value=_seal_stored(key, new_value), version=1)
             db.session.add(row)
         else:
-            row.value = new_value
+            row.value = _seal_stored(key, new_value)
             row.version += 1
-        row.previous_value = old_value
+        # previous_value：secret 键同样以密文留存（历史明文顺带重封），绝不落新明文
+        if EDITABLE_KEYS[key]['type'] == 'secret' and old_value is not None:
+            row.previous_value = (old_value if str(old_value).startswith(_SEALED_PREFIX)
+                                  else _seal(str(old_value)))
+        else:
+            row.previous_value = old_value
         row.reason = (item.get('reason') or '')[:200] or None
         row.updated_by = admin_user.id if admin_user is not None else None
         row.updated_at = datetime.now()
@@ -214,6 +321,11 @@ def editable_view():
             'updated_by_name': publisher,
             'reason': row.reason if row is not None else None,
         }
+        if spec['type'] == 'bool':
+            # S08：把「最终运行值由谁决定」透出给界面（环境熔断/平台覆盖/默认）
+            item['effective_source'] = (
+                'env_off' if current_app.config.get(key, True) is False
+                else ('platform' if overridden else 'default'))
         if spec['type'] == 'secret':
             env_configured = bool(os.getenv(key))
             item.update({

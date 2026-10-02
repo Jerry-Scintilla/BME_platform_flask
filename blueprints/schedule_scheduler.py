@@ -65,6 +65,18 @@ def _job_reminder_scan(app):
     run_reminder_scan_with_heartbeat(app)
 
 
+def _job_capture_sweep(app):
+    """超时录入兜底扫描（S01 整改新增）：把卡死在 pending/processing 超过
+    STALE_AFTER 的 capture 判死，使恢复不再依赖用户读请求轮询触发。
+    条件更新幂等，异常自吞不影响调度器。"""
+    from services.schedule import capture as capture_svc
+    try:
+        with app.app_context():
+            capture_svc.sweep_stale()
+    except Exception:
+        app.logger.exception("[schedule_scheduler] capture 超时兜底扫描失败")
+
+
 def init_schedule_scheduler(app):
     global _scheduler
     if _scheduler is not None:
@@ -82,6 +94,10 @@ def init_schedule_scheduler(app):
         _job_reminder_scan, trigger=IntervalTrigger(seconds=interval, timezone=tz_name),
         args=[app], id="schedule_reminder_scan",
         coalesce=True, max_instances=1, misfire_grace_time=120, replace_existing=True)
+    sched.add_job(
+        _job_capture_sweep, trigger=IntervalTrigger(seconds=interval, timezone=tz_name),
+        args=[app], id="schedule_capture_sweep",
+        coalesce=True, max_instances=1, misfire_grace_time=120, replace_existing=True)
     sched.start()
     _scheduler = sched
-    app.logger.info(f"[schedule_scheduler] 已启动：个人日程提醒扫描（每 {interval} 秒，{tz_name}）")
+    app.logger.info(f"[schedule_scheduler] 已启动：提醒扫描 + capture 超时兜底（每 {interval} 秒，{tz_name}）")

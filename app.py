@@ -146,6 +146,10 @@ ensure_ai_topic_schema(app)
 init_ai_topic_scheduler(app)
 # 个人日程提醒扫描（AI 日程模块 Phase 1）：秒级短周期，锁与营期调度独立
 init_schedule_scheduler(app)
+# 日程在线凭据历史明文行加密重封（S09 整改）：幂等 best-effort，无则跳过
+from services.schedule.runtime_config import seal_legacy_plaintext
+with app.app_context():
+    seal_legacy_plaintext()
 
 
 # 与原全站封禁检查共用一次用户查询，并增加 /admin/ 路径的角色门禁。
