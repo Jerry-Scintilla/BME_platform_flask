@@ -108,8 +108,9 @@ def list_workspaces():
     for r in rows:
         g = groups.get(r.club_group_id)
         items.append({
-            'id': r.id, 'club_group_id': r.club_group_id,
-            'group_name': g.name if g else None, 'status': r.status, 'role': None,
+            'id': r.id, 'club_group_id': r.club_group_id, 'scope': r.scope,
+            'group_name': (g.name if g else None) if r.scope == 'group' else '社团工作区',
+            'status': r.status, 'role': None,
             'group_status': g.status if g else None,
             'active_grants': WorkAccessGrant.query.filter_by(
                 workspace_id=r.id, status='active').count(),

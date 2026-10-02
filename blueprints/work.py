@@ -36,7 +36,9 @@ def _handle_work_api_error(err):
 
 def _ws_dict(ws, group_name, role=None):
     return {
-        "id": ws.id, "club_group_id": ws.club_group_id, "group_name": group_name,
+        "id": ws.id, "club_group_id": ws.club_group_id,
+        "scope": ws.scope,
+        "group_name": group_name if ws.scope == 'group' else "社团工作区",
         "status": ws.status, "role": role, "auto_grant": bool(ws.auto_grant),
     }
 
@@ -407,11 +409,29 @@ def governance_list_workspaces():
 @jwt_required()
 @audit_log(operation="开通组工作区")
 def governance_create_workspace():
-    """为启用组别开通工作区（一组最多一个，§4.2）。body {club_group_id, auto_grant?=true}
+    """开通工作区（§4.2/跨组 §4.4）。body {club_group_id, auto_grant?=true}（组区）
+    或 {scope: 'club', auto_grant?}（社团区——全社公告与讨论，开通口径=在任干事+组长）。
     auto_grant=true（默认）时建区即按现任归属/任职批量补授（授权自动化方案 §3.2）。"""
     user = _current_user()
     access.require_governance(user)
     data = request.get_json(silent=True) or {}
+
+    if data.get("scope") == "club":
+        if WorkWorkspace.query.filter_by(scope="club").first():
+            return jsonify({"code": 409, "message": "社团工作区已开通"}), 409
+        ws = WorkWorkspace(scope="club", club_group_id=None, status='active',
+                           auto_grant=bool(data.get("auto_grant", True)))
+        db.session.add(ws)
+        db.session.flush()
+        counts = {}
+        if ws.auto_grant:
+            counts = provisioning_service.backfill_workspace(ws, user.id, event='开通社团工作区')
+        db.session.commit()
+        return jsonify({"code": 200,
+                        "message": "已开通社团工作区" + (
+                            f"（自动授权 {counts.get('granted', 0)} 人）" if ws.auto_grant else ""),
+                        "data": {**_ws_dict(ws, None), "backfill": counts}})
+
     try:
         gid = int(data.get("club_group_id"))
     except (TypeError, ValueError):
@@ -448,8 +468,6 @@ def governance_set_auto_grant(wid):
     ws = WorkWorkspace.query.get(wid)
     if not ws:
         return jsonify({"code": 404, "message": "工作区不存在"}), 404
-    if ws.scope != 'group':
-        return jsonify({"code": 400, "message": "仅组工作区支持自动授"}), 400
     data = request.get_json(silent=True) or {}
     enabled = data.get("enabled")
     if not isinstance(enabled, bool):
@@ -460,8 +478,9 @@ def governance_set_auto_grant(wid):
     if enabled and not old:
         counts = provisioning_service.backfill_workspace(ws, user.id, event='开启自动授')
     db.session.commit()
-    g = ClubGroup.query.get(ws.club_group_id)
-    msg = (f"已开启「{g.name if g else ''}」入职自动授"
+    g = ClubGroup.query.get(ws.club_group_id) if ws.club_group_id else None
+    ws_label = g.name if g else '社团工作区'
+    msg = (f"已开启「{ws_label}」入职自动授"
            + (f"（补授 {counts.get('granted', 0)} 人）" if counts else "")
            ) if enabled and not old else (
            f"已关闭自动授（存量授权保留）" if not enabled else "自动授本已开启")

@@ -69,9 +69,24 @@ def _desired(user_id, ws):
     """按当前组织事实算 (user, ws) 应有的自动角色。返回 (role, source_type, source_id) 或 None。
 
     一人至多 1 条 active 任职（模型约束），组长类任职优先于归属；member 角色
-    优先挂 membership 来源（任职变动不带走），无归属时回落任职来源。"""
-    group_id = ws.club_group_id
+    优先挂 membership 来源（任职变动不带走），无归属时回落任职来源。
+    社团工作区（scope=club，X3）：开通口径=全部在任干事＋各组组长（跨组方案 §4.4
+    默认建议）——任意组的在任任职即资格，组长类挂 coordinator、普通干事挂 member；
+    普通组员不进社团区（无 membership 来源）。"""
     today = date.today()
+    if ws.scope == 'club':
+        for o in ClubOfficer.query.filter_by(user_id=user_id).all():
+            if not _officer_in_term(o, today):
+                continue
+            pos = ClubPosition.query.get(o.title_id) if o.title_id else None
+            rank = pos.sort_rank if pos else LEADER_RANK_MIN
+            if rank >= LEADER_RANK_MIN:
+                return ('coordinator', 'officer', o.id)
+        for o in ClubOfficer.query.filter_by(user_id=user_id).all():
+            if _officer_in_term(o, today):
+                return ('member', 'officer', o.id)
+        return None
+    group_id = ws.club_group_id
     ms = (ClubMembership.query
           .filter_by(user_id=user_id, group_id=group_id).first())
     coord = None
@@ -108,7 +123,7 @@ def sync_user_workspace(user_id, workspace_id, operator_id=None, event='同步')
     返回动作名（granted/revoked/changed/unchanged/skipped/vetoed/manual_present/none），
     供回填脚本与调用方统计。"""
     ws = WorkWorkspace.query.get(workspace_id)
-    if not ws or ws.scope != 'group':
+    if not ws or ws.scope not in ('group', 'club'):
         return 'skipped'
     if not ws.auto_grant or ws.status != 'active':
         return 'skipped'          # 停自动：只停新增，存量自动行不动（方案 §3.2 末行）
@@ -148,7 +163,7 @@ def sync_user_workspace(user_id, workspace_id, operator_id=None, event='同步')
         return 'manual_present'
 
     group_name = (ClubGroup.query.get(ws.club_group_id).name
-                  if ws.club_group_id else '')
+                  if ws.club_group_id else '社团工作区')
     if current:
         current.status = 'revoked'
         current.revoke_reason = f'{AUTO_REASON}：角色或来源变更（{event}）'
@@ -177,8 +192,14 @@ def sync_after_membership(user_id, group_ids, operator_id=None, event='归属变
 
 
 def sync_after_officer(user_id, old_group_id, new_group_id, operator_id=None, event='任职变更'):
-    """任职写入点联动：旧组+新组各重算（换组两边都要看；卸任 old=组 new=None）。"""
-    return sync_after_membership(user_id, [old_group_id, new_group_id], operator_id, event)
+    """任职写入点联动：旧组+新组各重算（换组两边都要看；卸任 old=组 new=None）。
+
+    社团工作区（X3）资格完全由任职派生——任何任职变更都要重算全部社团区。"""
+    actions = list(sync_after_membership(user_id, [old_group_id, new_group_id],
+                                         operator_id, event))
+    for ws in WorkWorkspace.query.filter_by(scope='club', status='active').all():
+        actions.append(sync_user_workspace(user_id, ws.id, operator_id, event))
+    return actions
 
 
 def backfill_workspace(ws, operator_id=None, event='工作区回填'):
@@ -186,12 +207,18 @@ def backfill_workspace(ws, operator_id=None, event='工作区回填'):
     （后者覆盖「人已离开但自动行还在」的漂移）。返回动作计数。"""
     counts = {}
     user_ids = set()
-    for m in ClubMembership.query.filter_by(group_id=ws.club_group_id).all():
-        user_ids.add(m.user_id)
     today = date.today()
-    for o in ClubOfficer.query.filter_by(group_id=ws.club_group_id).all():
-        if _officer_in_term(o, today):
-            user_ids.add(o.user_id)
+    if ws.scope == 'club':
+        # 社团区（X3）：人群=全社在任干事（组长类经 _desired 升 coordinator）
+        for o in ClubOfficer.query.all():
+            if _officer_in_term(o, today):
+                user_ids.add(o.user_id)
+    else:
+        for m in ClubMembership.query.filter_by(group_id=ws.club_group_id).all():
+            user_ids.add(m.user_id)
+        for o in ClubOfficer.query.filter_by(group_id=ws.club_group_id).all():
+            if _officer_in_term(o, today):
+                user_ids.add(o.user_id)
     for g in WorkAccessGrant.query.filter_by(
             workspace_id=ws.id, status='active', origin='auto').all():
         user_ids.add(g.user_id)
