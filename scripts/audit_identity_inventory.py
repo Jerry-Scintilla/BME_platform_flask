@@ -264,6 +264,87 @@ class Inventory:
         except Exception as e:
             self.say(f"- Redis 扫描失败（不影响其余各节）: {type(e).__name__}")
 
+    # ── 9 身份运行时观测（D5 收尾 P0-2）─────────────────────────
+    def section_identity_runtime(self):
+        self.h("9. 身份运行时观测（人员规则 shadow / outbox / 锚点 / 人员态）")
+
+        def _try(label, fn):
+            try:
+                fn()
+            except Exception as e:
+                self.say(f"- {label} 扫描失败（不影响其余小节）: {type(e).__name__}: {e}")
+
+        def shadow_stats():
+            rows = _q(
+                "SELECT event_id, evidence_refs, created_at FROM identity_event "
+                "WHERE action='identity.enforcement.shadow' ORDER BY event_id DESC LIMIT 5000")
+            from collections import Counter
+            by_code, by_scope, newest, hit = Counter(), Counter(), None, 0
+            for r in rows:
+                hit += 1
+                if newest is None:
+                    newest = r.created_at
+                note = (r.evidence_refs or '') if isinstance(r.evidence_refs, str) else str(r.evidence_refs or '')
+                # note 形如 {'note': 'camp_join#12: nonprimary;duplicate_person'}
+                for part in note.split(';'):
+                    code = part.strip().split(':')[-1].strip().strip("'}\"")
+                    if code and code[0].isalpha():
+                        by_code[code] += 1
+                if '#' in note:
+                    by_scope[note.split('#')[0].split(':')[-1].strip().strip("'{\"")] += 1
+            self.say(f"- enforcement.shadow 事件（采样最近 5000）: {hit} 条"
+                     + (f"，最新 {newest:%Y-%m-%d %H:%M}" if newest else ""))
+            for code, n in by_code.most_common():
+                self.say(f"  - 违规类型 {code}: {n}")
+            for scope, n in by_scope.most_common():
+                self.say(f"  - 业务 {scope}: {n}")
+            if not hit:
+                self.say("  - 无违规记录（enforce 决策前需至少一个完整营期周期的观测）")
+
+        def outbox_stats():
+            rows = _q(
+                "SELECT delivery_state, COUNT(*) AS n, MIN(created_at) AS oldest, "
+                "MAX(attempts) AS max_attempts FROM identity_outbox "
+                "GROUP BY delivery_state")
+            if not rows:
+                self.say("- outbox: 空（无待投递与历史）")
+            for r in rows:
+                age = f"，最早 {r.oldest:%Y-%m-%d %H:%M}" if r.oldest else ''
+                self.say(f"- outbox {r.delivery_state}: {r.n} 条{age}"
+                         f"（最大重试 {r.max_attempts}）")
+            stuck = _q("SELECT COUNT(*) AS n FROM identity_outbox "
+                       "WHERE delivery_state='pending' AND attempts>0")
+            if stuck[0].n:
+                self.say(f"  - 待关注: {stuck[0].n} 条重试中（消费者日志/依赖排查）")
+
+        def anchor_stats():
+            n_camp = _q("SELECT COUNT(*) AS n FROM camp_person_participation")[0].n
+            n_unit = _q("SELECT COUNT(*) AS n FROM unit_person_participation")[0].n
+            self.say(f"- 参与锚点: camp={n_camp} / unit={n_unit}")
+            drift = _q(
+                "SELECT COUNT(*) AS n FROM camp_member cm "
+                "LEFT JOIN camp_person_participation cpp "
+                "  ON cpp.camp_member_id = cm.id "
+                "WHERE cm.status='active' AND (cpp.camp_member_id IS NULL OR cpp.state != 'active')")
+            if drift[0].n:
+                self.say(f"  - 待关注: {drift[0].n} 个 active 成员无对应 active 锚点"
+                         f"（回填/接线遗漏或 shadow 冲突保留）")
+
+        def person_stats():
+            row = _q("SELECT COUNT(*) AS n FROM person")[0].n
+            verified = _q("SELECT COUNT(*) AS n FROM person "
+                          "WHERE verification_status='verified'")[0].n
+            merged = _q("SELECT COUNT(*) AS n FROM person "
+                        "WHERE record_status='merged'")[0].n
+            keys = _q("SELECT COUNT(*) AS n FROM person_identity")[0].n
+            self.say(f"- 人员: {row}（verified {verified} / merged {merged}），"
+                     f"已登记身份 key {keys}")
+
+        _try("shadow", shadow_stats)
+        _try("outbox", outbox_stats)
+        _try("锚点", anchor_stats)
+        _try("人员态", person_stats)
+
     def conclusion(self):
         self.h("结论与处置建议")
         self.say("- 本报告为只读盘点，未做任何写操作。")
@@ -297,6 +378,7 @@ def main():
         inv.section_user_references()
         inv.section_non_jwt_identities(repo_root)
         inv.section_redis()
+        inv.section_identity_runtime()
     inv.conclusion()
 
     out = args.out or os.path.join(repo_root, '..', 'docs', '记录',

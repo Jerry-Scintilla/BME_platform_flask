@@ -144,6 +144,9 @@ init_scheduler(app)
 init_camp_scheduler(app)
 init_work_scheduler(app)
 ensure_ai_topic_account(app)
+# 身份 outbox 消费者（D5 收尾 P0-1）：归并等核心写的通知投递，60s 扫描+退避重试
+from services.identity.outbox_worker import init_identity_outbox_scheduler
+init_identity_outbox_scheduler(app)
 # 幂等补表（checkfirst，对已有表无副作用）：未跑过 migrate_07 的库缺 article_v2，
 # 而 AiTopicLedger 外键指向它，不先建表则启动即 1824 崩（连 migrate 脚本都 import 不了 app）
 with app.app_context():
