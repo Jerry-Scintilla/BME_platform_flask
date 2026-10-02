@@ -30,6 +30,12 @@ ALLOWED_TYPES = {
     'jpeg': ('image/jpeg',),
     'txt': ('text/plain',),
     'md': ('text/plain', 'text/markdown'),
+    # Office 现代格式（2026-10-01 开放）：Open XML 容器（ZIP）本身无宏能力；
+    # 宏载体仍禁——旧格式 doc/xls/ppt（OLE2）与显式宏格式 docm/xlsm/pptm，
+    # 待病毒扫描服务接入后再评估开放
+    'docx': ('application/vnd.openxmlformats-officedocument.wordprocessingml.document',),
+    'xlsx': ('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',),
+    'pptx': ('application/vnd.openxmlformats-officedocument.presentationml.presentation',),
 }
 # 魔数（二进制类型必检；txt/md 走文本启发式：可 UTF-8 解码且无 NUL）
 MAGIC_BYTES = {
@@ -37,8 +43,13 @@ MAGIC_BYTES = {
     'png': b'\x89PNG\r\n\x1a\n',
     'jpg': b'\xff\xd8\xff',
     'jpeg': b'\xff\xd8\xff',
+    # Open XML 三件套同为 ZIP 容器：魔数只能验到 PK 头（改名 zip 伪装成 docx 会通过，
+    # 但本地打开即损坏、无宏执行面，可接受；OLE2 旧格式魔数不同，伪装即被拒）
+    'docx': b'PK\x03\x04',
+    'xlsx': b'PK\x03\x04',
+    'pptx': b'PK\x03\x04',
 }
-DETECT_RULES_VERSION = '1'
+DETECT_RULES_VERSION = '2'
 
 MAX_FILE_MB = int(os.getenv('WORK_FILE_MAX_MB', '25'))
 ITEM_QUOTA_MB = int(os.getenv('WORK_ITEM_QUOTA_MB', '200'))
@@ -66,7 +77,7 @@ def _looks_text(sample):
 def _check_format(ext, head_bytes):
     """扩展名 ∩ 魔数/文本启发式 交叉（C02：伪装扩展拒绝）。"""
     if ext not in ALLOWED_TYPES:
-        return False, '类型不在允许范围（pdf/png/jpg/jpeg/txt/md）'
+        return False, '类型不在允许范围（pdf/图片/txt/md/docx/xlsx/pptx）'
     magic = MAGIC_BYTES.get(ext)
     if magic is not None:
         if not head_bytes.startswith(magic):

@@ -1383,12 +1383,19 @@ class WorkFilesTest(_WorkItemsBase):
         self._patcher.stop()
         super().tearDown()
 
+    OOXML_TYPES = {   # 声明类型与扩展名交叉校验（C02 第三腿）用
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    }
+
     def _upload(self, user, item_id, filename, data, file_id=None, expect=200):
         from werkzeug.datastructures import FileStorage
+        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
         fs = FileStorage(stream=io.BytesIO(data), filename=filename,
                          content_type='text/plain' if filename.endswith(('.txt', '.md'))
                          else 'application/pdf' if filename.endswith('.pdf')
-                         else 'image/png')
+                         else self.OOXML_TYPES.get(ext, 'image/png'))
         r = self.client.post(f'/work/items/{item_id}/files', headers=self._auth(user),
                              data={'file': fs, **({'file_id': str(file_id)} if file_id else {})},
                              content_type='multipart/form-data')
@@ -1432,6 +1439,27 @@ class WorkFilesTest(_WorkItemsBase):
         self.assertEqual(len(self.fake_storage.objects), 0)
         # 白名单外扩展 → 415
         self._upload(self.member1, item, '工具.exe', b'MZ...', expect=415)
+
+    def test_office_openxml_accepted_macro_formats_rejected(self):
+        """Office 现代格式开放（2026-10-01）：docx/xlsx/pptx（ZIP 容器）放行；
+        宏载体仍禁——旧格式 doc（OLE2）、宏格式 xlsm 不在白名单；
+        可执行文件改名 docx 被魔数交叉校验拒绝。"""
+        from models import WorkFile
+        item = self._create_item(self.coord, self.ws_soft.id, title='Office 附件')
+        before = WorkFile.query.filter_by(item_id=item).count()
+        zip_head = b'PK\x03\x04' + b'x' * 64          # Open XML 容器头
+        for name in ('方案.docx', '排期.xlsx', '汇报.pptx'):
+            self._upload(self.member1, item, name, zip_head, expect=200)
+        # 旧格式（OLE2 复合文档魔数）与宏格式：白名单外
+        ole2 = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' + b'x' * 32
+        r = self._upload(self.member1, item, '旧文档.doc', ole2, expect=415)
+        self.assertIn('类型不在允许范围', r.get_json()['message'])
+        self._upload(self.member1, item, '宏表.xlsm', zip_head, expect=415)
+        # 可执行伪装 docx：魔数不符（MZ 头）
+        r = self._upload(self.member1, item, '木马.docx', b'MZ' + b'\x00' * 64, expect=415)
+        self.assertIn('内容与扩展名不符', r.get_json()['message'])
+        # 拒绝的都不留痕：行数只多了放行的三条
+        self.assertEqual(WorkFile.query.filter_by(item_id=item).count(), before + 3)
 
     def test_c01_size_and_quota_guards(self):
         from services.work import files as files_service
