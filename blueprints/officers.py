@@ -21,6 +21,7 @@ from exts import db
 from models import UserModel, ClubOfficer, ClubPosition, ClubGroup, ClubMembership
 from . import check_permission, audit_log, _current_user
 from services.club_rules import ORG_SLOT_CLUB, ORG_SLOT_GROUP, position_org_slot
+from services.identity import enforcement, gates
 from services.work.events import record_org_event
 from services.work import provisioning
 
@@ -337,10 +338,13 @@ def appoint_officer():
 
     current = _current_user()
     # D5 留白入口（P2-8）：任职属人员业务写——merged 账号不再新增任职
-    from services.identity import enforcement as _enf
-    _ok, _why = _enf.guard_business_write(user, 'club_officer')
+    _ok, _why = enforcement.guard_business_write(user, 'club_officer')
     if not _ok:
         return jsonify({"code": 409, "message": _why}), 409
+    # R0 核验门槛（2026-10-02 收紧批）：社团职务只能授予已核验账号
+    blocked = gates.ensure_verified_target(user, 'appoint', f'被任命为 {pos.name}')
+    if blocked:
+        return blocked
     officer = ClubOfficer(
         user_id=user.id,
         title_id=pos.id, title=pos.name,
@@ -425,6 +429,19 @@ def batch_appoint():
             rejected += 1
             continue
 
+        # 与单人端点对齐（探查实证的不对称缺口）：merged 守卫 + R0 核验门槛逐项拦
+        _ok, _why = enforcement.guard_business_write(user, 'club_officer')
+        if not _ok:
+            results.append({"index": idx, "ok": False, "reason": _why, "username": user.username})
+            rejected += 1
+            continue
+        _blocked = gates.verify_reject_reason(user, 'appoint')
+        if _blocked:
+            results.append({"index": idx, "ok": False, "reason": _blocked,
+                            "username": user.username})
+            rejected += 1
+            continue
+
         row = ClubOfficer(
             user_id=user.id,
             title_id=pos.id, title=pos.name,
@@ -493,6 +510,14 @@ def edit_officer(officer_id):
         term_start, terr = _parse_term_start(data.get("term_start"), fallback=officer.term_start)
         if terr:
             return jsonify({"code": 400, "message": terr}), 400
+
+        # R0：换职/换组属新挂载，目标账号须已核验（ended 行修正不受此限）
+        edit_user = UserModel.query.get(officer.user_id)
+        if edit_user is not None:
+            blocked = gates.ensure_verified_target(edit_user, 'appoint',
+                                                   f'改任为 {pos.name}')
+            if blocked:
+                return blocked
 
         officer.title_id, officer.title = pos.id, pos.name
         officer.group_id = group.id if group else None

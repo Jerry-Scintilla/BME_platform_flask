@@ -92,6 +92,12 @@ def medal_wear():
 
 
 # 用户信息请求
+def _verify_status(user):
+    """人员核验态（R0 收紧批）：无人员档案视同 unverified。"""
+    p = PersonModel.query.get(user.person_id) if user.person_id else None
+    return p.verification_status if p else "unverified"
+
+
 @bp.route("/user_index")
 @jwt_required()
 @swag_from('../apidocs/user/user_index.yaml')
@@ -149,6 +155,8 @@ def user_index():
         "permissions": get_user_permissions(user.id),
         "officers": public_officers(user.id),
         "groups": public_groups(user.id),
+        # R0（2026-10-02 收紧批）：首页核验提醒弹框与前端主动挂锁的数据源
+        "verification_status": _verify_status(user),
     }
     return jsonify(data)
 

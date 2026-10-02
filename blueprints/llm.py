@@ -562,6 +562,12 @@ def set_user_quota(user_id):
     if not u:
         return jsonify({"code": 404, "message": "用户不存在"}), 404
 
+    # 与审批端点对齐（探查实证的不对称缺口）：直接调额同样过 merged 守卫
+    from services.identity import enforcement as _enf
+    _ok, _why = _enf.guard_business_write(u, 'llm_quota')
+    if not _ok:
+        return jsonify({"code": 409, "message": _why}), 409
+
     data = request.get_json() or {}
     max_budget = data.get("max_budget")
     budget_duration = data.get("budget_duration")

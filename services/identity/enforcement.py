@@ -12,9 +12,12 @@ enforcement 模式（规格 13.1，IDENTITY_ENFORCEMENT_MODE）：
   R3 防授权复活：merged 账号不产生新自动工作区授权；veto 随人员走
       （person_workspace_restriction，换主号不得绕过——规格 9.4）
 
-核验要求（R0：正式参与需人员已核验或有效宽限）按规格 13.3 属强制阶段——
-第一轮 shadow 只记录不拦，enforce 模式下同样只记（avoid 拦死存量），
-30 天补全期结束后由运营决策打开（记在演进备忘）。
+核验门槛（R0，2026-10-02 收紧批落地）：职务/权限挂载的目标账号须已核验
+（仅 verified，pending 不放行——运营拍板）或持 verify_gate 宽限。与
+IDENTITY_ENFORCEMENT_MODE 解耦，按门槛组（IDENTITY_VERIFY_GATES）独立三态灰度；
+核验通道（双闸）关闭时 enforce 强制降级 shadow（被拦必有活核验入口，防死锁）。
+已接线组：appoint（职务/权限挂载）；预留组 community/camp_apply/camp_submit/
+publish 属用户端参与类，后续批接线。
 """
 from datetime import datetime
 
@@ -163,6 +166,73 @@ def migrate_account_veto_to_person(user, workspace_id, *, reason, source_event=N
         state='vetoed', reason=reason, source_event=source_event or 'account_veto')
     db.session.add(row)
     return row
+
+
+# ── R0：核验门槛（2026-10-02 收紧批）────────────────────────────
+
+def _verify_gate_modes():
+    """解析 IDENTITY_VERIFY_GATES（'组:模式,组:模式'）→ dict；非法值启动即炸。"""
+    modes = {}
+    for chunk in (config.IDENTITY_VERIFY_GATES_RAW or '').split(','):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name, sep, value = chunk.partition(':')
+        name, value = name.strip(), (value or '').strip()
+        if name not in config.VERIFY_GATE_GROUPS or not sep or value not in MODES:
+            raise RuntimeError(
+                f"IDENTITY_VERIFY_GATES 条目非法：{chunk!r}（组合法值 "
+                f"{config.VERIFY_GATE_GROUPS}，模式 {MODES}）")
+        modes[name] = value
+    return modes
+
+
+def gate_mode(gate):
+    """门槛组模式：组配置优先，缺省回落 IDENTITY_VERIFY_GATE_DEFAULT。
+    防死锁硬规则：核验双闸任一关闭时 enforce 一律降 shadow（不可配）。"""
+    m = _verify_gate_modes().get(gate, config.IDENTITY_VERIFY_GATE_DEFAULT)
+    if m == 'enforce' and not (config.IDENTITY_VERIFICATION_ENABLED
+                               and config.IDENTITY_UI_ENABLED):
+        return 'shadow'
+    return m
+
+
+def _verify_violation(status):
+    """核验态 → (违规码, 中文原因)。"""
+    return {
+        'person_missing': ('person_missing', '该账号尚未建立人员档案（未核验）'),
+        'unverified': ('unverified', '该账号尚未完成身份核验'),
+        'pending': ('pending', '该账号身份核验正在审核中，通过后即可被任命'),
+        'disputed': ('disputed', '该账号核验状态存在争议，需先处理'),
+        'revoked': ('revoked', '该账号核验状态已被撤销，需重新核验'),
+    }.get(status, ('unverified', '该账号尚未完成身份核验'))
+
+
+def check_verified(user, gate, scope_id=None):
+    """R0 核验门槛判定（挂载职务/权限前对目标账号调用）。
+
+    返回 (allowed, reason, verification_status)。判定链（短路）：
+    组 off 不评估 → 直通（super_admin/service/test）→ verify_gate 宽限 →
+    核验态仅 verified 通过（person 缺失视同 unverified）。
+    shadow 只记账本（note 前缀 gate=<组>），enforce 拒。
+    宽限口径：verify_gate 宽限不分组（scope_id 恒空）——核验是人员级事实，
+    一个有效宽限覆盖所有门槛组直至到期。"""
+    m = gate_mode(gate)
+    if m == 'off':
+        return True, None, None
+    person = db.session.get(PersonModel, user.person_id) if user.person_id else None
+    status = person.verification_status if person is not None else 'person_missing'
+    if user.is_admin() or (user.account_kind or 'standard') in ('service', 'test'):
+        return True, None, status
+    if exception_valid(user, 'verify_gate'):
+        return True, None, status
+    if status == 'verified':
+        return True, None, status
+    code, reason = _verify_violation(status)
+    _record(f'gate={gate}', user, scope_id, [(code, reason)])
+    if m == 'enforce':
+        return False, reason, status
+    return True, None, status
 
 
 # ── 记录 ────────────────────────────────────────────────────────

@@ -141,6 +141,12 @@ def validate_grant_payload(actor, data):
     target = UserModel.query.get(uid)
     if not target:
         raise WorkApiError(404, "用户不存在")
+    # R0 核验门槛（2026-10-02 收紧批）：工作区授权（member/coordinator/governance）
+    # 属权限挂载——目标账号须已核验（函数内导入，保持本模块零 flask 依赖的顶层干净）
+    from services.identity import gates as identity_gates
+    _reason = identity_gates.verify_reject_reason(target, 'appoint')
+    if _reason:
+        raise WorkApiError(403, _reason)
 
     role = data.get("role")
     if role not in access.GRANT_ROLES:

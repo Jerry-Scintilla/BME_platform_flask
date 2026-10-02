@@ -149,3 +149,13 @@ ACCOUNT_LINK_APPLY_ENABLED = os.getenv("ACCOUNT_LINK_APPLY_ENABLED", "false").lo
 IDENTITY_ENFORCEMENT_MODE = os.getenv("IDENTITY_ENFORCEMENT_MODE", "shadow")
 if IDENTITY_ENFORCEMENT_MODE not in ("off", "shadow", "enforce"):
     raise RuntimeError(f"IDENTITY_ENFORCEMENT_MODE 取值非法：{IDENTITY_ENFORCEMENT_MODE}（off/shadow/enforce）")
+# ── R0 核验门槛（2026-10-02 收紧批：职务/权限挂载目标人须已核验）──
+# 与 IDENTITY_ENFORCEMENT_MODE 解耦：门槛按"组"独立灰度，'组名:模式' 逗号串。
+# 已接线组：appoint（干事/组长/负责人/导生/项目负责/治理/辅助账号/审核人/全局角色/ACL）。
+# 预留组（用户端参与类，后续批接线）：community / camp_apply / camp_submit / publish。
+# 防死锁硬规则（代码内实现不可配）：核验通道（双闸）关闭时任何组 enforce 自动降级 shadow。
+IDENTITY_VERIFY_GATE_DEFAULT = os.getenv("IDENTITY_VERIFY_GATE_DEFAULT", "shadow")
+if IDENTITY_VERIFY_GATE_DEFAULT not in ("off", "shadow", "enforce"):
+    raise RuntimeError(f"IDENTITY_VERIFY_GATE_DEFAULT 取值非法：{IDENTITY_VERIFY_GATE_DEFAULT}")
+IDENTITY_VERIFY_GATES_RAW = os.getenv("IDENTITY_VERIFY_GATES", "")
+VERIFY_GATE_GROUPS = ("appoint", "community", "camp_apply", "camp_submit", "publish")

@@ -340,10 +340,48 @@ class Inventory:
             self.say(f"- 人员: {row}（verified {verified} / merged {merged}），"
                      f"已登记身份 key {keys}")
 
+        def gate_stats():
+            """R0 核验门槛（2026-10-02 收紧批）：shadow 事件按 gate= 切组 +
+            未核验账号的"可挂载职务"暴露面清单（enforce 前的口径评估）。"""
+            rows = _q(
+                "SELECT event_id, evidence_refs, created_at FROM identity_event "
+                "WHERE action='identity.enforcement.shadow' ORDER BY event_id DESC LIMIT 5000")
+            from collections import Counter
+            by_gate, newest = Counter(), None
+            for r in rows:
+                note = (r.evidence_refs or '') if isinstance(r.evidence_refs, str) else str(r.evidence_refs or '')
+                if 'gate=' not in note:
+                    continue
+                if newest is None:
+                    newest = r.created_at
+                gate = note.split('gate=')[-1].split('#')[0].split(':')[0].strip().strip("'}\"")
+                by_gate[gate] += 1
+            self.say("- R0 核验门槛 shadow（按组）:"
+                     + (f"采样最新 {newest:%Y-%m-%d %H:%M}" if newest else "无记录"))
+            for gate, n in by_gate.most_common():
+                self.say(f"  - gate={gate}: {n} 次未核验目标拦截（shadow 记账）")
+            exposure = _q(
+                "SELECT COUNT(*) AS n FROM `user` u "
+                "LEFT JOIN person p ON p.id = u.person_id "
+                "WHERE u.role='user' AND u.status='active' "
+                "  AND COALESCE(u.lifecycle,'active')='active' "
+                "  AND COALESCE(p.verification_status,'unverified') != 'verified'")
+            self.say(f"  - 未核验活跃普通账号: {exposure[0].n} 个"
+                     f"（enforce 后不可被任命/授职，先引导核验或发 verify_gate 宽限）")
+            in_office = _q(
+                "SELECT COUNT(*) AS n FROM club_officer o "
+                "JOIN `user` u ON u.id = o.user_id "
+                "LEFT JOIN person p ON p.id = u.person_id "
+                "WHERE o.status='active' "
+                "  AND COALESCE(p.verification_status,'unverified') != 'verified'")
+            self.say(f"  - 在任干事中未核验: {in_office[0].n} 人"
+                     f"（存量不追溯，换任/新任命时将被拦）")
+
         _try("shadow", shadow_stats)
         _try("outbox", outbox_stats)
         _try("锚点", anchor_stats)
         _try("人员态", person_stats)
+        _try("R0 门槛", gate_stats)
 
     def conclusion(self):
         self.h("结论与处置建议")

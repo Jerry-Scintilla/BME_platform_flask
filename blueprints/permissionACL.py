@@ -68,7 +68,14 @@ def assign_permission():
             "code": 404,
             "message": "用户不存在"
         }), 404
-    
+
+    # R0 核验门槛：ACL 权限位是管理类权限的挂载口——目标账号须已核验
+    #（防"未核验→授 system_management→自我扩权"绕过链）
+    from services.identity import gates as _gates
+    _blocked = _gates.ensure_verified_target(user, 'appoint', '被授予平台权限')
+    if _blocked:
+        return _blocked
+
     # 获取权限
     permission = None
     if permission_id:

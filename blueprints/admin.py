@@ -95,6 +95,14 @@ def admin_set_user_role(user_id):
     if current and current.id == target.id and role != 'super_admin':
         return jsonify({"code": 400, "message": "不能撤销自己的管理员权限"}), 400
 
+    # R0 核验门槛：提为管理员是在成为"直通账号"之前唯一有牙的检查点——
+    # 未核验账号先提管理员再挂职务会绕过所有 appoint 门槛，此处在事前拦住。
+    if role == 'super_admin' and target.role != 'super_admin':
+        from services.identity import gates as _gates
+        _blocked = _gates.ensure_verified_target(target, 'appoint', '被提升为管理员')
+        if _blocked:
+            return _blocked
+
     old_role = target.role
     old_tag = target.admin_tag
     target.role = role

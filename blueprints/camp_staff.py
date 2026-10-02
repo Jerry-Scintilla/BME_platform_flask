@@ -240,6 +240,13 @@ def staff_assign(sid):
         return jsonify({"code": 400, "message": "管理员天然拥有营期权限，无需委任"}), 400
     if target.status == 'banned':
         return jsonify({"code": 400, "message": "该账号已被封禁"}), 400
+    # R0 核验门槛（2026-10-02 收紧批）：营期负责人只能授予已核验账号
+    from services.identity import gates as _gates
+    _blocked = _gates.ensure_verified_target(
+        target, 'appoint', f"被委任为{'主负责人' if role == 'owner' else '协同老师'}",
+        scope_id=sid)
+    if _blocked:
+        return _blocked
 
     _lock_camp(sid)
     row = CampStaff.query.filter_by(camp_session_id=sid, user_id=uid).first()
@@ -316,6 +323,12 @@ def staff_transfer_owner(sid):
     target = UserModel.query.get(uid)
     if not target or target.is_admin() or target.status == 'banned':
         return jsonify({"code": 400, "message": "转交目标须为正常的普通用户"}), 400
+    # R0 核验门槛：主负责人只能转交给已核验账号
+    from services.identity import gates as _gates
+    _blocked = _gates.ensure_verified_target(target, 'appoint', '被转交为主负责人',
+                                             scope_id=sid)
+    if _blocked:
+        return _blocked
     reason = (d.get("reason") or "").strip()[:500] or None
 
     _lock_camp(sid)

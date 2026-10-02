@@ -756,6 +756,11 @@ def appoint_group_leader(gid):
     _ok, _why = _enf.guard_business_write(user, 'club_officer')
     if not _ok:
         return jsonify({"code": 409, "message": _why}), 409
+    # R0 核验门槛（2026-10-02 收紧批）：组长只能授予已核验账号
+    from services.identity import gates as _gates
+    _blocked = _gates.ensure_verified_target(user, 'appoint', f'被任命为 {pos.name}')
+    if _blocked:
+        return _blocked
 
     incumbents = (ClubOfficer.query.filter_by(
         title_id=pos.id, group_id=gid, status='active').order_by(ClubOfficer.id).all())

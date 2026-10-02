@@ -380,6 +380,14 @@ def application_review(sid, vid):
         if CampUnit.query.filter_by(camp_session_id=sid, unit_type='project',
                                     name=app.name).first():
             return jsonify({"code": 400, "message": "已存在同名项目，请让负责人改名后重提"}), 400
+        # R0 核验门槛：申报通过即产生项目负责人——申报人须已核验
+        from services.identity import gates as _gates
+        _leader = UserModel.query.get(app.leader_user_id)
+        if _leader is not None:
+            _blocked = _gates.ensure_verified_target(_leader, 'appoint',
+                                                     '担任项目负责人', scope_id=sid)
+            if _blocked:
+                return _blocked
         unit = CampUnit(camp_session_id=sid, unit_type='project',
                         name=app.name, owner_user_id=app.leader_user_id)
         db.session.add(unit)
@@ -891,6 +899,12 @@ def leader_change(uid):
         return jsonify({"code": 404, "message": "新负责人用户不存在"}), 404
     if new_user.is_admin():
         return jsonify({"code": 400, "message": "管理员不作为项目负责人"}), 400
+    # R0 核验门槛：项目负责人只能授予已核验账号
+    from services.identity import gates as _gates
+    _blocked = _gates.ensure_verified_target(new_user, 'appoint', '担任项目负责人',
+                                             scope_id=camp.id)
+    if _blocked:
+        return _blocked
     if new_leader == unit.owner_user_id:
         return jsonify({"code": 400, "message": "该用户已是本项目负责人"}), 400
     # 新负责人若已有其他负责项目 → 拒（一人一营最多负责 1 个）

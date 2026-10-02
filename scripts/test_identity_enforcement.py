@@ -262,5 +262,143 @@ class WorkspaceRevivalTest(EnforcementTestBase):
         self.assertEqual(models.PersonWorkspaceRestrictionModel.query.count(), 1)
 
 
+class VerifyGateTest(EnforcementTestBase):
+    """R0 核验门槛（2026-10-02 收紧批）：check_verified 三态×核验态、直通、
+    宽限、通道关闭降级、gate 配置解析。"""
+
+    def setUp(self):
+        super().setUp()
+        self._prev = (config.IDENTITY_VERIFY_GATES_RAW,
+                      config.IDENTITY_VERIFY_GATE_DEFAULT,
+                      config.IDENTITY_VERIFICATION_ENABLED,
+                      config.IDENTITY_UI_ENABLED)
+        config.IDENTITY_VERIFY_GATES_RAW = ''
+        config.IDENTITY_VERIFY_GATE_DEFAULT = 'shadow'
+        config.IDENTITY_VERIFICATION_ENABLED = True
+        config.IDENTITY_UI_ENABLED = True
+
+    def tearDown(self):
+        (config.IDENTITY_VERIFY_GATES_RAW, config.IDENTITY_VERIFY_GATE_DEFAULT,
+         config.IDENTITY_VERIFICATION_ENABLED, config.IDENTITY_UI_ENABLED) = self._prev
+        super().tearDown()
+
+    def set_verified(self, user, status='verified'):
+        p = models.PersonModel.query.get(user.person_id)
+        p.verification_status = status
+        db.session.commit()
+
+    def test_verified_passes_in_all_modes(self):
+        u = self.make_user('v@x.dev')
+        self.set_verified(u)
+        for mode in ('off', 'shadow', 'enforce'):
+            config.IDENTITY_VERIFY_GATES_RAW = f'appoint:{mode}'
+            ok, reason, status = self.enf.check_verified(u, 'appoint')
+            self.assertTrue(ok, mode)
+            if mode != 'off':
+                self.assertEqual(status, 'verified')
+            else:
+                self.assertIsNone(status)      # off 不评估
+
+    def test_unverified_shadow_records_enforce_rejects(self):
+        u = self.make_user('u@x.dev')          # provisional person → unverified
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:shadow'
+        ok, _, status = self.enf.check_verified(u, 'appoint')
+        self.assertTrue(ok)
+        self.assertEqual(status, 'unverified')
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce'
+        ok, reason, status = self.enf.check_verified(u, 'appoint')
+        self.assertFalse(ok)
+        self.assertIn('核验', reason)
+        self.assertEqual(status, 'unverified')
+
+    def test_off_gate_not_evaluated(self):
+        u = self.make_user('o@x.dev')
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:off'
+        ok, reason, status = self.enf.check_verified(u, 'appoint')
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        self.assertIsNone(status)               # off 不评估连状态都不读
+
+    def test_pending_rejected_in_enforce(self):
+        u = self.make_user('p@x.dev')
+        self.set_verified(u, 'pending')
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce'
+        ok, reason, status = self.enf.check_verified(u, 'appoint')
+        self.assertFalse(ok)
+        self.assertEqual(status, 'pending')
+        self.assertIn('审核', reason)
+
+    def test_no_person_treated_as_unverified(self):
+        u = self.UserModel(username='裸号', email='np@x.dev')   # 不建 person
+        u.set_password('x' * 32)
+        db.session.add(u)
+        db.session.commit()
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce'
+        ok, reason, status = self.enf.check_verified(u, 'appoint')
+        self.assertFalse(ok)
+        self.assertEqual(status, 'person_missing')
+
+    def test_exempt_accounts_pass(self):
+        u = self.make_user('adm@x.dev')
+        u.role = 'super_admin'
+        t = self.make_user('tst@x.dev')
+        t.account_kind = 'test'
+        s = self.make_user('svc@x.dev')
+        s.account_kind = 'service'
+        db.session.commit()
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce'
+        for x in (u, t, s):
+            ok, _, _ = self.enf.check_verified(x, 'appoint')
+            self.assertTrue(ok)
+
+    def test_exception_grant_unlocks_all_gates(self):
+        """verify_gate 宽限不分组（scope_id 恒空）：一条宽限覆盖所有门槛组。"""
+        from datetime import datetime as _dt
+        u = self.make_user('g@x.dev')
+        db.session.add(models.IdentityExceptionGrantModel(
+            user_id=u.id, person_id=u.person_id, operation_scope='verify_gate',
+            scope_id=None, state='active',
+            valid_until=_dt.now() + timedelta(days=7),
+            reason='测试宽限', approved_by=u.id))
+        db.session.commit()
+        for gate in ('appoint', 'community'):
+            config.IDENTITY_VERIFY_GATES_RAW = f'{gate}:enforce'
+            ok, _, _ = self.enf.check_verified(u, gate)
+            self.assertTrue(ok, gate)
+
+    def test_exception_grant_expired_does_not_unlock(self):
+        from datetime import datetime as _dt
+        u = self.make_user('ge@x.dev')
+        db.session.add(models.IdentityExceptionGrantModel(
+            user_id=u.id, person_id=u.person_id, operation_scope='verify_gate',
+            scope_id=None, state='active',
+            valid_until=_dt.now() - timedelta(days=1),
+            reason='过期宽限', approved_by=u.id))
+        db.session.commit()
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce'
+        ok, _, _ = self.enf.check_verified(u, 'appoint')
+        self.assertFalse(ok)
+
+    def test_channel_closed_downgrades_enforce(self):
+        u = self.make_user('c@x.dev')
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce'
+        config.IDENTITY_VERIFICATION_ENABLED = False
+        self.assertEqual(self.enf.gate_mode('appoint'), 'shadow')
+        ok, _, _ = self.enf.check_verified(u, 'appoint')
+        self.assertTrue(ok)                      # 降级后只记账不拦
+        config.IDENTITY_VERIFICATION_ENABLED = True
+        config.IDENTITY_UI_ENABLED = False
+        self.assertEqual(self.enf.gate_mode('appoint'), 'shadow')
+
+    def test_gate_config_parsing_and_validation(self):
+        config.IDENTITY_VERIFY_GATES_RAW = 'appoint:enforce,community:off'
+        self.assertEqual(self.enf.gate_mode('appoint'), 'enforce')
+        self.assertEqual(self.enf.gate_mode('community'), 'off')
+        self.assertEqual(self.enf.gate_mode('camp_apply'), 'shadow')   # 缺省回落
+        config.IDENTITY_VERIFY_GATES_RAW = 'nonsense:x'
+        with self.assertRaises(RuntimeError):
+            self.enf.gate_mode('appoint')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

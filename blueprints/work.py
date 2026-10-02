@@ -758,6 +758,11 @@ def governance_bootstrap():
     target = UserModel.query.get(uid)
     if not target:
         return jsonify({"code": 404, "message": "用户不存在"}), 404
+    # R0 核验门槛：治理人员只能授予已核验账号
+    from services.identity import gates as _gates
+    _blocked = _gates.ensure_verified_target(target, 'appoint', '被任命为治理人员')
+    if _blocked:
+        return _blocked
     reason = (str(data.get("grant_reason") or "").strip())
     if not reason or len(reason) > 200:
         return jsonify({"code": 400, "message": "授权原因必填且 ≤200 字"}), 400

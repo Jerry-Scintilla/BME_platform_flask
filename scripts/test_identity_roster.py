@@ -93,7 +93,8 @@ class RosterTestBase(unittest.TestCase):
         return u
 
     def make_reviewer(self):
-        r = self.make_user('rev@x.dev')
+        # 审核人须管理员（10-02 运营决策，566a748/3d4d882 批次改的门槛，测试夹具同步）
+        r = self.make_user('rev@x.dev', role='super_admin')
         from models import IdentitySchoolConfigModel
         cfg = db.session.get(IdentitySchoolConfigModel, 'external:scuec')
         cfg.reviewer_user_ids = [r.id]

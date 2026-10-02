@@ -1016,6 +1016,13 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
     allowed, rule_reason = identity_enforcement.check_camp_join(sid, user)
     if not allowed:
         return None, (rule_reason, 409)
+    # R0 核验门槛（2026-10-02 收紧批）：导生是职务——挂 mentor 角色须已核验。
+    # 单点覆盖直接分配/批量/报名审批/导入确认四入口；student/member 不查（只管职务）。
+    if role == 'mentor':
+        from services.identity import gates as identity_gates
+        _reason = identity_gates.verify_reject_reason(user, 'appoint', scope_id=sid)
+        if _reason:
+            return None, (_reason, 403)
     from models import member_history_scope
     with member_history_scope():          # 复职判定须看到历史行
         existing = CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first()

@@ -177,6 +177,8 @@ def login():
                     "Major": Major,
                     "Github_Id": Github_Id,
                     "Skill_Tags": Skill_Tags,
+                    # R0（2026-10-02 收紧批）：核验态随登录下发，首页提醒弹框数据源
+                    "verification_status": _login_verify_status(user),
                 }
                 # D1：v2 会话签发（client_type=user；refresh 按 cookie 开关决定去向）
                 issued, refresh, csrf_token = _issue_with_optional_cookie(
@@ -699,6 +701,13 @@ def admin_logout():
     return _typed_logout("admin")
 
 
+def _login_verify_status(user):
+    """人员核验态（R0 收紧批）：无人员档案视同 unverified。"""
+    from models import PersonModel
+    p = PersonModel.query.get(user.person_id) if user.person_id else None
+    return p.verification_status if p else "unverified"
+
+
 @bp.route("/refresh", methods=["POST"])
 @jwt_required(refresh=True)
 def refresh():
@@ -718,6 +727,7 @@ def refresh():
         "role": user.role,
         "permissions": get_user_permissions(user.id),
         "level": user.level,
+        "verification_status": _login_verify_status(user),
     }), 200
 
 

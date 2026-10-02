@@ -20,7 +20,7 @@ from models import (AuxiliaryAccountGrantModel, AuthSessionModel,
                     PersonPrimaryAccountModel, UserModel,
                     CampPersonParticipationModel, CampMember,
                     WorkAccessGrant)
-from services.identity import events
+from services.identity import enforcement, events
 
 GRANT_DAYS = 90
 REMIND_DAYS = 7
@@ -45,6 +45,12 @@ def approve_grant(operator, *, user_id, purpose, scope=None, days=GRANT_DAYS):
     if target.account_kind == 'service':
         from services.auth_context import AuthRejected
         raise AuthRejected('服务号不能转为辅助账号', status=400, machine='BAD_REQUEST')
+    # R0 核验门槛（2026-10-02 收紧批）：辅助账号是权限位——目标账号须已核验
+    _ok, _reason, _status = enforcement.check_verified(target, 'appoint')
+    if not _ok:
+        from services.auth_context import AuthRejected
+        raise AuthRejected(_reason, status=403,
+                           machine='IDENTITY_VERIFICATION_REQUIRED')
     row = AuxiliaryAccountGrantModel(
         user_id=target.id,
         owner_person_id=operator.person_id,
