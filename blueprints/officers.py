@@ -205,7 +205,8 @@ def public_officers(user_id):
     """单用户 active 任职的公开形态（user_index / profile 回包附字段）。"""
     return [
         {"title": r.title, "department": r.department,
-         "term_start": r.term_start.isoformat() if r.term_start else None}
+         "term_start": r.term_start.isoformat() if r.term_start else None,
+         "scope_note": r.scope_note}
         for r in officers_by_user([user_id]).get(user_id, [])
     ]
 
@@ -238,6 +239,7 @@ def _officer_dict(o, user=None, positions=None):
         "term_end": o.term_end.isoformat() if o.term_end else None,
         "status": o.status,
         "end_reason": o.end_reason,
+        "scope_note": o.scope_note,
         "created_at": o.created_at.isoformat() if o.created_at else None,
     }
 
@@ -336,6 +338,10 @@ def appoint_officer():
     if terr:
         return jsonify({"code": 400, "message": terr}), 400
 
+    scope_note = (str(data.get("scope_note") or "").strip() or None)
+    if scope_note and len(scope_note) > 200:
+        return jsonify({"code": 400, "message": "任职范围描述不能超过 200 字"}), 400
+
     current = _current_user()
     # D5 留白入口（P2-8）：任职属人员业务写——merged 账号不再新增任职
     _ok, _why = enforcement.guard_business_write(user, 'club_officer')
@@ -353,6 +359,7 @@ def appoint_officer():
         term_start=term_start,
         status='active',
         appointed_by=current.id if current else None,
+        scope_note=scope_note,
     )
     db.session.add(officer)
     db.session.flush()          # 拿 id 供组织事件留痕
@@ -477,7 +484,7 @@ def edit_officer(officer_id):
     # 编辑前快照：组织事件留痕用（换届后仍可解释「当时为什么有权」，§10.1）
     before = {'title': officer.title, 'group_id': officer.group_id,
               'term_start': str(officer.term_start), 'term_end': str(officer.term_end or ''),
-              'end_reason': officer.end_reason or ''}
+              'end_reason': officer.end_reason or '', 'scope_note': officer.scope_note or ''}
     if officer.status == 'active':
         # 入参只认一种轨道：显式 id 优先；传名则不带旧 id（否则 id 解析会盖掉改名入参）；
         # 都不传回落当前值（组转原组名解析）。department 显式 null = 清空（不挂组职位）。
@@ -519,6 +526,12 @@ def edit_officer(officer_id):
             if blocked:
                 return blocked
 
+        if "scope_note" in data:
+            scope_note = (str(data.get("scope_note") or "").strip() or None)
+            if scope_note and len(scope_note) > 200:
+                return jsonify({"code": 400, "message": "任职范围描述不能超过 200 字"}), 400
+            officer.scope_note = scope_note
+
         officer.title_id, officer.title = pos.id, pos.name
         officer.group_id = group.id if group else None
         officer.department = group.name if group else None
@@ -539,7 +552,7 @@ def edit_officer(officer_id):
     current = _current_user()
     after = {'title': officer.title, 'group_id': officer.group_id,
              'term_start': str(officer.term_start), 'term_end': str(officer.term_end or ''),
-             'end_reason': officer.end_reason or ''}
+             'end_reason': officer.end_reason or '', 'scope_note': officer.scope_note or ''}
     changed = {k: {'from': before[k], 'to': after[k]} for k in before if before[k] != after[k]}
     if changed:
         record_org_event('officer_edited', user_id=officer.user_id, officer_id=officer.id,
