@@ -111,6 +111,7 @@ def list_workspaces():
             'id': r.id, 'club_group_id': r.club_group_id, 'scope': r.scope,
             'group_name': (g.name if g else None) if r.scope == 'group' else '社团工作区',
             'status': r.status, 'role': None,
+            'auto_grant': bool(r.auto_grant),
             'group_status': g.status if g else None,
             'active_grants': WorkAccessGrant.query.filter_by(
                 workspace_id=r.id, status='active').count(),
