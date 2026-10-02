@@ -2801,6 +2801,7 @@ class ClubOfficer(db.Model):
     appointed_by = db.Column(db.Integer)                          # 任命操作人（审计留痕，非 FK）
     ended_by = db.Column(db.Integer)                              # 卸任操作人
     end_reason = db.Column(db.String(200))                        # 卸任原因（选填）
+    scope_note = db.Column(db.String(200))                        # 任职范围描述（选填；个人主页社团身份卡展示）
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
