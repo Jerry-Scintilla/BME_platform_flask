@@ -6,6 +6,8 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
+from datetime import datetime
+
 from exts import db, mail
 from models import UserModel, NotificationModel
 from flask_mail import Message
@@ -31,6 +33,26 @@ SOURCE_TYPE_MAP = {
     'notice': 'group',
     'admin': 'system',
 }
+
+
+def create_notification_once_unread(user_id, title, content, category='community',
+                                     source_type=None, source_id=None,
+                                     is_important=False):
+    """社区互动去重（L2-2，轻方案）：同 (user, source_type, source_id) 已有未读
+    通知时不新建行——刷新内容与时间（一个未读徽标，最新信息），避免热帖刷屏。
+    仅用于 discussion_reply / discussion_like（source_id 统一为帖子 id）。
+    """
+    existing = NotificationModel.query.filter_by(
+        user_id=user_id, source_type=source_type, source_id=source_id,
+        is_read=False).first()
+    if existing is not None:
+        existing.content = content
+        existing.created_at = datetime.now()
+        db.session.add(existing)
+        return existing
+    return create_notification(user_id, title, content, category=category,
+                               source_type=source_type, source_id=source_id,
+                               is_important=is_important)
 
 
 def create_notification(user_id, title, content, category='group',

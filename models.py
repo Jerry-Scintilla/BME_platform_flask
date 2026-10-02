@@ -149,7 +149,8 @@ class AuthSessionModel(db.Model):
     user_agent = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.now)
 
-    user = db.relationship('UserModel', backref=db.backref('auth_sessions', lazy='dynamic'))
+    user = db.relationship('UserModel', backref=db.backref(
+        'auth_sessions', lazy='dynamic', cascade='all, delete-orphan'))
 
     @property
     def is_live(self):
@@ -170,7 +171,8 @@ class AuthFactorModel(db.Model):
     confirmed_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.now)
 
-    user = db.relationship('UserModel', backref=db.backref('auth_factors', lazy='dynamic'))
+    user = db.relationship('UserModel', backref=db.backref(
+        'auth_factors', lazy='dynamic', cascade='all, delete-orphan'))
 
 
 class AuthRecoveryCodeModel(db.Model):
@@ -182,7 +184,8 @@ class AuthRecoveryCodeModel(db.Model):
     used_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=datetime.now)
 
-    user = db.relationship('UserModel', backref=db.backref('auth_recovery_codes', lazy='dynamic'))
+    user = db.relationship('UserModel', backref=db.backref(
+        'auth_recovery_codes', lazy='dynamic', cascade='all, delete-orphan'))
 
 
 class AuthLegacyRefreshConsumptionModel(db.Model):

@@ -923,7 +923,7 @@ def create_reply(thread_id):
     # 普通帖通知楼主；文章评论（scope=article/article_v2）通知文章作者；
     # 楼中楼额外通知父回复作者。自己回自己/通知对象=操作人时跳过。
     try:
-        from .notification import create_notification
+        from .notification import create_notification_once_unread
         from models import ArticleModel, ArticleV2Model
         targets = set()
         if thread.scope_type in ('article', 'article_v2'):
@@ -939,13 +939,14 @@ def create_reply(thread_id):
                 targets.add(pr.author_id)
         targets.discard(user.id)
         for uid in targets:
-            create_notification(
+            # L2：source_id 用帖子 id（深链/去重键）；未读合并防刷屏
+            create_notification_once_unread(
                 uid,
                 title='你的内容有新回复',
                 content=f"{user.username or '有人'} 回复了你：{content.strip()[:80]}",
                 category='community',
                 source_type='discussion_reply',
-                source_id=reply.id,
+                source_id=reply.thread_id,
             )
         db.session.commit()
     except Exception:
@@ -1195,7 +1196,7 @@ def toggle_reaction():
         # 文章评论 thread 点赞→文章作者）。取消赞不撤回通知；自己赞自己跳过。
         if reaction_type == 'like':
             try:
-                from .notification import create_notification
+                from .notification import create_notification_once_unread
                 from models import ArticleModel, ArticleV2Model
                 if target_type == 'thread' and target.scope_type in ('article', 'article_v2'):
                     model = ArticleV2Model if target.scope_type == 'article_v2' else ArticleModel
@@ -1204,13 +1205,19 @@ def toggle_reaction():
                 else:
                     notify_uid = target.author_id
                 if notify_uid and notify_uid != user.id:
-                    create_notification(
+                    # L2：点赞通知统一指向帖子 id（回复点赞经其 thread_id）——
+                    # 深链直达帖子 + 未读合并
+                    _thread_id = target_id
+                    if target_type == 'reply':
+                        _r = DiscussionReply.query.get(target_id)
+                        _thread_id = _r.thread_id if _r else _thread_id
+                    create_notification_once_unread(
                         notify_uid,
                         title='你的内容获赞',
                         content=f"{user.username or '有人'} 赞了你的{'回复' if target_type == 'reply' else '内容'}",
                         category='community',
                         source_type='discussion_like',
-                        source_id=target_id,
+                        source_id=_thread_id,
                     )
                     db.session.commit()
             except Exception:

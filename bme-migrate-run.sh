@@ -61,6 +61,8 @@ run scripts/migrate/migrate_66_person_participation.py
 run scripts/migrate/migrate_67_external_roster.py
 # P2 收尾（2026-10-02）：辅助账号授权表 + 身份岗位权限位种子
 run scripts/migrate/migrate_68_auxiliary_permissions.py
+# 审计转办根因修（2026-10-02）：D1 会话四表 user 外键改 ON DELETE CASCADE
+run scripts/migrate/migrate_69_auth_fk_cascade.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else
