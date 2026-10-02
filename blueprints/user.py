@@ -11,7 +11,7 @@ import base64
 from exts import db, redis_client
 
 # 导入数据库表
-from models import UserModel, GroupModel, CourseModel, LearningProgressModel, CheckRecord,MedalUserModel
+from models import UserModel, GroupModel, CourseModel, LearningProgressModel, CheckRecord,MedalUserModel, PersonModel
 
 # 对象存储 + 图片转码（09-15 头像切 storage，media/ 公开命名空间）
 from storage import storage
@@ -275,8 +275,14 @@ def user_search():
 @swag_from('../apidocs/user/user_list.yaml')
 def user_list():
     a_list = UserModel.query.all()
+    # 人员档案一次预取（管理端「核验」列数据源，避免逐用户 N+1）
+    person_map = {}
+    pid_list = [u.person_id for u in a_list if u.person_id]
+    if pid_list:
+        person_map = {p.id: p for p in PersonModel.query.filter(PersonModel.id.in_(pid_list))}
     data = []
     for user in a_list:
+        person = person_map.get(user.person_id)
         b_list = {"User_Email": user.email,
                   "User_Id": user.id,
                   "User_Name": user.username,
@@ -286,7 +292,9 @@ def user_list():
                   "admin_tag": user.admin_tag,
                   "level": user.level,
                   "status": user.status or 'active',
-                  "join_time": user.join_time
+                  "join_time": user.join_time,
+                  "verification_status": person.verification_status if person else None,
+                  "verified_name": person.verified_name if person else None,
                   }
         data.append(b_list)
 

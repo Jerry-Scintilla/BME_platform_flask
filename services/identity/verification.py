@@ -33,6 +33,16 @@ PURPOSE = 'school_identity'
 _IDENTIFIER_RE = re.compile(r'^[A-Za-z0-9._-]{2,64}$')
 
 
+def _reject_if_verified(user):
+    """人员档案已核验的账号拒绝再发起/提交核验（状态闭环的 API 侧兜底）。"""
+    if not user.person_id:
+        return
+    person = db.session.get(PersonModel, user.person_id)
+    if person is not None and person.verification_status == 'verified':
+        raise AuthRejected('该账号已核验通过，无需重复发起身份核验',
+                           status=409, machine='ALREADY_VERIFIED')
+
+
 # ── 申请 ────────────────────────────────────────────────────────
 
 def create_or_update_application(user, *, school_id, claimed_name,
@@ -42,6 +52,8 @@ def create_or_update_application(user, *, school_id, claimed_name,
     cfg = school.get_school_config(school_id)
     if user.account_kind in ('service',):
         raise AuthRejected('该类账号不能发起身份核验', status=403, machine='FORBIDDEN')
+    # 已核验通过的账号不再受理新申请（重复核验无意义，且会争抢唯一身份 key）
+    _reject_if_verified(user)
     name = (claimed_name or '').strip()
     if not name or len(name) > 100:
         raise AuthRejected('请填写待核验姓名', status=400, machine='BAD_CLAIM')
@@ -89,6 +101,7 @@ def create_or_update_application(user, *, school_id, claimed_name,
 def submit_application(user, app):
     """提交审核（不 commit）：必须先通过邮箱控制证明。"""
     _require_owner(user, app)
+    _reject_if_verified(user)
     if app.status != 'draft':
         raise AuthRejected('申请不在可提交状态', status=409, machine='BAD_STATE')
     if not app.challenge_verified_at:
