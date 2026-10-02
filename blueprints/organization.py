@@ -9,13 +9,13 @@ from flask_jwt_extended import jwt_required
 
 from exts import db
 from models import UserModel, ClubGroup, ClubPosition, ClubOfficer, ClubMembership
+from services.club_rules import is_club_position, is_group_position
 from .media import public_avatar_url
 
 bp = Blueprint("organization", __name__, url_prefix="/organization")
 
-# 顶部管理层区阈值：sort_rank ≤ 此值的职位进社长 hero + 管理层横排（种子：社长1/副社长2/
-# 团支书3/副团支书4；组长10 落组内 leader 位）。后台自建职位按其 sort_rank 自动归区。
-MANAGEMENT_RANK_MAX = 9
+# 管理层/组长类归区判定收敛 services/club_rules.py（club_position.org_slot，空值按
+# sort_rank 兜底；种子：社长1/副社长2/团支书3/副团支书4=社团职务，组长10=组内职位）
 MAX_DEPTH = 4  # 与 club_admin 校验同源
 
 
@@ -49,7 +49,7 @@ def org_chart():
         u = users.get(o.user_id)
         if not pos or not u:
             continue
-        if pos.sort_rank <= MANAGEMENT_RANK_MAX:
+        if is_club_position(pos):
             management.append((pos.sort_rank, {
                 **_user_card(u), "title": pos.name,
                 "group": group_names.get(o.group_id),
@@ -79,9 +79,9 @@ def org_chart():
         oversee = lead = None
         for sort_rank, u, pos in sorted(offs, key=lambda t: t[0]):
             card = {**_user_card(u), "title": pos.name}
-            if sort_rank <= MANAGEMENT_RANK_MAX and oversee is None:
+            if is_club_position(pos) and oversee is None:
                 oversee = card
-            elif sort_rank > MANAGEMENT_RANK_MAX and lead is None:
+            elif is_group_position(pos) and lead is None:
                 lead = card
 
         member_cards = []

@@ -5,8 +5,8 @@
 只管自动行（manual/direct 是人签的字，派生器不碰）；veto（status='vetoed'）
 按 (user_id, workspace_id) 拦截，退社再入社（新组织行新 id）不会绕过。
 
-角色映射（与组织页 leader 判定同源，organization.py MANAGEMENT_RANK_MAX=9）：
-  挂组任职 rank>9（组长类）→ coordinator；rank<=9（分管）→ member；
+角色映射（与组织页 leader 判定同源，services/club_rules.py 单源）：
+  挂组任职为组内职位（组长类，org_slot='group'）→ coordinator；社团职务挂组（分管）→ member；
   membership 归属（primary/secondary 两槽都授，D3）→ member；就高不叠加。
 失效三律不变：本模块只负责行的生灭，有效性仍由 access.py 每请求实时判定兜底
 （例如任期自然到界无人点卸任——日巡检任务再补重算）。
@@ -18,10 +18,7 @@ from datetime import date
 from exts import db
 from models import (ClubGroup, ClubMembership, ClubOfficer, ClubPosition,
                     WorkAccessGrant, WorkWorkspace)
-
-# 组长类判定阈值：与 blueprints/organization.py 的 MANAGEMENT_RANK_MAX 保持同值
-# （organization 是展示口径、本处是授权口径，改任一处须同步另一处）
-LEADER_RANK_MIN = 10          # sort_rank >= 10 视为组长类（挂组任职 → coordinator）
+from services.club_rules import is_club_position, is_group_position
 
 # 自动行的授权人（无真人操作时的落款）；reason 前缀供治理页辨识
 SYSTEM_OPERATOR_ID = None
@@ -79,8 +76,7 @@ def _desired(user_id, ws):
             if not _officer_in_term(o, today):
                 continue
             pos = ClubPosition.query.get(o.title_id) if o.title_id else None
-            rank = pos.sort_rank if pos else LEADER_RANK_MIN
-            if rank >= LEADER_RANK_MIN:
+            if is_group_position(pos):    # 职位缺失按组长类兜底（club_rules 单源）
                 return ('coordinator', 'officer', o.id)
         for o in ClubOfficer.query.filter_by(user_id=user_id).all():
             if _officer_in_term(o, today):
@@ -95,10 +91,10 @@ def _desired(user_id, ws):
         if not _officer_in_term(o, today):
             continue
         pos = ClubPosition.query.get(o.title_id) if o.title_id else None
-        rank = pos.sort_rank if pos else LEADER_RANK_MIN    # 无职位定义按组长类兜底
-        if rank >= LEADER_RANK_MIN and coord is None:
+        # 职位缺失按组长类兜底；类别判定收敛 club_rules（原 rank 阈值口径不变）
+        if is_group_position(pos) and coord is None:
             coord = o
-        elif rank < LEADER_RANK_MIN and member_off is None:
+        elif is_club_position(pos) and member_off is None:
             member_off = o
     if coord is not None:
         return ('coordinator', 'officer', coord.id)

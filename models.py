@@ -2749,12 +2749,15 @@ class ClubGroup(db.Model):
 
 class ClubPosition(db.Model):
     """职位定义：规则字段全部可配（原硬编码 R1-R4 语义转字段）。
+    org_slot 类别显式化（migrate_70）：club=社团职务（全社治理，社长/副社长/团支书类）/
+    group=组内职位（组长类，每组各一）；空=按 sort_rank 兜底（services/club_rules.py 单源）。
     group_rule 挂组约束；per_group_limit 同组同时在任上限（0=不限）；global_limit 全社上限（0=不限）；
     sort_rank 排序+徽标优先级（小=高；列名避开 MySQL 保留字 rank）；badge_tier 徽标样式层；
     badge_with_group 徽标是否拼组段。"""
     __tablename__ = 'club_position'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(30), nullable=False, unique=True)
+    org_slot = db.Column(db.String(10))                             # club / group；空=按 sort_rank 派生
     sort_rank = db.Column(db.Integer, nullable=False, default=99)
     badge_tier = db.Column(db.Integer, nullable=False, default=3)     # 1 干事强调 / 2 组长次强调 / 3 组名中性
     badge_with_group = db.Column(db.Boolean, nullable=False, default=False)

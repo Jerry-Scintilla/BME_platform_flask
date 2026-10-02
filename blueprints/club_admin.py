@@ -1,10 +1,12 @@
-"""社团身份体系·后台配置蓝图（设计方案 §4.2）：组别 / 职位 / 归属 三组资源。
+"""社团身份体系·后台配置蓝图（设计方案 §4.2）：组别 / 职位 / 归属 三组资源 + 组工作台端点。
 
 组别 club_group：树状 CRUD。改名自由（id 键控零迁移）；挪父校验无环 + 深度 ≤4；
 归档条件 = 无 active 任职 + 无归属（含 secondary）+ 无 active 子组；删除仅零引用。
-职位 club_position：规则字段 CRUD。收紧规则时校验存量 active 任职不违例；
-退役条件 = 无 active 任职；删除仅零引用。
+职位 club_position：规则字段 CRUD（含 org_slot 类别 club=社团职务/group=组内职位，
+migrate_70）。收紧规则时校验存量 active 任职不违例；退役条件 = 无 active 任职；删除仅零引用。
 归属 club_membership：单人两槽编辑（primary/secondary 互斥同组禁止、组须 active）+ 批量导入（逐项回报）。
+组工作台（2026-10-02 改版）：GET groups/<id>/detail 组维度聚合（组长槽/分管/成员表），
+POST groups/<id>/leader 原子换组长（卸旧任新 + 可选同步主要归属，补设计方案 §3.5）。
 
 权限与 officers 一致：system_management；写操作过 audit_log。
 """
@@ -15,8 +17,12 @@ from flask_jwt_extended import jwt_required
 
 from exts import db
 from models import UserModel, ClubGroup, ClubPosition, ClubOfficer, ClubMembership
+from services.club_rules import (ORG_SLOTS, ORG_SLOT_GROUP, is_club_position,
+                                 is_group_position, position_org_slot,
+                                 default_leader_position_id)
 from services.work import provisioning
 from . import check_permission, audit_log, _current_user
+from .officers import (_parse_term_start, _validate_appointment, _officer_dict)
 from services.work.events import record_org_event
 
 bp = Blueprint("club_admin", __name__, url_prefix="/admin/club")
@@ -224,7 +230,8 @@ def delete_group(gid):
 
 def _pos_dict(p):
     return {
-        "id": p.id, "name": p.name, "sort_rank": p.sort_rank,
+        "id": p.id, "name": p.name, "org_slot": position_org_slot(p),
+        "sort_rank": p.sort_rank,
         "badge_tier": p.badge_tier, "badge_with_group": bool(p.badge_with_group),
         "group_rule": p.group_rule, "per_group_limit": p.per_group_limit,
         "global_limit": p.global_limit, "status": p.status,
@@ -260,8 +267,19 @@ def _parse_position_payload(data, current=None):
             return None, (jsonify({"code": 400,
                                    "message": f"group_rule 仅支持 {'/'.join(GROUP_RULES)}"}), 400)
         fields["group_rule"] = data["group_rule"]
+    if "org_slot" in data:
+        if data["org_slot"] not in ORG_SLOTS:
+            return None, (jsonify({"code": 400,
+                                   "message": f"org_slot 仅支持 {'/'.join(ORG_SLOTS)}（缺省按 sort_rank 派生）"}), 400)
+        fields["org_slot"] = data["org_slot"]
     if "badge_with_group" in data:
         fields["badge_with_group"] = bool(data["badge_with_group"])
+    # 组内职位（组长类）天然挂在组上，与 forbidden 自相矛盾
+    merged_rule = fields.get("group_rule", current.group_rule if current else 'optional')
+    merged_slot = fields.get("org_slot", current.org_slot if current else None)
+    if merged_slot == ORG_SLOT_GROUP and merged_rule == 'forbidden':
+        return None, (jsonify({"code": 400,
+                               "message": "组内职位不能设为不挂组（forbidden）"}), 400)
     return fields, None
 
 
@@ -307,6 +325,7 @@ def create_position():
         return err
     p = ClubPosition(**{
         "name": fields["name"],
+        "org_slot": fields.get("org_slot"),          # 缺省 None=按 sort_rank 派生
         "sort_rank": fields.get("sort_rank", 99),
         "badge_tier": fields.get("badge_tier", 3),
         "badge_with_group": fields.get("badge_with_group", False),
@@ -409,6 +428,60 @@ def get_membership(user_id):
     return jsonify({"code": 200, "message": "获取归属成功", "data": data})
 
 
+def _apply_membership_slots(user_id, slots, operator_id, event='归属变更'):
+    """槽位写入核心（set_membership 与组工作台 leader 端点共用）。
+
+    slots 只含要动的槽：{slot: ClubGroup|None}（None=清除该槽）。含两槽互斥校验
+    （传入槽之间 + 与未传入的现有槽）、覆盖写、joined_at 刷新、组织事件留痕、
+    授权联动（§3.2）；只写 session 不 commit，由调用方提交。
+    校验不过抛 ValueError（中文消息）；返回 org_changes（空列表=无变化）。"""
+    if ("primary" in slots and "secondary" in slots
+            and slots["primary"] and slots["secondary"]
+            and slots["primary"].id == slots["secondary"].id):
+        raise ValueError("主要组与次要组不能是同一个组")
+    existing = {m.slot: m for m in ClubMembership.query.filter_by(user_id=user_id).all()}
+    other_names = {"primary": "次要组", "secondary": "主要组"}
+    for field, g in slots.items():
+        other = "secondary" if field == "primary" else "primary"
+        if (g and other in existing and existing[other]
+                and existing[other].group_id == g.id and other not in slots):
+            raise ValueError(f"与现有{other_names[field]}相同，不能同组")
+
+    # 组织变更留痕（内部工作台 §3.3）：归属原地覆盖无历史，变更前后同事务落事件
+    org_changes = []
+    for field, g in slots.items():
+        row = existing.get(field)
+        old_gid = row.group_id if row else None
+        new_gid = g.id if g else None
+        if old_gid != new_gid:
+            org_changes.append({'slot': field, 'membership_id': row.id if row else None,
+                                'from_group_id': old_gid, 'to_group_id': new_gid})
+
+    for field, g in slots.items():
+        row = existing.get(field)
+        if g is None:
+            if row:
+                db.session.delete(row)
+        elif row:
+            row.group_id = g.id
+            row.joined_at = date.today()
+        else:
+            db.session.add(ClubMembership(user_id=user_id, group_id=g.id,
+                                          slot=field, joined_at=date.today()))
+    if org_changes:
+        first = org_changes[0]
+        record_org_event('membership_set', user_id=user_id,
+                         membership_id=first['membership_id'],
+                         from_group_id=first['from_group_id'],
+                         to_group_id=first['to_group_id'],
+                         operator_id=operator_id,
+                         detail={'changes': org_changes})
+        # 授权自动化：归属变更即派生/迁移授权（旧组新组各重算，同事务，方案 §3.2）
+        gids = [c[k] for c in org_changes for k in ('from_group_id', 'to_group_id')]
+        provisioning.sync_after_membership(user_id, gids, operator_id, event=event)
+    return org_changes
+
+
 @bp.route("/membership/<int:user_id>", methods=["PUT"])
 @jwt_required()
 @check_permission('system_management')
@@ -433,54 +506,11 @@ def set_membership(user_id):
         else:
             slots[field] = res
 
-    if ("primary" in slots and "secondary" in slots
-            and slots["primary"] and slots["secondary"]
-            and slots["primary"].id == slots["secondary"].id):
-        return jsonify({"code": 400, "message": "主要组与次要组不能是同一个组"}), 400
-    # 与未传入的另一槽比对
-    existing = {m.slot: m for m in ClubMembership.query.filter_by(user_id=user_id).all()}
-    other_names = {"primary": "次要组", "secondary": "主要组"}
-    for field, g in slots.items():
-        other = "secondary" if field == "primary" else "primary"
-        if (g and other in existing and existing[other]
-                and existing[other].group_id == g.id and other not in slots):
-            return jsonify({"code": 400,
-                            "message": f"与现有{other_names[field]}相同，不能同组"}), 400
-
-    # 组织变更留痕（内部工作台 §3.3）：归属原地覆盖无历史，变更前后同事务落事件
-    org_changes = []
-    for field, g in slots.items():
-        row = existing.get(field)
-        old_gid = row.group_id if row else None
-        new_gid = g.id if g else None
-        if old_gid != new_gid:
-            org_changes.append({'slot': field, 'membership_id': row.id if row else None,
-                                'from_group_id': old_gid, 'to_group_id': new_gid})
-
-    for field, g in slots.items():
-        row = existing.get(field)
-        if g is None:
-            if row:
-                db.session.delete(row)
-        elif row:
-            row.group_id = g.id
-            row.joined_at = date.today()
-        else:
-            db.session.add(ClubMembership(user_id=user_id, group_id=g.id,
-                                          slot=field, joined_at=date.today()))
-    if org_changes:
-        current = _current_user()
-        first = org_changes[0]
-        record_org_event('membership_set', user_id=user_id,
-                         membership_id=first['membership_id'],
-                         from_group_id=first['from_group_id'],
-                         to_group_id=first['to_group_id'],
-                         operator_id=current.id if current else None,
-                         detail={'changes': org_changes})
-        # 授权自动化：归属变更即派生/迁移授权（旧组新组各重算，同事务，方案 §3.2）
-        gids = [c[k] for c in org_changes for k in ('from_group_id', 'to_group_id')]
-        provisioning.sync_after_membership(user_id, gids,
-                                           current.id if current else None, event='归属变更')
+    try:
+        _apply_membership_slots(user_id, slots,
+                                _current_user().id if _current_user() else None)
+    except ValueError as e:
+        return jsonify({"code": 400, "message": str(e)}), 400
     db.session.commit()
     return jsonify({"code": 200, "message": f"已更新 {user.username} 的组归属"})
 
@@ -583,3 +613,205 @@ def batch_membership():
     db.session.commit()
     return jsonify({"code": 200, "message": f"批量归属完成：{ok} 成功 / {rejected} 拒绝",
                     "data": {"results": results, "ok": ok, "rejected": rejected}})
+
+
+# ────────────────────────
+# 组工作台（2026-10-02 改版：组为中心管理）
+# ────────────────────────
+
+def _member_row(u, m, slot, title, officer_id=0, is_leader=False):
+    """组工作台成员行：m 为 ClubMembership 行（组长无归属行时为 None，joined_at 空）。"""
+    from .media import public_avatar_url
+    return {
+        "user_id": u.id, "username": u.username,
+        "avatar": public_avatar_url(u.avatar_url) if u.avatar_url else None,
+        "slot": slot, "title": title, "is_leader": is_leader,
+        "officer_id": officer_id,
+        "joined_at": m.joined_at.isoformat() if (m and m.joined_at) else None,
+    }
+
+
+@bp.route("/groups/<int:gid>/detail", methods=["GET"])
+@jwt_required()
+@check_permission('system_management')
+def group_detail(gid):
+    """组工作台聚合：组信息 + 组长类职位槽位（含空缺）+ 分管位 + 成员表（组长置顶）。
+    归档组可读（管理口径，操作由前端禁用）。"""
+    g = ClubGroup.query.get(gid)
+    if not g:
+        return jsonify({"code": 404, "message": "组不存在"}), 404
+
+    positions = {p.id: p for p in ClubPosition.query.filter_by(status='active').all()}
+    officers = ClubOfficer.query.filter_by(group_id=gid, status='active').all()
+    memberships = ClubMembership.query.filter_by(group_id=gid).all()
+
+    user_ids = ({o.user_id for o in officers} | {m.user_id for m in memberships})
+    users = ({u.id: u for u in UserModel.query.filter(UserModel.id.in_(user_ids)).all()}
+             if user_ids else {})
+
+    # 组长类槽位：org_slot=group 的 active 职位按 rank 升序，附该组在任者（含空缺）
+    officers_by_title = {}
+    for o in officers:
+        officers_by_title.setdefault(o.title_id, []).append(o)
+    group_positions = sorted((p for p in positions.values() if is_group_position(p)),
+                             key=lambda p: (p.sort_rank, p.id))
+    leader_slots = []
+    leader_holders = []        # (position, officer 行) rank 序，供成员表置顶
+    for p in group_positions:
+        holders = sorted(officers_by_title.get(p.id, []), key=lambda o: o.id)
+        leader_slots.append({
+            "position": {"id": p.id, "name": p.name, "org_slot": ORG_SLOT_GROUP,
+                         "sort_rank": p.sort_rank, "badge_tier": p.badge_tier,
+                         "per_group_limit": p.per_group_limit},
+            "officers": [_officer_dict(o, users.get(o.user_id), positions) for o in holders],
+            "vacant": not holders,
+        })
+        leader_holders.extend((p, o) for o in holders)
+
+    # 分管位：社团职务（club 类）挂本组的在任行
+    overseers = [_officer_dict(o, users.get(o.user_id), positions)
+                 for o in sorted(officers, key=lambda o: (
+                     positions[o.title_id].sort_rank if o.title_id in positions else 99, o.id))
+                 if o.title_id in positions and is_club_position(positions[o.title_id])]
+
+    # 成员表：组长类在任者置顶（无归属行也补位，与组织页口径一致）+ 归属行（primary 前）
+    title_by_user = {}
+    for o in ClubOfficer.query.filter_by(status='active').all():
+        pos = positions.get(o.title_id)
+        if pos and o.user_id not in title_by_user:
+            title_by_user[o.user_id] = pos.name
+    member_rows = []
+    seen = set()
+    for p, o in leader_holders:
+        u = users.get(o.user_id)
+        if not u or u.id in seen:
+            continue
+        seen.add(u.id)
+        member_rows.append(_member_row(u, None, "primary", p.name, o.id, True))
+    for m in sorted(memberships, key=lambda m: (0 if m.slot == 'primary' else 1, m.id)):
+        u = users.get(m.user_id)
+        if not u or u.id in seen:
+            continue
+        seen.add(u.id)
+        member_rows.append(_member_row(u, m, m.slot, title_by_user.get(u.id)))
+
+    counts = {
+        "primary": sum(1 for m in memberships if m.slot == 'primary'),
+        "secondary": sum(1 for m in memberships if m.slot == 'secondary'),
+        "total": len(member_rows),
+    }
+    return jsonify({"code": 200, "message": "获取组详情成功", "data": {
+        "group": _group_dict(g),
+        "leader_slots": leader_slots,
+        "overseers": overseers,
+        "members": member_rows,
+        "counts": counts,
+        "default_position_id": default_leader_position_id(),
+    }})
+
+
+@bp.route("/groups/<int:gid>/leader", methods=["POST"])
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation="组工作台任命组长")
+def appoint_group_leader(gid):
+    """原子换组长：body {user_id, position_id?, term_start?, sync_primary?=true, end_reason?}。
+
+    position_id 缺省=组内职位 sort_rank 最小者（组长类主职）；先卸该 (职位,组) 现任
+    （end_reason 默认「组长更替」，留痕照旧）再任新，校验复用 officers 语义
+    （现任行豁免——本人连任即任期重置）；sync_primary=true 时同步把主要归属迁到
+    本组（设计方案 §3.5 欠账；次要槽已占本组时自动让位清除）。"""
+    g = ClubGroup.query.get(gid)
+    if not g:
+        return jsonify({"code": 404, "message": "组不存在"}), 404
+    if g.status != 'active':
+        return jsonify({"code": 400, "message": "组已归档，不能任命组长"}), 400
+    data = request.get_json(silent=True) or {}
+    user = UserModel.query.get(int(data.get("user_id") or 0))
+    if not user:
+        return jsonify({"code": 404, "message": "用户不存在"}), 404
+
+    # 职位解析：显式传入须组内职位；缺省取组长类主职
+    if data.get("position_id"):
+        pos = ClubPosition.query.get(int(data["position_id"]))
+        if not pos or pos.status != 'active':
+            return jsonify({"code": 404, "message": "职位不存在或已退役"}), 404
+        if not is_group_position(pos):
+            return jsonify({"code": 400, "message": f"{pos.name} 是社团职务，不是组内职位"}), 400
+    else:
+        pid = default_leader_position_id()
+        if not pid:
+            return jsonify({"code": 400, "message": "尚未定义组内职位，请先在「职位定义」创建"}), 400
+        pos = ClubPosition.query.get(pid)
+    if pos.group_rule == 'forbidden':
+        return jsonify({"code": 400, "message": f"{pos.name} 配置为不挂组，与组长任命冲突"}), 400
+
+    term_start, terr = _parse_term_start(data.get("term_start"))
+    if terr:
+        return jsonify({"code": 400, "message": terr}), 400
+
+    current = _current_user()
+    # D5 留白入口（P2-8）：任职属人员业务写——merged 账号不再新增任职（与 appoint_officer 同款）
+    from services.identity import enforcement as _enf
+    _ok, _why = _enf.guard_business_write(user, 'club_officer')
+    if not _ok:
+        return jsonify({"code": 409, "message": _why}), 409
+
+    incumbents = (ClubOfficer.query.filter_by(
+        title_id=pos.id, group_id=gid, status='active').order_by(ClubOfficer.id).all())
+
+    # 校验先行（现任行豁免：即将被卸任/本人连任），失败不落任何变更
+    verr = _validate_appointment(user.id, pos, g, exclude_ids=[i.id for i in incumbents])
+    if verr:
+        return jsonify({"code": verr[0], "message": verr[1]}), verr[0]
+
+    # 卸现任（状态化留痕）→ 授权联动逐个重算
+    ended_dict = None
+    for inc in incumbents:
+        inc.status = 'ended'
+        inc.term_end = date.today()
+        inc.end_reason = (str(data.get("end_reason") or "").strip() or '组长更替')
+        inc.ended_by = current.id if current else None
+        record_org_event('officer_ended', user_id=inc.user_id, officer_id=inc.id,
+                         from_group_id=gid, operator_id=current.id if current else None,
+                         detail={'term_end': str(inc.term_end), 'reason': inc.end_reason})
+        provisioning.sync_after_officer(inc.user_id, gid, None,
+                                        current.id if current else None, event='组长更替')
+        if ended_dict is None:
+            ended_dict = _officer_dict(inc, UserModel.query.get(inc.user_id), {pos.id: pos})
+
+    officer = ClubOfficer(
+        user_id=user.id,
+        title_id=pos.id, title=pos.name,
+        group_id=gid, department=g.name,
+        term_start=term_start, status='active',
+        appointed_by=current.id if current else None,
+    )
+    db.session.add(officer)
+    db.session.flush()          # 拿 id 供组织事件留痕
+    record_org_event('officer_appointed', user_id=user.id, officer_id=officer.id,
+                     to_group_id=gid, operator_id=current.id if current else None,
+                     detail={'title': pos.name, 'via': 'group_workspace'})
+    provisioning.sync_after_officer(user.id, None, gid,
+                                    current.id if current else None, event='组长更替')
+
+    # §3.5 便利默认：同步把主要归属迁到本组（次要槽撞本组时让位清除）
+    primary_moved = False
+    if data.get("sync_primary", True):
+        existing = {m.slot: m for m in ClubMembership.query.filter_by(user_id=user.id).all()}
+        if existing.get("primary") is None or existing["primary"].group_id != gid:
+            slots = {"primary": g}
+            if existing.get("secondary") and existing["secondary"].group_id == gid:
+                slots["secondary"] = None
+            try:
+                primary_moved = bool(_apply_membership_slots(
+                    user.id, slots, current.id if current else None, event='组长就任'))
+            except ValueError as e:
+                db.session.rollback()
+                return jsonify({"code": 400,
+                                "message": f"同步主要归属失败：{e}"}), 400
+
+    db.session.commit()
+    return jsonify({"code": 200, "message": f"已任命 {user.username} 为 {pos.name} · {g.name}",
+                    "data": {"leader": _officer_dict(officer, user, {pos.id: pos}),
+                             "ended": ended_dict, "primary_moved": primary_moved}})

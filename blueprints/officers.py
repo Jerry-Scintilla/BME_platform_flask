@@ -20,13 +20,11 @@ from flask_jwt_extended import jwt_required
 from exts import db
 from models import UserModel, ClubOfficer, ClubPosition, ClubGroup, ClubMembership
 from . import check_permission, audit_log, _current_user
+from services.club_rules import ORG_SLOT_CLUB, ORG_SLOT_GROUP, position_org_slot
 from services.work.events import record_org_event
 from services.work import provisioning
 
 bp = Blueprint("officers", __name__, url_prefix="/admin/officers")
-
-# 管理层阈值（组织架构页顶部区判定，与 organization.py 同源）
-MANAGEMENT_RANK_MAX = 9
 
 from .media import public_avatar_url as _avatar_url     # 新链路 /media/，旧值兜底 /data/avatars/
 
@@ -77,23 +75,27 @@ def _resolve_group(data):
 # 校验（任命与编辑共用）
 # ────────────────────────────────
 
-def _validate_appointment(user_id, pos, group, exclude_id=None):
-    """读职位规则校验，通过返回 None，否则返回 (错误码, 中文原因)。"""
+def _validate_appointment(user_id, pos, group, exclude_ids=None):
+    """读职位规则校验，通过返回 None，否则返回 (错误码, 中文原因)。
+    exclude_ids：豁免行（编辑自身 / 组工作台换组长豁免即将卸任的现任行）。"""
+    exclude_ids = list(exclude_ids) if exclude_ids else None
+
     # group_rule
     if pos.group_rule == 'forbidden' and group:
         return 400, f"{pos.name}不挂组"
     if pos.group_rule == 'required' and not group:
         return 400, f"{pos.name}必须归属一个组"
 
-    # 一人至多 1 条 active
+    # 一人至多 1 条 active（消息带现任职名，方便前端引导先卸任）
     mine = ClubOfficer.query.filter(
         ClubOfficer.user_id == user_id,
         ClubOfficer.status == 'active',
     )
-    if exclude_id:
-        mine = mine.filter(ClubOfficer.id != exclude_id)
-    if mine.first():
-        return 409, "该成员已有在任职位（一人至多一职）"
+    if exclude_ids:
+        mine = mine.filter(~ClubOfficer.id.in_(exclude_ids))
+    hit = mine.first()
+    if hit:
+        return 409, f"该成员已有在任职位（{hit.title}，一人至多一职）"
 
     # per_group_limit：同职位同组同时在任
     if pos.per_group_limit:
@@ -102,8 +104,8 @@ def _validate_appointment(user_id, pos, group, exclude_id=None):
             ClubOfficer.group_id == (group.id if group else None),
             ClubOfficer.status == 'active',
         )
-        if exclude_id:
-            q1 = q1.filter(ClubOfficer.id != exclude_id)
+        if exclude_ids:
+            q1 = q1.filter(~ClubOfficer.id.in_(exclude_ids))
         dup = q1.first()
         if dup:
             holder = UserModel.query.get(dup.user_id)
@@ -117,8 +119,8 @@ def _validate_appointment(user_id, pos, group, exclude_id=None):
             ClubOfficer.title_id == pos.id,
             ClubOfficer.status == 'active',
         )
-        if exclude_id:
-            q2 = q2.filter(ClubOfficer.id != exclude_id)
+        if exclude_ids:
+            q2 = q2.filter(~ClubOfficer.id.in_(exclude_ids))
         if q2.count() >= pos.global_limit:
             return 409, f"{pos.name} 编制已满（{pos.global_limit} 名）"
 
@@ -218,8 +220,8 @@ def public_groups(user_id):
     return data
 
 
-def _officer_dict(o, user=None):
-    """admin 列表行形态（含治理字段；名/id 双份）"""
+def _officer_dict(o, user=None, positions=None):
+    """admin 列表行形态（含治理字段；名/id 双份；positions 传入时附 org_slot）"""
     return {
         "id": o.id,
         "user_id": o.user_id,
@@ -227,6 +229,8 @@ def _officer_dict(o, user=None):
         "avatar": _avatar_url(user.avatar_url) if user else "",
         "title": o.title,
         "title_id": o.title_id,
+        "org_slot": (position_org_slot(positions.get(o.title_id))
+                     if positions else None),
         "department": o.department,
         "group_id": o.group_id,
         "term_start": o.term_start.isoformat() if o.term_start else None,
@@ -245,13 +249,14 @@ def _officer_dict(o, user=None):
 @jwt_required()
 @check_permission('system_management')
 def list_officers():
-    """任职列表：分页 + status(active/ended/all) + 关键词（姓名/职位/组）"""
+    """任职列表：分页 + status(active/ended/all) + slot(club/group/all) + 关键词（姓名/职位/组）"""
     try:
         page = max(1, int(request.args.get("page", 1)))
         per_page = min(100, max(1, int(request.args.get("per_page", 20))))
     except ValueError:
         page, per_page = 1, 20
     status = request.args.get("status", "all")          # active / ended / all
+    slot = request.args.get("slot", "all")              # club / group / all（职位类别过滤）
     q = (request.args.get("q") or "").strip()
 
     query = ClubOfficer.query
@@ -273,6 +278,8 @@ def list_officers():
     rows = query.all()
     # 在任在前、职位 rank 序、新任命在前（数据量小，内存排序后分页）
     ranks = _rank_map()
+    if slot in (ORG_SLOT_CLUB, ORG_SLOT_GROUP):
+        rows = [r for r in rows if position_org_slot(ranks.get(r.title_id)) == slot]
     rows.sort(key=lambda r: (
         r.status != 'active',
         ranks[r.title_id].sort_rank if r.title_id in ranks else 99,
@@ -292,7 +299,7 @@ def list_officers():
         "code": 200,
         "message": "获取任职列表成功",
         "data": {
-            "officers": [_officer_dict(r, user_map.get(r.user_id)) for r in rows],
+            "officers": [_officer_dict(r, user_map.get(r.user_id), ranks) for r in rows],
             "total": total,
             "page": page,
             "per_page": per_page,
@@ -354,7 +361,7 @@ def appoint_officer():
                                     current.id if current else None, event='任命')
     db.session.commit()
     return jsonify({"code": 200, "message": f"已任命 {user.username} 为 {pos.name}",
-                    "data": _officer_dict(officer, user)})
+                    "data": _officer_dict(officer, user, {pos.id: pos})})
 
 
 @bp.route("/batch", methods=["POST"])
@@ -479,7 +486,7 @@ def edit_officer(officer_id):
         if err:
             return err
 
-        verr = _validate_appointment(officer.user_id, pos, group, exclude_id=officer.id)
+        verr = _validate_appointment(officer.user_id, pos, group, exclude_ids=[officer.id])
         if verr:
             return jsonify({"code": verr[0], "message": verr[1]}), verr[0]
 
@@ -519,7 +526,8 @@ def edit_officer(officer_id):
                                     current.id if current else None, event='任职编辑')
     db.session.commit()
     user = UserModel.query.get(officer.user_id)
-    return jsonify({"code": 200, "message": "任职信息已更新", "data": _officer_dict(officer, user)})
+    return jsonify({"code": 200, "message": "任职信息已更新",
+                    "data": _officer_dict(officer, user, _rank_map())})
 
 
 @bp.route("/<int:officer_id>/end", methods=["POST"])
@@ -562,4 +570,5 @@ def end_officer(officer_id):
                                     current.id if current else None, event='卸任')
     db.session.commit()
     user = UserModel.query.get(officer.user_id)
-    return jsonify({"code": 200, "message": "已卸任（记录保留）", "data": _officer_dict(officer, user)})
+    return jsonify({"code": 200, "message": "已卸任（记录保留）",
+                    "data": _officer_dict(officer, user, _rank_map())})

@@ -63,6 +63,9 @@ run scripts/migrate/migrate_67_external_roster.py
 run scripts/migrate/migrate_68_auxiliary_permissions.py
 # 审计转办根因修（2026-10-02）：D1 会话四表 user 外键改 ON DELETE CASCADE
 run scripts/migrate/migrate_69_auth_fk_cascade.py
+# 社团组织管理改版（2026-10-02）：club_position 加 org_slot（club/group 两类职位，
+# 可空+sort_rank 回填，行为零变化）；判定单源 services/club_rules.py
+run scripts/migrate/migrate_70_club_position_org_slot.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else
