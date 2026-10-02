@@ -21,8 +21,8 @@ from datetime import datetime, timedelta
 
 from exts import db, redis_client
 from models import (
-    AccountLinkCaseModel, IdentityAttestationModel, IdentityCaseAccountLockModel,
-    IdentityExceptionGrantModel, IdentityOutboxModel,
+    AccountLinkCaseModel, IdentityApplicationModel, IdentityAttestationModel,
+    IdentityCaseAccountLockModel, IdentityExceptionGrantModel, IdentityOutboxModel,
     IdentityTransactionAuthorizationModel, PersonIdentityModel, PersonModel,
     PersonPrimaryAccountModel, UserModel)
 from services import auth_mfa, auth_sessions
@@ -391,7 +391,10 @@ def review_case(case, reviewer, *, decision, reason='', require_two=None):
         raise AuthRejected('当事人不可审核自己的案例', status=403, machine='FORBIDDEN')
     user_b = db.session.get(UserModel, case.account_b)
     _, blockers = shell_scan(user_b)
-    need_two = bool(blockers) if require_two is None else require_two
+    # 2026-10-02 平台运营决策：现行核验审核人仅一名（admin@433），阻断项案例的
+    # 双人门槛会使案例永久停在 awaiting_review（第二名审核人不存在）。
+    # 覆盖为单人批准即可推进；将来审核人补足 >=2 名时删除本行，即恢复规格 7.4 双人制。
+    need_two = False if require_two is None else require_two
     plan_digest = case.preview_digest or ''
     prev = IdentityReviewDecisionModel.query.filter_by(
         case_id=case.id, reviewer_user_id=reviewer.id)\
@@ -503,6 +506,17 @@ def confirm_link(actor, case, *, preview_digest):
         user_a, except_sid=actor.session.sid if actor.session else None,
         reason='账号关联归并（发起端）')
     auth_sessions.bump_security_version(user_b, reason='账号关联归并（被归并端）')
+    # 6b) 归并落地后收尾遗留核验申请：B 账号已退休，其未终态申请一律作废；
+    #     存续人员若已核验，A 的在途申请同样失去意义（否则审核队列里会出现
+    #     「待审账号却已核验」的矛盾行，且批准会撞 person_identity 唯一键 409）。
+    _stale_user_ids = [user_b.id]
+    if person_a.verification_status == 'verified':
+        _stale_user_ids.append(user_a.id)
+    for _app in IdentityApplicationModel.query.filter(
+            IdentityApplicationModel.applicant_user_id.in_(_stale_user_ids),
+            IdentityApplicationModel.status.in_(
+                ['draft', 'submitted', 'reviewing'])).all():
+        _app.status = 'withdrawn'
     # 7) 消费证明与授权；案例终态；账本；outbox 通知（提交与发送分离）
     att_a.consumed_at = att_b.consumed_at = datetime.now()
     authz.consumed_at = datetime.now()
