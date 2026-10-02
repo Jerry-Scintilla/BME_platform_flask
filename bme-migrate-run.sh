@@ -57,6 +57,8 @@ run scripts/migrate/migrate_65_identity_link.py
 # D5 参与锚点（2026-10-02）：camp_member/camp_unit_member 三元组唯一键前置 + 锚点四表；
 # 影子登记与 veto 提升随后跑 scripts/backfill_person_participation.py --apply
 run scripts/migrate/migrate_66_person_participation.py
+# D3c 外校名册 + 恢复申诉骨架（2026-10-02）：名册/邀请/恢复三表 + external:scuec 种子
+run scripts/migrate/migrate_67_external_roster.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else

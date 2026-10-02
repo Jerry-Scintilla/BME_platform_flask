@@ -378,6 +378,7 @@ class IdentityApplicationModel(db.Model):
     claimed_identifier = db.Column(db.String(191), nullable=False)   # NetID 声明
     contact_email = db.Column(db.String(191), nullable=False)        # 归一化后
     method = db.Column(db.String(30), nullable=False, server_default='school_email')
+    roster_id = db.Column(db.Integer)  # 名册条目回链（method='roster'，migrate_67）
     status = db.Column(db.String(20), nullable=False, server_default='draft')
     challenge_verified_at = db.Column(db.DateTime)
     reviewed_by = db.Column(db.Integer)
@@ -401,10 +402,10 @@ class IdentityChallengeModel(db.Model):
     消费后不可再用（consumed_at）。"""
     __tablename__ = 'identity_challenge'
     id = db.Column(db.String(64), primary_key=True)          # uuid4().hex
-    purpose = db.Column(db.String(30), nullable=False)       # school_identity
+    purpose = db.Column(db.String(30), nullable=False)       # school_identity/roster_claim/recovery_claim
     application_id = db.Column(db.Integer)
     case_id = db.Column(db.String(64))
-    actor_user_id = db.Column(db.Integer, nullable=False)
+    actor_user_id = db.Column(db.Integer)  # 可空：公开流程（恢复申诉）无登录者（migrate_67 放宽）
     target_user_id = db.Column(db.Integer)
     destination_digest = db.Column(db.String(64), nullable=False)
     secret_digest = db.Column(db.String(64), nullable=False)
@@ -606,6 +607,75 @@ class IdentityExceptionGrantModel(db.Model):
     __table_args__ = (
         db.Index('idx_ieg_lookup', 'operation_scope', 'scope_id', 'state', 'valid_until'),
         db.Index('idx_ieg_person', 'person_id'),
+    )
+
+
+# ── D3c 外校名册 + 恢复申诉骨架（migrate_67，规格 5.2/7.4）──
+
+class IdentityRosterModel(db.Model):
+    """外校名册条目：负责人导入已确认名单。UNIQUE(school_id, roster_ref)——批次
+    可变、人员不因新批次重建（按稳定引用码 upsert）；认领并核验后绑定
+    claimed_person_id，后续来访/新批次找回同一 Person（规格 5.2）。"""
+    __tablename__ = 'identity_roster'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    school_id = db.Column(db.String(32), db.ForeignKey(
+        'identity_school_config.school_id'), nullable=False)
+    roster_ref = db.Column(db.String(64), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    contact_email = db.Column(db.String(191), nullable=False)
+    institution_id = db.Column(db.String(64))
+    owner_user_id = db.Column(db.Integer, nullable=False)
+    scope_note = db.Column(db.String(255))
+    claimed_person_id = db.Column(db.Integer)
+    claimed_at = db.Column(db.DateTime)
+    status = db.Column(db.String(20), nullable=False, server_default='active')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        db.UniqueConstraint('school_id', 'roster_ref', name='uq_roster_ref'),
+        db.Index('idx_roster_claim', 'claimed_person_id'),
+    )
+
+
+class IdentityRosterInviteModel(db.Model):
+    """外校认领邀请：绑定具体条目、一次使用、7 天有效；领取须验证名册联系
+    邮箱的控制权——邀请转发不自动构成核验成功（规格 5.2）。"""
+    __tablename__ = 'identity_roster_invite'
+    id = db.Column(db.String(64), primary_key=True)
+    roster_id = db.Column(db.Integer, db.ForeignKey('identity_roster.id'), nullable=False)
+    issued_by = db.Column(db.Integer, nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_rinv_roster', 'roster_id', 'used_at'),
+    )
+
+
+class IdentityRecoveryCaseModel(db.Model):
+    """账号/因素恢复案例骨架（规格 7.4）：公开提交（统一话术+邮箱控制验证）→
+    负责人决策（24h 冷静期；特权/争议 72h+双人复核）→ 执行走既有运维通道
+    （find_password/人工重置），本表承载状态机与审计；成功后撤旧会话由执行
+    步骤的 bump 完成。"""
+    __tablename__ = 'identity_recovery_case'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    kind = db.Column(db.String(20), nullable=False)      # account_lost / factor_lost
+    target_email = db.Column(db.String(191), nullable=False)
+    contact_email = db.Column(db.String(191), nullable=False)
+    contact_verified_at = db.Column(db.DateTime)
+    statement = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), nullable=False, server_default='draft')
+    require_two = db.Column(db.Boolean, nullable=False, server_default='0')
+    cooldown_until = db.Column(db.DateTime)
+    decided_by = db.Column(db.Integer)
+    decided_at = db.Column(db.DateTime)
+    decision_note = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_rc_status', 'status', 'created_at'),
     )
 
 

@@ -13,7 +13,7 @@
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 
-from exts import db
+from exts import db, mail
 from models import IdentityApplicationModel, PersonIdentityModel, UserModel
 from services.auth_context import AuthRejected, current_actor
 from services.identity import events, school, verification
@@ -232,3 +232,130 @@ def update_config(school_id):
     return jsonify({"code": 200, "message": "配置已更新",
                     "config_version": cfg.config_version,
                     "reviewers_ready": cfg.reviewers_ready})
+
+
+# ── D3c 外校名册管理（规格 5.2）──────────────────────────────────
+
+@bp.route("/roster", methods=["GET"])
+@jwt_required()
+@_admin_endpoint
+def roster_list():
+    """名册列表（?school_id= 过滤；含认领状态）。"""
+    _staff_actor()
+    from models import IdentityRosterModel, IdentitySchoolConfigModel
+    q = IdentityRosterModel.query
+    school_id = request.args.get('school_id')
+    if school_id:
+        q = q.filter_by(school_id=school_id)
+    rows = q.order_by(IdentityRosterModel.id.desc()).limit(300).all()
+    names = {c.school_id: c.name for c in IdentitySchoolConfigModel.query.all()}
+    return jsonify({"code": 200, "roster": [{
+        'id': r.id, 'school_id': r.school_id, 'school_name': names.get(r.school_id, r.school_id),
+        'roster_ref': r.roster_ref, 'name': r.name,
+        'contact_email': r.contact_email, 'institution_id': r.institution_id,
+        'claimed_person_id': r.claimed_person_id, 'status': r.status,
+    } for r in rows]})
+
+
+@bp.route("/roster/import", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def roster_import():
+    """导入/更新名册：{school_id, rows:[{roster_ref,name,contact_email,institution_id?}],
+    dry_run?}——按 (school, roster_ref) upsert，人员不因新批次重建（规格 5.2）。"""
+    actor = _staff_actor()
+    payload = request.get_json(silent=True) or {}
+    from services.identity import roster
+    out = roster.import_roster(
+        actor.user, school_id=payload.get('school_id') or '',
+        rows=payload.get('rows') or [], dry_run=bool(payload.get('dry_run')))
+    return jsonify({"code": 200, **out,
+                    "message": "干跑完成，确认后去掉 dry_run 提交" if payload.get('dry_run')
+                    else f"导入完成：新建 {out['created']} / 更新 {out['updated']}"})
+
+
+@bp.route("/roster/<int:roster_id>/invite", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def roster_invite(roster_id):
+    """发认领邀请（一次性令牌 7 天，邮件链接）——旧未用令牌作废。"""
+    actor = _staff_actor()
+    from services.identity import roster
+    invite, link = roster.issue_invite(actor.user, roster_id)
+    from models import IdentityRosterModel
+    entry = db.session.get(IdentityRosterModel, roster_id)
+    try:
+        from flask_mail import Message
+        mail.send(Message(
+            subject='BME 外校身份认领邀请',
+            recipients=[entry.contact_email],
+            body=f'你好 {entry.name}：\n请使用以下链接在 BME 平台完成身份认领'
+                 f'（7 天内有效，一次性使用）：\n{link}\n'
+                 f'如非本人请忽略本邮件。'))
+    except Exception:
+        db.session.rollback()
+        return jsonify({"code": 503, "message": '邮件发送失败，邀请未发出'}), 503
+    db.session.commit()
+    return jsonify({"code": 200, "message": "邀请已发送",
+                    "invite_link": link})
+
+
+# ── D3c 恢复案例管理（规格 7.4）──────────────────────────────────
+
+@bp.route("/recovery-cases", methods=["GET"])
+@jwt_required()
+@_admin_endpoint
+def recovery_queue():
+    _staff_actor()
+    from models import IdentityRecoveryCaseModel
+    status = request.args.get('status') or 'submitted'
+    q = IdentityRecoveryCaseModel.query
+    if status != 'all':
+        q = q.filter(IdentityRecoveryCaseModel.status == status)
+    rows = q.order_by(IdentityRecoveryCaseModel.id.desc()).limit(200).all()
+    return jsonify({"code": 200, "cases": [{
+        'id': c.id, 'kind': c.kind,
+        'target_email': c.target_email, 'contact_email': c.contact_email,
+        'contact_verified': bool(c.contact_verified_at),
+        'statement': c.statement, 'status': c.status, 'require_two': bool(c.require_two),
+        'cooldown_until': c.cooldown_until.strftime('%Y-%m-%d %H:%M') if c.cooldown_until else None,
+        'decision_note': c.decision_note,
+        'created_at': c.created_at.strftime('%Y-%m-%d %H:%M') if c.created_at else None,
+    } for c in rows]})
+
+
+@bp.route("/recovery-cases/<int:case_id>/decision", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def recovery_decision(case_id):
+    """决策：{decision: approved|rejected, note}。特权案例需两名不同审核人。"""
+    actor = _staff_actor()
+    from models import IdentityRecoveryCaseModel
+    from services.identity import recovery
+    case = db.session.get(IdentityRecoveryCaseModel, case_id)
+    if case is None:
+        return jsonify({"code": 404, "message": "案例不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    recovery.decide_case(case, actor.user,
+                         decision=payload.get('decision') or '',
+                         note=payload.get('note') or '')
+    db.session.commit()
+    return jsonify({"code": 200, "state": case.status,
+                    "message": "已记录（待第二复核人）" if case.status == 'submitted'
+                    else "已决策"})
+
+
+@bp.route("/recovery-cases/<int:case_id>/complete", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def recovery_complete(case_id):
+    """冷静期届满后标记执行完毕（凭据重置/撤会话在既有运维通道完成）。"""
+    actor = _staff_actor()
+    from models import IdentityRecoveryCaseModel
+    from services.identity import recovery
+    case = db.session.get(IdentityRecoveryCaseModel, case_id)
+    if case is None:
+        return jsonify({"code": 404, "message": "案例不存在"}), 404
+    recovery.complete_case(case, actor.user)
+    db.session.commit()
+    return jsonify({"code": 200, "state": case.status})

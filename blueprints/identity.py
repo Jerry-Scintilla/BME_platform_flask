@@ -70,7 +70,11 @@ def status():
 @jwt_required()
 @_identity_endpoint
 def create_application():
-    """建/改草稿：{school_id, claimed_name, claimed_identifier, contact_email}。"""
+    """建/改草稿：{school_id, claimed_name, claimed_identifier, contact_email}。
+
+    外校学校（无个人域配置）：claimed_identifier（学号）可选、contact_email
+    任意个人邮箱（服务端强制 method=manual，规格 5.2）。
+    """
     _require_writes_open()
     actor = _actor()
     payload = request.get_json(silent=True) or {}
@@ -346,3 +350,92 @@ def reauth():
     actor.session.auth_time = datetime.now()
     db.session.commit()
     return jsonify({"code": 200, "message": "已完成操作认证（5 分钟内有效）"})
+
+
+# ── D3c 外校名册领取（规格 5.2）──────────────────────────────────
+
+@bp.route("/roster/claim", methods=["POST"])
+@jwt_required()
+@limiter.limit("5/minute")
+@_identity_endpoint
+def roster_claim_start():
+    """领取第一步：{token}（邮件链接携带）→ 向名册联系邮箱发验证码。"""
+    _require_writes_open()
+    actor = _actor()
+    from services.identity import roster
+    payload = request.get_json(silent=True) or {}
+    entry, _invite, code = roster.start_claim(actor.user, payload.get("token") or "")
+    preview = roster.claim_preview(payload.get("token") or "")
+    try:
+        mail.send(Message(subject="BME 外校身份认领验证码",
+                          recipients=[entry.contact_email],
+                          body=f"您的认领验证码是：{code}（5 分钟内有效）。"
+                               f"如非本人操作请忽略本邮件。"))
+    except Exception:
+        db.session.rollback()
+        return jsonify({"code": 503, "message": "邮件发送失败，请稍后重试"}), 503
+    db.session.commit()
+    return jsonify({"code": 200, "message": "验证码已发送至名册联系邮箱",
+                    "preview": preview})
+
+
+@bp.route("/roster/claim/verify", methods=["POST"])
+@jwt_required()
+@limiter.limit("10/minute")
+@_identity_endpoint
+def roster_claim_verify():
+    """领取第二步：{token, code} → 生成名册认领申请（进负责人审核队列）。"""
+    _require_writes_open()
+    actor = _actor()
+    from services.identity import roster
+    payload = request.get_json(silent=True) or {}
+    app = roster.verify_claim(actor.user, payload.get("token") or "",
+                              payload.get("code") or "")
+    db.session.commit()
+    if app is None:
+        return jsonify({"code": 400, "message": "验证码错误或已失效"}), 400
+    return jsonify({"code": 200, "message": "认领申请已提交，等待负责人审核"})
+
+
+# ── D3c 恢复申诉（公开入口，规格 7.4）─────────────────────────────
+
+@bp.route("/recovery-cases", methods=["POST"])
+@limiter.limit("3/hour")
+@_identity_endpoint
+def recovery_submit():
+    """公开提交（无需登录）：{kind, target_email, contact_email, statement}。
+
+    统一响应话术——不回显账号存在性（防枚举）；验证码发至联系邮箱。
+    """
+    payload = request.get_json(silent=True) or {}
+    from services.identity import recovery
+    case, code = recovery.submit_case(
+        kind=payload.get("kind") or "",
+        target_email=payload.get("target_email") or "",
+        contact_email=payload.get("contact_email") or "",
+        statement=payload.get("statement") or "")
+    try:
+        mail.send(Message(subject="BME 账号恢复验证码",
+                          recipients=[case.contact_email],
+                          body=f"您的恢复申请验证码是：{code}（10 分钟内有效）。"
+                               f"如非本人操作请忽略本邮件。"))
+    except Exception:
+        db.session.rollback()
+        return jsonify({"code": 503, "message": "邮件发送失败，请稍后重试"}), 503
+    db.session.commit()
+    return jsonify({"code": 200,
+                    "message": "如信息无误，验证码已发送至你填写的联系邮箱",
+                    "case_id": case.id})
+
+
+@bp.route("/recovery-cases/<int:case_id>/verify", methods=["POST"])
+@limiter.limit("10/minute")
+@_identity_endpoint
+def recovery_verify(case_id):
+    payload = request.get_json(silent=True) or {}
+    from services.identity import recovery
+    ok = recovery.verify_case(case_id, payload.get("code") or "")
+    db.session.commit()
+    if not ok:
+        return jsonify({"code": 400, "message": "验证码错误或已失效"}), 400
+    return jsonify({"code": 200, "message": "已提交，等待负责人审核（统一话术）"})

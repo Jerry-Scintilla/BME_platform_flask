@@ -46,9 +46,14 @@ def _reject_if_verified(user):
 # ── 申请 ────────────────────────────────────────────────────────
 
 def create_or_update_application(user, *, school_id, claimed_name,
-                                 claimed_identifier, contact_email):
+                                 claimed_identifier, contact_email,
+                                 method='school_email'):
     """建/改草稿（不 commit）。同一用户同校仅一个活跃申请；声明变更
-    （标识/邮箱）使既有邮箱证明作废——challenge_verified_at 清零重验。"""
+    （标识/邮箱）使既有邮箱证明作废——challenge_verified_at 清零重验。
+
+    外校路径（D3c，规格 5.2）：学校配置 personal_email_domains 为空 = 无自动
+    域校验——identifier（机构学号）可选、不做 NetID-邮箱映射，凭邮箱控制 +
+    名册/人工核对；method 固定 'manual'。"""
     cfg = school.get_school_config(school_id)
     if user.account_kind in ('service',):
         raise AuthRejected('该类账号不能发起身份核验', status=403, machine='FORBIDDEN')
@@ -58,10 +63,26 @@ def create_or_update_application(user, *, school_id, claimed_name,
     if not name or len(name) > 100:
         raise AuthRejected('请填写待核验姓名', status=400, machine='BAD_CLAIM')
     identifier = (claimed_identifier or '').strip()
-    if not _IDENTIFIER_RE.match(identifier):
-        raise AuthRejected('NetID/学号格式不合法（2-64 位字母数字与 . _ -）',
-                           status=400, machine='BAD_CLAIM')
-    normalized = school.validate_contact_email(cfg, contact_email, identifier)
+    is_external = not (cfg.personal_email_domains or [])
+    if is_external:
+        # 外校：学号可选、无域匹配——仅基础合法性 + 配置的共享域排除（通常为空）
+        method = 'manual'
+        if identifier and not _IDENTIFIER_RE.match(identifier):
+            raise AuthRejected('学号格式不合法（2-64 位字母数字与 . _ -，可选填）',
+                               status=400, machine='BAD_CLAIM')
+        from services.identity.registry import canonicalize
+        try:
+            normalized = canonicalize('email', contact_email or '')
+        except ValueError:
+            raise AuthRejected('请填写有效的联系邮箱', status=400, machine='BAD_CLAIM')
+        if normalized.rpartition('@')[2] in set(cfg.excluded_email_domains or []):
+            raise AuthRejected('该邮箱域不可用于核验，请换个人邮箱或联系负责人',
+                               status=400, machine='EMAIL_DOMAIN_EXCLUDED')
+    else:
+        if not _IDENTIFIER_RE.match(identifier):
+            raise AuthRejected('NetID/学号格式不合法（2-64 位字母数字与 . _ -）',
+                               status=400, machine='BAD_CLAIM')
+        normalized = school.validate_contact_email(cfg, contact_email, identifier)
 
     app = IdentityApplicationModel.query.filter(
         IdentityApplicationModel.applicant_user_id == user.id,
@@ -73,7 +94,7 @@ def create_or_update_application(user, *, school_id, claimed_name,
         action = 'identity.application.create'
         app = IdentityApplicationModel(
             school_id=school_id, applicant_user_id=user.id,
-            applicant_person_id=user.person_id,
+            applicant_person_id=user.person_id, method=method,
             claimed_name=name, claimed_identifier=identifier,
             contact_email=normalized)
         db.session.add(app)
@@ -87,6 +108,7 @@ def create_or_update_application(user, *, school_id, claimed_name,
         app.claimed_name = name
         app.claimed_identifier = identifier
         app.contact_email = normalized
+        app.method = method
     if changed and action != 'identity.application.create':
         app.challenge_verified_at = None  # 声明变了，旧邮箱证明作废（防挪用）
     events.record_event(
@@ -257,16 +279,34 @@ def approve_application(app, reviewer, *, note=''):
         raise AuthRejected('申请人缺少人员档案（数据异常）', status=500,
                            machine='PERSON_MISSING')
     before = {'status': app.status, 'verification_status': person.verification_status}
+    # 身份键种类按申请路径选择（D3c）：本校邮箱→netid；名册认领→roster_ref
+    # （并回绑名册条目，后续批次/来访找回同一人）；外校人工→email（已验控制权）
+    if app.method == 'roster':
+        kind, key, assurance = 'roster_ref', app.claimed_identifier, 'roster'
+        from models import IdentityRosterModel
+        entry = db.session.get(IdentityRosterModel, app.roster_id)
+        if entry is None:
+            raise AuthRejected('名册条目缺失（数据异常）', status=500,
+                               machine='PERSON_MISSING')
+        if entry.claimed_person_id and entry.claimed_person_id != person.id:
+            raise AuthRejected('该名册条目已绑定其他人员，请人工核对',
+                               status=409, machine='IDENTITY_KEY_CONFLICT')
+    elif app.method == 'manual':
+        kind, key, assurance = 'email', app.contact_email, 'manual_review'
+    else:
+        kind, key, assurance = 'netid', app.claimed_identifier, 'school_email'
     try:
         register_identity_key(
-            person, issuer=cfg.school_id, kind='netid',
-            key=app.claimed_identifier,
-            assurance_method='school_email',
+            person, issuer=cfg.school_id, kind=kind, key=key,
+            assurance_method=assurance,
             proof_ref=f'application#{app.id}')
     except IdentityKeyConflict:
-        raise AuthRejected('该 NetID 已被其他档案登记，不能重复核验通过；'
+        raise AuthRejected('该身份标识已被其他档案登记，不能重复核验通过；'
                            '请人工核对名册后按争议流程处理',
                            status=409, machine='IDENTITY_KEY_CONFLICT')
+    if app.method == 'roster':
+        entry.claimed_person_id = person.id   # 名册回绑（同事务）
+        entry.claimed_at = datetime.now()
     person.verification_status = 'verified'
     person.verified_name = app.claimed_name
     app.status = 'approved'
@@ -322,8 +362,9 @@ def application_overview(user):
     from models import IdentitySchoolConfigModel
     person = db.session.get(PersonModel, user.person_id) if user.person_id else None
     apps = list_my_applications(user)
-    schools = [{'school_id': c.school_id, 'name': c.name} for c in
-               IdentitySchoolConfigModel.query.order_by(
+    schools = [{'school_id': c.school_id, 'name': c.name,
+                'external': not (c.personal_email_domains or [])}
+               for c in IdentitySchoolConfigModel.query.order_by(
                    IdentitySchoolConfigModel.school_id).all()]
     return {
         'person': None if person is None else {
