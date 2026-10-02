@@ -177,8 +177,8 @@ class SchoolConfigTest(VerificationTestBase):
 
     def test_reviewer_config(self):
         from services.identity import school
-        u1 = self.make_user('r1@x.dev')
-        u2 = self.make_user('r2@x.dev')
+        u1 = self.make_user('r1@x.dev', role='super_admin')
+        u2 = self.make_user('r2@x.dev', role='super_admin')
         self.assertFalse(self.cfg.reviewers_ready)  # 0 名
         school.update_school_config(self.cfg, reviewer_user_ids=[u1.id])
         db.session.commit()
@@ -197,6 +197,21 @@ class SchoolConfigTest(VerificationTestBase):
             school.update_school_config(self.cfg, reviewer_user_ids=[99999])
         with self.assertRaises(IdentityError):
             school.update_school_config(self.cfg, reviewer_user_ids=[])
+        # 运营规则（2026-10-02）：非管理员账号不能被添加为审核人
+        plain = self.make_user('plain@x.dev')
+        with self.assertRaises(IdentityError):
+            school.update_school_config(self.cfg, reviewer_user_ids=[plain.id])
+
+    def test_reviewer_gate_requires_admin(self):
+        """名单内但非管理员（如被降级）：解析过滤、审批门槛拒绝——降级即失效。"""
+        from services.identity import school
+        from services.auth_context import AuthRejected
+        plain = self.make_user('plain@x.dev')
+        self.cfg.reviewer_user_ids = [plain.id]  # 绕过添加校验模拟存量脏数据
+        self.assertEqual(school.resolve_reviewers(self.cfg), [])
+        with self.assertRaises(AuthRejected) as c:
+            school.require_reviewer(self.cfg, plain)
+        self.assertEqual(c.exception.machine, 'NOT_REVIEWER')
 
 
 class ApplicationFlowTest(VerificationTestBase):

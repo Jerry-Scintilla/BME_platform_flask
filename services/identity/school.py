@@ -5,6 +5,8 @@
 
 审核人是数据驱动配置（identity_school_config.reviewer_user_ids）：
 - 审批动作要求 actor 在该配置内（super_admin 不旁路——核验负责人制）；
+- 审核人必须是管理员账号（2026-10-02 运营规则）：添加时校验、解析与
+  审批门槛同步过滤——账号被降级即自动失去审核资格，无需改配置；
 - reviewers_ready（≥2 名）只标运营就绪、不拦功能（规格 §18 的就绪前置，
   生产上线前由管理端补齐真人；dev 用 seed 号占位可全流程联调）。
 """
@@ -55,20 +57,20 @@ def validate_contact_email(cfg, email, claimed_identifier):
 
 
 def resolve_reviewers(cfg):
-    """核验负责人 → 有效 user 列表（过滤已不存在/封禁账号）。"""
+    """核验负责人 → 有效 user 列表（过滤已不存在/封禁/非管理员账号）。"""
     from models import UserModel
     out = []
     for uid in cfg.reviewer_user_ids or []:
         u = db.session.get(UserModel, uid)
-        if u and (u.status or 'active') == 'active':
+        if u and (u.status or 'active') == 'active' and u.is_admin():
             out.append(u)
     return out
 
 
 def require_reviewer(cfg, actor_user):
-    """审批动作的审核人门槛：必须在配置名单内（super_admin 不旁路）。"""
-    if not cfg.is_reviewer(actor_user.id):
-        raise AuthRejected('仅该学校配置的核验负责人可审核',
+    """审批动作的审核人门槛：必须在配置名单内且为管理员（super_admin 不旁路）。"""
+    if not cfg.is_reviewer(actor_user.id) or not actor_user.is_admin():
+        raise AuthRejected('仅该学校配置的核验负责人（管理员）可审核',
                            status=403, machine='NOT_REVIEWER')
     return True
 
@@ -104,6 +106,8 @@ def update_school_config(cfg, *, name=None, personal_email_domains=None,
             u = db.session.get(UserModel, uid)
             if u is None or u.account_kind == 'service':
                 raise IdentityError(f'审核人 id={uid} 不存在或为服务号')
+            if not u.is_admin():
+                raise IdentityError(f'审核人必须是管理员账号（id={uid} 不是管理员）')
         cfg.reviewer_user_ids = ids
     cfg.config_version = (cfg.config_version or 1) + 1
     return cfg
