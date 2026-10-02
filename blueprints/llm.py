@@ -649,6 +649,15 @@ def review_quota_request(request_id):
         return jsonify({"code": 400, "message": "action 必须为 approve 或 reject"}), 400
 
     if action == "approve":
+        # D5 留白入口（P2-8，规格 9.1 奖励/额度行）：配额属个人权益——
+        # merged 副号不新增额度（防归并后双份权益）
+        from models import UserModel as _UM
+        from services.identity import enforcement as _enf
+        _target = db.session.get(_UM, r.user_id)
+        if _target is not None:
+            _ok, _why = _enf.guard_business_write(_target, 'llm_quota')
+            if not _ok:
+                return jsonify({"code": 409, "message": _why}), 409
         config = _get_quota_config()
         expires_days = _parse_duration_days(config.budget_duration)
         try:

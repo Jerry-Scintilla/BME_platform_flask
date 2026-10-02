@@ -59,6 +59,8 @@ run scripts/migrate/migrate_65_identity_link.py
 run scripts/migrate/migrate_66_person_participation.py
 # D3c 外校名册 + 恢复申诉骨架（2026-10-02）：名册/邀请/恢复三表 + external:scuec 种子
 run scripts/migrate/migrate_67_external_roster.py
+# P2 收尾（2026-10-02）：辅助账号授权表 + 身份岗位权限位种子
+run scripts/migrate/migrate_68_auxiliary_permissions.py
 
 echo "──── 最终 app 启动验证 ────"
 if $PY -c "from app import app; print('boot ok')" >> "$LOG" 2>&1; then echo "  ✓"; else

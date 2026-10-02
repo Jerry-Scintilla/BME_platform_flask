@@ -1120,6 +1120,7 @@ def member_assign_batch(sid):
     if len(items) > 200:
         return jsonify({"code": 400, "message": "单次批量上限 200 人"}), 400
     default_role = 'member' if camp.category == 'project' else 'student'
+    dry_run = bool((request.json or {}).get("dry_run"))   # P3：批量 dry-run（12.2）
     results, ok = [], 0
     for it in items:
         uid = it.get("user_id") if isinstance(it, dict) else None
@@ -1132,9 +1133,14 @@ def member_assign_batch(sid):
             msg, _code = err
             results.append({"user_id": uid, "status": "failed", "message": msg})
         else:
-            _notify_member_assigned(sid, m)
+            if not dry_run:
+                _notify_member_assigned(sid, m)
             results.append({"user_id": uid, "status": "added", "member_id": m.id})
             ok += 1
+    if dry_run:
+        db.session.rollback()   # 干跑：校验/人员规则照跑，全部回滚只出报告
+        return jsonify({"code": 200, "message": f"干跑：可加入 {ok}/{len(items)} 人",
+                        "dry_run": True, "added": ok, "results": results})
     if ok:
         db.session.commit()
     return jsonify({"code": 200, "message": f"已加入 {ok}/{len(items)} 人",
@@ -1925,6 +1931,11 @@ def leave_submit():
         return jsonify({"code": 400, "message": "不能对已过去的日期请假（今天之前）"}), 400
     if ed_d > camp.end_date or sd_d < camp.start_date:
         return jsonify({"code": 400, "message": f"请假日期须在营期范围内（{camp.start_date} ~ {camp.end_date}）"}), 400
+    # D5 留白入口（P2-8）：请假属营内业务写——merged/非参与号 shadow 记录
+    from services.identity import enforcement as _enf
+    _ok, _why = _enf.guard_business_write(user, 'camp_leave', sid)
+    if not _ok:
+        return jsonify({"code": 409, "message": _why}), 409
     lv = CampLeave(camp_session_id=sid, user_id=user.id,
                    start_date=sd_d, end_date=ed_d,
                    reason=d.get("reason", ""))

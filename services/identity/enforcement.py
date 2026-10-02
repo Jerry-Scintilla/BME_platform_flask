@@ -177,3 +177,33 @@ def _record(operation, user_or_id, scope_id, violations):
         evidence_refs={'note': f'{operation}#{scope_id}: '
                                + ';'.join(v[0] for v in violations)[:120]},
         reason='人员规则' + ('拒绝（enforce）' if _is_enforce() else '记录（shadow）'))
+
+
+# ── 通用业务写入口判定（P2-8：考勤/请假/任职/配额等留白入口接入）──
+
+def guard_business_write(user, operation, scope_id=None):
+    """业务写入口的人员规则判定（规格 9.1 留白入口共用）。
+
+    语义：merged 副号不产生新业务记录；同一人员在营锚点非本账号时（nonprimary
+    in-scope）提示走主号。shadow 只记账本；enforce 拒绝（409）。
+    与 check_camp_join 互补：那管「入营」，这管「入营后的日常业务写」。
+    """
+    violations = []
+    if user.lifecycle == 'merged':
+        violations.append(('merged_account', '已合并账号不产生新的业务记录'))
+    if user.person_id:
+        from models import CampPersonParticipationModel as _Cpp
+        active_elsewhere = _Cpp.query.filter(
+            _Cpp.person_id == user.person_id, _Cpp.user_id != user.id,
+            _Cpp.state == 'active').first()
+        if active_elsewhere is not None and not exception_valid(
+                user, 'business_write', scope_id):
+            violations.append((
+                'nonprimary',
+                '本人员在本营的参与锚点在另一账号上；日常业务请用正式参与账号操作'))
+    if not violations:
+        return True, None
+    _record(operation, user, scope_id, violations)
+    if _is_enforce():
+        return False, violations[0][1]
+    return True, None

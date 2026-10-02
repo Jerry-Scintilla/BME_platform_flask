@@ -213,6 +213,10 @@ def check_in_out():
             for record in records:
                 db.session.delete(record)
 
+        from services.identity import enforcement as _enf
+        _ok, _why = _enf.guard_business_write(user, 'attendance')
+        if not _ok:
+            return jsonify({"error": _why}), 409
         record = CheckRecord(
             user_id=user.id,
             check_in=now,
@@ -312,6 +316,10 @@ def face_check():
             for record in records:
                 db.session.delete(record)
         
+        from services.identity import enforcement as _enf
+        _ok, _why = _enf.guard_business_write(user, 'attendance')
+        if not _ok:
+            return jsonify({"error": _why}), 409
         record = CheckRecord(
             user_id=user.id,
             check_in=now,

@@ -21,8 +21,8 @@ from datetime import datetime, timedelta
 
 from exts import db, redis_client
 from models import (
-    AccountLinkCaseModel, IdentityAttestationModel,
-    IdentityCaseAccountLockModel, IdentityOutboxModel,
+    AccountLinkCaseModel, IdentityAttestationModel, IdentityCaseAccountLockModel,
+    IdentityExceptionGrantModel, IdentityOutboxModel,
     IdentityTransactionAuthorizationModel, PersonIdentityModel, PersonModel,
     PersonPrimaryAccountModel, UserModel)
 from services import auth_mfa, auth_sessions
@@ -486,8 +486,11 @@ def confirm_link(actor, case, *, preview_digest):
         row.person_id = person_a.id
     # 3) B 账号归属存续人员（nonprimary；先迁登记再改指针）
     user_b.person_id = person_a.id
-    # 4) B 生命周期与旧人员档案
-    user_b.lifecycle = 'merged'
+    # 4) B 生命周期与旧人员档案——7.3 语义：空壳立即冻结；有业务数据的账号
+    #    保持 active（已归存续人员、明确 nonprimary），生成 14 天续办宽限供
+    #    在途事项收尾，到期由管理端 freeze 复核后才 merged（不斩断进行中业务）
+    _freeze_now = shell_scan(user_b)[0]
+    user_b.lifecycle = 'merged' if _freeze_now else 'active'
     person_b.record_status = 'merged'
     person_b.merged_to_person_id = person_a.id
     # 5) 存续人员核验态继承（B 若已核验，A 的 Person 获得核验依据）
@@ -509,7 +512,7 @@ def confirm_link(actor, case, *, preview_digest):
               'merged_person': person_b.id}
     after = {'status': case.state, 'person_id': person_a.id,
              'primary_user_id': user_a.id, 'merged_to_person_id': person_a.id,
-             'lifecycle': 'merged', 'record_status': 'merged'}
+             'lifecycle': user_b.lifecycle, 'record_status': 'merged'}
     op, _created = events.run_idempotent(
         user_a.id, 'identity.link.apply', case.id,
         {'case': case.id, 'digest': case.preview_digest},
@@ -522,6 +525,13 @@ def confirm_link(actor, case, *, preview_digest):
         before=before, after=after,
         evidence_refs={'operation_id': op.operation_id},
         reason='空壳副号归并执行')
+    if not _freeze_now:
+        db.session.add(IdentityExceptionGrantModel(
+            person_id=person_a.id, user_id=user_b.id,
+            operation_scope='camp_join', scope_id=None,
+            valid_until=datetime.now() + timedelta(days=14),
+            reason=f'续办：案例 {case.id[:8]} 归并交接期（在途事项收尾，到期人工复核冻结）',
+            approved_by=0))
     # 通知双端原验证渠道（提交与发送分离，规格 7.1.11/S14；发送属后续 outbox 消费者）
     for uid in (user_a.id, user_b.id):
         db.session.add(IdentityOutboxModel(
@@ -590,3 +600,34 @@ def _check_collection_window(case):
         _transition(case, 'expired', case.account_a, '收集期届满')
         _release_locks(case)
         raise AuthRejected('案例已过期，请重新发起', status=409, machine='CASE_EXPIRED')
+
+
+def freeze_merged_account(case, operator):
+    """续办到期后的冻结动作（7.3：指定事项完成/交接验收后才 merged）。
+
+    仅对 applied 案例且 B 未 merged 时有效；同事务：B.lifecycle=merged、
+    bump 撤 B 会话、撤续办宽限、账本留痕。空壳案例 confirm 时已即时 merged，
+    不经此函数；幂等（已 merged 直接返回）。
+    """
+    c = db.session.get(AccountLinkCaseModel, case.id)
+    if c is None or c.state != 'applied':
+        raise AuthRejected('案例未完成归并', status=409, machine='BAD_STATE')
+    user_b = db.session.get(UserModel, c.account_b)
+    if user_b is None:
+        raise AuthRejected('目标账号缺失', status=404, machine='NOT_FOUND')
+    if user_b.lifecycle == 'merged':
+        return c
+    auth_sessions.lock_user(user_b.id)
+    user_b.lifecycle = 'merged'
+    auth_sessions.bump_security_version(user_b, reason='续办期满冻结（人工复核）')
+    for g in IdentityExceptionGrantModel.query.filter_by(
+            user_id=user_b.id, operation_scope='camp_join', state='active').all():
+        if (g.reason or '').startswith('续办'):
+            g.state = 'expired'
+    events.record_event(
+        'identity.link.freeze', actor_user_id=operator.id,
+        target_ids={'user_id': user_b.id, 'person_id': user_b.person_id},
+        before={'lifecycle': 'active'}, after={'lifecycle': 'merged'},
+        evidence_refs={'note': c.id[:12]},
+        reason='续办期满人工复核冻结')
+    return c

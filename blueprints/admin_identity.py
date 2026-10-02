@@ -106,7 +106,7 @@ def detail(app_id):
 @_admin_endpoint
 def approve(app_id):
     """批准：需该学校核验负责人（配置名单内）；key 冲突转可恢复 409。"""
-    actor = _staff_actor()
+    actor = _require_identity_role('identity_review')
     app = db.session.get(IdentityApplicationModel, app_id)
     if app is None:
         return jsonify({"code": 404, "message": "申请不存在"}), 404
@@ -121,7 +121,7 @@ def approve(app_id):
 @jwt_required()
 @_admin_endpoint
 def reject(app_id):
-    actor = _staff_actor()
+    actor = _require_identity_role('identity_review')
     app = db.session.get(IdentityApplicationModel, app_id)
     if app is None:
         return jsonify({"code": 404, "message": "申请不存在"}), 404
@@ -150,9 +150,11 @@ def link_case_queue():
         b = db.session.get(UserModel, c.account_b) if c.account_b else None
         scan = linking.shell_scan_summary(b) if b else {'is_shell': False,
                                                         'blockers': ['no_target']}
+        _b = db.session.get(UserModel, c.account_b) if c.account_b else None
         out.append({
             'id': c.id, 'state': c.state, 'version': c.version,
             'account_a': c.account_a, 'account_b': c.account_b,
+            'b_lifecycle': _b.lifecycle if _b else None,
             'surviving_person_id': c.surviving_person_id,
             'created_at': c.created_at.strftime('%Y-%m-%d %H:%M') if c.created_at else None,
             'scan': scan,
@@ -168,7 +170,7 @@ def link_case_decision(case_id):
 
     审核人须非当事人；有阻断项（特权/扫描异常）需 ≥2 名不同审核人批准。
     """
-    actor = _staff_actor()
+    actor = _require_identity_role('identity_review')
     from models import AccountLinkCaseModel
     from services.identity import linking
     case = db.session.get(AccountLinkCaseModel, case_id)
@@ -213,7 +215,7 @@ def update_config(school_id):
 
     reviewer_user_ids 传全量名单；生产上线前在此补 ≥2 名真人。
     """
-    actor = _staff_actor()
+    actor = _require_identity_role('identity_admin')
     cfg = school.get_school_config(school_id)
     payload = request.get_json(silent=True) or {}
     school.update_school_config(
@@ -329,7 +331,7 @@ def recovery_queue():
 @_admin_endpoint
 def recovery_decision(case_id):
     """决策：{decision: approved|rejected, note}。特权案例需两名不同审核人。"""
-    actor = _staff_actor()
+    actor = _require_identity_role('identity_recover')
     from models import IdentityRecoveryCaseModel
     from services.identity import recovery
     case = db.session.get(IdentityRecoveryCaseModel, case_id)
@@ -350,7 +352,7 @@ def recovery_decision(case_id):
 @_admin_endpoint
 def recovery_complete(case_id):
     """冷静期届满后标记执行完毕（凭据重置/撤会话在既有运维通道完成）。"""
-    actor = _staff_actor()
+    actor = _require_identity_role('identity_recover')
     from models import IdentityRecoveryCaseModel
     from services.identity import recovery
     case = db.session.get(IdentityRecoveryCaseModel, case_id)
@@ -359,3 +361,75 @@ def recovery_complete(case_id):
     recovery.complete_case(case, actor.user)
     db.session.commit()
     return jsonify({"code": 200, "state": case.status})
+
+
+# ── 岗位能力权限位（P2-10，规格 11）───────────────────────────────
+# super_admin 直通；普通账号可经 UserPermission 授予（营期老师按范围审核等）。
+def _require_identity_role(permission_name):
+    actor = _staff_actor()
+    from models import PermissionModel, UserPermissionModel
+    if actor.user.is_admin():
+        return actor
+    perm = PermissionModel.query.filter_by(name=permission_name).first()
+    if perm and UserPermissionModel.query.filter_by(
+            user_id=actor.user.id, permission_id=perm.id).first():
+        return actor
+    raise AuthRejected(f"需要 {permission_name} 权限（或管理员）",
+                       status=403, machine="FORBIDDEN")
+
+
+# ── 辅助账号授权（P2-9，规格 9.3）────────────────────────────────
+@bp.route("/auxiliary-grants", methods=["GET"])
+@jwt_required()
+@_admin_endpoint
+def auxiliary_list():
+    """辅助账号授权列表（含临期/过期状态）。"""
+    _require_identity_role('identity_admin')
+    from services.identity import auxiliary
+    return jsonify({"code": 200, "grants": auxiliary.list_grants()})
+
+
+@bp.route("/auxiliary-grants", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def auxiliary_approve():
+    """批准辅助账号：{user_id, purpose, scope?, days?}（默认 90 天复核）。"""
+    actor = _require_identity_role('identity_admin')
+    payload = request.get_json(silent=True) or {}
+    from services.identity import auxiliary
+    row = auxiliary.approve_grant(
+        actor.user, user_id=payload.get('user_id'),
+        purpose=payload.get('purpose') or '',
+        scope=payload.get('scope'),
+        days=int(payload.get('days') or auxiliary.GRANT_DAYS))
+    db.session.commit()
+    return jsonify({"code": 200, "message": "辅助账号已批准（到期实时失效）",
+                    "id": row.id})
+
+
+@bp.route("/auxiliary-grants/<int:grant_id>/revoke", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def auxiliary_revoke(grant_id):
+    actor = _require_identity_role('identity_admin')
+    payload = request.get_json(silent=True) or {}
+    from services.identity import auxiliary
+    auxiliary.revoke_grant(actor.user, grant_id, reason=payload.get('reason') or '')
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已撤销"})
+
+
+@bp.route("/link-cases/<case_id>/freeze", methods=["POST"])
+@jwt_required()
+@_admin_endpoint
+def link_case_freeze(case_id):
+    """续办期满冻结（7.3）：非空壳归并的 B 账号在交接完成后转 merged+撤会话。"""
+    actor = _require_identity_role('identity_review')
+    from models import AccountLinkCaseModel
+    from services.identity import linking
+    case = db.session.get(AccountLinkCaseModel, case_id)
+    if case is None:
+        return jsonify({"code": 404, "message": "案例不存在"}), 404
+    linking.freeze_merged_account(case, actor.user)
+    db.session.commit()
+    return jsonify({"code": 200, "message": "已冻结（merged+撤会话+撤续办宽限）"})

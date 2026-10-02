@@ -329,6 +329,11 @@ def appoint_officer():
         return jsonify({"code": 400, "message": terr}), 400
 
     current = _current_user()
+    # D5 留白入口（P2-8）：任职属人员业务写——merged 账号不再新增任职
+    from services.identity import enforcement as _enf
+    _ok, _why = _enf.guard_business_write(user, 'club_officer')
+    if not _ok:
+        return jsonify({"code": 409, "message": _why}), 409
     officer = ClubOfficer(
         user_id=user.id,
         title_id=pos.id, title=pos.name,

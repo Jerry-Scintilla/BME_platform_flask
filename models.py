@@ -610,6 +610,27 @@ class IdentityExceptionGrantModel(db.Model):
     )
 
 
+class AuxiliaryAccountGrantModel(db.Model):
+    """管理辅助账号授权（规格 3.2/9.3）：绑定归属人员与用途，期限默认 90 天
+    复核；到期实时检查（状态位只是缓存，判定一律看 valid_until）。同人关系
+    不替代角色授权——辅助号做批准范围内的治理动作，不继承主号权限。"""
+    __tablename__ = 'auxiliary_account_grant'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    owner_person_id = db.Column(db.Integer)
+    purpose = db.Column(db.String(100), nullable=False)
+    scope = db.Column(db.String(100))
+    valid_until = db.Column(db.DateTime, nullable=False)
+    approved_by = db.Column(db.Integer, nullable=False)
+    state = db.Column(db.String(20), nullable=False, server_default='active')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    __table_args__ = (
+        db.Index('idx_aag_user', 'user_id', 'state', 'valid_until'),
+        db.Index('idx_aag_owner', 'owner_person_id'),
+    )
+
+
 # ── D3c 外校名册 + 恢复申诉骨架（migrate_67，规格 5.2/7.4）──
 
 class IdentityRosterModel(db.Model):

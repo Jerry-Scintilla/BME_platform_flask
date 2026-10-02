@@ -525,6 +525,36 @@ class ReviewPathTest(LinkingTestBase):
         self.assertEqual(self.case.state, 'cancelled')
         self.assertIsNone(db.session.get(IdentityCaseAccountLockModel, self.a.id))
 
+    def test_nonshell_confirm_keeps_active_with_continuation_then_freeze(self):
+        """7.3：有业务数据的 B 归并后保持 active（续办宽限 14 天），冻结动作才 merged。"""
+        from models import IdentityExceptionGrantModel
+        frz1 = self.make_user('frz1@x.dev')
+        frz2 = self.make_user('frz2@x.dev')
+        self.linking.review_case(self.case, frz1, decision='approved')
+        self.linking.review_case(self.case, frz2, decision='approved')
+        db.session.commit()
+        result = self.linking.confirm_link(self.actor, self.case,
+                                           preview_digest=self.out['digest'])
+        db.session.commit()
+        self.assertEqual(result['state'], 'applied')
+        db.session.refresh(self.b)
+        self.assertEqual(self.b.lifecycle, 'active')      # 不斩断在途业务
+        self.assertEqual(self.b.person_id, self.a.person_id)  # 已归存续人员（nonprimary）
+        grant = IdentityExceptionGrantModel.query.filter_by(
+            user_id=self.b.id, operation_scope='camp_join').one()
+        self.assertEqual(grant.state, 'active')
+        # 冻结：merged + 撤宽限 + bump
+        reviewer = self.make_user('frz@x.dev')
+        self.linking.freeze_merged_account(self.case, reviewer)
+        db.session.commit()
+        db.session.refresh(self.b)
+        self.assertEqual(self.b.lifecycle, 'merged')
+        db.session.refresh(grant)
+        self.assertEqual(grant.state, 'expired')
+        # 幂等
+        self.linking.freeze_merged_account(self.case, reviewer)
+        db.session.commit()
+
     def test_approved_then_confirm_applies(self):
         from models import PersonModel
         self.linking.review_case(self.case, self.r1, decision='approved')
