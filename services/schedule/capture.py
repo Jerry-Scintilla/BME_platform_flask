@@ -167,14 +167,29 @@ def process_capture(capture_id, *, llm=None, now=None):
         mark_failed(capture_id, str(exc), exc.code)
         return 'failed'
     except Exception:
+        # internal 类失败原先静默吞掉（10-02 排障实测：三次 failed 在服务端零痕迹，
+        # 无法定位）——必须落异常堆栈，用户侧仍只见通用文案
+        try:
+            from flask import current_app
+            current_app.logger.exception(f"[schedule_capture] #{capture_id} 意图阶段异常")
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(f"[schedule_capture] #{capture_id} 意图阶段异常")
         mark_failed(capture_id, '处理出错，请重试', 'internal')
         return 'failed'
 
-    # ── 最终大事务 ──
+    # ── 最终大事务（now 取真正结束时刻：相对日期解析用提交时锚点，
+    # finished_at/elapsed_ms 必须含模型耗时——审计静态项整改） ──
     try:
-        return _finalize(capture_id, parsed, now)
+        return _finalize(capture_id, parsed, datetime.now())
     except Exception:
         db.session.rollback()
+        try:
+            from flask import current_app
+            current_app.logger.exception(f"[schedule_capture] #{capture_id} 落库阶段异常")
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(f"[schedule_capture] #{capture_id} 落库阶段异常")
         mark_failed(capture_id, '处理出错，请重试', 'internal')
         return 'failed'
 
