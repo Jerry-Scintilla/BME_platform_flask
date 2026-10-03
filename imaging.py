@@ -29,7 +29,7 @@ BANNER_MAX_BYTES = 500 * 1024        # docs/首页banner-运营规范.md
 AVATAR_SIZE = 256
 MENTOR_PHOTO_MAX_SIDE = 800
 MEDAL_SIZE = 512
-BANNER_SIZE = (1600, 800)
+BANNER_SIZE = (1983, 793)       # 首页主卡显示比 1983:793≈2.5:1（StudyHub PREFERRED_BANNER_RATIO 同源）
 COVER_MASTER_MAX = (1200, 1600)
 COVER_THUMB = (600, 800)
 SHOWCASE_COVER_MASTER_MAX = (1600, 900)
@@ -119,9 +119,11 @@ def medal_bytes(stream) -> bytes:
 
 
 def banner_bytes(stream) -> bytes:
-    """轮播底图：cover 裁 2:1 -> 1600x800，q80 起逐档降到 <=500KB。"""
+    """轮播底图：cover 裁 1983:793（≈2.5:1，与首页显示框一致——2026-10-03 统一，
+    管理端取景所见即所得）-> 1983x793，q80 起逐档降到 <=500KB。
+    存量 1600x800（2:1）底图不重转，显示端照旧按 focus_y 纵向取景。"""
     img = _load(stream)
-    img = _center_crop(img, 2, 1).resize(BANNER_SIZE, Image.LANCZOS)
+    img = _center_crop(img, 1983, 793).resize(BANNER_SIZE, Image.LANCZOS)
     if _has_alpha(img):
         img = img.convert("RGBA").convert("RGB")   # 轮播无透明需求
     else:
