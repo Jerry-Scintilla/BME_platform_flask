@@ -187,5 +187,68 @@ class ClubBackfillSyncTest(ClubWsTestBase):
         self.assertEqual(row.status, 'revoked')
 
 
+class DualSlotAppointmentTest(ClubWsTestBase):
+    """2026-10-04 组长解耦：club/group 两槽跨槽可兼任（组长+社团职务并存），
+    同槽互斥（不可双组长/双社团职务）。校验器 + 授权派生双覆盖。"""
+
+    def setUp(self):
+        super().setUp()
+        from blueprints.officers import _validate_appointment
+        self.validate = _validate_appointment
+
+    def test_leader_can_hold_club_position(self):
+        u = self.make_user('dual@x.dev')
+        self.make_officer(u, self.g1, self.pos_leader)      # 组长（group 槽）
+        db.session.commit()
+        # 再任社团职务（club 槽，挂另一组）——放行
+        self.assertIsNone(self.validate(u.id, self.pos_member, self.g2))
+
+    def test_club_position_then_leader_allowed(self):
+        u = self.make_user('dual2@x.dev')
+        self.make_officer(u, self.g1, self.pos_member)      # 干事（club 槽）
+        db.session.commit()
+        # 再任组长（group 槽，同组）——放行
+        self.assertIsNone(self.validate(u.id, self.pos_leader, self.g1))
+
+    def test_two_leaderships_blocked(self):
+        u = self.make_user('dup@x.dev')
+        self.make_officer(u, self.g1, self.pos_leader)
+        db.session.commit()
+        code, msg = self.validate(u.id, self.pos_leader, self.g2)
+        self.assertEqual(code, 409)
+        self.assertIn('同级', msg)
+
+    def test_two_club_positions_blocked(self):
+        u = self.make_user('dup2@x.dev')
+        self.make_officer(u, self.g1, self.pos_member)
+        self.pos_vp = self.ClubPosition(name='副社长', sort_rank=2)
+        db.session.add(self.pos_vp)
+        db.session.flush()
+        db.session.commit()
+        code, _ = self.validate(u.id, self.pos_vp, self.g1)
+        self.assertEqual(code, 409)
+
+    def test_edit_self_row_exempt(self):
+        u = self.make_user('renew@x.dev')
+        row = self.make_officer(u, self.g1, self.pos_leader)
+        db.session.commit()
+        # 连任/编辑自身行：exclude_ids 豁免
+        self.assertIsNone(self.validate(u.id, self.pos_leader, self.g1,
+                                        exclude_ids=[row.id]))
+
+    def test_dual_slot_role_derivation(self):
+        """组长+干事并存：社团区=coordinator（组长优先），组长组=coordinator，
+        干事挂组=member（无归属回落任职来源）。"""
+        u = self.make_user('dual3@x.dev')
+        self.make_officer(u, self.g1, self.pos_leader)
+        self.make_officer(u, self.g2, self.pos_member)
+        db.session.commit()
+        self.assertEqual(self.prov._desired(u.id, self.ws_club)[0], 'coordinator')
+        self.assertEqual(self.prov._desired(u.id, self.ws_group)[0], 'coordinator')
+        ws_g2 = self.WorkWorkspace(club_group_id=self.g2.id, scope='group')
+        db.session.add(ws_g2)
+        db.session.commit()
+        self.assertEqual(self.prov._desired(u.id, ws_g2)[0], 'member')
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

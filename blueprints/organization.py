@@ -61,12 +61,13 @@ def org_chart():
     for m in memberships:
         memberships_by_group.setdefault(m.group_id, []).append(m)
 
-    # user → 在任职位名（一人至多一条 active，map 足够）
-    title_by_user = {}
+    # user → 在任职位名（2026-10-04 起跨槽可兼任——组长+社团职务并存，多职位合并展示）
+    titles_by_user = {}
     for o in officers:
         pos = positions.get(o.title_id)
-        if pos and o.user_id not in title_by_user:
-            title_by_user[o.user_id] = pos.name
+        if pos:
+            titles_by_user.setdefault(o.user_id, []).append(pos.name)
+    title_by_user = {uid: ' · '.join(names) for uid, names in titles_by_user.items()}
 
     children_of = {}
     for g in groups:
