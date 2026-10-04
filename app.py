@@ -5,6 +5,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import config
 from exts import db, mail, limiter, redis_client
 from storage import storage
+from points_center_client import init_points_center
 from services.request_guard import enforce_request_access
 from flask_migrate import Migrate
 
@@ -51,6 +52,9 @@ mail.init_app(app)
 limiter.init_app(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+
+# 积分中心 SSO 客户端初始化校验：开关关闭时零行为；开启时配置不完整/格式非法拒绝启动
+init_points_center(app)
 
 
 # ── JWT 吊销 blocklist（2026-09-16 安全加固）──
@@ -132,6 +136,7 @@ app.register_blueprint(feedback_tickets_bp)
 app.register_blueprint(feedback_tickets_admin_bp)
 app.register_blueprint(work_bp)
 app.register_blueprint(work_files_bp)
+app.register_blueprint(points_sso_bp)
 
 # 每日出勤报告：幂等创建收件人权限 + 启动定时任务（多 worker 下仅一个生效）
 ensure_recipient_permission(app)

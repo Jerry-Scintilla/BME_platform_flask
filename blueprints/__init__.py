@@ -400,6 +400,7 @@ from .feedback_tickets import bp as feedback_tickets_bp
 from .feedback_tickets_admin import bp as feedback_tickets_admin_bp
 from .work import bp as work_bp
 from .work_files import bp as work_files_bp
+from .points_sso import bp as points_sso_bp
 
 __all__ = [
     'auth_bp',
@@ -441,5 +442,6 @@ __all__ = [
     'feedback_tickets_bp',
     'feedback_tickets_admin_bp',
     'work_bp',
-    'work_files_bp'
+    'work_files_bp',
+    'points_sso_bp'
 ]
