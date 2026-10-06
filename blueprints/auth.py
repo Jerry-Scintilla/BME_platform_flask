@@ -146,6 +146,14 @@ def login():
 
 
             if user.check_password(password):
+                # 2026-10-06 补洞：merged/disabled 账号停登录（banned 已前置自查，
+                # 此前漏检——被合并/停用账号仍能在此换新 token，随后才被全局
+                # _resolve 401，形成「登录成功却全站不可用」的矛盾态；先验密码
+                # 再查状态，不向不知道密码的人泄露账号状态）
+                try:
+                    validate_account_lifecycle(user)
+                except AuthRejected as exc:
+                    return exc.to_response()
                 # 历史遗留的明文(MD5)密码，登录成功后自动升级为加盐哈希
                 if not user.password_is_hashed:
                     user.set_password(password)
@@ -276,6 +284,11 @@ def admin_login():
                 }),402
 
             else:
+                # 2026-10-06 补洞：同 /auth/login——merged/disabled 停管理端登录
+                try:
+                    validate_account_lifecycle(admin)
+                except AuthRejected as exc:
+                    return exc.to_response()
                 # 先验证凭据再判断准入，避免借不同状态码探测普通用户邮箱。
                 # 单项业务权限不等于管理端准入；营期老师使用用户端工作台。
                 if not admin.is_staff():
