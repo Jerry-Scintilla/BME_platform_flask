@@ -41,6 +41,7 @@ from models import (
 from . import camp_role, audit_log, _current_user
 from .notification import create_notification
 from .camp_staff import camp_access
+from services.identity import matcher
 from .camp_course_assign import upsert_assignment
 from .forms import AvatarForm
 from .media import public_avatar_url
@@ -1466,6 +1467,97 @@ def assign_roster(sid):
         "stats": {"students": len(students), "assigned": assigned,
                   "unassigned": len(students) - assigned, "submitted": submitted},
     }})
+
+
+@bp.route("/<int:sid>/assign/batch/preview", methods=["POST"])
+@jwt_required()
+@camp_access('mentor_selection.operate')
+def assign_batch_preview(sid):
+    """配对名单实名匹配预览（A1，2026-10-04 计划 §5.4）：body
+    {pairs: [{student_real_name?|student_user_id?, mentor_real_name?|mentor_user_id?}]}。
+
+    「学员姓名、导生姓名」两列配对表无需账号 ID：学员在本营 student 名册、导生
+    在本营 mentor 名册的人员范围内按当前核验姓名解析（matcher 统一口径——唯一
+    自动预填、重名返回全部候选、资格过滤不冒充姓名唯一性）；已分配学员 / 未入
+    营人员仅标注原因不除名（不自动找同名人替代）。只读端点：不发通知不落配对；
+    确认提交仍走 /assign/batch（显式 ID + 全量重验，不按姓名重新猜人）。
+    阶段守卫与名册口径一致（不要求志愿已截止——解析无害，写操作仍由提交拦）。"""
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    stage_err = ms_stage_guard(camp)
+    if stage_err:
+        return stage_err
+    pairs = (request.json or {}).get("pairs")
+    if not isinstance(pairs, list) or not pairs:
+        return jsonify({"code": 400, "message": "缺少 pairs 数组"}), 400
+    if len(pairs) > 500:
+        return jsonify({"code": 400, "message": "单批至多 500 对"}), 400
+
+    members = CampMember.query.filter_by(camp_session_id=sid).all()
+    student_uids = {m.user_id for m in members if m.role == 'student'}
+    mentor_uids = {m.user_id for m in members if m.role == 'mentor'}
+    uids = student_uids | mentor_uids
+    users = {u.id: u for u in UserModel.query.filter(
+        UserModel.id.in_(uids)).all()} if uids else {}
+    person_scope_student = {u.person_id for u in users.values()
+                            if u.id in student_uids and u.person_id}
+    person_scope_mentor = {u.person_id for u in users.values()
+                           if u.id in mentor_uids and u.person_id}
+    assigned_by_uid = {m.user_id: m.team_mentor_id for m in members
+                       if m.role == 'student' and m.team_mentor_id}
+
+    def _student_filter(u):
+        if u.id not in student_uids:
+            return False, '未入本营学员名册'
+        if u.id in assigned_by_uid:
+            other = users.get(assigned_by_uid[u.id])
+            return False, (f"已归属导生 {other.username if other else assigned_by_uid[u.id]}"
+                           "（先释放或改派再提交）")
+        return True, None
+
+    def _mentor_filter(u):
+        if u.id not in mentor_uids:
+            return False, '未入本营导生名册'
+        return True, None
+
+    stu_entries, men_entries = [], []
+    for idx, p in enumerate(pairs):
+        if isinstance(p, dict):
+            stu_entries.append({"row_key": idx, "real_name": p.get("student_real_name"),
+                                "user_id": p.get("student_user_id")})
+            men_entries.append({"row_key": idx, "real_name": p.get("mentor_real_name"),
+                                "user_id": p.get("mentor_user_id")})
+        else:
+            stu_entries.append({"row_key": idx})
+            men_entries.append({"row_key": idx})
+    stu_matches = matcher.resolve_batch(
+        stu_entries, scope=lambda p: p.id in person_scope_student,
+        account_filter=_student_filter)
+    men_matches = matcher.resolve_batch(
+        men_entries, scope=lambda p: p.id in person_scope_mentor,
+        account_filter=_mentor_filter)
+
+    rows = []
+    for idx, (p, sm, mm) in enumerate(zip(pairs, stu_matches, men_matches)):
+        reason = None
+        if not isinstance(p, dict):
+            reason = "条目格式错误"
+        else:
+            for side_label, m in (("学员", sm), ("导生", mm)):
+                acc = m.get("resolved_account")
+                if m.get("resolved_user_id") is None:
+                    if reason is None:
+                        reason = f"{side_label}未解析：{m.get('message') or '需在候选中确认人员'}"
+                elif acc is not None and not acc.get("eligible", True):
+                    if reason is None:
+                        reason = (f"{side_label}「{acc.get('username')}」"
+                                  f"{acc.get('ineligible_reason')}")
+        rows.append({"index": idx, "student": sm, "mentor": mm,
+                     "ready": reason is None, "reason": reason})
+    db.session.rollback()   # 预览零持久化（防御：matcher 纯读，防后续回归）
+    return jsonify({"code": 200, "message": "配对匹配预览完成（未执行任何指派）",
+                    "data": {"rows": rows}})
 
 
 @bp.route("/<int:sid>/assign/batch", methods=["POST"])

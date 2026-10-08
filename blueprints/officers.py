@@ -21,7 +21,7 @@ from exts import db
 from models import UserModel, ClubOfficer, ClubPosition, ClubGroup, ClubMembership
 from . import check_permission, audit_log, _current_user
 from services.club_rules import ORG_SLOT_CLUB, ORG_SLOT_GROUP, position_org_slot
-from services.identity import enforcement, gates
+from services.identity import enforcement, gates, matcher
 from services.work.events import record_org_event
 from services.work import provisioning
 
@@ -375,13 +375,105 @@ def appoint_officer():
                     "data": _officer_dict(officer, user, {pos.id: pos})})
 
 
+@bp.route("/batch/preview", methods=["POST"])
+@jwt_required()
+@check_permission('system_management')
+def batch_appoint_preview():
+    """实名名单匹配预览（A1，2026-10-04 计划 §5.4）：body
+    {items: [{real_name?|user_id?, title|title_id, department|group_id?, term_start?}]}。
+
+    身份解析走 services/identity/matcher：当前核验姓名精确匹配，唯一人员自动
+    预填账号，重名返回全部候选人工消歧；行内同时预检职位/组解析与既有校验
+    （任职规则 / merged 守卫 / R0 核验门槛）的纯求值结果。
+    只读端点：不发通知、不建授权、不落任何事件（shadow 记账随 rollback 丢弃）。
+    确认提交仍走 POST /batch 且仅收显式 user_id，服务端全量重验——提交不重新
+    按姓名猜人，也不能只信预览结论。"""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"code": 400, "message": "缺少 items 数组"}), 400
+    if len(items) > 200:
+        return jsonify({"code": 400, "message": "单批至多 200 条"}), 400
+
+    entries = []
+    for idx, it in enumerate(items):
+        if isinstance(it, dict):
+            entries.append({"row_key": idx, "real_name": it.get("real_name"),
+                            "user_id": it.get("user_id")})
+        else:
+            entries.append({"row_key": idx})
+    matches = matcher.resolve_batch(entries)   # 任命属全局管理操作，人员范围即全库
+
+    rows = []
+    try:
+        for idx, (it, match) in enumerate(zip(items, matches)):
+            row = {"index": idx, "match": match,
+                   "title_id": None, "title": None,
+                   "group_id": None, "group_name": None,
+                   "ready": False, "reason": None}
+            rows.append(row)
+            if not isinstance(it, dict):
+                row["reason"] = "条目格式错误"
+                continue
+            # 旧 username 文本 = 旧昵称线索：昵称可改可重名，不参与自动匹配（计划 §5.4.4）
+            if it.get("username") and not it.get("user_id") and not it.get("real_name"):
+                row["reason"] = (f"昵称「{it.get('username')}」不能自动匹配（昵称可修改、"
+                                 "可重名）；请改填实名姓名，或到用户管理查到账号 ID 后填写")
+                continue
+
+            resolved_uid = match.get("resolved_user_id")
+            user = UserModel.query.get(resolved_uid) if resolved_uid else None
+            reason = None
+            pos = group = None
+            if user is not None:
+                pos, err = _resolve_position(it)
+                if err:
+                    reason = err[0].get_json()["message"]
+                else:
+                    group, gerr = _resolve_group(it)
+                    if gerr:
+                        reason = gerr[0].get_json()["message"]
+                    else:
+                        verr = _validate_appointment(user.id, pos, group)
+                        if verr:
+                            reason = verr[1]
+                        else:
+                            _ts, terr = _parse_term_start(it.get("term_start"))
+                            if terr:
+                                reason = terr
+                            else:
+                                _ok, _why = enforcement.guard_business_write(
+                                    user, 'club_officer')
+                                if not _ok:
+                                    reason = _why
+                                else:
+                                    reason = gates.verify_reject_reason(user, 'appoint')
+                row["title_id"] = pos.id if pos else None
+                row["title"] = pos.name if pos else None
+                row["group_id"] = group.id if group else None
+                row["group_name"] = group.name if group else None
+            else:
+                reason = match.get("message") or "需先在候选中确认人员"
+            row["reason"] = reason
+            row["ready"] = user is not None and reason is None
+    finally:
+        db.session.rollback()   # 预览零持久化：丢弃核验门槛的 shadow 记账
+    return jsonify({"code": 200, "message": "匹配预览完成（未执行任何任命）",
+                    "data": {"rows": rows}})
+
+
 @bp.route("/batch", methods=["POST"])
 @jwt_required()
 @check_permission('system_management')
 @audit_log(operation="批量任命社团干事")
 def batch_appoint():
-    """批量导入：body {items: [{user_id|username, title|title_id, department|group_id?, term_start?}]}
-    逐项校验逐项回报；批内互查（同批任命先行 flush 后续可读）。"""
+    """批量导入：body {items: [{user_id, title|title_id, department|group_id?, term_start?}]}
+    逐项校验逐项回报；批内互查（同批任命先行 flush 后续可读）。
+
+    仅收显式账号 ID：实名姓名先经 /batch/preview 匹配确认（唯一自动预填、重名
+    人工消歧），前端带解析出的 ID 提交；本端点对每行全量重验，不按姓名重新
+    猜人。旧 username（昵称）直写分支已移除——昵称可修改、可重名，曾可误任
+    命他人（2026-10-04 计划 §3.1）。"""
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     if not isinstance(items, list) or not items:
@@ -401,13 +493,26 @@ def batch_appoint():
 
         if item.get("user_id"):
             user = UserModel.query.get(int(item["user_id"]))
+            if not user:
+                results.append({"index": idx, "ok": False,
+                                "reason": f"账号 #{item['user_id']} 不存在"})
+                rejected += 1
+                continue
+        elif item.get("real_name"):
+            results.append({"index": idx, "ok": False, "reason": (
+                f"实名「{str(item.get('real_name')).strip()}」请先经匹配预览"
+                "（/admin/officers/batch/preview），确认候选后按账号 ID 提交")})
+            rejected += 1
+            continue
         elif item.get("username"):
-            user = UserModel.query.filter_by(username=(item["username"] or "").strip()).first()
+            results.append({"index": idx, "ok": False, "reason": (
+                f"按昵称「{item.get('username')}」导入已停用：昵称可修改、可重名，"
+                "会误任命他人；请改用实名姓名（经匹配预览）或账号 ID")})
+            rejected += 1
+            continue
         else:
-            user = None
-        if not user:
-            reason = f"用户 {item.get('user_id') or '「' + str(item.get('username')) + '」'} 不存在"
-            results.append({"index": idx, "ok": False, "reason": reason})
+            results.append({"index": idx, "ok": False,
+                            "reason": "缺少账号 ID（实名姓名请先经匹配预览）"})
             rejected += 1
             continue
 

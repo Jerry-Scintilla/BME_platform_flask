@@ -41,7 +41,7 @@ from models import (CampSession, CampMember, CampUnit, CampUnitMember,
                     CampMeetingChapterPlan, CampMeetingTask,
                     CampMeetingTaskSubmission, CampMeetingTaskAttachment,
                     CampChapterMaterial, CampChapterMaterialAttachment,
-                    CampMentorProfile)
+                    CampMentorProfile, PersonModel)
 
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team, _direction_of_mentor
@@ -1399,8 +1399,21 @@ def meeting_submissions_zip(mid):
 
     ch_names = {c.id: c.name for c in Chapter.query.filter(
         Chapter.id.in_([p.chapter_id for p in plans])).all()}
+    # 人员清单（A1，2026-10-04 计划 §3.3）：目录带账号 ID 后同名学员不再互串，
+    # 清单按稳定人员编号回查；核验姓名仅 verified 展示（历史残留不外泄）。
+    pids = {u.person_id for u in students if u.person_id}
+    persons = {p.id: p for p in PersonModel.query.filter(
+        PersonModel.id.in_(pids)).all()} if pids else {}
     lines = [f"组会：{m.title}（{m.meeting_date.isoformat()}）",
-             f"组员 {len(students)} 人 · 任务 {len(tasks)} 项 · 课内章 {len(plans)} 项", ""]
+             f"组员 {len(students)} 人 · 任务 {len(tasks)} 项 · 课内章 {len(plans)} 项", "",
+             "【人员清单】账号ID · 人员编号 · 核验姓名 · 昵称 · 核验状态"]
+    for u in students:
+        p = persons.get(u.person_id) if u.person_id else None
+        vname = p.verified_name if (p is not None
+                                    and p.verification_status == 'verified') else None
+        lines.append(f"{u.id} · {p.public_id if p else '-'} · {vname or '-'}"
+                     f" · {u.username} · {p.verification_status if p else '无档案'}")
+    lines.append("")
     for t in tasks:
         lines.append(f"【任务】{t.title}（{SUBMIT_TYPE_TEXT.get(t.submit_type, t.submit_type)}）")
         for u in students:
@@ -1447,7 +1460,9 @@ def meeting_submissions_zip(mid):
             zf.writestr("提交情况.txt", "\n".join(lines))
             for u in students:
                 for t in tasks:
-                    folder = f"{_zip_name(u.username)}/{_zip_name(t.title)}"
+                    # 目录尾缀实体 ID（A1，2026-10-04 计划 §3.3）：姓名负责可读、
+                    # ID 保证唯一——同昵称/同清洗名学员不再生成可互覆盖的路径
+                    folder = f"{_zip_name(u.username)}__U{u.id}/{_zip_name(t.title)}__T{t.id}"
                     used = {}
                     s = sub_by_key.get((t.id, u.id))
                     if not s:
@@ -1459,7 +1474,8 @@ def meeting_submissions_zip(mid):
                         _copy_att(zf, folder, a, used)
                 for p in plans:
                     ch_title = ch_names.get(p.chapter_id, str(p.chapter_id))
-                    folder = f"{_zip_name(u.username)}/{_zip_name(f'课内·{ch_title}')}"
+                    folder = (f"{_zip_name(u.username)}__U{u.id}/"
+                              f"课内·{_zip_name(ch_title)}__C{p.chapter_id}")
                     used = {}
                     rows = mats.get((u.id, p.chapter_id), [])
                     if not rows:

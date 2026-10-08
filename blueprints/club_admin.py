@@ -21,6 +21,7 @@ from services.club_rules import (ORG_SLOTS, ORG_SLOT_GROUP, is_club_position,
                                  is_group_position, position_org_slot,
                                  default_leader_position_id)
 from services.work import provisioning
+from services.identity import matcher
 from . import check_permission, audit_log, _current_user
 from .officers import (_parse_term_start, _validate_appointment, _officer_dict)
 from services.work.events import record_org_event
@@ -515,12 +516,93 @@ def set_membership(user_id):
     return jsonify({"code": 200, "message": f"已更新 {user.username} 的组归属"})
 
 
+@bp.route("/membership/batch/preview", methods=["POST"])
+@jwt_required()
+@check_permission('system_management')
+def batch_membership_preview():
+    """实名名单匹配预览（A1，2026-10-04 计划 §5.4）：body
+    {items: [{real_name?|user_id?, primary?, secondary?}]}。
+
+    身份解析走 services/identity/matcher（当前核验姓名精确匹配，唯一自动预填、
+    重名返回全部候选）；槽位（primary/secondary 传组 id，null=清除）做与正式
+    提交一致的解析与互斥预检。只读端点：不写归属、不触发授权重算。
+    确认提交走 POST /membership/batch 且仅收显式 user_id。"""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"code": 400, "message": "缺少 items 数组"}), 400
+    if len(items) > 200:
+        return jsonify({"code": 400, "message": "单批至多 200 条"}), 400
+
+    entries = []
+    for idx, it in enumerate(items):
+        if isinstance(it, dict):
+            entries.append({"row_key": idx, "real_name": it.get("real_name"),
+                            "user_id": it.get("user_id")})
+        else:
+            entries.append({"row_key": idx})
+    matches = matcher.resolve_batch(entries)
+
+    rows = []
+    try:
+        for idx, (it, match) in enumerate(zip(items, matches)):
+            row = {"index": idx, "match": match,
+                   "primary": None, "secondary": None,
+                   "ready": False, "reason": None}
+            rows.append(row)
+            if not isinstance(it, dict):
+                row["reason"] = "条目格式错误"
+                continue
+            if it.get("username") and not it.get("user_id") and not it.get("real_name"):
+                row["reason"] = (f"昵称「{it.get('username')}」不能自动匹配（昵称可修改、"
+                                 "可重名）；请改填实名姓名，或到用户管理查到账号 ID 后填写")
+                continue
+
+            # 槽位解析与互斥预检（与正式提交同一套 _resolve_slot_group）
+            slots, bad = {}, None
+            for field in ("primary", "secondary"):
+                if field not in it:
+                    continue
+                res = _resolve_slot_group(it.get(field), field)
+                if res is None:
+                    slots[field] = None
+                elif isinstance(res, tuple):
+                    bad = res
+                    break
+                else:
+                    slots[field] = res
+            if bad:
+                row["reason"] = bad[0].get_json()["message"]
+                continue
+            if ("primary" in slots and "secondary" in slots and slots["primary"]
+                    and slots["secondary"] and slots["primary"].id == slots["secondary"].id):
+                row["reason"] = "两槽不能同组"
+                continue
+            for field, g in slots.items():
+                row[field] = {"id": g.id, "name": g.name} if g else None
+
+            resolved_uid = match.get("resolved_user_id")
+            if resolved_uid is None:
+                row["reason"] = match.get("message") or "需先在候选中确认人员"
+                continue
+            row["ready"] = True
+    finally:
+        db.session.rollback()   # 预览零持久化（防御：本路径现无写入，防回归）
+    return jsonify({"code": 200, "message": "匹配预览完成（未执行任何归属变更）",
+                    "data": {"rows": rows}})
+
+
 @bp.route("/membership/batch", methods=["POST"])
 @jwt_required()
 @check_permission('system_management')
 @audit_log(operation="批量设置社团归属")
 def batch_membership():
-    """批量导入（预留接口）：items [{user_id|username, primary?, secondary?}]，逐项回报。"""
+    """批量导入：items [{user_id, primary?, secondary?}]，逐项回报。
+
+    仅收显式账号 ID：实名姓名先经 /membership/batch/preview 匹配确认，前端带
+    解析出的 ID 提交，本端点全量重验。旧 username（昵称）直写分支已移除——
+    昵称可修改、可重名，曾可能给错人设置组归属并重算工作台授权（2026-10-04
+    计划 §3.1）。"""
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     if not isinstance(items, list) or not items:
@@ -537,12 +619,26 @@ def batch_membership():
             continue
         if item.get("user_id"):
             user = UserModel.query.get(int(item["user_id"]))
+            if not user:
+                results.append({"index": idx, "ok": False,
+                                "reason": f"账号 #{item['user_id']} 不存在"})
+                rejected += 1
+                continue
+        elif item.get("real_name"):
+            results.append({"index": idx, "ok": False, "reason": (
+                f"实名「{str(item.get('real_name')).strip()}」请先经匹配预览"
+                "（/admin/club/membership/batch/preview），确认候选后按账号 ID 提交")})
+            rejected += 1
+            continue
         elif item.get("username"):
-            user = UserModel.query.filter_by(username=(item["username"] or "").strip()).first()
+            results.append({"index": idx, "ok": False, "reason": (
+                f"按昵称「{item.get('username')}」导入已停用：昵称可修改、可重名，"
+                "会给错人设置归属；请改用实名姓名（经匹配预览）或账号 ID")})
+            rejected += 1
+            continue
         else:
-            user = None
-        if not user:
-            results.append({"index": idx, "ok": False, "reason": "用户不存在"})
+            results.append({"index": idx, "ok": False,
+                            "reason": "缺少账号 ID（实名姓名请先经匹配预览）"})
             rejected += 1
             continue
 
