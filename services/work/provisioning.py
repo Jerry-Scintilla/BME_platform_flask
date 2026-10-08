@@ -65,7 +65,8 @@ def _officer_in_term(officer, today=None):
 def _desired(user_id, ws):
     """按当前组织事实算 (user, ws) 应有的自动角色。返回 (role, source_type, source_id) 或 None。
 
-    一人至多 1 条 active 任职（模型约束），组长类任职优先于归属；member 角色
+    任职按 org_slot 分槽至多一条（2026-10-04 起跨槽可兼任：组长+社团职务并存，
+    本函数按行遍历天然兼容），组长类任职优先于归属；member 角色
     优先挂 membership 来源（任职变动不带走），无归属时回落任职来源。
     社团工作区（scope=club，X3）：开通口径=全部在任干事＋各组组长（跨组方案 §4.4
     默认建议）——任意组的在任任职即资格，组长类挂 coordinator、普通干事挂 member；

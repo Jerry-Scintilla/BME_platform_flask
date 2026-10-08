@@ -5,7 +5,8 @@ admin 侧 CRUD：任命 / 编辑 / 卸任（状态化不删行）/ 批量导入�
   group_rule（forbidden 职位禁挂组 / required 必挂组）
   per_group_limit（同组同时在任上限，0=不限）
   global_limit（全社同时在任上限，0=不限）
-  一人至多 1 条 active 任职（原「兼两组」由 club_membership 两槽承接，「组员」头衔已退役）
+  同 org_slot 至多 1 条 active 任职（club/group 两槽可跨槽兼任——组长可同时任社团职务，
+  2026-10-04 前为全局一人一职；原「兼两组」由 club_membership 两槽承接）
 兼容：入参 title/department 传名（旧 admin UI）或 title_id/group_id 传 id 均可；
 出参双份（title/title_id、department/group_id）；title/department 列为双写冗余，Phase C 退役。
 
@@ -87,16 +88,21 @@ def _validate_appointment(user_id, pos, group, exclude_ids=None):
     if pos.group_rule == 'required' and not group:
         return 400, f"{pos.name}必须归属一个组"
 
-    # 一人至多 1 条 active（消息带现任职名，方便前端引导先卸任）
+    # 同槽位至多 1 条 active（2026-10-04 组长解耦兑现）：club（社长/副社长/团支书
+    # 等全社治理职）与 group（组长类）两个 org_slot 各至多一条，跨槽可兼任——
+    # 既是组长又任社团职务合法；同槽互斥（不可双组长、不可双社团职务）。
+    # 消息带现任职名，方便前端引导先卸任。
+    slot = position_org_slot(pos)
     mine = ClubOfficer.query.filter(
         ClubOfficer.user_id == user_id,
         ClubOfficer.status == 'active',
     )
     if exclude_ids:
         mine = mine.filter(~ClubOfficer.id.in_(exclude_ids))
-    hit = mine.first()
-    if hit:
-        return 409, f"该成员已有在任职位（{hit.title}，一人至多一职）"
+    ranks = _rank_map()
+    for o in mine.all():
+        if position_org_slot(ranks.get(o.title_id)) == slot:
+            return 409, f"该成员已有同级在任职位（{o.title}，同级至多一职；组长与社团职务可兼任）"
 
     # per_group_limit：同职位同组同时在任
     if pos.per_group_limit:

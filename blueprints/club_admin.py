@@ -771,11 +771,13 @@ def group_detail(gid):
                  if o.title_id in positions and is_club_position(positions[o.title_id])]
 
     # 成员表：组长类在任者置顶（无归属行也补位，与组织页口径一致）+ 归属行（primary 前）
-    title_by_user = {}
+    # 跨槽兼任（2026-10-04）后一人可有多职位名，合并展示（与 organization.py 同口径）
+    _titles = {}
     for o in ClubOfficer.query.filter_by(status='active').all():
         pos = positions.get(o.title_id)
-        if pos and o.user_id not in title_by_user:
-            title_by_user[o.user_id] = pos.name
+        if pos:
+            _titles.setdefault(o.user_id, []).append(pos.name)
+    title_by_user = {uid: ' · '.join(names) for uid, names in _titles.items()}
     member_rows = []
     seen = set()
     for p, o in leader_holders:

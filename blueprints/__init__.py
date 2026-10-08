@@ -453,6 +453,7 @@ from .work import bp as work_bp
 from .work_files import bp as work_files_bp
 from .identity import bp as identity_bp
 from .admin_identity import bp as admin_identity_bp
+from .points_sso import bp as points_sso_bp
 
 __all__ = [
     'auth_bp',
@@ -497,5 +498,6 @@ __all__ = [
     'work_bp',
     'work_files_bp',
     'identity_bp',
-    'admin_identity_bp'
+    'admin_identity_bp',
+    'points_sso_bp'
 ]
