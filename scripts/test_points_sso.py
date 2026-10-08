@@ -148,12 +148,18 @@ class PointsSSORouteTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.get_json()['error_code'], 'AUTH_USER_MISSING')
 
-    def test_banned_user_403(self):
+    def test_banned_user_401(self):
+        # D1 安全地基起 _current_user 收口 services.auth_context.resolve_actor
+        # （带账号生命周期校验）：本测试的裸 Flask app 未挂真 app 的入口守卫
+        # （enforce_request_access），封禁账号在解析层即得 None → 401 AUTH_USER_MISSING，
+        # 走不到蓝图内自带的封禁 403 分支（该分支保留作纵深防御）。生产真 app 中
+        # 封禁用户由入口守卫先拦，仍为 403 ACCOUNT_BANNED。无论哪层拒绝，上游不得被调用。
         self.user.status = 'banned'
         db.session.commit()
         with patch('points_center_client.ensure_user') as mock_ensure:
             resp = self._post(self.user)
-        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.get_json()['error_code'], 'AUTH_USER_MISSING')
         mock_ensure.assert_not_called()
 
     # ── 开关与邮箱 ──────────────────────────────────────────────
