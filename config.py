@@ -57,6 +57,20 @@ LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY")
 LITELLM_DEFAULT_MAX_BUDGET = float(os.getenv("LITELLM_DEFAULT_MAX_BUDGET", "5"))
 LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "30d")
 
+# 积分中心（医工融合创新协会 PointsCenter）外部接入，POINTS-SIGN-V1 签名协议。
+# 总开关默认关闭：关闭时 /points-sso/ticket 返回 503，客户端不解析私钥不连上游。
+# 配置完整性与格式校验统一在 points_center_client.init_points_center(app)（app.py 启动时调用），
+# 此处只做读取。回调地址不设内网默认值，开启前必须显式填写浏览器可达的商城地址。
+POINTS_CENTER_ENABLED = os.getenv("POINTS_CENTER_ENABLED", "false").lower() == "true"
+POINTS_CENTER_BASE_URL = os.getenv("POINTS_CENTER_BASE_URL", "http://172.25.56.83:18081")
+POINTS_PLATFORM_ID = os.getenv("POINTS_PLATFORM_ID", "")
+POINTS_KEY_ID = os.getenv("POINTS_KEY_ID", "")
+# Ed25519 私钥（Base64 编码的 32 字节 raw 格式）。仅后端持有，严禁入 git/前端/日志
+POINTS_PRIVATE_KEY_B64 = os.getenv("POINTS_PRIVATE_KEY_B64", "")
+POINTS_STORE_CALLBACK_URL = os.getenv("POINTS_STORE_CALLBACK_URL", "")
+POINTS_CENTER_CONNECT_TIMEOUT = float(os.getenv("POINTS_CENTER_CONNECT_TIMEOUT", "3"))
+POINTS_CENTER_READ_TIMEOUT = float(os.getenv("POINTS_CENTER_READ_TIMEOUT", "10"))
+
 # 每日出勤报告（00:00 自动汇总昨日出勤并发邮件）
 # 收件人通过 RBAC 权限 attendance_report_recipient 管理（见 /permission/assign）
 ATTENDANCE_REPORT_ENABLED = os.getenv("ATTENDANCE_REPORT_ENABLED", "true").lower() == "true"
