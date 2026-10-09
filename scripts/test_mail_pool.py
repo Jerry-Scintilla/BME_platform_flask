@@ -44,6 +44,7 @@ class MailPoolTests(unittest.TestCase):
     def make_app(self, **config):
         app = Flask(__name__)
         app.config.update(TESTING=True, MAIL_SUPPRESS_SEND=False, MAIL_POOL_ENABLED=True,
+                          MAIL_POOL_GLOBAL_INTERVAL=0,
                           MAIL_POOL_ACCOUNTS=json.dumps([
                               {"username": f"pool{i}@163.com", "password_env": f"POOL_TEST_{i}"}
                               for i in range(5)]))
@@ -111,6 +112,78 @@ class MailPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(MailPoolError, "BUSY_OR_LIMITED"):
             self.mail.send(self.message())
         self.assertEqual(self.factory.call_count, 5)
+
+    def test_global_gap_blocks_another_worker_and_preserves_round_robin(self):
+        app, mail = self.make_app(MAIL_POOL_GLOBAL_INTERVAL=3)
+        app2, mail2 = self.make_app(MAIL_POOL_GLOBAL_INTERVAL=3)
+        pool = app.extensions['mail_pool']
+        with app.app_context():
+            mail.send(self.message())
+        key = pool.prefix + 'global'
+        self.assertEqual(self.redis.get(key), b'cooldown')
+        self.assertGreater(self.redis.ttl(key), 0)
+        self.assertLessEqual(self.redis.ttl(key), 3)
+        with app2.app_context(), self.assertRaisesRegex(MailPoolError, 'BUSY_OR_LIMITED'):
+            mail2.send(self.message())
+        self.assertEqual(self.factory.call_count, 1)
+        self.redis.delete(key)  # Advance past the global cooldown without sleeping.
+        with app2.app_context():
+            mail2.send(self.message())
+        self.assertEqual([c.args[0] for c in self.smtp.login.call_args_list],
+                         ['pool0@163.com', 'pool1@163.com'])
+
+    def test_global_inflight_lease_allows_only_one_worker(self):
+        pools = [self.make_app(MAIL_POOL_GLOBAL_INTERVAL=3)[0].extensions['mail_pool'] for _ in range(8)]
+        barrier = threading.Barrier(8)
+
+        def reserve(i):
+            barrier.wait()
+            try:
+                return pools[i].reserve(set(), 1, f'worker-{i}').username
+            except MailPoolError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(reserve, range(8)))
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertGreater(self.redis.ttl(pools[0].prefix + 'global'), 3)
+
+    def test_global_gap_does_not_block_safe_failover_of_same_message(self):
+        app, mail = self.make_app(MAIL_POOL_GLOBAL_INTERVAL=3)
+        bad = Mock()
+        bad.login.side_effect = smtplib.SMTPAuthenticationError(535, b'private')
+        self.factory.side_effect = [bad, self.smtp]
+        with app.app_context():
+            mail.send(self.message())
+        self.assertEqual(self.smtp.sendmail.call_args.args[0], 'pool1@163.com')
+        self.assertEqual(self.redis.get(app.extensions['mail_pool'].prefix + 'global'), b'cooldown')
+
+    def test_global_failed_delivery_still_starts_cooldown(self):
+        app, mail = self.make_app(MAIL_POOL_GLOBAL_INTERVAL=3)
+        self.smtp.sendmail.side_effect = smtplib.SMTPServerDisconnected('private')
+        with app.app_context(), self.assertRaisesRegex(MailPoolError, 'DELIVERY_UNCERTAIN'):
+            mail.send(self.message())
+        self.assertEqual(self.redis.get(app.extensions['mail_pool'].prefix + 'global'), b'cooldown')
+
+    def test_global_cleanup_cannot_replace_another_owner(self):
+        app, mail = self.make_app(MAIL_POOL_GLOBAL_INTERVAL=3)
+        key = app.extensions['mail_pool'].prefix + 'global'
+
+        def send(*_args):
+            self.redis.set(key, 'new-owner', ex=60)
+            return {}
+
+        self.smtp.sendmail.side_effect = send
+        with app.app_context():
+            mail.send(self.message())
+        self.assertEqual(self.redis.get(key), b'new-owner')
+
+    def test_global_interval_default_is_three_seconds(self):
+        app = Flask(__name__)
+        app.config.update(self.app.config)
+        app.config.pop('MAIL_POOL_GLOBAL_INTERVAL')
+        PoolMail(redis_client=self.redis).init_app(app)
+        self.assertEqual(app.extensions['mail_pool'].global_interval, 3)
 
     def test_minute_and_day_budgets_count_all_recipients(self):
         for budget in ("MAIL_POOL_PER_MINUTE", "MAIL_POOL_PER_DAY"):

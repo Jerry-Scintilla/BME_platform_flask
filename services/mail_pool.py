@@ -55,10 +55,14 @@ _RESERVE = """
 local n = tonumber(ARGV[1])
 local start = tonumber(redis.call('GET', KEYS[1]) or '0') % n
 local cost = tonumber(ARGV[2])
+local global_owner = redis.call('GET', KEYS[2])
+if tonumber(ARGV[8]) > 0 and global_owner and global_owner ~= ARGV[6] then
+    return 0
+end
 for offset = 1, n do
     local i = (start + offset - 1) % n + 1
-    local k = 2 + (i - 1) * 5
-    if ARGV[7 + i] == '1'
+    local k = 3 + (i - 1) * 5
+    if ARGV[8 + i] == '1'
        and redis.call('EXISTS', KEYS[k], KEYS[k+3], KEYS[k+4]) == 0
        and tonumber(redis.call('GET', KEYS[k+1]) or '0') + cost <= tonumber(ARGV[3])
        and tonumber(redis.call('GET', KEYS[k+2]) or '0') + cost <= tonumber(ARGV[4]) then
@@ -71,6 +75,9 @@ for offset = 1, n do
             redis.call('EXPIRE', KEYS[k+2], 86400)
         end
         redis.call('SET', KEYS[k+4], ARGV[6], 'EX', ARGV[7])
+        if tonumber(ARGV[8]) > 0 then
+            redis.call('SET', KEYS[2], ARGV[6], 'EX', ARGV[7])
+        end
         return i
     end
 end
@@ -80,6 +87,14 @@ return 0
 _RELEASE = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
     return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+_FINISH_GLOBAL = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('SET', KEYS[1], 'cooldown', 'EX', ARGV[2])
+    return 1
 end
 return 0
 """
@@ -124,6 +139,7 @@ class Pool:
         self.timeout = _integer(config, "MAIL_POOL_TIMEOUT", 5, 1, 15)
         self.attempts = _integer(config, "MAIL_POOL_MAX_ATTEMPTS", 3, 1, 5)
         self.interval = _integer(config, "MAIL_POOL_MIN_INTERVAL", 10, 1, 3600)
+        self.global_interval = _integer(config, "MAIL_POOL_GLOBAL_INTERVAL", 3, 0, 60)
         self.minute_limit = _integer(config, "MAIL_POOL_PER_MINUTE", 5, 1, 1000)
         self.day_limit = _integer(config, "MAIL_POOL_PER_DAY", 200, 1, 100000)
         self.cooldown = _integer(config, "MAIL_POOL_FAILURE_COOLDOWN", 300, 1, 86400)
@@ -141,13 +157,13 @@ class Pool:
         return [base + suffix for suffix in ("gap", "minute", "day", "cooldown", "busy")]
 
     def reserve(self, excluded, count, token):
-        keys = [self.prefix + "cursor"]
+        keys = [self.prefix + "cursor", self.prefix + "global"]
         for account in self.accounts:
             keys.extend(self.keys(account))
         # Upper bound for sequential RCPT commands plus connection/DATA overhead.
         lease = (count + 15) * self.timeout + 30
         args = [len(self.accounts), count, self.minute_limit, self.day_limit,
-                self.interval, token, lease]
+                self.interval, token, lease, self.global_interval]
         args.extend(int(a.key not in excluded) for a in self.accounts)
         try:
             index = int(self.redis.eval(_RESERVE, len(keys), *keys, *args))
@@ -180,9 +196,20 @@ class Pool:
         # Keep synchronous sends bounded. Current callers send one recipient.
         if len(recipients) > 100:
             raise MailPoolError("MAIL_POOL_TOO_MANY_RECIPIENTS")
+        token = uuid.uuid4().hex
+        try:
+            self._send(message, recipients, token)
+        finally:
+            if self.global_interval:
+                try:
+                    self.redis.eval(_FINISH_GLOBAL, 1, self.prefix + "global",
+                                    token, self.global_interval)
+                except Exception:
+                    current_app.logger.warning("mail_pool global reservation release failed")
+
+    def _send(self, message, recipients, token):
         excluded = set()
         for _ in range(min(self.attempts, len(self.accounts))):
-            token = uuid.uuid4().hex
             account = self.reserve(excluded, len(recipients), token)
             excluded.add(account.key)
             host = None
