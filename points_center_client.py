@@ -260,7 +260,7 @@ def ensure_user(email, platform_user_id):
             category="CONTRACT",
             detail={"resp_email": str(data.get("email"))[:128]},
         )
-    if data.get("status") != "active":
+    if data.get("status") not in ("active", "ACTIVE"):
         raise PointsCenterError(
             f"ensure 返回账号状态异常: {data.get('status')}",
             category="CONTRACT",

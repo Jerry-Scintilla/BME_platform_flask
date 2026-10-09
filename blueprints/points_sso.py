@@ -13,7 +13,6 @@
 - 日志只记 request_id / 用户 / 阶段 / 上游状态与错误类别 / 耗时，
   不记 ticket（含前缀）、JWT、签名头与完整请求响应体。
 """
-import re
 import time
 import uuid
 
@@ -24,6 +23,7 @@ from redis.exceptions import RedisError
 import points_center_client
 from blueprints import _current_user
 from exts import limiter
+from services.points_identity import resolve_points_identity
 
 try:
     from flask_limiter import RateLimitExceeded
@@ -44,10 +44,6 @@ USER_BUCKET = "10/minute"     # 单用户：服务器查明的 user.id，与 jti
 IP_BUCKET = "300/minute"      # 入口防刷：按客户端 IP（校园网共享出口，额度放宽）
 TOTAL_BUCKET = "20/second"    # 平台级总量：所有 worker 经 Redis 共桶（正常请求=2 次上游调用）
 
-# 校园邮箱域名白名单：精确匹配域名（拒绝 mail.sysu.edu.cn.example.com 之类相似域）
-ALLOWED_EMAIL_DOMAINS = ("mail2.sysu.edu.cn", "mail.sysu.edu.cn")
-_LOCAL_PART_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
-
 
 def _resp(code, message, error_code=None, headers=None, **extra):
     """统一响应构造：顶层字段平铺（沿用仓库惯例，不加 data 包装）+ no-store。"""
@@ -61,23 +57,6 @@ def _resp(code, message, error_code=None, headers=None, **extra):
     for k, v in (headers or {}).items():
         resp.headers[k] = v
     return resp, code
-
-
-def _normalize_campus_email(raw):
-    """规范化并校验校园邮箱：去首尾空白、域名转小写后精确匹配白名单。
-    返回规范化邮箱；不合法返回 None。不接受前端传入的任何身份字段。"""
-    if not raw:
-        return None
-    email = str(raw).strip()
-    local, sep, domain = email.rpartition("@")
-    if not sep:
-        return None
-    local, domain = local.strip(), domain.strip().lower()
-    if not local or not _LOCAL_PART_RE.fullmatch(local):
-        return None
-    if domain not in ALLOWED_EMAIL_DOMAINS:
-        return None
-    return f"{local}@{domain}"
 
 
 def _retry_after_seconds(exc):
@@ -124,6 +103,19 @@ def _upstream_error_response(request_id, user_id, e):
                  error_code="POINTS_INTEGRATION_ERROR")
 
 
+@bp.route("/eligibility", methods=["GET"])
+@jwt_required()
+def eligibility():
+    """只读本平台资格；不创建积分绑定，不暴露核验邮箱，不签发票据。"""
+    user = _current_user()
+    if user is None:
+        return _resp(401, "登录状态异常，请重新登录", error_code="AUTH_USER_MISSING")
+    identity = resolve_points_identity(user)
+    return _resp(200, identity.message, eligible=identity.eligible,
+                 source=identity.source, reason=identity.error_code,
+                 enabled=bool(current_app.config.get("POINTS_CENTER_ENABLED")))
+
+
 @bp.route("/ticket", methods=["POST"])
 @jwt_required()
 def create_ticket():
@@ -142,12 +134,13 @@ def create_ticket():
     if not current_app.config.get("POINTS_CENTER_ENABLED"):
         return _resp(503, "积分商城暂未开放", error_code="POINTS_DISABLED")
 
-    # ③ 邮箱：只取服务器侧当前用户邮箱，域名精确白名单
-    email = _normalize_campus_email(user.email)
-    if not email:
+    # ③ 后端实时解析登录教育邮箱或正式核验邮箱，不接受浏览器指定身份。
+    identity = resolve_points_identity(user)
+    if not identity.eligible:
         current_app.logger.info(
-            f"[points_sso] rid={request_id} uid={user.id} rejected=email_domain")
-        return _resp(400, "积分商城目前仅支持中大校园邮箱账号", error_code="EMAIL_DOMAIN")
+            f"[points_sso] rid={request_id} uid={user.id} rejected={identity.error_code}")
+        return _resp(identity.status, identity.message, error_code=identity.error_code)
+    email = identity.email
 
     # 身份既定，生成对外的平台用户标识（与登录响应 User_Id 一致，绑定后不可改）
     platform_user_id = str(user.id).zfill(7)

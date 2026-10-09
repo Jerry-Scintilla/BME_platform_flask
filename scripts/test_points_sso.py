@@ -137,6 +137,182 @@ class PointsSSORouteTest(unittest.TestCase):
     def _post(self, user):
         return self.client.post('/points-sso/ticket', headers=self._auth(user))
 
+    def _verify_school_email(self, user=None):
+        """走现有申请、验证码与负责人批准流程，证明普通登录邮箱不需变更。"""
+        from models import IdentitySchoolConfigModel, PersonIdentityModel
+        from services.identity import person, verification
+        from test_identity_verification import _FakeRedis
+        user = user or self.outsider
+        person.create_provisional(user)
+        reviewer = UserModel(username='审核人', email='reviewer@example.com', role='super_admin')
+        reviewer.set_password('a' * 32)
+        db.session.add(reviewer)
+        db.session.flush()
+        db.session.add(IdentitySchoolConfigModel(
+            school_id='sysu', name='中山大学',
+            personal_email_domains=['mail2.sysu.edu.cn', 'mail.sysu.edu.cn'],
+            excluded_email_domains=[], email_local_matches_identifier=True,
+            reviewer_user_ids=[reviewer.id]))
+        db.session.flush()
+        application = verification.create_or_update_application(
+            user, school_id='sysu', claimed_name='学员', claimed_identifier='verified01',
+            contact_email='verified01@mail2.sysu.edu.cn')
+        with patch.object(verification, 'redis_client', _FakeRedis()):
+            code, _ = verification.issue_challenge(user, application)
+            self.assertTrue(verification.verify_challenge(user, application, code))
+        verification.submit_application(user, application)
+        verification.approve_application(application, reviewer)
+        db.session.commit()
+        identity = PersonIdentityModel.query.filter_by(person_id=user.person_id).one()
+        return application, identity
+
+    def test_qq_registration_then_real_verification_enters_with_verified_email(self):
+        application, _ = self._verify_school_email()
+        original_email = self.outsider.email
+        with patch('points_center_client.ensure_user') as ensure, \
+                patch('points_center_client.create_sso_ticket', return_value=('verified-ticket', 90)) as ticket:
+            response = self._post(self.outsider)
+        self.assertEqual(response.status_code, 200)
+        uid = str(self.outsider.id).zfill(7)
+        ensure.assert_called_once_with(application.contact_email, uid)
+        ticket.assert_called_once_with(uid)
+        self.assertEqual(self.outsider.email, original_email)
+
+    def test_eligibility_is_read_only_private_and_separate_from_open_switch(self):
+        application, _ = self._verify_school_email()
+        self.app.config['POINTS_CENTER_ENABLED'] = False
+        with patch('points_center_client.ensure_user') as ensure, \
+                patch('points_center_client.create_sso_ticket') as ticket:
+            response = self.client.get('/points-sso/eligibility', headers=self._auth(self.outsider))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['eligible'])
+        self.assertFalse(response.json['enabled'])
+        self.assertEqual(response.json['source'], 'verified_school_email')
+        self.assertNotIn(application.contact_email, response.get_data(as_text=True))
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+        ensure.assert_not_called()
+        ticket.assert_not_called()
+        self.assertEqual(self.client.get('/points-sso/eligibility').status_code, 401)
+
+    def test_unverified_or_untrusted_evidence_never_calls_points_center(self):
+        from models import PersonModel
+        application, identity = self._verify_school_email()
+        person = db.session.get(PersonModel, self.outsider.person_id)
+        cases = [
+            (person, 'verification_status', 'unverified'),
+            (person, 'verification_status', 'pending'),
+            (person, 'verification_status', 'disputed'),
+            (person, 'verification_status', 'revoked'),
+            (person, 'record_status', 'merged'),
+            (identity, 'proof_status', 'revoked'),
+            (identity, 'issuer', 'external:other'),
+            (identity, 'assurance_method', 'manual_review'),
+            (identity, 'kind', 'roster_ref'),
+            (identity, 'proof_ref', 'application#999999'),
+            (identity, 'proof_ref', 'self-claimed'),
+            (identity, 'canonical_key', 'someone_else'),
+            (application, 'status', 'submitted'),
+            (application, 'status', 'rejected'),
+            (application, 'challenge_verified_at', None),
+            (application, 'reviewed_at', None),
+            (application, 'reviewed_by', None),
+            (application, 'method', 'manual'),
+            (application, 'school_id', 'external:other'),
+            (application, 'contact_email', 'fake@mail2.sysu.edu.cn.evil.com'),
+            (application, 'applicant_user_id', self.user.id),
+        ]
+        for obj, field, value in cases:
+            with self.subTest(field=field, value=value):
+                original = getattr(obj, field)
+                setattr(obj, field, value)
+                db.session.commit()
+                with patch('points_center_client.ensure_user') as ensure, \
+                        patch('points_center_client.create_sso_ticket') as ticket:
+                    response = self._post(self.outsider)
+                    status = self.client.get('/points-sso/eligibility', headers=self._auth(self.outsider))
+                self.assertIn(response.status_code, (400, 403))
+                self.assertFalse(status.json['eligible'])
+                ensure.assert_not_called()
+                ticket.assert_not_called()
+                setattr(obj, field, original)
+                db.session.commit()
+
+    def test_revocation_after_eligibility_is_rechecked_on_ticket(self):
+        _, identity = self._verify_school_email()
+        self.assertTrue(self.client.get('/points-sso/eligibility', headers=self._auth(self.outsider)).json['eligible'])
+        identity.proof_status = 'revoked'
+        db.session.commit()
+        with patch('points_center_client.ensure_user') as ensure:
+            self.assertEqual(self._post(self.outsider).status_code, 400)
+        ensure.assert_not_called()
+
+    def test_campus_login_retains_original_binding_email_after_verification(self):
+        self._verify_school_email(self.user)
+        with patch('points_center_client.ensure_user') as ensure, \
+                patch('points_center_client.create_sso_ticket', return_value=('ticket', 90)):
+            self.assertEqual(self._post(self.user).status_code, 200)
+        ensure.assert_called_once_with(self.user.email, str(self.user.id).zfill(7))
+
+    def test_migrated_identity_proof_follows_current_person_after_account_merge(self):
+        from models import PersonModel
+        application, identity = self._verify_school_email()
+        old_person = db.session.get(PersonModel, self.outsider.person_id)
+        surviving = PersonModel(public_id=uuid.uuid4().hex, verification_status='verified', record_status='active')
+        db.session.add(surviving)
+        db.session.flush()
+        self.user.email = 'survivor@qq.com'
+        self.user.person_id = surviving.id
+        self.outsider.person_id = surviving.id
+        self.outsider.lifecycle = 'merged'
+        identity.person_id = surviving.id
+        old_person.record_status = 'merged'
+        old_person.merged_to_person_id = surviving.id
+        db.session.commit()
+        self.assertNotEqual(application.applicant_person_id, surviving.id)
+        with patch('points_center_client.ensure_user') as ensure, \
+                patch('points_center_client.create_sso_ticket', return_value=('ticket', 90)):
+            self.assertEqual(self._post(self.user).status_code, 200)
+        ensure.assert_called_once_with(application.contact_email, str(self.user.id).zfill(7))
+
+    def test_multiple_verified_emails_require_review(self):
+        from models import IdentityApplicationModel, PersonIdentityModel
+        application, _ = self._verify_school_email()
+        other = IdentityApplicationModel(
+            school_id='sysu', applicant_user_id=self.outsider.id,
+            applicant_person_id=self.outsider.person_id, claimed_name='学员',
+            claimed_identifier='another', contact_email='another@mail.sysu.edu.cn',
+            method='school_email', status='approved', challenge_verified_at=application.challenge_verified_at,
+            reviewed_by=application.reviewed_by, reviewed_at=application.reviewed_at)
+        db.session.add(other)
+        db.session.flush()
+        db.session.add(PersonIdentityModel(
+            person_id=self.outsider.person_id, issuer='sysu', kind='netid',
+            canonical_key='another', proof_status='verified', assurance_method='school_email',
+            proof_ref=f'application#{other.id}'))
+        db.session.commit()
+        with patch('points_center_client.ensure_user') as ensure:
+            response = self._post(self.outsider)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json['error_code'], 'POINTS_IDENTITY_AMBIGUOUS')
+        ensure.assert_not_called()
+
+    def test_verified_qq_binding_conflict_does_not_issue_ticket(self):
+        self._verify_school_email()
+        with patch('points_center_client.ensure_user', side_effect=PointsCenterError('conflict', category='HTTP', status_code=409)), \
+                patch('points_center_client.create_sso_ticket') as ticket:
+            response = self._post(self.outsider)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json['error_code'], 'POINTS_BINDING_CONFLICT')
+        ticket.assert_not_called()
+
+    def test_browser_cannot_supply_verified_identity_or_another_users_email(self):
+        with patch('points_center_client.ensure_user') as ensure:
+            response = self.client.post('/points-sso/ticket', headers=self._auth(self.outsider), json={
+                'email': self.user.email, 'person_id': self.user.person_id,
+                'verification_status': 'verified', 'eligible': True})
+        self.assertEqual(response.status_code, 400)
+        ensure.assert_not_called()
+
     # ── 登录与账号 ──────────────────────────────────────────────
     def test_missing_token_rejected(self):
         resp = self.client.post('/points-sso/ticket')
@@ -513,6 +689,13 @@ class PointsCenterClientTest(unittest.TestCase):
             with self.assertRaises(PointsCenterError) as ctx:
                 points_center_client.ensure_user("a@mail2.sysu.edu.cn", "0000123")
         self.assertEqual(ctx.exception.category, "CONTRACT")
+
+    def test_ensure_accepts_production_uppercase_active_without_rebinding(self):
+        response = _make_response(payload={'platform_user_id': '0000123',
+                                           'email': 'a@mail2.sysu.edu.cn', 'status': 'ACTIVE'})
+        with patch('points_center_client.requests.request', return_value=response) as request:
+            points_center_client.ensure_user('a@mail2.sysu.edu.cn', '0000123')
+        self.assertFalse(json.loads(request.call_args.kwargs['data'])['allow_rebind'])
 
     def test_ticket_expires_in_mismatch_stops(self):
         odd = _make_response(payload={"ticket": "x" * 64, "expires_in": 120})
