@@ -1,0 +1,2 @@
+# Test-only; runtime already uses redis and Flask-Mail.
+fakeredis[lua]==2.32.1

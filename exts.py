@@ -7,7 +7,7 @@ load_dotenv()
 # flask-sqlalchemy
 from flask_sqlalchemy import SQLAlchemy
 # flask_mail
-from flask_mail import Mail
+from services.mail_pool import PoolMail
 # flask_limiter
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -15,7 +15,7 @@ from flask_redis import FlaskRedis
 
 db = SQLAlchemy()
 
-mail = Mail()
+mail = PoolMail()
 
 limiter = Limiter(
     key_func=get_remote_address,  # 使用客户端 IP 作为限流键

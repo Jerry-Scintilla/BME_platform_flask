@@ -37,9 +37,6 @@ if not JWT_SECRET_KEY or len(JWT_SECRET_KEY) < 32:
         '请在 .env 写入随机密钥：python3 -c "import secrets; print(secrets.token_urlsafe(48))"'
     )
 
-# 邮箱授权码
-# MBWa73BLhWMgkEmJ
-
 # 邮箱配置
 MAIL_SERVER = os.getenv("EMAIL_SERVER")
 MAIL_USE_SSL = True
@@ -47,6 +44,21 @@ MAIL_PORT = 465
 MAIL_USERNAME = os.getenv("MAIL_USERNAME")
 MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
 MAIL_DEFAULT_SENDER = os.getenv("MAIL_USERNAME")
+
+# 可选 SMTP 邮箱池；关闭时继续使用上方原有单邮箱配置。
+# 授权码只从环境变量读取，JSON 仅保存邮箱和授权码变量名。
+MAIL_POOL_ENABLED = os.getenv("MAIL_POOL_ENABLED", "false")
+MAIL_POOL_ACCOUNTS = os.getenv("MAIL_POOL_ACCOUNTS", "[]")
+MAIL_POOL_SERVER = os.getenv("MAIL_POOL_SERVER", "smtp.163.com")
+MAIL_POOL_PORT = os.getenv("MAIL_POOL_PORT", "465")
+MAIL_POOL_SENDER_NAME = os.getenv("MAIL_POOL_SENDER_NAME", "BME 训练营")
+MAIL_POOL_NAMESPACE = os.getenv("MAIL_POOL_NAMESPACE", "bme:mail-pool:v1")
+MAIL_POOL_TIMEOUT = os.getenv("MAIL_POOL_TIMEOUT", "5")
+MAIL_POOL_MAX_ATTEMPTS = os.getenv("MAIL_POOL_MAX_ATTEMPTS", "3")
+MAIL_POOL_MIN_INTERVAL = os.getenv("MAIL_POOL_MIN_INTERVAL", "10")
+MAIL_POOL_PER_MINUTE = os.getenv("MAIL_POOL_PER_MINUTE", "5")
+MAIL_POOL_PER_DAY = os.getenv("MAIL_POOL_PER_DAY", "200")
+MAIL_POOL_FAILURE_COOLDOWN = os.getenv("MAIL_POOL_FAILURE_COOLDOWN", "300")
 
 # LiteLLM 大模型代理配置
 # LiteLLM Proxy 的基础地址，例如 http://127.0.0.1:4000
