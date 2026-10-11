@@ -498,7 +498,12 @@ def can_learn_course(user, course):
     row = UserCourseModel.query.filter_by(user_id=user.id, course_id=course.id).first()
     if row and row.status != UserCourseModel.STATUS_DROPPED and row.camp_session_id:
         return True
-    return _camp_scope(user.id, course.id) is not None
+    from models import CampCourseAssignment, CampSession, CampMember
+    return db.session.query(CampCourseAssignment.id).join(CampSession,
+        CampSession.id == CampCourseAssignment.camp_session_id).join(CampMember,
+        db.and_(CampMember.camp_session_id == CampSession.id, CampMember.user_id == user.id)).filter(
+        CampCourseAssignment.student_user_id == user.id, CampCourseAssignment.course_id == course.id,
+        CampCourseAssignment.status == 'active', CampSession.status != 'deleted', CampMember.status == 'active').first() is not None
 
 
 def _ensure_open_course_enrollment(user, course):
@@ -595,8 +600,14 @@ def update_lesson_progress():
     try:
         prefer_sid = int(data.get('camp_session_id'))
     except (TypeError, ValueError):
-        prefer_sid = None                   # 非法值静默忽略，回落推导口径
-    camp = _camp_scope(user.id, course_id, prefer_sid=prefer_sid)
+        if data.get('camp_session_id') is not None:
+            return jsonify({'code': 400, 'message': 'camp_session_id 非法'}), 400
+        prefer_sid = None
+    from services.groups import GroupError
+    try:
+        camp = _camp_scope(user.id, course_id, prefer_sid=prefer_sid)
+    except GroupError as exc:
+        return jsonify(code=exc.status, message=str(exc), machine=exc.machine), exc.status
     if camp is not None:
         snap = CampLearningProgress.query.filter_by(
             camp_session_id=camp.id, user_id=user.id, lesson_id=lesson_id).first()
@@ -929,9 +940,26 @@ def check_course():
     # ——结营后全局才是有效口径；前端用它做进度口径分流（effectiveSid），保证从任意
     # 路径进详情页口径一致。同课跨营多活营时返回最新分配营（与打点分流一致）。
     camp_sid = None
-    scope = _camp_scope(user.id, course_id)
-    if scope is not None:
-        camp_sid = scope.id
+    from services.groups import GroupError
+    scope_required = False
+    explicit_sid = request.args.get('camp_session_id', type=int)
+    try:
+        if explicit_sid:
+            from models import CampCourseAssignment, CampSession
+            explicit_camp = db.session.get(CampSession, explicit_sid)
+            assignment = CampCourseAssignment.query.filter_by(camp_session_id=explicit_sid,
+                student_user_id=user.id, course_id=course_id).first()
+            if not explicit_camp or explicit_camp.status == 'deleted' or not assignment:
+                return jsonify(code=403, message='未在指定营期修读此课程'), 403
+            camp_sid = explicit_sid
+        else:
+            scope = _camp_scope(user.id, course_id)
+            if scope is not None:
+                camp_sid = scope.id
+    except GroupError as exc:
+        if exc.machine != 'CAMP_COURSE_SCOPE_REQUIRED':
+            raise
+        scope_required = True
 
     # active 与 completed 都算已选课（completed=已学完，仍可复习进入）；
     # dropped 不算。此前只认 active，自主学课自动课成（migrate_52）后会丢入口。
@@ -950,6 +978,7 @@ def check_course():
                 "status": user_course.status,
                 "enroll_time": user_course.enroll_time.strftime('%Y-%m-%d %H:%M:%S') if user_course.enroll_time else None,
                 "camp_session_id": camp_sid,
+                "camp_context_required": scope_required,
                 "learning_mode": course.learning_mode,
                 "can_learn": can_learn
             }
@@ -962,6 +991,7 @@ def check_course():
                 "enrolled": False,
                 "status": user_course.status if user_course else None,
                 "camp_session_id": camp_sid,
+                "camp_context_required": scope_required,
                 "learning_mode": course.learning_mode,
                 "can_learn": can_learn
             }

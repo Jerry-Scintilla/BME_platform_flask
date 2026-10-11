@@ -23,7 +23,7 @@ from flask_jwt_extended import jwt_required
 from exts import db
 from storage import storage
 from models import (
-    CampSession, CampMember, CampUnit, CampUnitMember,
+    CampSession, CampMember, CampUnit,
     ProjectTemplate, ProjectTemplateNode,
     CampMilestone, CampSubmissionVersion, CampSubmissionAttachment,
     CampNodeEvaluation,
@@ -31,6 +31,7 @@ from models import (
     CampMembershipEvent, UserModel,
 )
 
+from services.camp_groups.reads import UnitMembershipRead
 from . import camp_role, audit_log, _current_user
 from .camp import _camp_writable
 from .camp_project import (_camp_or_404, _unit_or_404, _is_unit_leader, _notify,
@@ -49,15 +50,12 @@ VALID_SUBMIT_MODES = ('team', 'member')
 
 def _unit_role(unit, user):
     """请求者在单元内的身份：'leader' / 'member'（active）/ None。admin 恒 'leader' 视角（admin 分支单独判断）。"""
-    if user.is_admin():
-        return 'leader'
-    row = CampUnitMember.query.filter_by(
-        unit_id=unit.id, user_id=user.id, status='active').first()
-    return row.role if row else None
+    from services.camp_groups.projects import unit_role
+    return unit_role(unit, user)
 
 
 def _active_unit_members(unit_id):
-    return CampUnitMember.query.filter_by(unit_id=unit_id, status='active').all()
+    return UnitMembershipRead.query.filter_by(unit_id=unit_id, status='active').all()
 
 
 def _template_dict(t, nodes=None):
@@ -435,7 +433,7 @@ def node_evaluation_put(mid, member_uid):
         return jsonify({"code": 400, "message": "营期已归档，只读"}), 400
     if unit.status != 'active':
         return jsonify({"code": 400, "message": f"项目状态为 {unit.status}，不可评价"}), 400
-    row = CampUnitMember.query.filter_by(
+    row = UnitMembershipRead.query.filter_by(
         unit_id=unit.id, user_id=member_uid, status='active').first()
     if not row or member_uid == unit.owner_user_id:
         return jsonify({"code": 400, "message": "评价对象须为本项目在职成员（不含负责人本人）"}), 400
@@ -913,7 +911,7 @@ def freeze_camp_archive(camp, operator_id):
     units = CampUnit.query.filter_by(camp_session_id=camp.id, unit_type='project').all()
     unit_snapshots = []
     for unit in units:
-        um_rows = CampUnitMember.query.filter_by(unit_id=unit.id).all()
+        um_rows = UnitMembershipRead.query.filter_by(unit_id=unit.id).all()
         ms_rows = CampMilestone.query.filter_by(unit_id=unit.id).order_by(CampMilestone.order_no).all()
         ms_snap = []
         for m in ms_rows:

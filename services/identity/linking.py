@@ -46,8 +46,18 @@ from models import (ArticleModel, ArticleV2Model, CampChapterCertification,
                      FeedbackTicket, LearningProgressModel, LLMQuotaRequestModel,
                      LLMUserKeyModel, MedalUserModel, ShowcaseProject, TaskAssignee,
                      UserCourseModel, WorkAccessGrant, WorkFile, WorkItemParticipant)
+from models import GroupMembership, CampGroup, GroupRoleAssignment, GroupMembershipEvent, GroupOperation, CampTeachingEvent, TrainingGroupProfile, TrainingMigrationRun
 
 SHELL_MODULES = {
+    'training_migration_actor': (TrainingMigrationRun, 'actor_user_id'),
+    'training_event_subject': (CampTeachingEvent, 'user_id'),
+    'training_event_actor': (CampTeachingEvent, 'actor_user_id'),
+    'training_recruitment': (TrainingGroupProfile, 'recruitment_mentor_id'),
+    'group_member': (GroupMembership, 'user_id'),
+    'group_owner': (CampGroup, 'owner_user_id'),
+    'group_appointment': (GroupRoleAssignment, 'granted_by'),
+    'group_event': (GroupMembershipEvent, 'actor_user_id'),
+    'group_operation': (GroupOperation, 'actor_user_id'),
     'user_course': (UserCourseModel, 'user_id'),
     'learning_progress': (LearningProgressModel, 'user_id'),
     'camp_learning': (CampLearningProgress, 'user_id'),
@@ -478,6 +488,9 @@ def confirm_link(actor, case, *, preview_digest):
         if not hmac.compare_digest(digest_now, case.preview_digest):
             raise AuthRejected('目标账号数据已变化，需重新审核',
                                status=409, machine='STALE_PREVIEW')
+
+    from services.camp_groups.identity import prepare_person_rebind
+    prepare_person_rebind(user_b, person_a.id, user_a.id)
 
     # ── prepared → applied：一个事务内完成全部写（规格 3.4 顺序）──
     _transition(case, 'prepared', user_a.id, '确认执行')

@@ -380,9 +380,10 @@ def teacher_overview(sid):
 
     stage_labels = {'draft': '草稿', 'upcoming': '待开放', 'selecting': '报名与选导生',
                     'running': '进行中', 'archived': '已结营'}
-    students = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
-    mentors = CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()
-    unmatched = [m for m in students if not m.team_mentor_id]
+    students = CampMember.query.filter_by(camp_session_id=sid, is_learner=True).all()
+    mentors = CampMember.query.filter_by(camp_session_id=sid, is_mentor=True).all()
+    from services.camp_groups import training_access
+    unmatched = [m for m in students if not training_access.learner_units(sid, m.user_id)] if camp.training_groups_ready else [m for m in students if not m.team_mentor_id]
 
     # 待审报名（学员+导生分开计）与最早等待时间
     pending_apps = CampJoinRequest.query.filter_by(camp_session_id=sid, status='pending') \
@@ -395,7 +396,7 @@ def teacher_overview(sid):
     pending_leaves = CampLeave.query.filter_by(camp_session_id=sid, status='pending') \
         .order_by(CampLeave.created_at).all()
     student_team = {m.user_id: m.team_mentor_id for m in students}
-    unassigned_leaves = sum(1 for lv in pending_leaves if not student_team.get(lv.user_id))
+    unassigned_leaves = sum(1 for lv in pending_leaves if not training_access.approver_ids(sid, lv.user_id))
 
     # 选导生就绪（2026-09-21 阶段收缩）：仅 selecting 阶段投影——开营后选导生流程
     # 已结束，不再出现「未发布名片/未交志愿」等选导生阶段待办

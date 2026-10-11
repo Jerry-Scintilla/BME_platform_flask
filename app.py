@@ -117,6 +117,8 @@ app.register_blueprint(llm_bp)
 app.register_blueprint(notification_bp)
 app.register_blueprint(seat_bp)
 app.register_blueprint(attendance_report_bp)
+from blueprints.camp_training import bp as camp_training_bp
+app.register_blueprint(camp_training_bp)
 app.register_blueprint(camp_bp)
 app.register_blueprint(camp_staff_bp)
 app.register_blueprint(camp_announcement_bp)
@@ -165,6 +167,10 @@ init_ai_topic_scheduler(app)
 
 # 与原全站封禁检查共用一次用户查询，并增加 /admin/ 路径的角色门禁。
 app.before_request(enforce_request_access)
+from services.camp_groups.maintenance import install as install_camp_maintenance
+install_camp_maintenance(app)
+from services.camp_groups.legacy_boundary import install as install_legacy_group_boundary
+install_legacy_group_boundary(app)
 
 
 @app.route('/')

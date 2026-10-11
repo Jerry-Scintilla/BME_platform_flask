@@ -13,7 +13,7 @@
 - scope='team'：培训组。现役学习营不落 camp_unit（mentor_team 单元迁移窗口未到），
   组=CampMember(role='mentor') + 学员 team_mentor_id 指回（1 导生 1 组），
   故以组长（导生）用户为组的锚点（mentor_id）。
-- scope='unit'：项目组。挂 camp_unit.id，负责人=CampUnitMember(role='leader')。
+- scope='unit'：项目组。挂 camp_unit.id，负责人=UnitMembershipRead(role='leader')。
 
 附件走 storage 层（STORAGE_BACKEND=minio|local），object_key 规则
 camp/{sid}/meeting/{meeting_id}/{uuid}{ext}；下载走鉴权代理端点
@@ -35,7 +35,7 @@ from sqlalchemy import or_
 
 from exts import db
 from storage import storage
-from models import (CampSession, CampMember, CampUnit, CampUnitMember,
+from models import (CampSession, CampMember, CampUnit,
                     CampMeeting, CampMeetingAttachment, UserModel,
                     CourseModel, Chapter, CampChapterCertification,
                     CampMeetingChapterPlan, CampMeetingTask,
@@ -43,6 +43,7 @@ from models import (CampSession, CampMember, CampUnit, CampUnitMember,
                     CampChapterMaterial, CampChapterMaterialAttachment,
                     CampMentorProfile, PersonModel)
 
+from services.camp_groups.reads import UnitMembershipRead
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team, _direction_of_mentor
 from .camp_project import _camp_or_404, _unit_or_404, _is_unit_leader, _usernames
@@ -77,14 +78,35 @@ def _parse_due_at(raw):
 # 辅助
 # ─────────────────────────────────────────────
 
+from services.camp_groups import training_access
+from services.groups import GroupError
+from models import TrainingGroupProfile
+
+
+@bp.errorhandler(GroupError)
+def training_group_error(exc):
+    db.session.rollback()
+    return jsonify(code=exc.status, message=str(exc), machine=exc.machine), exc.status
+
+
+def _selected_training_group(sid, user):
+    own = {u.id: u for _, u in training_access.roles(sid, user.id)}
+    selected = request.args.get('unit_id', type=int) or request.form.get('unit_id', type=int)
+    if selected is None and len(own) == 1:
+        selected = next(iter(own))
+    if selected is not None and selected not in own:
+        raise GroupError('不在该培训组', status=403)
+    return own.get(selected), [{'unit_id': u.id, 'name': u.name} for u in own.values()]
+
+
 def _team_context(sid, user):
     """解析请求者在学习营的培训组上下文（以组长为锚）。
     返回 (mentor, member_count) ；未编组/非营内成员返回 (None, 0)。"""
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
     mentor_id = None
-    if member and member.role == 'mentor':
+    if member and member.is_mentor:
         mentor_id = user.id
-    elif member and member.role == 'student' and member.team_mentor_id:
+    elif member and member.is_learner and member.team_mentor_id:
         mentor_id = member.team_mentor_id
     if not mentor_id:
         return None, 0
@@ -92,13 +114,20 @@ def _team_context(sid, user):
     if not mentor:
         return None, 0
     count = CampMember.query.filter_by(
-        camp_session_id=sid, role='student', team_mentor_id=mentor_id).count()
+        camp_session_id=sid, is_learner=True, team_mentor_id=mentor_id).count()
     return mentor, count
 
 
 def _can_view(user, m):
     """组会可见性：本组成员（team=组长及其学员；unit=active 单元成员）或 admin；
     营期负责人（CampStaff，meeting.read_all）可看全营组会（2026-09-20 A3）。"""
+    if m.scope == 'team' and training_access.enabled(m.camp_session_id):
+        if user.is_admin():
+            return True
+        if training_access.staff(m.camp_session_id, user.id):
+            return True
+        unit_id = training_access.meeting_unit_id(m)
+        return any(True for r, u in training_access.roles(m.camp_session_id, user.id, unit_id=unit_id)) if unit_id else False
     if user.is_admin():
         return True
     from .camp_staff import camp_staff_row
@@ -115,6 +144,11 @@ def _can_view(user, m):
 
 def _can_manage(user, m):
     """组会管理权（编辑/删除）：创建人、现任组长（team=该导生；unit=active leader）或 admin。"""
+    if m.scope == 'team' and training_access.enabled(m.camp_session_id):
+        if user.is_admin():
+            return True
+        unit_id = training_access.meeting_unit_id(m)
+        return any(r.role == 'mentor' for r, u in training_access.roles(m.camp_session_id, user.id, unit_id=unit_id)) if unit_id else False
     if user.is_admin() or m.created_by == user.id:
         return True
     if m.scope == 'team':
@@ -216,38 +250,30 @@ def _meeting_summaries(sid, meeting_ids, due_by_meeting, user, student_ids, lead
             cert_q = cert_q.filter(CampChapterCertification.student_user_id == user.id)
         cert_pairs = {(r.student_user_id, r.chapter_id) for r in cert_q.all()}
     now = datetime.now()
+    meetings = {m.id:m for m in CampMeeting.query.filter(CampMeeting.id.in_(meeting_ids))}
     for mid in meeting_ids:
+        meeting = meetings[mid]
         m_tasks = tasks_by_meeting.get(mid, [])
-        m_chs = plan_chapters.get(mid, [])
-        done_by_user = {}
-        for (m_id, t_id, uid) in done_pairs:
-            if m_id == mid:
-                done_by_user.setdefault(uid, set()).add(t_id)
-        overdue_tasks = [t for t in m_tasks
-                         if t.required and t.due_at and now > t.due_at]
-        summary = {"task_count": len(m_tasks), "chapter_count": len(m_chs)}
+        m_plans = [p for p in plan_rows if p.meeting_id == mid]
+        expected_tasks = {t.id:_expected_students(meeting,t,student_ids or []) for t in m_tasks}
+        expected_chapters = {p.chapter_id:_expected_students(meeting,p,student_ids or []) for p in m_plans}
+        done = {(tid,uid) for m_id,tid,uid in done_pairs if m_id == mid}
         past_ch_due = bool(due_by_meeting.get(mid) and now > due_by_meeting[mid])
+        summary = {'task_count':len(m_tasks), 'chapter_count':len(m_plans)}
         if leader_view:
-            summary["expected_count"] = len(m_tasks) * len(student_ids or [])
-            summary["submission_count"] = sum(len(v) for v in done_by_user.values())
-            summary["overdue_count"] = sum(
-                1 for t in overdue_tasks
-                for u in (student_ids or [])
-                if t.id not in done_by_user.get(u, set()))
-            summary["chapter_expected"] = len(m_chs) * len(student_ids or [])
-            summary["chapter_certified"] = sum(
-                1 for ch_id in m_chs for u in (student_ids or [])
-                if (u, ch_id) in cert_pairs)
-            summary["chapter_overdue_count"] = (
-                summary["chapter_expected"] - summary["chapter_certified"]) if past_ch_due else 0
+            summary['expected_count'] = sum(len(expected_tasks[t.id] | {uid for tid,uid in done if tid == t.id}) for t in m_tasks)
+            summary['submission_count'] = len(done)
+            summary['overdue_count'] = sum(1 for t in m_tasks if t.required and t.due_at and now > t.due_at
+                                          for uid in expected_tasks[t.id] if (t.id,uid) not in done)
+            summary['chapter_expected'] = sum(len(ids) for ids in expected_chapters.values())
+            summary['chapter_certified'] = sum((uid,cid) in cert_pairs for cid,ids in expected_chapters.items() for uid in ids)
+            summary['chapter_overdue_count'] = (summary['chapter_expected']-summary['chapter_certified']) if past_ch_due else 0
         else:
-            mine = done_by_user.get(user.id, set())
-            summary["my_pending"] = len([t for t in m_tasks if t.id not in mine])
-            summary["my_overdue"] = len([t for t in overdue_tasks if t.id not in mine])
-            summary["my_chapter_pending"] = sum(
-                1 for ch_id in m_chs if (user.id, ch_id) not in cert_pairs)
-            summary["my_chapter_overdue"] = (
-                summary["my_chapter_pending"]) if past_ch_due else 0
+            summary['my_pending'] = sum(user.id in expected_tasks[t.id] and (t.id,user.id) not in done for t in m_tasks)
+            summary['my_overdue'] = sum(user.id in expected_tasks[t.id] and (t.id,user.id) not in done
+                for t in m_tasks if t.required and t.due_at and now > t.due_at)
+            summary['my_chapter_pending'] = sum(user.id in ids and (user.id,cid) not in cert_pairs for cid,ids in expected_chapters.items())
+            summary['my_chapter_overdue'] = summary['my_chapter_pending'] if past_ch_due else 0
         out[mid] = summary
     return out
 
@@ -380,12 +406,22 @@ def team_meeting_list(sid):
     if err:
         return err
     user = _current_user()
+    if camp.training_groups_ready:
+        unit, options = _selected_training_group(sid, user)
+        if not unit:
+            return jsonify(code=200, group=None, groups=options, is_leader=False, meetings=[])
+        leader = any(r.role == 'mentor' for r, u in training_access.roles(sid, user.id, unit_id=unit.id))
+        from types import SimpleNamespace
+        students = training_access.meeting_students(SimpleNamespace(unit_id=unit.id, camp_session_id=sid, mentor_id=None))
+        return jsonify(code=200, groups=options, group={'scope':'team', 'unit_id':unit.id, 'mentor_id':unit.owner_user_id,
+            'mentor_name':unit.name, 'member_count':len(students)}, is_leader=leader,
+            meetings=_meetings_payload(sid, user, students, leader, scope='team', unit_id=unit.id))
     mentor, count = _team_context(sid, user)
     if not mentor:
         return jsonify({"code": 200, "group": None, "is_leader": False, "meetings": []})
     is_leader = mentor.id == user.id or user.is_admin()
     student_ids = [r.user_id for r in CampMember.query.filter_by(
-        camp_session_id=sid, role='student', team_mentor_id=mentor.id).all()]
+        camp_session_id=sid, is_learner=True, team_mentor_id=mentor.id).all()]
     return jsonify({
         "code": 200,
         "group": {"scope": "team", "mentor_id": mentor.id, "mentor_name": mentor.username,
@@ -441,7 +477,8 @@ def camp_meetings_all(sid):
         except (ValueError, TypeError):
             return jsonify({"code": 400, "message": "mentor_id 需为本营导生 ID"}), 400
         if not CampMember.query.filter_by(
-                camp_session_id=sid, user_id=mentor_id, role='mentor').first():
+                camp_session_id=sid, user_id=mentor_id, is_mentor=True).first() and not CampMeeting.query.filter_by(
+                    camp_session_id=sid, scope='team', mentor_id=mentor_id).first():
             return jsonify({"code": 400, "message": "该导生不在本营"}), 400
         q = q.filter(CampMeeting.scope == 'team', CampMeeting.mentor_id == mentor_id)
 
@@ -475,13 +512,13 @@ def camp_meetings_all(sid):
     mentor_ids = {m.mentor_id for m in rows if m.scope == 'team' and m.mentor_id}
     mentor_names = {u.id: u.username for u in UserModel.query.filter(
         UserModel.id.in_(mentor_ids))} if mentor_ids else {}
-    unit_ids = {m.unit_id for m in rows if m.scope == 'unit' and m.unit_id}
+    unit_ids = {m.unit_id for m in rows if m.unit_id}
     units = {u.id: u.name for u in CampUnit.query.filter(
         CampUnit.id.in_(unit_ids))} if unit_ids else {}
     out = []
     for m in rows:
         item = _meeting_dict(m, atts[m.id], names)
-        item["team_label"] = (mentor_names.get(m.mentor_id, str(m.mentor_id))
+        item["team_label"] = (units.get(m.unit_id) or mentor_names.get(m.mentor_id, str(m.mentor_id))
                               if m.scope == 'team'
                               else units.get(m.unit_id, f"项目组#{m.unit_id}"))
         item["task_count"] = int(task_counts.get(m.id, 0))
@@ -491,7 +528,11 @@ def camp_meetings_all(sid):
 
     # mentors 筛选选项：本营全部导生（全量、稳定；direction 供前端展示）
     mentor_rows = CampMember.query.filter_by(
-        camp_session_id=sid, role='mentor').order_by(CampMember.user_id).all()
+        camp_session_id=sid, is_mentor=True).order_by(CampMember.user_id).all()
+    from types import SimpleNamespace
+    known = {row.user_id for row in mentor_rows}
+    old_ids = {row.mentor_id for row in CampMeeting.query.filter_by(camp_session_id=sid, scope='team') if row.mentor_id}
+    mentor_rows += [SimpleNamespace(user_id=uid) for uid in sorted(old_ids - known)]
     m_uids = [m.user_id for m in mentor_rows]
     m_users = {u.id: u.username for u in UserModel.query.filter(
         UserModel.id.in_(m_uids))} if m_uids else {}
@@ -530,14 +571,20 @@ def team_meeting_create(sid):
         return jsonify({"code": 400, "message": "组会纪要（培训组）仅学习营可用"}), 400
     user = _current_user()
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    if not member or member.role != 'mentor':
+    if not member or not member.is_mentor:
         return jsonify({"code": 403, "message": "仅组长（导生）可发起组会"}), 403
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
     fields, files, err = _parse_meeting_form()
     if err:
         return err
-    m = CampMeeting(camp_session_id=sid, scope='team', mentor_id=user.id,
+    unit_id = None
+    if camp.training_groups_ready:
+        unit, options = _selected_training_group(sid, user)
+        if not unit or not any(r.role == 'mentor' for r, u in training_access.roles(sid, user.id, unit_id=unit.id)):
+            raise GroupError('请选择具有带教职责的培训组', status=403)
+        unit_id = unit.id
+    m = CampMeeting(camp_session_id=sid, scope='team', unit_id=unit_id, mentor_id=user.id,
                     created_by=user.id, **fields)
     db.session.add(m)
     db.session.flush()
@@ -546,9 +593,7 @@ def team_meeting_create(sid):
         return err
     # 通知与业务同事务落库（2026-09-20 P0：原 commit 后 add 不再提交，通知从未持久化）
     _notify_new_meeting(
-        [r.user_id for r in CampMember.query.filter_by(
-            camp_session_id=sid, role='student', team_mentor_id=m.mentor_id).all()
-         if r.user_id != user.id],
+        [uid for uid in training_access.meeting_students(m) if uid != user.id],
         sid, m, user.username, "组长")
     db.session.commit()
     names = _usernames({m.created_by})
@@ -572,12 +617,12 @@ def unit_meeting_list(uid):
     if not _unit_role(unit, user):
         return jsonify({"code": 403, "message": "仅项目成员可查看组会纪要"}), 403
     is_leader = _is_unit_leader(unit, user)
-    student_ids = [r.user_id for r in CampUnitMember.query.filter_by(
+    student_ids = [r.user_id for r in UnitMembershipRead.query.filter_by(
         unit_id=unit.id, status='active').all() if r.role != 'leader']
     return jsonify({
         "code": 200,
         "group": {"scope": "unit", "unit_id": unit.id, "unit_name": unit.name,
-                  "member_count": CampUnitMember.query.filter_by(
+                  "member_count": UnitMembershipRead.query.filter_by(
                       unit_id=unit.id, status='active').count()},
         "is_leader": is_leader,
         "meetings": _meetings_payload(camp.id, user, student_ids, is_leader,
@@ -613,7 +658,7 @@ def unit_meeting_create(uid):
         return err
     # 通知与业务同事务落库（同 team_meeting_create 的 P0 修复）
     _notify_new_meeting(
-        [r.user_id for r in CampUnitMember.query.filter_by(
+        [r.user_id for r in UnitMembershipRead.query.filter_by(
             unit_id=unit.id, status='active').all()
          if r.user_id != user.id],
         camp.id, m, user.username, "项目负责人")
@@ -735,24 +780,46 @@ VALID_SUBMIT_TYPES = ('file', 'text', 'any')
 SUBMIT_TYPE_TEXT = {'file': '需交文件', 'text': '需交文字', 'any': '文字或文件'}
 
 
-def _group_students(m):
+def _group_students(m, *, history=False):
     """组会作用域的组员名单（不含组长/负责人）：team=该导生组学员；unit=active 成员减 leader。"""
     if m.scope == 'team':
-        ids = [r.user_id for r in CampMember.query.filter_by(
-            camp_session_id=m.camp_session_id, role='student',
-            team_mentor_id=m.mentor_id).all()]
+        ids = training_access.meeting_students(m)
     else:
-        ids = [r.user_id for r in CampUnitMember.query.filter_by(
+        ids = [r.user_id for r in UnitMembershipRead.query.filter_by(
             unit_id=m.unit_id, status='active').all() if r.role != 'leader']
+    if history:
+        submitted = db.session.query(CampMeetingTaskSubmission.student_user_id).join(
+            CampMeetingTask, CampMeetingTask.id == CampMeetingTaskSubmission.task_id).filter(
+            CampMeetingTask.meeting_id == m.id).all()
+        ids = sorted(set(ids) | {row[0] for row in submitted})
     users = UserModel.query.filter(UserModel.id.in_(ids)).all() if ids else []
     return sorted(users, key=lambda u: u.id)     # 稳定排序，矩阵列序一致
+
+
+def _expected_students(meeting, item, fallback):
+    """布置当时已入组且仍承担职责的人；历史实际提交另行保留，不重新制造欠交。"""
+    if meeting.scope != 'team':
+        return set(fallback)
+    course_id = getattr(item, 'course_id', None)
+    ids = set(training_access.meeting_students(meeting, assigned_at=item.created_at, course_id=course_id))
+    if course_id and training_access.enabled(meeting.camp_session_id):
+        from models import CampCourseAssignment
+        ids &= {a.student_user_id for a in CampCourseAssignment.query.filter_by(
+            camp_session_id=meeting.camp_session_id, course_id=course_id,
+            unit_id=training_access.meeting_unit_id(meeting), status='active')}
+    return ids
 
 
 def _leader_uid(m):
     """组会现任组长（提交通知接收人）：team=导生；unit=active leader 行（兜底 owner）。"""
     if m.scope == 'team':
+        if training_access.enabled(m.camp_session_id):
+            unit_id = training_access.meeting_unit_id(m)
+            candidates = {member.user_id for r, member, unit in training_access.role_query(m.camp_session_id, role='mentor').all() if unit.id == unit_id}
+            current = sorted(uid for uid in candidates if any(r.role == 'mentor' for r, u in training_access.roles(m.camp_session_id, uid, unit_id=unit_id)))
+            return (m.mentor_id if m.mentor_id in current else current[0] if current else None)
         return m.mentor_id
-    row = CampUnitMember.query.filter_by(
+    row = UnitMembershipRead.query.filter_by(
         unit_id=m.unit_id, role='leader', status='active').first()
     if row:
         return row.user_id
@@ -783,10 +850,13 @@ def _chapter_catalog(camp, m):
     """布置区的章节选择目录（仅 team 域）：导生方向课程 × 学习单元章；
     admin 无方向归属 → 营全部分类方向课程并集。"""
     course_ids = []
-    if m.mentor_id:
+    if camp.training_groups_ready:
+        profile = db.session.get(TrainingGroupProfile, training_access.meeting_unit_id(m))
+        course_ids = profile.course_ids if profile else []
+    elif m.mentor_id:
         direction = _direction_of_mentor(camp, m.mentor_id)
         course_ids = (direction or {}).get("course_ids") or []
-    if not course_ids:
+    if not course_ids and not camp.training_groups_ready:
         from .camp_ms import _ms_directions
         seen = set()
         for d in _ms_directions(camp):
@@ -817,7 +887,7 @@ def _detail_payload(m, user, role):
     （计数无明细、无私有态——修此前老师误入组员分支看到自己「未提交」的错位）。"""
     is_leader = role == 'leader'
     camp = CampSession.query.get(m.camp_session_id)
-    students = _group_students(m)
+    students = _group_students(m, history=role in ('leader', 'staff'))
     tasks = (CampMeetingTask.query.filter_by(meeting_id=m.id)
              .order_by(CampMeetingTask.id).all())
     plans = (CampMeetingChapterPlan.query.filter_by(meeting_id=m.id)
@@ -834,11 +904,15 @@ def _detail_payload(m, user, role):
 
     tasks_out = []
     for t in tasks:
+        expected = _expected_students(m, t, [u.id for u in students])
+        submitted_ids = {s.student_user_id for s in subs if s.task_id == t.id}
         item = {"id": t.id, "title": t.title, "note": t.note,
                 "submit_type": t.submit_type,
                 "submit_type_text": SUBMIT_TYPE_TEXT.get(t.submit_type, t.submit_type),
                 "due_at": t.due_at.isoformat() if t.due_at else None,
-                "required": bool(t.required), "allow_late": bool(t.allow_late)}
+                "required": bool(t.required), "allow_late": bool(t.allow_late),
+                "expected_count": len(expected | submitted_ids), "expected_user_ids": sorted(expected) if is_leader else [],
+                "required_for_me": user.id in expected}
         if is_leader:
             item["submissions"] = {}
             item["submission_count"] = 0
@@ -860,7 +934,7 @@ def _detail_payload(m, user, role):
                 if s.status == 'submitted' and _submission_valid(s, t, len(atts.get(s.id, []))):
                     item["pending_review"] += 1
             past_due = bool(t.required and t.due_at and datetime.now() > t.due_at)
-            item["overdue_count"] = (len(students) - item["submission_count"]) if past_due else 0
+            item["overdue_count"] = sum(uid not in submitted_ids or not item['submissions'].get(str(uid), {}).get('valid') for uid in expected) if past_due else 0
         elif role == 'staff':
             done = 0
             for u in students:
@@ -869,7 +943,7 @@ def _detail_payload(m, user, role):
                     done += 1
             item["submission_count"] = done
             past_due = bool(t.required and t.due_at and datetime.now() > t.due_at)
-            item["overdue_count"] = (len(students) - done) if past_due else 0
+            item["overdue_count"] = sum(not (sub_by_key.get((t.id,uid)) and _submission_done(sub_by_key[(t.id,uid)],t,len(atts.get(sub_by_key[(t.id,uid)].id,[])))) for uid in expected) if past_due else 0
         else:
             s = sub_by_key.get((t.id, user.id))
             valid = (_submission_done(s, t, len(atts.get(s.id, []))) if s else False)
@@ -880,8 +954,8 @@ def _detail_payload(m, user, role):
                 "content": s.content,
                 "updated_at": s.updated_at.isoformat() if s.updated_at else None,
                 "attachments": [_task_att_dict(a, user) for a in atts.get(s.id, [])]})
-            item["my_overdue"] = _task_overdue(t, valid)
-            item["late_locked"] = bool(t.due_at and t.required and not t.allow_late
+            item["my_overdue"] = user.id in expected and _task_overdue(t, valid)
+            item["late_locked"] = bool(user.id in expected and t.due_at and t.required and not t.allow_late
                                        and datetime.now() > t.due_at and not valid)
         tasks_out.append(item)
 
@@ -910,19 +984,27 @@ def _detail_payload(m, user, role):
                 mat_counts[(r.student_user_id, r.chapter_id)] = \
                     mat_counts.get((r.student_user_id, r.chapter_id), 0) + 1
         for p in plans:
+            expected = _expected_students(m, p, [u.id for u in students])
             ch = {"chapter_id": p.chapter_id, "course_id": p.course_id,
                   "chapter_title": ch_names.get(p.chapter_id, str(p.chapter_id)),
-                  "course_title": course_titles.get(p.course_id, "")}
+                  "course_title": course_titles.get(p.course_id, ""),
+                  "expected_count": len(expected), "required_for_me": user.id in expected}
             if is_leader:
+                from services.camp_groups.training_history import manager
+                visible = {u.id for u in students if manager(m.camp_session_id, user)
+                           or training_access.can_teach(m.camp_session_id, user.id, u.id, p.course_id)}
+                ch['visible_user_ids'] = sorted(visible)
+                ch['expected_user_ids'] = sorted(expected & visible)
+                ch['expected_count'] = len(expected & visible)
                 ch["certs"] = {str(u.id): (None if (u.id, p.chapter_id) not in certs
                                            else {"score": certs[(u.id, p.chapter_id)].score})
-                               for u in students}
+                               for u in students if u.id in visible}
                 ch["material_counts"] = {str(u.id): mat_counts.get((u.id, p.chapter_id), 0)
-                                         for u in students}
-                ch["certified_count"] = sum(1 for v in ch["certs"].values() if v)
+                                         for u in students if u.id in visible}
+                ch["certified_count"] = sum((uid, p.chapter_id) in certs for uid in expected & visible)
             elif role == 'staff':
                 ch["certified_count"] = sum(
-                    1 for u in students if (u.id, p.chapter_id) in certs)
+                    1 for uid in expected if (uid, p.chapter_id) in certs)
             else:
                 r = certs.get((user.id, p.chapter_id))
                 ch["my_cert"] = None if r is None else {"score": r.score}
@@ -970,15 +1052,25 @@ def team_task_summary(sid):
         return err
     user = _current_user()
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    if not user.is_admin() and (not member or member.role != 'mentor'):
+    if not user.is_admin() and (not member or not member.is_mentor):
         return jsonify({"code": 403, "message": "仅本营导生可查看任务汇总"}), 403
-    mentor_id = None if user.is_admin() else user.id
-    meeting_ids = ([m.id for m in CampMeeting.query.filter_by(
-        camp_session_id=sid, scope='team', mentor_id=mentor_id).all()]
-        if mentor_id else [])
-    student_ids = ([r.user_id for r in CampMember.query.filter_by(
-        camp_session_id=sid, role='student', team_mentor_id=mentor_id).all()]
-        if mentor_id else [])
+    if camp.training_groups_ready:
+        unit, options = _selected_training_group(sid, user)
+        if not unit:
+            return jsonify(code=200, groups=options, meeting_count=0, task_total=0, summary=[])
+        if not any(r.role == 'mentor' for r, u in training_access.roles(sid, user.id, unit_id=unit.id)):
+            raise GroupError('无此组带教职责', status=403)
+        meeting_ids = [m.id for m in CampMeeting.query.filter_by(camp_session_id=sid, scope='team', unit_id=unit.id).all()]
+        from types import SimpleNamespace
+        student_ids = training_access.meeting_students(SimpleNamespace(unit_id=unit.id, camp_session_id=sid, mentor_id=None))
+    else:
+        mentor_id = None if user.is_admin() else user.id
+        meeting_ids = ([m.id for m in CampMeeting.query.filter_by(
+            camp_session_id=sid, scope='team', mentor_id=mentor_id).all()]
+            if mentor_id else [])
+        student_ids = ([r.user_id for r in CampMember.query.filter_by(
+            camp_session_id=sid, is_learner=True, team_mentor_id=mentor_id).all()]
+            if mentor_id else [])
     tasks = (CampMeetingTask.query.filter(
         CampMeetingTask.meeting_id.in_(meeting_ids)).all() if meeting_ids else [])
     subs = (CampMeetingTaskSubmission.query
@@ -991,9 +1083,11 @@ def team_task_summary(sid):
         t = task_by_id[s.task_id]
         if s.student_user_id in student_ids and _submission_done(s, t, att_counts.get(s.id, 0)):
             done.add((t.id, s.student_user_id))
+    meetings = {m.id:m for m in CampMeeting.query.filter(CampMeeting.id.in_(meeting_ids))}
+    expected = {t.id:_expected_students(meetings[t.meeting_id],t,student_ids) for t in tasks}
     return jsonify({"code": 200, "meeting_count": len(meeting_ids), "task_total": len(tasks),
-                    "summary": [{"user_id": uid, "submitted": sum(
-                        1 for (tid, su) in done if su == uid)} for uid in student_ids]})
+                    "summary": [{"user_id": uid, "task_total": sum(uid in expected[t.id] or (t.id,uid) in done for t in tasks),
+                        "submitted": sum(1 for (tid, su) in done if su == uid)} for uid in student_ids]})
 
 
 @bp.route("/meetings/<int:mid>/assignments", methods=["PUT"])
@@ -1099,8 +1193,10 @@ def meeting_assignments_save(mid):
     if m.chapter_due_at != chapter_due_at:
         changed = True
         m.chapter_due_at = chapter_due_at
-    CampMeetingChapterPlan.query.filter_by(meeting_id=mid).delete(synchronize_session=False)
-    for cid in chapter_ids:
+    # 保留仍在布置范围的行及首次布置时间，编辑截止或任务不重新向后来入组者派旧章。
+    CampMeetingChapterPlan.query.filter_by(meeting_id=mid).filter(
+        ~CampMeetingChapterPlan.chapter_id.in_(chapter_ids)).delete(synchronize_session=False)
+    for cid in set(chapter_ids) - old_plan_ids:
         db.session.add(CampMeetingChapterPlan(meeting_id=mid,
                                               course_id=ch_course[cid], chapter_id=cid))
     if changed and (chapter_ids or norm):
@@ -1136,7 +1232,8 @@ def meeting_task_submit(tid):
     sub = CampMeetingTaskSubmission.query.filter_by(
         task_id=t.id, student_user_id=user.id).first()
     # 截止锁定（migrate_44）：必交且已过截止且不允许迟交 → 拒收（已通过的更新不受限）
-    if t.due_at and t.required and not t.allow_late and datetime.now() > t.due_at \
+    required_here = user.id in _expected_students(m, t, [user.id])
+    if required_here and t.due_at and t.required and not t.allow_late and datetime.now() > t.due_at \
             and not (sub and sub.status == 'accepted'):
         return jsonify({"code": 400,
                         "message": f"任务「{t.title}」已于 {t.due_at.strftime('%m-%d %H:%M')} 截止，不再接收提交"}), 400
@@ -1316,7 +1413,7 @@ def _zip_name(s):
     return (cleaned[:80] or '_')
 
 
-def _planned_materials(m, students):
+def _planned_materials(m, students, viewer=None):
     """本次组会布置章的课内材料（2026-09-20 打包口径对齐「全部提交」）：
     返回 {(student_user_id, chapter_id): [CampChapterMaterial]}，仅本组学员、仅布置章。"""
     plans = (CampMeetingChapterPlan.query.filter_by(meeting_id=m.id)
@@ -1327,18 +1424,20 @@ def _planned_materials(m, students):
                 CampChapterMaterial.camp_session_id == m.camp_session_id,
                 CampChapterMaterial.chapter_id.in_([p.chapter_id for p in plans]),
                 CampChapterMaterial.student_user_id.in_([u.id for u in students])).all():
-            out.setdefault((r.student_user_id, r.chapter_id), []).append(r)
+            from .camp_material import _can_read
+            if viewer is None or _can_read(viewer, r):
+                out.setdefault((r.student_user_id, r.chapter_id), []).append(r)
     return plans, out
 
 
-def _meeting_zip_empty(m, students, tasks):
+def _meeting_zip_empty(m, students, tasks, viewer=None):
     """空包判定（token 预检与 zip 端点共用）：任务提交与课内材料皆无才为空。
     预检放 token 端点，让前端在换签时就收到 400 走 toast——修「新标签页裸渲染
     JSON message 页」（zip 端点开着 token 后新窗打开，前端无法捕获其错误体）。"""
     if tasks and CampMeetingTaskSubmission.query.filter(
             CampMeetingTaskSubmission.task_id.in_([t.id for t in tasks])).count():
         return False
-    _, mats = _planned_materials(m, students)
+    _, mats = _planned_materials(m, students, viewer)
     return not mats
 
 
@@ -1353,8 +1452,8 @@ def meeting_zip_token(mid):
     user = _current_user()
     if not _can_manage(user, m):
         return jsonify({"code": 403, "message": "仅组长可打包下载"}), 403
-    if _meeting_zip_empty(m, _group_students(m),
-                          CampMeetingTask.query.filter_by(meeting_id=m.id).all()):
+    if _meeting_zip_empty(m, _group_students(m, history=True),
+                          CampMeetingTask.query.filter_by(meeting_id=m.id).all(), user):
         return jsonify({"code": 400, "message": "本次组会暂无提交可打包"}), 400
     return media_token_response('meeting_zip', mid, user.id,
                                 path=f"/camp/meetings/{mid}/submissions/zip")
@@ -1375,7 +1474,7 @@ def meeting_submissions_zip(mid):
         return auth_err
     if not _can_manage(user, m):
         return jsonify({"code": 403, "message": "仅组长可打包下载"}), 403
-    students = _group_students(m)
+    students = _group_students(m, history=True)
     tasks = (CampMeetingTask.query.filter_by(meeting_id=m.id)
              .order_by(CampMeetingTask.id).all())
     subs = (CampMeetingTaskSubmission.query
@@ -1387,14 +1486,14 @@ def meeting_submissions_zip(mid):
                 [s.id for s in subs])).all() if subs else []):
         atts.setdefault(a.submission_id, []).append(a)
     sub_by_key = {(s.task_id, s.student_user_id): s for s in subs}
-    plans, mats = _planned_materials(m, students)
+    plans, mats = _planned_materials(m, students, user)
     mat_atts = {}
     mat_ids = [x.id for rows in mats.values() for x in rows]
     if mat_ids:
         for a in CampChapterMaterialAttachment.query.filter(
                 CampChapterMaterialAttachment.material_id.in_(mat_ids)).all():
             mat_atts.setdefault(a.material_id, []).append(a)
-    if _meeting_zip_empty(m, students, tasks):
+    if _meeting_zip_empty(m, students, tasks, user):
         return jsonify({"code": 400, "message": "本次组会暂无提交可打包"}), 400
 
     ch_names = {c.id: c.name for c in Chapter.query.filter(
@@ -1414,12 +1513,13 @@ def meeting_submissions_zip(mid):
         lines.append(f"{u.id} · {p.public_id if p else '-'} · {vname or '-'}"
                      f" · {u.username} · {p.verification_status if p else '无档案'}")
     lines.append("")
+    expected_tasks = {t.id:_expected_students(m,t,[u.id for u in students]) for t in tasks}
     for t in tasks:
         lines.append(f"【任务】{t.title}（{SUBMIT_TYPE_TEXT.get(t.submit_type, t.submit_type)}）")
         for u in students:
             s = sub_by_key.get((t.id, u.id))
             if not s:
-                lines.append(f"  未交    {u.username}")
+                lines.append(f"  未交    {u.username}" if u.id in expected_tasks[t.id] else f"  不要求本次提交    {u.username}")
                 continue
             n = len(atts.get(s.id, []))
             text = '有文字' if (s.content or '').strip() else '无文字'
@@ -1431,7 +1531,7 @@ def meeting_submissions_zip(mid):
         for u in students:
             rows = mats.get((u.id, p.chapter_id), [])
             if not rows:
-                lines.append(f"  未交    {u.username}")
+                lines.append(f"  无可查看材料    {u.username}")
                 continue
             n = sum(len(mat_atts.get(r.id, [])) for r in rows)
             lines.append(f"  已交    {u.username}（材料×{len(rows)} · 文件×{n}）")
@@ -1466,7 +1566,8 @@ def meeting_submissions_zip(mid):
                     used = {}
                     s = sub_by_key.get((t.id, u.id))
                     if not s:
-                        zf.writestr(f"{folder}/未提交.txt", "该学员未提交本任务。")
+                        if u.id in expected_tasks[t.id]:
+                            zf.writestr(f"{folder}/未提交.txt", "该学员未提交本任务。")
                         continue
                     if (s.content or '').strip():
                         zf.writestr(f"{folder}/文字提交.txt", s.content)
@@ -1479,7 +1580,7 @@ def meeting_submissions_zip(mid):
                     used = {}
                     rows = mats.get((u.id, p.chapter_id), [])
                     if not rows:
-                        zf.writestr(f"{folder}/未提交材料.txt", "该学员未提交本章节材料。")
+                        zf.writestr(f"{folder}/无可查看材料.txt", "当前权限范围内没有可查看的章节材料。")
                         continue
                     for idx, r in enumerate(rows, 1):
                         if (r.content or '').strip():

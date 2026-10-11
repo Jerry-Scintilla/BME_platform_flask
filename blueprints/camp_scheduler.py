@@ -30,6 +30,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from exts import db, redis_client
+from services.camp_groups.maintenance import scheduler_guard
 
 bp = None   # 本模块只有调度任务，无 HTTP 端点（占位避免被当蓝图注册）
 
@@ -89,6 +90,7 @@ def _job_deadline_reminder(app):
             app.logger.exception(f"[camp_scheduler] 志愿截止提醒失败: {e}")
 
 
+@scheduler_guard
 def _deadline_reminder_scan(now=None):
     """collecting 阶段、24h 内截止且未提醒的营 → 未交志愿学员 + 责任人。
     直接调用（app_context 内）便于手动补跑与测试。"""
@@ -98,7 +100,7 @@ def _deadline_reminder_scan(now=None):
     from .notification import create_notification
 
     now = now or datetime.now()
-    camps = CampSession.query.filter(
+    camps = CampSession.query.filter(CampSession.training_migration_paused.is_(False),
         CampSession.status == 'selecting',
         CampSession.mentor_selection_enabled.is_(True)).all()
     sent = 0
@@ -115,7 +117,7 @@ def _deadline_reminder_scan(now=None):
         submitted = {p.student_user_id for p in CampMentorPreference.query
                      .filter_by(camp_session_id=camp.id).all()}
         pending = [m for m in CampMember.query.filter_by(
-            camp_session_id=camp.id, role='student').all()
+            camp_session_id=camp.id, needs_attendance=True).all()
             if m.user_id not in submitted]
         dl_text = dl.strftime("%m-%d %H:%M")
         for m in pending:
@@ -154,6 +156,7 @@ def _job_attendance_digest(app):
             app.logger.exception(f"[camp_scheduler] 考勤日摘要失败: {e}")
 
 
+@scheduler_guard
 def _attendance_digest_scan(day, *, force=False):
     """某日考勤异常摘要：导生收本队明细，责任人收全营汇总；无异常不发。
     force=True 跳过幂等游标（手动补跑指定日期）。直接调用便于测试。"""
@@ -162,7 +165,7 @@ def _attendance_digest_scan(day, *, force=False):
     from .camp_staff import camp_responsible_ids
     from .notification import create_notification
 
-    camps = CampSession.query.filter(CampSession.status == 'running').all()
+    camps = CampSession.query.filter(CampSession.training_migration_paused.is_(False), CampSession.status == 'running').all()
     digested = 0
     for camp in camps:
         if _attendance_mode(camp) != 'daily':
@@ -171,7 +174,7 @@ def _attendance_digest_scan(day, *, force=False):
                                           ttl_seconds=8 * 86400):
             continue
         students = CampMember.query.filter_by(
-            camp_session_id=camp.id, role='student').all()
+            camp_session_id=camp.id, needs_attendance=True).all()
         if not students:
             continue
         plans = CampAttendancePlan.query.filter_by(camp_session_id=camp.id, date=day).all()
@@ -203,9 +206,11 @@ def _attendance_digest_scan(day, *, force=False):
         unassigned = []
         for s in students:
             if s.user_id in abnormal:
-                if s.team_mentor_id:
-                    team.setdefault(s.team_mentor_id, []).append(s.user_id)
-                else:
+                from services.camp_groups.training_access import approver_ids
+                targets = approver_ids(camp.id, s.user_id)
+                for mentor_id in targets:
+                    team.setdefault(mentor_id, []).append(s.user_id)
+                if not targets:
                     unassigned.append(s.user_id)
         day_text = day.isoformat()
         for mentor_id, uids in team.items():
@@ -243,6 +248,7 @@ def _job_task_deadline_scan(app):
             app.logger.exception(f"[camp_scheduler] 任务截止扫描失败: {e}")
 
 
+@scheduler_guard
 def _task_deadline_scan(now=None):
     """未结营营期里带截止的必交任务：T-24h 内到期提醒未完成的组员；刚逾期通知本人+组长。
     幂等游标按 (task, 类型) 一轮：due_soon 每 6h 重发一次（游标 6h 过期，截止前持续催办），
@@ -258,7 +264,8 @@ def _task_deadline_scan(now=None):
              .join(CampSession, CampSession.id == CampMeeting.camp_session_id)
              .filter(CampMeetingTask.due_at.isnot(None),
                      CampMeetingTask.required.is_(True),
-                     CampSession.status.notin_(('archived', 'deleted')))
+                     CampSession.status.notin_(('archived', 'deleted')),
+                     CampSession.training_migration_paused.is_(False))
              .all())
     if not tasks:
         return 0
@@ -281,13 +288,13 @@ def _task_deadline_scan(now=None):
         if not m:
             continue
         # 本任务的组员（team=该导生组学员；unit=active 成员减 leader）
-        from models import CampMember, CampUnitMember
+        from models import CampMember
+        from services.camp_groups.reads import UnitMembershipRead
         if m.scope == 'team':
-            members = [r.user_id for r in CampMember.query.filter_by(
-                camp_session_id=m.camp_session_id, role='student',
-                team_mentor_id=m.mentor_id).all()]
+            from services.camp_groups.training_access import meeting_students
+            members = meeting_students(m, assigned_at=t.created_at)
         else:
-            members = [r.user_id for r in CampUnitMember.query.filter_by(
+            members = [r.user_id for r in UnitMembershipRead.query.filter_by(
                 unit_id=m.unit_id, status='active').all() if r.role != 'leader']
         pending = [uid for uid in members if uid not in done]
         if not pending:
@@ -346,6 +353,7 @@ def _job_chapter_due_scan(app):
             app.logger.exception(f"[camp_scheduler] 课内截止扫描失败: {e}")
 
 
+@scheduler_guard
 def _chapter_due_scan(now=None):
     """未结营营期里带 chapter_due_at 且有布置章的 team 组会：T-24h 提醒未认证的组员
     （学员侧动作=学习+提交材料，是认证的前置）；刚逾期通知本人 + 组长（汇总，文案兼催
@@ -362,24 +370,25 @@ def _chapter_due_scan(now=None):
              .join(CampSession, CampSession.id == CampMeeting.camp_session_id)
              .filter(CampMeeting.chapter_due_at.isnot(None),
                      CampMeeting.scope == 'team',
-                     CampSession.status.notin_(('archived', 'deleted')))
+                     CampSession.status.notin_(('archived', 'deleted')),
+                     CampSession.training_migration_paused.is_(False))
              .all())
     sent = 0
     for m in meets:
-        ch_ids = [p.chapter_id for p in CampMeetingChapterPlan.query.filter_by(
-            meeting_id=m.id).all()]
+        plans = CampMeetingChapterPlan.query.filter_by(meeting_id=m.id).all()
+        ch_ids = [p.chapter_id for p in plans]
         if not ch_ids:
             continue
-        members = [r.user_id for r in CampMember.query.filter_by(
-            camp_session_id=m.camp_session_id, role='student',
-            team_mentor_id=m.mentor_id).all()]
+        from services.camp_groups.training_access import meeting_students, enabled, meeting_unit_id
+        members = meeting_students(m)
         if not members:
             continue
         certs = {(r.student_user_id, r.chapter_id) for r in CampChapterCertification.query.filter(
             CampChapterCertification.camp_session_id == m.camp_session_id,
             CampChapterCertification.chapter_id.in_(ch_ids),
             CampChapterCertification.student_user_id.in_(members)).all()}
-        pending_by_user = {uid: [cid for cid in ch_ids if (uid, cid) not in certs]
+        eligible_by_chapter = {p.chapter_id: set(meeting_students(m, assigned_at=p.created_at, course_id=p.course_id)) for p in plans}
+        pending_by_user = {uid: [cid for cid in ch_ids if uid in eligible_by_chapter[cid] and (uid, cid) not in certs and _chapter_responsibility_matches(m, uid, cid)]
                            for uid in members}
         pending_by_user = {uid: miss for uid, miss in pending_by_user.items() if miss}
         if not pending_by_user:
@@ -463,3 +472,13 @@ def init_camp_scheduler(app):
     _scheduler = sched
     app.logger.info(f"[camp_scheduler] 已启动：志愿/任务/课内截止提醒（30 分钟扫描）+ "
                     f"考勤日摘要（每天 08:30，{tz_name}）")
+
+
+def _chapter_responsibility_matches(meeting, uid, chapter_id):
+    from services.camp_groups.training_access import enabled, meeting_unit_id
+    if not enabled(meeting.camp_session_id):
+        return True
+    from models import Chapter, CampCourseAssignment
+    chapter = db.session.get(Chapter, chapter_id)
+    return bool(chapter and CampCourseAssignment.query.filter_by(camp_session_id=meeting.camp_session_id,
+        student_user_id=uid, course_id=chapter.course_id, status='active', unit_id=meeting_unit_id(meeting)).first())

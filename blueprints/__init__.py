@@ -161,6 +161,8 @@ def audit_log(operation=None, is_login=False):
 
                 return response
             except Exception as e:
+                # 业务异常必须先回滚，防审计提交把未完成的编组/课程变更一起提交。
+                db.session.rollback()
                 # 记录异常情况
                 username = user.username if user else '未知用户'
                 user_id = user.id if user else None
@@ -338,7 +340,8 @@ def camp_role(*roles):
             member = CampMember.query.filter_by(
                 camp_session_id=sid_int, user_id=user.id
             ).first()
-            if not member or member.role not in roles:
+            from services.camp_groups.training_access import has_role
+            if not member or not any(has_role(sid_int, user.id, role) for role in roles):
                 return jsonify({"code": 403, "message": "营期内角色权限不足"}), 403
             return func(*args, **kwargs)
         return wrapper

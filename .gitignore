@@ -23,9 +23,11 @@ __pycache__/
 # 本地种子/开发测试脚本（开发自用，不入库）
 # 虚拟环境（本地）
 dev_*.py
-# docs/ 本地笔记不入库，但 docs/deploy/（生产部署指导）必须随代码到服务器
+# docs/ 本地笔记不入库；部署指导和已实施的小组服务契约随代码维护
 docs/*
 !docs/deploy/
+!docs/group-core.md
+!docs/legacy-group-retirement.md
 init_seats_*.py
 litellm_proxy_config.yaml
 log/

@@ -62,6 +62,16 @@ def active_scope_camp(user_id, course_id, prefer_sid=None):
        语境，等价旧「覆盖营戳」的行为语义但不破坏旧营 linkage）；
     3. (user, course) 完全无 assignment 行（任意状态）→ 回退 legacy 营戳（回填漏网
        兜底；有行但全 ended/全 archived 则返回 None——分配表一旦有据即权威）。"""
+    from services.groups import GroupError
+    from models import CampMember
+    if prefer_sid is not None:
+        camp = db.session.get(CampSession, prefer_sid)
+        member = CampMember.query.filter_by(camp_session_id=prefer_sid, user_id=user_id).first()
+        assignment = CampCourseAssignment.query.filter_by(camp_session_id=prefer_sid, student_user_id=user_id,
+                                                         course_id=course_id, status='active').first()
+        if not camp or camp.status in ('archived', 'deleted') or not member or not assignment:
+            raise GroupError('指定营期不可写或未在此营修读该课程', machine='CAMP_COURSE_SCOPE_INVALID', status=403)
+        return camp
     rows = CampCourseAssignment.query.filter_by(
         student_user_id=user_id, course_id=course_id).all()
     if not rows:
@@ -88,6 +98,8 @@ def active_scope_camp(user_id, course_id, prefer_sid=None):
              if c.status != 'archived']
     if not camps:
         return None                     # 有分配行但全 ended/archived：不回退戳
+    if len(camps) > 1:
+        raise GroupError('此课程在多个营期修读，请从具体营期进入学习', machine='CAMP_COURSE_SCOPE_REQUIRED')
     newest = active[0].camp_session_id
     for camp in camps:                  # 最新分配的营优先，其余按 id 稳定排序
         if camp.id == newest:
