@@ -222,6 +222,77 @@ class TrainingSmoke(unittest.TestCase):
         self.assertEqual(response.status_code,200,response.json)
         self.assertEqual(len(response.json['meetings']),1)
 
+    def test_empty_direction_group_then_add_courses(self):
+        self.camp.start_date = date.today() - timedelta(days=7)
+        db.session.commit()
+        client, headers = self.client_as(self.actor)
+        path = f'/camp/sessions/{self.camp.id}'
+        tags = [{'name': '编程', 'course_ids': [self.course.id]},
+                {'name': '待设计方向', 'course_ids': []}]
+        response = client.put(path, headers=headers, json={'ms_tags': tags})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json['session']['ms_directions'], tags)
+        response = client.post(path + '/training-groups', headers=headers, json={
+            'mentor_user_id': self.owner.id, 'name': '先建组后配课', 'direction': '待设计方向'})
+        self.assertEqual(response.status_code, 200, response.json)
+        from models import CampUnit
+        unit = db.session.get(CampUnit, response.json['unit_id'])
+        service.add_role(unit, self.student.id, 'learner', self.actor.id)
+        db.session.commit()
+        self.assertEqual(CampCourseAssignment.query.count(), 0)
+        self.assertEqual(UserCourseModel.query.count(), 0)
+        tags[1]['course_ids'] = [self.course.id]
+        response = client.put(path, headers=headers, json={'ms_tags': tags})
+        self.assertEqual(response.status_code, 200, response.json)
+        assignment = CampCourseAssignment.query.one()
+        self.assertEqual((assignment.student_user_id, assignment.unit_id), (self.student.id, unit.id))
+        self.assertEqual(UserCourseModel.query.count(), 1)
+        tags[1]['course_ids'] = []
+        response = client.put(path, headers=headers, json={'ms_tags': tags})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(CampCourseAssignment.query.one().status, 'active')
+        self.assertEqual(UserCourseModel.query.count(), 1)
+
+    def test_empty_courses_keep_invalid_course_and_time_checks(self):
+        self.camp.start_date = date.today() - timedelta(days=7)
+        db.session.commit()
+        client, headers = self.client_as(self.actor)
+        path = f'/camp/sessions/{self.camp.id}'
+        response = client.put(path, headers=headers, json={
+            'ms_tags': [{'name': '无效课程', 'course_ids': [999999]}]})
+        self.assertEqual(response.status_code, 400, response.json)
+        self.assertIn('关联课程无效', response.json['message'])
+        response = client.put(path, headers=headers, json={
+            'ms_tags': [{'name': '空课程', 'course_ids': []}],
+            'ms_preference_start': (datetime.now() + timedelta(days=1)).isoformat(timespec='seconds')})
+        self.assertEqual(response.status_code, 400, response.json)
+        self.assertIn('志愿开始', response.json['message'])
+        self.camp.mentor_selection_enabled = False
+        db.session.commit()
+        response = client.put(path, headers=headers, json={'ms_tags': [{'name': '空课程', 'course_ids': []}]})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.camp.status = 'archived'
+        db.session.commit()
+        response = client.put(path, headers=headers, json={'ms_tags': [{'name': '归档不可改', 'course_ids': []}]})
+        self.assertEqual(response.status_code, 400, response.json)
+
+    def test_create_camp_with_empty_course_direction(self):
+        from models import CampCycle
+        cycle = CampCycle(code='empty-course-test', name='空课程测试周期')
+        db.session.add(cycle)
+        db.session.commit()
+        client, headers = self.client_as(self.actor)
+        response = client.post('/camp/sessions', headers=headers, json={
+            'name': '空课程方向营', 'cycle_id': cycle.id, 'category': 'learning',
+            'start_date': date.today().isoformat(),
+            'end_date': (date.today() + timedelta(days=30)).isoformat(),
+            'mentor_selection_enabled': True,
+            'ms_preference_start': (datetime.now() + timedelta(days=1)).isoformat(timespec='seconds'),
+            'ms_preference_deadline': (datetime.now() + timedelta(days=2)).isoformat(timespec='seconds'),
+            'ms_tags': [{'name': '先建方向', 'course_ids': []}]})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json['session']['ms_directions'], [{'name': '先建方向', 'course_ids': []}])
+
     def test_failed_api_does_not_commit_partial_membership(self):
         service.add_role(self.a,self.student.id,'learner',self.actor.id);db.session.commit()
         client,headers=self.client_as(self.actor)

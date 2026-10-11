@@ -131,7 +131,7 @@ def _ms_directions_raw(camp):
     """ms_tags 原始解析：兼容三种形状——
     新：[{"name":"硬件组","course_ids":[12,13]},...]（09-13 多课制：方向可绑多门课程）
     中：[{"name":"硬件组","course_id":12},...]（09-12 单课制存量，读时归一为单元素 course_ids）
-    旧：["硬件组",...]（纯字符串，legacy 营；无课程绑定，编辑时强制补齐）
+    旧：["硬件组",...]（纯字符串，legacy 营；允许暂不绑定课程）
     返回 list（元素为 dict 或 str），未配置/脏数据回退默认集字符串。"""
     if camp.ms_tags:
         try:
@@ -163,7 +163,7 @@ def _ms_tags_list(camp):
 def _ms_directions(camp):
     """方向定义（继承与课程派生/管理端配置回显的唯一取用口）：[{name, course_ids: [...]}]。
     09-13 多课制：一方向可绑多门课程；单课存量与 legacy 字符串读时归一
-    （字符串 → 空列表，老营未补绑课程的过渡态，可见可补）；死课程 id 剔除、去重保序。"""
+    （字符串 → 空列表，课程可后续补充）；死课程 id 剔除、去重保序。"""
     from models import CourseModel
     out = []
     for d in _ms_directions_raw(camp):
@@ -199,7 +199,7 @@ def _apply_ms_fields(camp, d):
     """从请求体应用选导生配置（只处理出现的键；datetime 解析失败 raise ValueError）。
     空字符串/None → 置 NULL。round 截止键已随单轮化废弃，传入一律忽略。
     ms_tags 接受三种形状（09-13 多课制）：[{name, course_ids:[...]}]（新）/[{name, course_id}]
-    单课存量 / 纯字符串数组（legacy 容忍直存，_validate_ms 在 enabled 时会拦截缺课程的形状）。"""
+    单课存量 / 纯字符串数组（legacy 容忍直存，课程允许留空）。"""
     if "mentor_selection_enabled" in d:
         camp.mentor_selection_enabled = bool(d.get("mentor_selection_enabled"))
     for f in ("ms_preference_start", "ms_preference_deadline"):
@@ -233,12 +233,12 @@ def _apply_ms_fields(camp, d):
 
 
 def _validate_directions(camp):
-    """方向定义完整性（2026-09-28 方向解耦）：与选导生开关正交——只要配了方向，
-    无论是否启用选导生，每个方向至少绑定一门有效课程（0 方向是否允许由调用方
-    按启用态自行拦截）。"""
-    for d in _ms_directions(camp):
-        if not d["course_ids"]:
-            return f"分类「{d['name']}」未关联有效课程（方向制：每个方向至少绑定一门课程）"
+    """方向可先建立、后绑定课程；显式填写课程时仍须有有效课程。
+    是否必须配置方向由选导生流程校验，不以课程数量决定。"""
+    directions = _ms_directions(camp)
+    for raw, direction in zip(_ms_directions_raw(camp), directions):
+        if isinstance(raw, dict) and raw.get("course_ids") and not direction["course_ids"]:
+            return f"分类「{direction['name']}」关联课程无效，请重新选择或留空"
     return None
 
 
@@ -246,7 +246,7 @@ def _validate_ms(camp):
     """选导生配置校验（create/update 存库前调用）。返回 None 或错误 message。
     09-12 时间统领拍板：选导生是营期的第一个阶段——志愿时间窗必须落在营期起止之内
     （营期开始日 00:00 ≤ 志愿开始 < 志愿截止 ≤ 营期结束日 23:59，不再压在营期开始之前）；
-    且每个方向至少绑定一门存在的课程（09-13 多课制：一方向可绑多门）。
+    方向课程可留空，后续可补充一门或多门课程。
     round 截止字段已随单轮化废弃，不参与校验。关闭 enabled 随时允许。"""
     if not camp.mentor_selection_enabled:
         return None
