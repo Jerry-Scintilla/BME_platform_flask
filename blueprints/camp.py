@@ -17,6 +17,7 @@ from sqlalchemy import or_
 from flask import Blueprint, Response, request, jsonify
 from flask_jwt_extended import jwt_required
 
+from services.camp_groups import recruitment
 from exts import db, redis_client
 from models import (
     CampSession, CampCycle, CampPolicy, CampMember, CampCourse, CampAttendancePlan,
@@ -28,7 +29,7 @@ from models import (
     Chapter, LessonModel, LearningProgressModel,
     CampUnit, ProjectApplicationVersion, CampMilestone, CampSubmissionVersion,
     CampOutcome, CampArchive, CampMembershipEvent,
-    CAMP_CATEGORY_DEFAULTS,
+    CAMP_CATEGORY_DEFAULTS, TrainingGroupProfile,
 )
 
 from . import camp_role, audit_log, _current_user
@@ -40,7 +41,16 @@ from .camp_ms import (_apply_ms_fields, _validate_ms, _validate_directions, _ms_
                       _ms_directions, _inherit_direction_course)
 from .camp_course_assign import upsert_assignment, end_member_assignments
 
+from services.camp_groups import training, training_access as training_access
+from services.groups import GroupError
+
 bp = Blueprint("camp", __name__, url_prefix="/camp")
+
+
+@bp.errorhandler(GroupError)
+def training_error(error):
+    db.session.rollback()
+    return jsonify({'code': error.status, 'message': str(error), 'machine': error.machine}), error.status
 
 
 # ─────────────────────────────────────────────
@@ -100,7 +110,7 @@ def _sync_plans(camp):
                 synchronize_session=False)
     out_q.delete(synchronize_session=False)
     db.session.flush()      # 让上面 delete 的行即时可见，零 plan 判定不受本事务脏读影响
-    for m in CampMember.query.filter_by(camp_session_id=camp.id, role='student').all():
+    for m in CampMember.query.filter_by(camp_session_id=camp.id, needs_attendance=True).all():
         _gen_plan(camp, m.user_id)
     return CampAttendancePlan.query.filter_by(camp_session_id=camp.id).count()
 
@@ -111,19 +121,13 @@ def _camp_writable(camp):
 
 
 def _visible_student_ids(camp_id, user):
-    """导生=本团队学员；营期负责人（CampStaff）/超管=全营学员。"""
     if user.is_admin() or camp_staff_row(camp_id, user.id):
-        return [m.user_id for m in CampMember.query.filter_by(
-            camp_session_id=camp_id, role='student').all()]
-    return [m.user_id for m in CampMember.query.filter_by(
-        camp_session_id=camp_id, role='student', team_mentor_id=user.id).all()]
+        return [m.user_id for m in CampMember.query.filter_by(camp_session_id=camp_id).filter(CampMember.is_learner).all()]
+    return sorted(training_access.taught_students(camp_id, user.id))
 
 
 def _in_my_team(camp_id, mentor, student_id):
-    """student_id 是否是该 mentor 在本营的团队成员"""
-    return CampMember.query.filter_by(
-        camp_session_id=camp_id, role='student',
-        user_id=student_id, team_mentor_id=mentor.id).first() is not None
+    return student_id in training_access.taught_students(camp_id, mentor.id)
 
 
 def _staff_or_mentor_gate(sid, user):
@@ -133,7 +137,7 @@ def _staff_or_mentor_gate(sid, user):
     if user.is_admin() or camp_staff_row(sid, user.id):
         return None
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    if not member or member.role != 'mentor':
+    if not member or not member.is_mentor:
         return jsonify({"code": 403, "message": "仅本营负责人或导生可访问"}), 403
     return None
 
@@ -618,6 +622,7 @@ def session_create():
     try:
         camp = CampSession(
             name=name, category=category, cycle_id=cycle.id,
+            training_groups_ready=(category == "learning"),
             start_date=date.fromisoformat(start), end_date=date.fromisoformat(end),
             expected_check_in=time.fromisoformat(d["expected_check_in"]) if d.get("expected_check_in") else None,
             min_daily_hours=d.get("min_daily_hours"),
@@ -691,13 +696,11 @@ def session_list():
         perspectives = []
         if staff_role:
             perspectives.append('teacher')
-        if my_roles.get(c.id) == 'mentor':
-            perspectives.append('mentor')
-        elif my_roles.get(c.id) == 'student':
-            perspectives.append('student')
+        perspectives.extend(training_access.member_roles(next((m for m in my_rows if m.camp_session_id == c.id), None)))
         return {
             "is_member": c.id in member_ids,
             "my_role": my_roles.get(c.id),
+            "my_roles": [r for r in perspectives if r != "teacher"],
             "my_staff_role": staff_role,
             "has_camp_access": bool(staff_role) or c.id in member_ids,
             "available_perspectives": perspectives or None,
@@ -720,12 +723,12 @@ def session_detail(sid):
     perspectives = []
     if staff:
         perspectives.append('teacher')
-    if member and member.role in ('mentor', 'student'):
-        perspectives.append(member.role)
+    perspectives.extend(training_access.member_roles(member))
     return jsonify({"code": 200, "session": {
         **_session_dict(camp),
         "is_member": bool(member),
         "my_role": member.role if member else None,
+        "my_roles": training_access.member_roles(member),
         "my_staff_role": staff.role if staff else None,
         "has_camp_access": bool(staff or member or user.is_admin()),
         "available_perspectives": perspectives or None,
@@ -750,8 +753,8 @@ def session_admin_overview(sid):
 
     stage_labels = {'draft': '草稿', 'upcoming': '待开放', 'selecting': '报名与选导生',
                     'running': '进行中', 'archived': '已结营'}
-    students = CampMember.query.filter_by(camp_session_id=sid, role='student').all()
-    mentors = CampMember.query.filter_by(camp_session_id=sid, role='mentor').all()
+    students = CampMember.query.filter_by(camp_session_id=sid, is_learner=True).all()
+    mentors = CampMember.query.filter_by(camp_session_id=sid, is_mentor=True).all()
 
     pending_join = CampJoinRequest.query.filter_by(camp_session_id=sid, status='pending').count()
     oldest_join = (db.session.query(db.func.min(CampJoinRequest.created_at))
@@ -766,7 +769,7 @@ def session_admin_overview(sid):
         "counts": {
             "student": len(students), "mentor": len(mentors),
             "member": CampMember.query.filter_by(camp_session_id=sid, role='member').count(),
-            "unmatched": sum(1 for m in students if not m.team_mentor_id),
+            "unmatched": sum(1 for m in students if not training_access.learner_units(sid, m.user_id)) if camp.training_groups_ready else sum(1 for m in students if not m.team_mentor_id),
         },
         "pending": {
             "join": pending_join,
@@ -995,6 +998,7 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
     软删除（migrate_45）：历史移除行存在时走复职（status 回 active + 记 reactivate 事件），
     不再插入新行（UQ(camp,user) 兜底防重）。
     返回 (CampMember, None) 成功（未 commit）；或 (None, (message, code)) 失败。"""
+    operator_id = operator_id or (_current_user().id if _current_user() else None)
     camp = CampSession.query.get(sid)
     if not camp:
         return None, ("营期不存在", 404)
@@ -1005,7 +1009,7 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
         return None, ("用户不存在", 404)
     # 身份解耦（1a）：营内角色由调用方显式指定（默认学员），不再从全局 user.role 派生；
     # 仅拒绝 super_admin 入营期成员（管理动作走管理入口）。
-    # v1.3：+ 'member'=项目营通用入池值（负责人身份在单元层 CampUnitMember.role=leader）。
+    # v1.3：+ 'member'=项目营通用入池值（负责人身份在单元层 UnitMembershipRead.role=leader）。
     if user.is_admin():
         return None, ("教师/超管通过营期管理入口操作，不作为营期成员加入", 400)
     if role not in ('student', 'mentor', 'member'):
@@ -1027,10 +1031,18 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
     with member_history_scope():          # 复职判定须看到历史行
         existing = CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first()
     if existing and existing.status == 'active':
-        return None, ("该用户已在营期中", 402)
+        if camp.training_groups_ready and role == 'student' and not existing.is_learner:
+            existing.learning_enabled = True
+            existing.attendance_required = True
+            if team_mentor_id:
+                training.recruit(sid, user_id, team_mentor_id, operator_id, daily=True)
+            if auto_plan and _pledge_daily(camp):
+                _gen_plan(camp, user_id)
+            return existing, None
+        return None, ("该用户已在营期中；额外教学职责请在小组管理中添加", 402)
     # 归属导生仅学员可设，且必须是本营导生
     if role == 'student' and team_mentor_id:
-        if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
+        if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, is_mentor=True).first():
             return None, ("指定的导生不在本营", 400)
     else:
         team_mentor_id = None
@@ -1038,7 +1050,8 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
         before = {"role": existing.role, "status": existing.status,
                   "team_mentor_id": existing.team_mentor_id}
         existing.role = role
-        existing.team_mentor_id = team_mentor_id
+        if not camp.training_groups_ready:
+            existing.team_mentor_id = team_mentor_id
         existing.status = 'active'
         existing.joined_at = datetime.now()
         existing.ended_at = None
@@ -1050,11 +1063,20 @@ def _assign_member(sid, user_id, team_mentor_id=None, auto_plan=True, role="stud
                       operator_id or (existing.ended_by or user_id))
     else:
         m = CampMember(camp_session_id=sid, user_id=user_id, role=role,
-                       team_mentor_id=team_mentor_id)
+                       team_mentor_id=None if camp.training_groups_ready else team_mentor_id)
         db.session.add(m)
         _member_event(sid, user_id, action, None,
                       {"role": role, "status": 'active', "team_mentor_id": team_mentor_id},
                       operator_id or user_id)
+    if camp.training_groups_ready:
+        m.learning_enabled = role == 'student'
+        m.attendance_required = role == 'student'
+        m.recruitment_unit_id = None
+        db.session.flush()
+        if role == 'mentor':
+            training.recruitment_group(sid, user_id, operator_id)
+        elif team_mentor_id:
+            training.recruit(sid, user_id, team_mentor_id, operator_id, daily=True)
     if auto_plan and role == 'student' and _pledge_daily(camp):
         _gen_plan(camp, user_id)          # 直接加成员：零 plan 学员按工作日生成（兜底）
     # 方向制继承（09-12）：学员归属导生 → 自动入读该方向绑定的课程（不 commit，随调用方事务）
@@ -1092,13 +1114,13 @@ def _notify_member_assigned(sid, m):
         return
     role_label = {'student': '学员', 'mentor': '导生', 'member': '成员'}.get(m.role, m.role)
     content = f"你已被加入「{camp.name}」，当前身份：{role_label}。点击进入营期工作台。"
-    if m.role == 'student' and m.team_mentor_id:
+    if m.is_learner and m.team_mentor_id:
         mentor = UserModel.query.get(m.team_mentor_id)
         if mentor:
             content += f"你的导生是 {mentor.username}。"
     create_notification(m.user_id, "已加入营期", content, category='camp',
                         source_type='camp_session', source_id=sid, camp_session_id=sid)
-    if m.role == 'student' and m.team_mentor_id:
+    if m.is_learner and m.team_mentor_id:
         mentor = UserModel.query.get(m.team_mentor_id)
         if mentor:
             create_notification(mentor.id, "新学员加入你的团队",
@@ -1170,7 +1192,7 @@ def member_list(sid):
             .join(UserModel, UserModel.id == CampMember.user_id)
             .filter(CampMember.camp_session_id == sid))
     if not see_all:
-        base = base.filter(or_(CampMember.role != 'student',
+        base = base.filter(or_(CampMember.is_learner.is_(False),
                                CampMember.user_id.in_(visible)))
 
     paged = any(k in request.args for k in ("page", "page_size", "keyword", "role"))
@@ -1186,7 +1208,7 @@ def member_list(sid):
             query = query.filter(UserModel.username.like(f"%{escaped}%", escape="\\"))
         roles = [r.strip() for r in (request.args.get("role") or "").split(",") if r.strip()]
         if roles:
-            query = query.filter(CampMember.role.in_(roles))
+            query = query.filter(db.or_(*[CampMember.is_learner if r == 'student' else CampMember.is_mentor if r == 'mentor' else CampMember.role == r for r in roles]))
         total = query.count() if paged else None
         if paged:
             try:
@@ -1214,7 +1236,7 @@ def member_list(sid):
 
     # 方向解耦（09-28）：mentor 行带名片方向（管理端成员页方向列数据源）；
     # 批量查一次名片，无 N+1。学员行不带——前端按 team_mentor_id 映射导生方向。
-    mentor_uids = {m.user_id for m, _ in rows if m.role == 'mentor'}
+    mentor_uids = {m.user_id for m, _ in rows if m.is_mentor}
     _dir_by_uid = {}
     if mentor_uids:
         for p in CampMentorProfile.query.filter(
@@ -1228,8 +1250,8 @@ def member_list(sid):
                 _dir_by_uid[p.user_id] = str(t[0])
     data = [{
             "user_id": m.user_id, "username": u.username,
-            "role": m.role, "team_mentor_id": m.team_mentor_id,
-            "direction": _dir_by_uid.get(m.user_id) if m.role == 'mentor' else None,
+            "role": m.role, "roles": training_access.member_roles(m), "team_mentor_id": m.team_mentor_id,
+            "direction": _dir_by_uid.get(m.user_id) if m.is_mentor else None,
             "joined_at": m.joined_at.isoformat() if m.joined_at else None,
             "status": m.status,
             "ended_at": m.ended_at.isoformat() if m.ended_at else None,
@@ -1239,9 +1261,9 @@ def member_list(sid):
         return jsonify({"code": 200, "members": data})
 
     counts = {"student": 0, "mentor": 0, "member": 0}
-    for role, count in (base.with_entities(CampMember.role, db.func.count(CampMember.id))
-                        .group_by(CampMember.role).all()):
-        counts[role] = count
+    counts['student'] = base.filter(CampMember.is_learner).count()
+    counts['mentor'] = base.filter(CampMember.is_mentor).count()
+    counts['member'] = base.filter(CampMember.role == 'member').count()
     return jsonify({"code": 200, "members": data, "total": total,
                     "page": page, "page_size": page_size, "counts": counts})
 
@@ -1302,6 +1324,15 @@ def member_remove(sid, uid):
     user = _current_user()
     reason = ((request.json or {}).get("reason") or "").strip()[:500] or None
     before = {"role": m.role, "status": m.status, "team_mentor_id": m.team_mentor_id}
+    if camp.training_groups_ready:
+        training.end_participation(sid, uid, user.id)
+    from services.camp_groups.projects import end_camp_participations
+    from services.groups import GroupError
+    try:
+        end_camp_participations(sid, uid, user.id, reason)
+    except GroupError as exc:
+        db.session.rollback()
+        return jsonify({'code': exc.status, 'machine': exc.machine, 'message': str(exc)}), exc.status
     m.status = 'removed'
     m.ended_at = datetime.now()
     m.ended_by = user.id
@@ -1321,9 +1352,10 @@ def member_remove(sid, uid):
         CampMentorMatch.camp_session_id == sid,
         (CampMentorMatch.mentor_user_id == uid) | (CampMentorMatch.student_user_id == uid)
     ).delete(synchronize_session=False)
-    CampMember.query.filter(
-        CampMember.camp_session_id == sid, CampMember.team_mentor_id == uid
-    ).update({CampMember.team_mentor_id: None}, synchronize_session=False)
+    if not camp.training_groups_ready:
+        CampMember.query.filter(
+            CampMember.camp_session_id == sid, CampMember.legacy_team_mentor_id == uid
+        ).update({CampMember.legacy_team_mentor_id: None}, synchronize_session=False)
     # 课程分配收尾（2026-09-20 B2）：该营分配行置 ended；UserCourse/进度/认证不回收
     # （学习历史保留——移除后课程口径自动回全局/其它营，active_scope_camp 不再命中本营）
     end_member_assignments(sid, uid)
@@ -1461,7 +1493,7 @@ def plan_adjust(sid, uid):
         return jsonify({"code": 400, "message": "营期已归档或删除，只读"}), 400
     if not _pledge_daily(camp):
         return jsonify({"code": 400, "message": "本营考勤模式为按周累计，无承诺出勤日"}), 400
-    member = CampMember.query.filter_by(camp_session_id=sid, user_id=uid, role='student').first()
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=uid, is_learner=True).first()
     if not member:
         return jsonify({"code": 404, "message": "学员不在本营"}), 404
     d = request.json or {}
@@ -1573,12 +1605,15 @@ def attendance_dashboard(sid):
 
     # 09-12 模式 C（学期校区·按周累计）：导生/老师看本团队学员的周分桶统计
     if _attendance_mode(camp) == 'weekly':
-        visible = _visible_student_ids(sid, user)
+        from services.camp_groups import training_history
+        historical = training_history.include_history(camp, user, request.args.get('include_history') == '1')
+        visible = training_history.attendance_ids(camp, user, history=historical)
         stats = _weekly_stats(camp, visible)
         users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(visible))} if visible else {}
         rows = [{"user_id": uid, "username": users[uid].username if uid in users else "",
                  **stats[uid]} for uid in visible]
-        return jsonify({"code": 200, "mode": "weekly",
+        return jsonify({"code": 200, "mode": "weekly", "include_history": historical,
+                        "can_include_history": training_history.manager(sid, user),
                         "range": {"from": camp.start_date.isoformat(),
                                   "to": camp.end_date.isoformat()},
                         "rows": rows})
@@ -1592,7 +1627,9 @@ def attendance_dashboard(sid):
     if frm > to:
         return jsonify({"code": 400, "message": "from 不能晚于 to"}), 400
 
-    visible = _visible_student_ids(sid, user)
+    from services.camp_groups import training_history
+    historical = training_history.include_history(camp, user, request.args.get('include_history') == '1')
+    visible = training_history.attendance_ids(camp, user, history=historical)
     empty_summary = {"present": 0, "late": 0, "short_hours": 0,
                      "late_and_short": 0, "absent": 0, "on_leave": 0,
                      "total": 0, "attendance_rate": None}
@@ -1621,7 +1658,7 @@ def attendance_dashboard(sid):
     users = {u.id: u.username for u in
              UserModel.query.filter(UserModel.id.in_(visible)).all()}
     mentors = {m.user_id: m.team_mentor_id for m in
-               CampMember.query.filter_by(camp_session_id=sid, role='student').all()}
+               CampMember.query.filter_by(camp_session_id=sid, is_learner=True).all()}
 
     # 4. 矩阵（全范围日期 × 可见学员）+ 汇总：未承诺 unpledged，未来承诺日 pledged，过去承诺日 _eval_day
     today = date.today()
@@ -1695,7 +1732,8 @@ def attendance_dashboard(sid):
         "attendance_rate": round(g_attended / g_elapsed, 3) if g_elapsed else None,
     }
     return jsonify({
-        "code": 200, "mode": "daily",
+        "code": 200, "mode": "daily", "include_history": historical,
+        "can_include_history": training_history.manager(sid, user),
         "range": {"from": frm.isoformat(), "to": to.isoformat()},
         "dates": sorted(d.isoformat() for d in dates_set),
         "summary": summary,
@@ -1709,22 +1747,23 @@ def unit_weekly_attendance(uid):
     """项目营·单元周考勤面板（09-13）：负责人看本项目成员的按周出勤统计。
     项目营成员是 CampMember.role='member'，进不了 @camp_role('mentor') 的营级 dashboard，
     此处以单元负责人视角出数（admin 亦可）；周分桶复用 _weekly_stats 同口径。"""
-    from models import CampUnit, CampUnitMember
+    from models import CampUnit
+    from services.camp_groups.reads import UnitMembershipRead
     unit = CampUnit.query.get(uid)
     if not unit or unit.unit_type != 'project':
         return jsonify({"code": 404, "message": "项目不存在"}), 404
     camp = CampSession.query.get(unit.camp_session_id)
     user = _current_user()
-    is_leader = user.is_admin() or CampUnitMember.query.filter_by(
-        unit_id=unit.id, user_id=user.id, role='leader', status='active').first()
+    from services.camp_groups.projects import unit_role
+    is_leader = unit_role(unit, user) == 'leader'
     if not is_leader:
         return jsonify({"code": 403, "message": "仅项目负责人可查看项目周考勤"}), 403
     if not _capability_enabled(camp, 'attendance'):
         return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     if _attendance_mode(camp) != 'weekly':
         return jsonify({"code": 400, "message": "本营期考勤模式非按周累计"}), 400
-    members = (CampUnitMember.query.filter_by(unit_id=unit.id, status='active')
-               .order_by(CampUnitMember.user_id).all())
+    members = (UnitMembershipRead.query.filter_by(unit_id=unit.id, status='active')
+               .order_by(UnitMembershipRead.user_id).all())
     uids = [m.user_id for m in members]
     stats = _weekly_stats(camp, uids)
     users = {u.id: u for u in UserModel.query.filter(UserModel.id.in_(uids))} if uids else {}
@@ -1738,7 +1777,6 @@ def unit_weekly_attendance(uid):
 
 @bp.route("/attendance/export/<int:sid>")
 @jwt_required()
-@camp_role('mentor')
 @audit_log(operation="导出营期考勤")
 def attendance_export(sid):
     """考勤 CSV（utf-8-sig 带 BOM，Excel 可直接打开）：存档/线下核算用。
@@ -1752,9 +1790,14 @@ def attendance_export(sid):
         return jsonify({"code": 400, "message": "本营期未启用考勤（能力开关关闭）"}), 400
     user = _current_user()
 
+    denied = _staff_or_mentor_gate(sid, user)
+    if denied:
+        return denied
     buf = io.StringIO()
     w = csv.writer(buf)
-    visible = _visible_student_ids(sid, user)
+    from services.camp_groups import training_history
+    historical = training_history.include_history(camp, user, request.args.get('include_history') == '1')
+    visible = training_history.attendance_ids(camp, user, history=historical)
     users = {u.id: u.username for u in
              UserModel.query.filter(UserModel.id.in_(visible))} if visible else {}
 
@@ -1843,6 +1886,11 @@ def attendance_mine():
     camp = CampSession.query.get(sid)
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    if not member:
+        return jsonify({'code': 403, 'message': '非本营成员'}), 403
+    if not member.needs_attendance:
+        return jsonify({'code': 200, 'mode': 'off', 'exempt': True})
     # 09-14 修复：远程不考勤营（模式 B）显式返回 mode=off，不再走 daily 空承诺日分支
     # （此前前端拿到无 mode 的空数据回退 daily 画每日看板）
     if _attendance_mode(camp) == 'off':
@@ -1952,9 +2000,7 @@ def leave_submit():
     # 无权审批且不该看到请假隐私；未分组（或所属导生已不在营）走责任链
     # （owner+teachers → 无工作人员的营才兜底全部超管）。
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    approvers = []
-    if member and member.team_mentor_id:
-        approvers = [member.team_mentor_id]
+    approvers = training_access.approver_ids(sid, user.id)
     if not approvers:
         approvers = camp_responsible_ids(sid)
     for aid in approvers:
@@ -1972,9 +2018,14 @@ def leave_approve(lid):
     营期参数会 500（7517c32 的 query/body 回落也覆盖不到本端点 body）；
     权限在端点内自查——admin 通过、导生限本团队（_in_my_team），语义与装饰器一致。"""
     user = _current_user()
-    lv = CampLeave.query.get(lid)
+    lv = CampLeave.query.filter_by(id=lid).populate_existing().with_for_update().first()
     if not lv:
         return jsonify({"code": 404, "message": "请假记录不存在"}), 404
+    if user.id == lv.user_id:
+        return jsonify({'code': 403, 'message': '不能审批自己的请假'}), 403
+    camp = db.session.get(CampSession, lv.camp_session_id)
+    if not camp or not _camp_writable(camp):
+        return jsonify({'code': 409, 'message': '营期只读'}), 409
     if lv.status != 'pending':
         return jsonify({"code": 400, "message": "该请假已处理，不能重复审批（如需改判请先撤回）"}), 400
     _lv_camp = CampSession.query.get(lv.camp_session_id)
@@ -1982,7 +2033,7 @@ def leave_approve(lid):
         return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
     # 导生仅限本团队；营期负责人（owner/teacher）/超管不限（阶段 1 责任链）
     if not (user.is_admin() or camp_staff_row(lv.camp_session_id, user.id)):
-        if not _in_my_team(lv.camp_session_id, user, lv.user_id):
+        if user.id not in training_access.approver_ids(lv.camp_session_id, lv.user_id):
             return jsonify({"code": 403, "message": "无权审批（非本团队）"}), 403
     d = request.json or {}
     approved = bool(d.get("approve", True))
@@ -2014,19 +2065,24 @@ def leave_revoke(lid):
     撤回即生效，看板/我的考勤中该段自动回算，无需迁移历史。
     权限同审批：admin 通过、导生限本团队（不用 @camp_role，原因见 leave_approve）。"""
     user = _current_user()
-    _rk_lv = CampLeave.query.get(lid)
+    _rk_lv = CampLeave.query.filter_by(id=lid).populate_existing().with_for_update().first()
     if _rk_lv:
         _rk_camp = CampSession.query.get(_rk_lv.camp_session_id)
         if _rk_camp and not _capability_enabled(_rk_camp, 'leave'):
             return jsonify({"code": 400, "message": "本营期未启用请假（能力开关关闭）"}), 400
-    lv = CampLeave.query.get(lid)
+    lv = CampLeave.query.filter_by(id=lid).populate_existing().with_for_update().first()
     if not lv:
         return jsonify({"code": 404, "message": "请假记录不存在"}), 404
+    if user.id == lv.user_id:
+        return jsonify({'code': 403, 'message': '不能审批自己的请假'}), 403
+    camp = db.session.get(CampSession, lv.camp_session_id)
+    if not camp or not _camp_writable(camp):
+        return jsonify({'code': 409, 'message': '营期只读'}), 409
     if lv.status != 'approved':
         return jsonify({"code": 400, "message": "仅已批准的请假可撤回"}), 400
     # 与审批同权限：导生仅限本团队；营期负责人/超管不限
     if not (user.is_admin() or camp_staff_row(lv.camp_session_id, user.id)):
-        if not _in_my_team(lv.camp_session_id, user, lv.user_id):
+        if user.id not in training_access.approver_ids(lv.camp_session_id, lv.user_id):
             return jsonify({"code": 403, "message": "无权撤回（非本团队）"}), 403
     lv.status = 'pending'
     lv.approver_id = None
@@ -2060,7 +2116,7 @@ def leave_list(sid):
     approver_names = {u.id: u.username for u in UserModel.query.filter(
         UserModel.id.in_(approver_ids))} if approver_ids else {}
     for lv in q.order_by(CampLeave.created_at.desc()).all():
-        if not see_all and lv.user_id not in visible:
+        if not (see_all or camp_staff_row(sid, user.id)) and user.id not in training_access.approver_ids(sid, lv.user_id):
             continue
         u = UserModel.query.get(lv.user_id)
         data.append({
@@ -2221,7 +2277,7 @@ def seat_list(sid):
 def _camp_mentors(sid):
     """本营导生列表（供审批/改派选归属导生）"""
     out = []
-    for m in CampMember.query.filter_by(camp_session_id=sid, role='mentor').all():
+    for m in CampMember.query.filter_by(camp_session_id=sid, is_mentor=True).all():
         u = UserModel.query.get(m.user_id)
         if u:
             out.append({"user_id": u.id, "username": u.username})
@@ -2415,7 +2471,7 @@ def _apply_join_approval(req, join_mentor):
         return None, err
     # 用学员申请时手选的承诺日建 CampAttendancePlan（替代 _gen_plan 自动工作日）
     # 09-12 三模式：仅模式 A（每日承诺出勤）建 plan；按周累计/不考勤跳过
-    plan_camp = _camp if m.role == 'student' else None
+    plan_camp = _camp if m.is_learner else None
     if plan_camp and _pledge_daily(plan_camp):
         days = []
         try:
@@ -2570,29 +2626,17 @@ def member_update(sid, uid):
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
     if not m:
         return jsonify({"code": 404, "message": "成员不存在"}), 404
-    if m.role != 'student':
+    if not m.is_learner:
         return jsonify({"code": 400, "message": "仅学员可指定归属导生"}), 400
     user = _current_user()   # 账本 operator_id 用（dfb3091 补通知块时漏定义，改派必 500）
     d = request.json or {}
     team_mentor_id = d.get("team_mentor_id")
     if team_mentor_id:
-        if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, role='mentor').first():
+        if not CampMember.query.filter_by(camp_session_id=sid, user_id=team_mentor_id, is_mentor=True).first():
             return jsonify({"code": 400, "message": "指定的导生不在本营"}), 400
     old_mentor_id = m.team_mentor_id
-    m.team_mentor_id = team_mentor_id
-    # 启用选导生的营期：改派同步回写配对账本（结果页/看板与 live 链接保持一致）；清空归属则删账本行
-    if camp.mentor_selection_enabled:
-        row = CampMentorMatch.query.filter_by(camp_session_id=sid, student_user_id=uid).first()
-        if team_mentor_id:
-            if row:
-                row.mentor_user_id = team_mentor_id
-                row.round = None
-                row.source = 'admin'
-            else:
-                db.session.add(CampMentorMatch(camp_session_id=sid, mentor_user_id=team_mentor_id,
-                                               student_user_id=uid, round=None, source='admin'))
-        elif row:
-            db.session.delete(row)
+    recruitment.assign(m, team_mentor_id, user.id, daily=True, allow_over=True,
+                       write_ledger=bool(camp.mentor_selection_enabled))
     # 方向制继承（09-12）：改派到新导生 → 继承其方向课程（旧课程行保留为学习历史）
     if team_mentor_id:
         _inherit_direction_course(camp, uid, team_mentor_id)
@@ -2654,7 +2698,7 @@ def mentor_direction_set(sid):
         return jsonify({"code": 400, "message": "缺少有效 user_id"}), 400
     direction = str(d.get("direction") or "").strip()
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
-    if not m or m.role != 'mentor':
+    if not m or not m.is_mentor:
         return jsonify({"code": 400, "message": "仅本营导生可设置方向"}), 400
     directions = _ms_directions(camp)
     # 只认绑定了课程的方向：ms_tags 未配置时 _ms_directions 会回落营级默认标签集
@@ -2681,13 +2725,15 @@ def mentor_direction_set(sid):
         profile = CampMentorProfile(camp_session_id=sid, user_id=uid, capacity=None)
         db.session.add(profile)
     profile.tags = json.dumps([direction], ensure_ascii=False)
+    if camp.training_groups_ready:
+        training.sync_recruitment_profile(sid, uid, _current_user().id, direction, named[direction]['course_ids'], profile.capacity)
 
     # 方向变更传播（只增不减）：名下学员补入读新方向课程（_inherit 幂等——已在修
     # 的课复用全局行、ended 分配行复活；旧方向课不动）；实际新增的学员聚一条通知
     new_cids = named[direction]["course_ids"]
     propagated = 0
     for s in CampMember.query.filter_by(
-            camp_session_id=sid, role='student', team_mentor_id=uid).all():
+            camp_session_id=sid, is_learner=True, team_mentor_id=uid).all():
         existing = {r.course_id for r in CampCourseAssignment.query.filter_by(
             camp_session_id=sid, student_user_id=s.user_id,
             status=CampCourseAssignment.STATUS_ACTIVE).all()}
@@ -2748,6 +2794,7 @@ def course_assign_list(sid):
         "course_id": r.course_id,
         "title": titles.get(r.course_id, f"#{r.course_id}"),
         "source_type": r.source_type,
+        "unit_id": r.unit_id,
         "assigned_at": r.assigned_at.isoformat() if r.assigned_at else None,
     } for r in rows]})
 
@@ -2771,7 +2818,7 @@ def course_assign_add(sid):
     except (ValueError, TypeError):
         return jsonify({"code": 400, "message": "缺少有效 user_id / course_id"}), 400
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=uid).first()
-    if not m or m.role != 'student':
+    if not m or not m.is_learner:
         return jsonify({"code": 400, "message": "仅本营学员可手动入课"}), 400
     course = CourseModel.query.get(cid)
     if not course:
@@ -2785,8 +2832,16 @@ def course_assign_add(sid):
     else:
         db.session.add(UserCourseModel(user_id=uid, course_id=cid,
                                        status=UserCourseModel.STATUS_ACTIVE))
-    upsert_assignment(camp, uid, cid,
-                      source_type='manual', source_ref_id=_current_user().id)
+    if camp.training_groups_ready:
+        training.core._lock_users(_current_user().id, uid)
+        training.lock_camp(sid)
+    if d.get('unit_id') is not None:
+        unit = db.session.get(CampUnit, d['unit_id'])
+        if not unit or unit.camp_session_id != sid or unit.unit_type != 'mentor_team':
+            raise GroupError('课程责任组不在本营', status=400)
+        training.assign_course(unit, uid, cid, _current_user().id, source='manual')
+    else:
+        upsert_assignment(camp, uid, cid, source_type='manual', source_ref_id=_current_user().id)
     create_notification(
         uid, "老师为你添加了课程",
         f"「{camp.name}」的老师为你添加了课程「{course.title}」，请开始学习。",
@@ -2947,6 +3002,11 @@ def _course_block(camp, course_id, student_uid, ctx=None):
     else:
         uc = UserCourseModel.query.filter_by(
             user_id=student_uid, course_id=course_id).first()
+    assignment = (ctx.get('assignments', {}).get((student_uid, course_id)) if ctx is not None else
+        CampCourseAssignment.query.filter_by(camp_session_id=camp.id, student_user_id=student_uid, course_id=course_id).first())
+    # 营期完成态只看本营认证；其他营的全局 UserCourse 完成态不能污染历史报表。
+    course_status = ('completed' if chapters and certified == len(chapters) else
+                     'active' if assignment or (uc and uc.camp_session_id == camp.id) else None)
     return {
         "course_id": course_id,
         "course_title": course.title if course else "",
@@ -2955,7 +3015,7 @@ def _course_block(camp, course_id, student_uid, ctx=None):
         "certified_chapters": certified,
         "total_chapters": len(chapters),
         "score_avg": round(sum(scores) / len(scores)) if scores else None,
-        "course_status": uc.status if uc else None,
+        "course_status": course_status,
     }
 
 
@@ -3010,6 +3070,9 @@ def _team_progress_ctx(camp, uids, course_ids):
         "material_count": material_count,
         "courses": {c.id: c for c in CourseModel.query.filter(
             CourseModel.id.in_(course_ids)).all()},
+        "assignments": {(a.student_user_id, a.course_id): a for a in CampCourseAssignment.query.filter(
+            CampCourseAssignment.camp_session_id == camp.id, CampCourseAssignment.student_user_id.in_(uids),
+            CampCourseAssignment.course_id.in_(course_ids)).all()},
         "user_course": {(uc.user_id, uc.course_id): uc for uc in
                         UserCourseModel.query.filter(
                             UserCourseModel.user_id.in_(uids),
@@ -3055,12 +3118,38 @@ def team_progress(sid):
     if not camp:
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     user = _current_user()
+    if camp.training_groups_ready:
+        units = {u.id: u for r, u in training_access.roles(sid, user.id) if r.role == 'mentor'}
+        options = [{'unit_id': u.id, 'name': u.name} for u in units.values()]
+        selected = request.args.get('unit_id', type=int)
+        if selected is None and len(units) == 1:
+            selected = next(iter(units))
+        if selected is None:
+            return jsonify(code=200, groups=options, courses=[], students=[], direction=None,
+                           message='请选择要查看的教学组' if units else '暂无有效带教职责')
+        if selected not in units:
+            raise GroupError('无权查看该教学组', status=403)
+        profile = db.session.get(TrainingGroupProfile, selected)
+        ids = sorted(training_access.taught_students(sid, user.id, unit_id=selected))
+        course_ids = profile.course_ids or []
+        ctx = _team_progress_ctx(camp, ids, course_ids)
+        names = {u.id: u.username for u in UserModel.query.filter(UserModel.id.in_(ids)).all()} if ids else {}
+        students = []
+        for uid in ids:
+            courses = []
+            for cid in course_ids:
+                block = _course_block(camp, cid, uid, ctx)
+                block['can_certify'] = training_access.can_teach(sid, user.id, uid, cid)
+                courses.append(block)
+            students.append({'student_user_id': uid, 'username': names.get(uid, ''), 'courses': courses})
+        return jsonify(code=200, groups=options, unit_id=selected, direction=profile.direction or units[selected].name,
+                       courses=[{'course_id': cid, 'course_title': ctx['courses'][cid].title if ctx['courses'].get(cid) else ''} for cid in course_ids], students=students)
     direction = _direction_of_mentor(camp, user.id)
     if not direction or not direction["course_ids"]:
         return jsonify({"code": 200, "direction": direction["name"] if direction else None,
                         "courses": [], "students": [],
                         "message": "尚未设置方向或方向未绑定课程"})
-    students = (CampMember.query.filter_by(camp_session_id=sid, role='student')
+    students = (CampMember.query.filter_by(camp_session_id=sid, is_learner=True)
                 .order_by(CampMember.user_id).all())
     mine = [s for s in students
             if user.is_admin() or _in_my_team(sid, user, s.user_id)]
@@ -3126,15 +3215,18 @@ def progress_board(sid):
             return jsonify({"code": 400,
                             "message": "mentor_id 需为本营导生 ID 或 unassigned"}), 400
 
+    if camp.training_groups_ready:
+        from .camp_training import progress_board_data
+        return jsonify(progress_board_data(camp, user, page, page_size, mentor_filter))
     visible = set(_visible_student_ids(sid, user))
     students = [s for s in CampMember.query.filter_by(
-        camp_session_id=sid, role='student').all() if s.user_id in visible]
+        camp_session_id=sid, is_learner=True).all() if s.user_id in visible]
     buckets = defaultdict(list)                     # team_mentor_id -> [CampMember]
     for s in students:
         buckets[s.team_mentor_id].append(s)
 
     # 导生元数据一次批量：姓名 + 方向（名片 tags[0] 匹配方向定义，与 _direction_of_mentor 同口径）
-    mentor_rows = CampMember.query.filter_by(camp_session_id=sid, role='mentor') \
+    mentor_rows = CampMember.query.filter_by(camp_session_id=sid, is_mentor=True) \
         .order_by(CampMember.user_id).all()
     if mentor_filter is not None and mentor_filter != 'unassigned' \
             and mentor_filter not in {m.user_id for m in mentor_rows}:
@@ -3233,8 +3325,7 @@ def progress_board(sid):
                 chs = ctx["chapters"].get(cid, [])
                 cert_n += sum(1 for ch in chs if ch.id in certs)
                 total_n += len(chs)
-                uc = ctx["user_course"].get((s.user_id, cid))
-                if uc is not None and uc.status == UserCourseModel.STATUS_COMPLETED:
+                if chs and all(ch.id in certs for ch in chs):
                     done_n += 1
         return cert_n, total_n, done_n
 
@@ -3295,24 +3386,38 @@ def team_progress_certify(sid):
     student_uid, chapter_id = d.get("student_user_id"), d.get("chapter_id")
     if not student_uid or not chapter_id:
         return jsonify({"code": 400, "message": "缺少 student_user_id/chapter_id"}), 400
-    score = d.get("score")
-    if score is not None:
-        try:
-            score = int(score)
-        except (ValueError, TypeError):
-            return jsonify({"code": 400, "message": "评分须为 0-100 的整数"}), 400
-        if not 0 <= score <= 100:
-            return jsonify({"code": 400, "message": "评分须为 0-100 的整数"}), 400
-    if not user.is_admin() and not _in_my_team(sid, user, student_uid):
-        return jsonify({"code": 403, "message": "仅本团队学员可认证"}), 403
-    direction = _direction_of_mentor(camp, user.id)
-    if not direction or not direction["course_ids"]:
-        return jsonify({"code": 400, "message": "你尚未设置方向（或方向未绑定课程）"}), 400
-    ch = Chapter.query.filter_by(id=chapter_id).first()
-    if not ch or ch.course_id not in direction["course_ids"]:
-        return jsonify({"code": 404, "message": "章节不在你的方向课程内"}), 404
+    try:
+        student_uid, chapter_id = int(student_uid), int(chapter_id)
+    except (TypeError, ValueError):
+        raise GroupError('学员和章节参数非法', status=400)
+    if student_uid == user.id:
+        raise GroupError('不能认证自己的学习记录', status=403)
+    score = d.get('score')
+    if score is not None and (type(score) is not int or not 0 <= score <= 100):
+        raise GroupError('评分须为 0-100 的整数', status=400)
+    ch = db.session.get(Chapter, chapter_id)
+    if not ch:
+        raise GroupError('章节不存在', status=404)
+    if camp.training_groups_ready:
+        training.core._lock_users(user.id, student_uid)
+        training.lock_camp(sid)
+    if not training_access.can_teach(sid, user.id, student_uid, ch.course_id):
+        raise GroupError('仅该课程责任组的有效导生可认证，且学员须在本营修读', status=403)
+    if not camp.training_groups_ready:
+        direction = _direction_of_mentor(camp, user.id)
+        if not direction or ch.course_id not in direction['course_ids']:
+            raise GroupError('章节不在你的方向课程内', status=403)
+    if chapter_id not in {c['chapter_id'] for c in _chapters_payload(camp, ch.course_id, student_uid)}:
+        raise GroupError('该章节不是可认证的学习单元', status=400)
     row = CampChapterCertification.query.filter_by(
         camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id).first()
+    if request.method == 'DELETE' and not row:
+        raise GroupError('该章节尚未认证', status=404)
+    training.record(sid, student_uid, user.id,
+        'certification_revoke' if request.method == 'DELETE' else 'certification',
+        {'score': row.score, 'mentor_user_id': row.mentor_user_id} if row else None,
+        None if request.method == 'DELETE' else {'score': score if score is not None else row.score if row else None},
+        ch.course_id, chapter_id, reason='章节认证变更')
     course = CourseModel.query.get(ch.course_id)
     course_title = course.title if course else ''
     if request.method == "DELETE":
@@ -3384,8 +3489,25 @@ def my_direction(sid):
         return jsonify({"code": 404, "message": "营期不存在"}), 404
     user = _current_user()
     m = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    if not m or m.role != 'student':
+    if not m or not m.is_learner:
         return jsonify({"code": 403, "message": "仅本营学员可查看"}), 403
+    if camp.training_groups_ready:
+        units = {u.id: u for r, u in training_access.roles(sid, user.id) if r.role == 'learner'}
+        selected = request.args.get('unit_id', type=int)
+        if selected is not None and selected not in units:
+            raise GroupError('不在该学习组', status=403)
+        assignments = CampCourseAssignment.query.filter_by(camp_session_id=sid, student_user_id=user.id, status='active').all()
+        options = [{'unit_id': u.id, 'name': u.name} for u in units.values()]
+        courses = []
+        for row in assignments:
+            if selected is not None and row.unit_id != selected:
+                continue
+            block = _course_block(camp, row.course_id, user.id)
+            block['unit_id'] = row.unit_id
+            block['group_name'] = units[row.unit_id].name if row.unit_id in units else None
+            courses.append(block)
+        return jsonify(code=200, direction=units[selected].name if selected else '我的课程',
+                       groups=options, courses=courses, hint='暂无本营修读课程' if not courses else None)
     if not m.team_mentor_id:
         return jsonify({"code": 200, "direction": None, "courses": [],
                         "hint": "尚未归属导生——开放报名后选择导生，将自动继承其方向与课程"})

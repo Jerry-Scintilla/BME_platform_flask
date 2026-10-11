@@ -21,16 +21,19 @@ from flask import Blueprint, request, jsonify, Response
 from flask_jwt_extended import jwt_required
 from sqlalchemy.exc import IntegrityError
 
-from exts import db, redis_client
+from exts import db
 from models import (
     CampSession, CampPolicy, CampMember,
     CampUnit, ProjectProfile, ProjectApplicationVersion,
     ProjectTemplate, ProjectTemplateNode, CampMilestone,
-    CampUnitMember, CampMembershipEvent, CampProjectPreference,
+    CampMembershipEvent, CampProjectPreference,
     CampUnitActivity, CampUnitActivityCheck,
     UserModel,
 )
 
+from services.camp_groups.reads import UnitMembershipRead
+from services.camp_groups import projects as project_groups
+from services.groups import GroupError, GroupService
 from . import camp_role, audit_log, _current_user
 from .camp import _camp_writable, _capability_enabled
 from .notification import create_notification
@@ -124,61 +127,42 @@ def _instantiate_milestones(camp, unit, nodes):
 def _active_project_count(sid, user_id):
     """该用户在本营以成员身份（member）active 加入的项目数——project_limit 只管加入位；
     负责人（leader）位不占上限（09-13 放宽多负责：申报/负责无数量限制，把关在 admin 审核）。"""
-    return (CampUnitMember.query
-            .filter(CampUnitMember.user_id == user_id, CampUnitMember.status == 'active',
-                    CampUnitMember.role == 'member')
-            .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
+    return (UnitMembershipRead.query
+            .filter(UnitMembershipRead.user_id == user_id, UnitMembershipRead.status == 'active',
+                    UnitMembershipRead.role == 'member')
+            .join(CampUnit, CampUnit.id == UnitMembershipRead.unit_id)
             .filter(CampUnit.camp_session_id == sid, CampUnit.unit_type == 'project')
             .count())
 
 
 def _lock_member(sid, user_id):
-    """锁 (camp,user) 参与者行，串行化同一人的并发 3 上限计数（方案 §3.8）。"""
-    return (CampMember.query
-            .filter_by(camp_session_id=sid, user_id=user_id)
-            .with_for_update().first())
+    # 组织应用服务统一锁账号、人员、组和营期，此处只解析当前有效参与。
+    return CampMember.query.filter_by(camp_session_id=sid, user_id=user_id).first()
 
 
 def _is_unit_leader(unit, user):
-    return user.is_admin() or CampUnitMember.query.filter_by(
-        unit_id=unit.id, user_id=user.id, role='leader', status='active').first() is not None
+    return project_groups.unit_role(unit, user) == 'leader'
 
 
 def _unit_version(unit_id):
-    """roster 乐观锁版本：取本单元最新事件 id（每次变更都追加事件，天然单调）。"""
-    row = (CampMembershipEvent.query.filter_by(unit_id=unit_id)
-           .order_by(CampMembershipEvent.id.desc()).first())
-    return row.id if row else 0
-
-
-def _add_event(camp_id, unit_id, user_id, action, source, operator_id,
-               before=None, after=None, reason=None):
-    db.session.add(CampMembershipEvent(
-        camp_session_id=camp_id, unit_id=unit_id, user_id=user_id,
-        action=action, source=source, operator_id=operator_id,
-        before=json.dumps(before, ensure_ascii=False) if before else None,
-        after=json.dumps(after, ensure_ascii=False) if after else None,
-        reason=reason))
+    return project_groups.selection_version(unit_id)
 
 
 def _add_unit_member(unit, user_id, role, source, operator_id, reason=None):
-    """写单元成员行 + 事件（不 commit）。调用方保证 3 上限已校验/行锁已持。"""
-    row = CampUnitMember.query.filter_by(unit_id=unit.id, user_id=user_id).first()
-    if row:
-        row.role, row.status, row.ended_at = role, 'active', None
-    else:
-        row = CampUnitMember(unit_id=unit.id, user_id=user_id, role=role, status='active')
-        db.session.add(row)
-    _add_event(unit.camp_session_id, unit.id, user_id, 'select', source, operator_id,
-               before=None, after={"role": role}, reason=reason)
-    return row
+    return project_groups.add_member(unit, user_id, role, source, operator_id, reason)
 
 
 def _end_unit_member(unit, row, action, source, operator_id, reason):
-    row.status, row.ended_at = 'ended', datetime.now()
-    _add_event(unit.camp_session_id, unit.id, row.user_id, action, source, operator_id,
-               before={"role": row.role, "status": 'active'},
-               after={"role": row.role, "status": 'ended'}, reason=reason)
+    return project_groups.end_member(unit, row.user_id, action, source, operator_id, reason)
+
+
+@bp.errorhandler(GroupError)
+def group_error(error):
+    db.session.rollback()
+    payload = {'code': error.status, 'machine': error.machine, 'message': str(error)}
+    if error.machine == 'SELECTION_VERSION_CONFLICT' and request.view_args.get('uid'):
+        payload['current_version'] = _unit_version(request.view_args['uid'])
+    return jsonify(payload), error.status
 
 
 def _usernames(ids):
@@ -250,16 +234,16 @@ def project_mine(sid):
     apps = (ProjectApplicationVersion.query
             .filter_by(camp_session_id=sid, leader_user_id=user.id)
             .order_by(ProjectApplicationVersion.version.desc()).all())
-    my_rows = (CampUnitMember.query
-               .filter(CampUnitMember.user_id == user.id, CampUnitMember.status == 'active')
-               .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
+    my_rows = (UnitMembershipRead.query
+               .filter(UnitMembershipRead.user_id == user.id, UnitMembershipRead.status == 'active')
+               .join(CampUnit, CampUnit.id == UnitMembershipRead.unit_id)
                .filter(CampUnit.camp_session_id == sid, CampUnit.unit_type == 'project').all())
     unit_ids = [r.unit_id for r in my_rows]
     units = {u.id: u for u in CampUnit.query.filter(CampUnit.id.in_(unit_ids)).all()} if unit_ids else {}
     names = _usernames({u.owner_user_id for u in units.values()} | {user.id})
-    counts = dict(db.session.query(CampUnitMember.unit_id, db.func.count(CampUnitMember.id))
-                  .filter(CampUnitMember.unit_id.in_(unit_ids), CampUnitMember.status == 'active')
-                  .group_by(CampUnitMember.unit_id).all()) if unit_ids else {}
+    counts = dict(db.session.query(UnitMembershipRead.unit_id, db.func.count(UnitMembershipRead.id))
+                  .filter(UnitMembershipRead.unit_id.in_(unit_ids), UnitMembershipRead.status == 'active')
+                  .group_by(UnitMembershipRead.unit_id).all()) if unit_ids else {}
     leading, joining = [], []
     for r in my_rows:
         u = units.get(r.unit_id)
@@ -375,6 +359,11 @@ def application_review(sid, vid):
     d = request.json or {}
     action = d.get("action")
     admin = _current_user()
+    if action in ('approve', 'reject'):
+        GroupService._lock_users(admin.id, app.leader_user_id)
+        app = ProjectApplicationVersion.query.filter_by(id=vid).populate_existing().with_for_update().one()
+        if app.status != 'pending':
+            return jsonify({'code': 409, 'message': '该申报已被处理，请刷新'}), 409
     if action == 'approve':
         # 09-13 放宽：可负责多个项目，负责位不占 project_limit——审核即放行（同名项目仍拦）
         if CampUnit.query.filter_by(camp_session_id=sid, unit_type='project',
@@ -420,11 +409,7 @@ def application_review(sid, vid):
                          for n in ProjectTemplateNode.query.filter_by(template_id=t.id)
                          .order_by(ProjectTemplateNode.sort_order)]
             instantiated = _instantiate_milestones(camp, unit, node_rows)
-        if not CampMember.query.filter_by(
-                camp_session_id=sid, user_id=app.leader_user_id).first():
-            db.session.add(CampMember(camp_session_id=sid, user_id=app.leader_user_id,
-                                      role='member'))       # 过审自动入池（v1.3 §3.7）
-        _add_unit_member(unit, app.leader_user_id, 'leader', 'approve', admin.id)
+        project_groups.bind_new_project(unit, admin.id)
         app.status, app.unit_id = 'approved', unit.id
         app.reviewed_by, app.reviewed_at = admin.id, datetime.now()
         _notify(app.leader_user_id, "项目申报已通过",
@@ -473,13 +458,13 @@ def project_list(sid):
     profiles = {p.unit_id: p for p in ProjectProfile.query.filter(
         ProjectProfile.unit_id.in_([u.id for u in units])).all()} if units else {}
     names = _usernames({u.owner_user_id for u in units})
-    counts = dict(db.session.query(CampUnitMember.unit_id, db.func.count(CampUnitMember.id))
-                  .filter(CampUnitMember.unit_id.in_([u.id for u in units]),
-                          CampUnitMember.status == 'active')
-                  .group_by(CampUnitMember.unit_id).all()) if units else {}
-    my_roles = {r.unit_id: r.role for r in CampUnitMember.query.filter(
-        CampUnitMember.user_id == user.id, CampUnitMember.status == 'active',
-        CampUnitMember.unit_id.in_([u.id for u in units])).all()} if units else {}
+    counts = dict(db.session.query(UnitMembershipRead.unit_id, db.func.count(UnitMembershipRead.id))
+                  .filter(UnitMembershipRead.unit_id.in_([u.id for u in units]),
+                          UnitMembershipRead.status == 'active')
+                  .group_by(UnitMembershipRead.unit_id).all()) if units else {}
+    my_roles = {r.unit_id: r.role for r in UnitMembershipRead.query.filter(
+        UnitMembershipRead.user_id == user.id, UnitMembershipRead.status == 'active',
+        UnitMembershipRead.unit_id.in_([u.id for u in units])).all()} if units else {}
     my_prefs = {p.unit_id: p.rank for p in CampProjectPreference.query.filter_by(
         camp_session_id=sid, student_user_id=user.id).all()}
     return jsonify({"code": 200, "selection_open": camp.status == 'selecting',
@@ -528,9 +513,9 @@ def preference_submit(sid):
         if not u or u.status == 'terminated':
             return jsonify({"code": 400, "message": f"PROJECT_NOT_APPROVED 项目 {uid} 不存在或已终止"}), 400
     # 09-13 修复：自己负责/已加入的项目不许再进意向（自选自项目无意义）
-    my_units = {r.unit_id for r in CampUnitMember.query.filter(
-        CampUnitMember.user_id == user.id, CampUnitMember.status == 'active',
-        CampUnitMember.unit_id.in_(unit_ids)).all()}
+    my_units = {r.unit_id for r in UnitMembershipRead.query.filter(
+        UnitMembershipRead.user_id == user.id, UnitMembershipRead.status == 'active',
+        UnitMembershipRead.unit_id.in_(unit_ids)).all()}
     if my_units:
         in_names = "、".join(units[i].name for i in my_units if i in units)
         return jsonify({"code": 400, "message": f"你已加入项目「{in_names}」，无需对它提交意向"}), 400
@@ -588,12 +573,12 @@ def preference_export(sid):
         prefs.setdefault(r.student_user_id, []).append(r)
     unit_ids = {r.unit_id for r in prefs}
     joined = {}
-    for um in (CampUnitMember.query
-               .filter(CampUnitMember.status == 'active')
-               .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
+    for um in (UnitMembershipRead.query
+               .filter(UnitMembershipRead.status == 'active')
+               .join(CampUnit, CampUnit.id == UnitMembershipRead.unit_id)
                .filter(CampUnit.camp_session_id == sid,
                        CampUnit.unit_type == 'project',
-                       CampUnitMember.user_id.in_([m.user_id for m in members])).all()):
+                       UnitMembershipRead.user_id.in_([m.user_id for m in members])).all()):
         joined.setdefault(um.user_id, []).append(um.unit_id)
     unit_ids |= {uid for lst in joined.values() for uid in lst}
     units = {u.id: u for u in CampUnit.query.filter(CampUnit.id.in_(unit_ids)).all()} if unit_ids else {}
@@ -662,7 +647,7 @@ def assign_batch(sid):
         if not member or member.role not in ('member', 'student'):
             results.append({**item, "status": "error", "message": "该用户不在本营（须先入营）"})
             continue
-        if CampUnitMember.query.filter_by(unit_id=unit.id, user_id=uid,
+        if UnitMembershipRead.query.filter_by(unit_id=unit.id, user_id=uid,
                                           status='active').first():
             results.append({**item, "status": "skipped", "message": "已在该项目中，跳过"})
             continue
@@ -670,14 +655,14 @@ def assign_batch(sid):
             results.append({**item, "status": "conflict",
                             "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 该成员加入的项目数已达上限 {limit}（自己负责的不计）"})
             continue
-        _add_unit_member(unit, uid, 'member', 'admin', admin.id)
-        _notify(uid, "已加入项目",
-                f"老师已将你加入「{camp.name}」项目「{unit.name}」。", sid, source_id=unit.id)
         try:
+            _add_unit_member(unit, uid, 'member', 'admin', admin.id)
+            _notify(uid, "已加入项目",
+                    f"老师已将你加入「{camp.name}」项目「{unit.name}」。", sid, source_id=unit.id)
             db.session.commit()
-        except IntegrityError:
+        except (IntegrityError, GroupError) as exc:
             db.session.rollback()
-            results.append({**item, "status": "error", "message": "写入冲突（并发回填），请重试"})
+            results.append({**item, "status": "error", "message": str(exc) if isinstance(exc, GroupError) else "写入冲突，请重试"})
             continue
         results.append({**item, "status": "assigned", "message": "已加入"})
     return jsonify({"code": 200, "results": results})
@@ -698,17 +683,17 @@ def selection_roster(uid):
         return err
     if not _is_unit_leader(unit, user):
         return jsonify({"code": 403, "message": "UNIT_MANAGEMENT_FORBIDDEN 仅项目负责人或管理员可查看名单"}), 403
-    members_now = (CampUnitMember.query.filter_by(unit_id=unit.id, status='active')
-                   .order_by(CampUnitMember.role.desc(), CampUnitMember.started_at).all())
+    members_now = (UnitMembershipRead.query.filter_by(unit_id=unit.id, status='active')
+                   .order_by(UnitMembershipRead.role.desc(), UnitMembershipRead.started_at).all())
     member_ids = {m.user_id for m in members_now}
     pool = CampMember.query.filter(
         CampMember.camp_session_id == camp.id,
         CampMember.role.in_(('member', 'student'))).all()
     pool_ids = [m.user_id for m in pool]
-    active_rows = (CampUnitMember.query
-                   .filter(CampUnitMember.user_id.in_(pool_ids),
-                           CampUnitMember.status == 'active')
-                   .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
+    active_rows = (UnitMembershipRead.query
+                   .filter(UnitMembershipRead.user_id.in_(pool_ids),
+                           UnitMembershipRead.status == 'active')
+                   .join(CampUnit, CampUnit.id == UnitMembershipRead.unit_id)
                    .filter(CampUnit.camp_session_id == camp.id,
                            CampUnit.unit_type == 'project').all()) if pool_ids else []
     cnt = {}
@@ -753,7 +738,7 @@ def selection_roster(uid):
 def member_selection(uid):
     """负责人普通勾选（原子整批）：body {expected_version, idempotency_key, operations:[{user_id, op}]}。
     op=add/remove；逐项返回 added/removed/unchanged/conflict/forbidden。
-    幂等键重放返回上次结果（redis 24h）；expected_version 不匹配报 SELECTION_VERSION_CONFLICT。
+    幂等键重放由数据库返回原结果；expected_version 在锁内核对，不匹配报 SELECTION_VERSION_CONFLICT。
     窗口=selecting 且单元 active（H-005 定稿：开营后普通勾选关闭，变更走管理员通道）。"""
     user = _current_user()
     unit, camp, err = _unit_or_404(uid)
@@ -777,61 +762,8 @@ def member_selection(uid):
         return jsonify({"code": 400, "message": "缺少 idempotency_key"}), 400
     if not isinstance(expected, int):
         return jsonify({"code": 400, "message": "缺少 expected_version（整型，取 roster.version）"}), 400
-    idem_key = f"proj:msel:{unit.id}:{idem}"
-    try:
-        cached = redis_client.get(idem_key)
-        if cached:
-            return jsonify(json.loads(cached))          # 幂等重放：原样返回上次结果
-    except Exception:
-        cached = None                                    # redis 不可用降级：仍有乐观锁保护
-    if expected != _unit_version(unit.id):
-        return jsonify({"code": 409, "message": "SELECTION_VERSION_CONFLICT 名单已变化，请刷新后重试",
-                        "current_version": _unit_version(unit.id)}), 409
-    limit = _project_limit(camp)
-    results = []
-    # 锁定涉及用户（按 id 排序防死锁），再逐项处理
-    user_ids = sorted({o.get("user_id") for o in ops if isinstance(o, dict) and o.get("user_id")})
-    locked = {m.user_id: m for u in user_ids
-              if (m := _lock_member(camp.id, u)) is not None}
-    for o in ops:
-        target, op = (o.get("user_id") if isinstance(o, dict) else None), \
-                     (o.get("op") if isinstance(o, dict) else None)
-        item = {"user_id": target, "op": op}
-        if op not in ('add', 'remove'):
-            results.append({**item, "result": "forbidden", "message": "op 仅支持 add/remove"})
-            continue
-        row = CampUnitMember.query.filter_by(unit_id=unit.id, user_id=target).first()
-        if op == 'add':
-            member = locked.get(target)
-            if not member or member.role not in ('member', 'student'):
-                results.append({**item, "result": "forbidden", "message": "非本营成员，不可勾选"})
-                continue
-            if row and row.status == 'active':
-                results.append({**item, "result": "unchanged", "message": "已在本项目"})
-                continue
-            if limit is not None and _active_project_count(camp.id, target) >= limit:
-                results.append({**item, "result": "conflict",
-                                "message": f"PROJECT_MEMBERSHIP_LIMIT_REACHED 该成员加入的项目数已达上限 {limit}（自己负责的不计）"})
-                continue
-            _add_unit_member(unit, target, 'member', 'leader_pick', user.id)
-            results.append({**item, "result": "added"})
-        else:
-            if not row or row.status != 'active':
-                results.append({**item, "result": "unchanged", "message": "不在本项目"})
-                continue
-            if row.role == 'leader':
-                results.append({**item, "result": "forbidden",
-                                "message": "负责人不可被移除，请先变更负责人"})
-                continue
-            _end_unit_member(unit, row, 'deselect', 'leader_pick', user.id, None)
-            results.append({**item, "result": "removed"})
+    payload = project_groups.select_members(unit, user.id, ops, idem, expected)
     db.session.commit()
-    new_version = _unit_version(unit.id)
-    payload = {"code": 200, "version": new_version, "results": results}
-    try:
-        redis_client.setex(idem_key, 86400, json.dumps(payload, ensure_ascii=False))
-    except Exception:
-        pass
     return jsonify(payload)
 
 
@@ -860,7 +792,7 @@ def member_end(uid, target):
     reason = _admin_reason(d)
     if not reason:
         return jsonify({"code": 400, "message": "管理员通道变更须填写原因（留痕）"}), 400
-    row = CampUnitMember.query.filter_by(unit_id=unit.id, user_id=target).first()
+    row = UnitMembershipRead.query.filter_by(unit_id=unit.id, user_id=target).first()
     if not row or row.status != 'active':
         return jsonify({"code": 404, "message": "该成员不在本项目（或已退出）"}), 404
     if row.role == 'leader':
@@ -907,31 +839,9 @@ def leader_change(uid):
         return _blocked
     if new_leader == unit.owner_user_id:
         return jsonify({"code": 400, "message": "该用户已是本项目负责人"}), 400
-    # 新负责人若已有其他负责项目 → 拒（一人一营最多负责 1 个）
-    if CampUnitMember.query.filter(
-            CampUnitMember.user_id == new_leader, CampUnitMember.role == 'leader',
-            CampUnitMember.status == 'active'
-    ).join(CampUnit, CampUnit.id == CampUnitMember.unit_id).filter(
-            CampUnit.camp_session_id == camp.id,
-            CampUnit.id != unit.id).first():
-        return jsonify({"code": 402, "message": "PROJECT_NOT_APPROVED 该用户已负责本营其他项目（一人最多负责 1 个）"}), 402
     old_leader = unit.owner_user_id
     admin = _current_user()
-    member = _lock_member(camp.id, new_leader)
-    if not member:
-        db.session.add(CampMember(camp_session_id=camp.id, user_id=new_leader, role='member'))
-    elif member.role not in ('member', 'student'):
-        return jsonify({"code": 400, "message": "新负责人营内身份异常"}), 400
-    already = CampUnitMember.query.filter_by(
-        unit_id=unit.id, user_id=new_leader, status='active').first()
-    # 09-13 多负责放宽：新负责人以 leader 位接手，不占 project_limit（上限只管加入位）
-    old_row = CampUnitMember.query.filter_by(unit_id=unit.id, user_id=old_leader).first()
-    if old_row and old_row.status == 'active':
-        old_row.role = 'member'                      # 旧负责人转普通成员，贡献保留
-    unit.owner_user_id = new_leader
-    _add_unit_member(unit, new_leader, 'leader', 'admin_adjust', admin.id, reason=reason)
-    _add_event(camp.id, unit.id, new_leader, 'leader_change', 'admin_adjust', admin.id,
-               before={"leader": old_leader}, after={"leader": new_leader}, reason=reason)
+    project_groups.transfer_leader(unit, new_leader, admin.id, reason)
     _notify(new_leader, "你已成为项目负责人",
             f"管理员指定你为「{camp.name}」项目「{unit.name}」的负责人。", camp.id,
             source_id=unit.id, important=True)
@@ -967,17 +877,8 @@ def unit_status(uid):
     if status == unit.status:
         return jsonify({"code": 400, "message": f"项目已是 {status} 状态"}), 400
     admin = _current_user()
-    prev_status = unit.status
-    unit.status = status
-    _add_event(camp.id, unit.id, unit.owner_user_id, 'unit_status', 'admin_adjust',
-               admin.id, before={"unit_status": prev_status},
-               after={"unit_status": status}, reason=reason)
+    project_groups.set_status(unit, status, admin.id, reason)
     if status == 'terminated':
-        for row in CampUnitMember.query.filter_by(unit_id=unit.id, status='active').all():
-            if row.role == 'leader':
-                row.status, row.ended_at = 'ended', datetime.now()   # 负责人关系一并结束（历史保留）
-            else:
-                _end_unit_member(unit, row, 'remove', 'admin_adjust', admin.id, f"项目终止：{reason}")
         _notify(unit.owner_user_id, "项目已终止",
                 f"「{camp.name}」项目「{unit.name}」已被管理员终止。原因：{reason}",
                 camp.id, source_id=unit.id, important=True)
@@ -1012,14 +913,14 @@ def project_overview(sid):
     unit_ids = [u.id for u in units]
     profiles = {p.unit_id: p for p in ProjectProfile.query.filter(
         ProjectProfile.unit_id.in_(unit_ids)).all()} if unit_ids else {}
-    rows = (CampUnitMember.query
-            .filter(CampUnitMember.unit_id.in_(unit_ids))
-            .order_by(CampUnitMember.status, CampUnitMember.role.desc()).all()) if unit_ids else []
+    rows = (UnitMembershipRead.query
+            .filter(UnitMembershipRead.unit_id.in_(unit_ids))
+            .order_by(UnitMembershipRead.status, UnitMembershipRead.role.desc()).all()) if unit_ids else []
     names = _usernames({u.owner_user_id for u in units} |
                        {r.user_id for r in rows})
-    counts = dict(db.session.query(CampUnitMember.unit_id, db.func.count(CampUnitMember.id))
-                  .filter(CampUnitMember.unit_id.in_(unit_ids), CampUnitMember.status == 'active')
-                  .group_by(CampUnitMember.unit_id).all()) if unit_ids else {}
+    counts = dict(db.session.query(UnitMembershipRead.unit_id, db.func.count(UnitMembershipRead.id))
+                  .filter(UnitMembershipRead.unit_id.in_(unit_ids), UnitMembershipRead.status == 'active')
+                  .group_by(UnitMembershipRead.unit_id).all()) if unit_ids else {}
     projects = []
     for u in units:
         d = _project_dict(u, profiles.get(u.id), names, member_count=counts.get(u.id, 0))
@@ -1074,17 +975,17 @@ def my_activities(sid):
         return err
     if camp.category != 'project':
         return jsonify({"code": 400, "message": "该营期不是项目营"}), 400
-    my_rows = (CampUnitMember.query
-               .filter(CampUnitMember.user_id == user.id, CampUnitMember.status == 'active')
-               .join(CampUnit, CampUnit.id == CampUnitMember.unit_id)
+    my_rows = (UnitMembershipRead.query
+               .filter(UnitMembershipRead.user_id == user.id, UnitMembershipRead.status == 'active')
+               .join(CampUnit, CampUnit.id == UnitMembershipRead.unit_id)
                .filter(CampUnit.camp_session_id == sid, CampUnit.unit_type == 'project').all())
     if not my_rows:
         return jsonify({"code": 200, "units": []})
     unit_ids = [r.unit_id for r in my_rows]
     units = {u.id: u for u in CampUnit.query.filter(CampUnit.id.in_(unit_ids)).all()}
-    member_counts = dict(db.session.query(CampUnitMember.unit_id, db.func.count(CampUnitMember.id))
-                         .filter(CampUnitMember.unit_id.in_(unit_ids), CampUnitMember.status == 'active')
-                         .group_by(CampUnitMember.unit_id).all())
+    member_counts = dict(db.session.query(UnitMembershipRead.unit_id, db.func.count(UnitMembershipRead.id))
+                         .filter(UnitMembershipRead.unit_id.in_(unit_ids), UnitMembershipRead.status == 'active')
+                         .group_by(UnitMembershipRead.unit_id).all())
     acts = (CampUnitActivity.query.filter(CampUnitActivity.unit_id.in_(unit_ids))
             .order_by(CampUnitActivity.happens_on.desc(), CampUnitActivity.id.desc()).all())
     checks_by_act = {}
@@ -1093,8 +994,8 @@ def my_activities(sid):
                   .filter(CampUnitActivityCheck.activity_id.in_([a.id for a in acts])).all()):
             checks_by_act.setdefault(c.activity_id, []).append(c)
     # 成员名单（勾选出席弹窗用；全 active 成员含负责人）
-    unit_member_rows = CampUnitMember.query.filter(
-        CampUnitMember.unit_id.in_(unit_ids), CampUnitMember.status == 'active').all()
+    unit_member_rows = UnitMembershipRead.query.filter(
+        UnitMembershipRead.unit_id.in_(unit_ids), UnitMembershipRead.status == 'active').all()
     unit_members = {}
     for m in unit_member_rows:
         unit_members.setdefault(m.unit_id, []).append(m.user_id)
@@ -1196,7 +1097,7 @@ def activity_mark(aid):
     ids = (request.json or {}).get("present_user_ids")
     if not isinstance(ids, list):
         return jsonify({"code": 400, "message": "缺少 present_user_ids 数组"}), 400
-    members = CampUnitMember.query.filter_by(unit_id=unit.id, status='active').all()
+    members = UnitMembershipRead.query.filter_by(unit_id=unit.id, status='active').all()
     member_ids = {m.user_id for m in members}
     unknown = [i for i in ids if i not in member_ids]
     if unknown:

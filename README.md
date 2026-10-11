@@ -51,6 +51,12 @@
 点击一键登录；数据来自 `GET /auth/dev_accounts`（debug 模式自动可用，非 debug 需
 `.env` 设 `DEV_TEST_ACCOUNTS=on`，生产一律 404）。
 
+## 教学与项目共用小组核心
+
+已实现通用核心及阶段 2 项目适配，服务契约见 [group-core.md](docs/group-core.md)。
+新项目审核绑定核心；旧项目组织关系保留只读，成员变更前须完成映射。迁移 72/73 默认仅输出 DDL，
+显式 `--apply` 才修改结构，均不迁移成员；部署这些代码前必须完成结构准备。
+
 ## 安装
 
 1. 安装MySQL8.0.39
@@ -95,3 +101,11 @@
 This project's code is for viewing only. **Modification, commercial use, and redistribution are prohibited.**
 License: **CC BY-NC-ND 4.0**
 For details, view the [LICENSE](LICENSE) file or visit: [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/).
+
+培训组阶段 3 已实现，接口与迁移边界见 [小组核心契约](docs/group-core.md#阶段-3-培训接入-2026-10-11)。发布前需完成结构迁移 72/73/74/75；本轮未执行数据库迁移。
+
+旧营阶段 4 已补齐名单预览、显式映射、维护暂停、切换及受保护恢复工具。入口为 `scripts/training_group_cutover.py`（默认只读）；详见 [迁移操作与限制](docs/group-core.md#阶段-4旧培训名单映射切换与恢复2026-10-11)。真实生产切换和完整上线验收尚未执行。
+
+阶段 4 运营收口已补充历史名单看板/考勤导出、历史材料只读权限、组会任务提醒口径和共享维护栅栏；定向检查见 `scripts/test_training_operations.py`。生产迁移及真实并发验收仍未执行。
+
+阶段 5 已完成兼容代码收口：新营招生归属改为绑定读投影，旧营保留兼容写入；项目旧实体只读保护及旧 API 营期上下文边界已加入。见 [旧小组退役清单](docs/legacy-group-retirement.md)。没有新增结构迁移或关闭历史蓝图。

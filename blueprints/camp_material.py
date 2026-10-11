@@ -18,6 +18,9 @@ from exts import db
 from storage import storage
 from models import CampSession, CampMember, Chapter, CampChapterMaterial, CampChapterMaterialAttachment
 
+from services.camp_groups import training_access
+from services.camp_groups.training_history import manager as history_manager
+from models import CampCourseAssignment
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team
 from .camp_project import _camp_or_404
@@ -58,7 +61,7 @@ def material_create(sid):
         return err
     user = _current_user()
     member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-    if not user.is_admin() and (not member or member.role != 'student'):
+    if not user.is_admin() and (not member or not member.is_learner):
         return jsonify({"code": 403, "message": "仅本营学员可提交材料"}), 403
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
@@ -69,6 +72,9 @@ def material_create(sid):
     chapter = Chapter.query.get(chapter_id)
     if not chapter:
         return jsonify({"code": 404, "message": "章节不存在"}), 404
+    if training_access.enabled(sid) and not CampCourseAssignment.query.filter_by(
+            camp_session_id=sid, student_user_id=user.id, course_id=chapter.course_id, status='active').first():
+        return jsonify({'code': 403, 'message': '请先在本营入读该课程'}), 403
     content = (request.form.get("content") or "").strip() or None
     files = [f for f in request.files.getlist("Files") if f.filename]
     if not content and not files:
@@ -100,7 +106,7 @@ def material_create(sid):
 @bp.route("/sessions/<int:sid>/materials")
 @jwt_required()
 def material_list(sid):
-    """材料列表（按学员维度）：student_user_id 缺省=请求者本人；查他人须 admin 或本团队导生。
+    """材料列表（按学员维度）：student_user_id 缺省=请求者本人；查他人须 admin、本营老师或当前责任导生。
     chapter_id 可选过滤（导生端按章弹层）；响应不回 object_key（下载走代理端点）。"""
     camp, err = _camp_or_404(sid)
     if err:
@@ -114,9 +120,9 @@ def material_list(sid):
             target_uid = int(raw_target)
         except ValueError:
             return jsonify({"code": 400, "message": "student_user_id 须为整数"}), 400
-        if target_uid != user.id and not user.is_admin():
+        if target_uid != user.id and not history_manager(sid, user):
             member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
-            if not member or member.role != 'mentor' or not _in_my_team(sid, user, target_uid):
+            if not member or not member.is_mentor or not _in_my_team(sid, user, target_uid):
                 return jsonify({"code": 403, "message": "仅本团队学员的材料可查看"}), 403
     q = CampChapterMaterial.query.filter_by(camp_session_id=sid, student_user_id=target_uid)
     chapter_id = request.args.get("chapter_id")
@@ -126,6 +132,8 @@ def material_list(sid):
         except ValueError:
             return jsonify({"code": 400, "message": "chapter_id 须为整数"}), 400
     rows = q.order_by(CampChapterMaterial.created_at, CampChapterMaterial.id).all()
+    if target_uid != user.id and not history_manager(sid, user) and training_access.enabled(sid):
+        rows = [m for m in rows if training_access.can_teach(sid, user.id, target_uid, m.course_id)]
     atts = _atts_by_material([m.id for m in rows])
     return jsonify({"code": 200, "materials": [_material_dict(m, atts[m.id]) for m in rows]})
 
@@ -141,10 +149,17 @@ def _can_manage(user, m):
     """删/下载权限：材料本人、admin、本团队导生。"""
     if m.student_user_id == user.id or user.is_admin():
         return True
+    if training_access.enabled(m.camp_session_id):
+        return training_access.can_teach(m.camp_session_id, user.id, m.student_user_id, m.course_id)
     member = CampMember.query.filter_by(
         camp_session_id=m.camp_session_id, user_id=user.id).first()
-    return bool(member and member.role == 'mentor'
+    return bool(member and member.is_mentor
                 and _in_my_team(m.camp_session_id, user, m.student_user_id))
+
+
+def _can_read(user, material):
+    """老师可核查历史材料，但只读能力不授予删除或认证权限。"""
+    return history_manager(material.camp_session_id, user) or _can_manage(user, material)
 
 
 @bp.route("/materials/<int:mid>", methods=["DELETE"])
@@ -180,14 +195,14 @@ def material_attachment_token(aid):
     if not m:
         return jsonify({"code": 404, "message": "材料不存在"}), 404
     user = _current_user()
-    if not _can_manage(user, m):
+    if not _can_read(user, m):
         return jsonify({"code": 403, "message": "仅材料本人、本团队导生或老师可下载"}), 403
     return media_token_response('material', aid, user.id)
 
 
 @bp.route("/materials/attachments/<int:aid>")
 def material_attachment_download(aid):
-    """附件代理下载（存储对象不暴露直链；权限同删除：本人/本团队导生/admin）。
+    """附件代理下载（本人/当前责任导生/admin/本营老师；老师只读，不授予删除）。
     双通道鉴权：短签（/token 换取）或常规 JWT 均可，见 media_sign.py。"""
     a = CampChapterMaterialAttachment.query.get(aid)
     if not a:
@@ -198,7 +213,7 @@ def material_attachment_download(aid):
     user, auth_err = resolve_media_request('material', aid)
     if auth_err:
         return auth_err
-    if not _can_manage(user, m):
+    if not _can_read(user, m):
         return jsonify({"code": 403, "message": "仅材料本人、本团队导生或老师可下载"}), 403
     try:
         obj = storage.get_object(a.object_key)

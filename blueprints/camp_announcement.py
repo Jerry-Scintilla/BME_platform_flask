@@ -62,7 +62,7 @@ def announcement_list(sid):
             # 非成员（报名窗口内的旁观者）只看全员公告——招募期「开放报名」类公告的出口
             q = q.filter_by(audience='all', status='active')
         else:
-            auds = ['all', 'mentors'] if member.role == 'mentor' else ['all', 'students']
+            auds = ['all'] + (['mentors'] if member.is_mentor else []) + (['students'] if member.is_learner else [])
             q = q.filter(CampAnnouncement.audience.in_(auds), CampAnnouncement.status == 'active')
         q = q.filter((CampAnnouncement.expires_at.is_(None))
                      | (CampAnnouncement.expires_at > now))
@@ -114,9 +114,9 @@ def _fanout_announcement(camp, a, operator):
     受众快照取发布时点的成员（方案 §5.6：事件生成时保存受众口径）。"""
     q = CampMember.query.filter_by(camp_session_id=camp.id)
     if a.audience == 'mentors':
-        q = q.filter_by(role='mentor')
+        q = q.filter(CampMember.is_mentor)
     elif a.audience == 'students':
-        q = q.filter_by(role='student')
+        q = q.filter(CampMember.is_learner)
     content = f"「{camp.name}」发布了公告「{a.title}」，点击进入营期查看。"
     for m in q.all():
         if m.user_id == operator.id:
