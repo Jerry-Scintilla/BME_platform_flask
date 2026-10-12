@@ -44,6 +44,7 @@ from models import (CampSession, CampMember, CampUnit,
                     CampMentorProfile, PersonModel)
 
 from services.camp_groups.reads import UnitMembershipRead
+from services.camp_groups import chapter_timing
 from . import audit_log, _current_user
 from .camp import _camp_writable, _in_my_team, _direction_of_mentor
 from .camp_project import _camp_or_404, _unit_or_404, _is_unit_leader, _usernames
@@ -239,6 +240,7 @@ def _meeting_summaries(sid, meeting_ids, due_by_meeting, user, student_ids, lead
             done_pairs.add((t.meeting_id, t.id, s.student_user_id))
     # 章节认证对 (uid, chapter_id)：营内布置章并集一次查齐（plans 仅 team 域存在）
     cert_pairs = set()
+    cert_by_pair = {}
     all_plan_chs = {p.chapter_id for p in plan_rows}
     if all_plan_chs:
         cert_q = CampChapterCertification.query.filter(
@@ -248,7 +250,8 @@ def _meeting_summaries(sid, meeting_ids, due_by_meeting, user, student_ids, lead
             cert_q = cert_q.filter(CampChapterCertification.student_user_id.in_(student_ids or []))
         else:
             cert_q = cert_q.filter(CampChapterCertification.student_user_id == user.id)
-        cert_pairs = {(r.student_user_id, r.chapter_id) for r in cert_q.all()}
+        cert_by_pair = {(r.student_user_id, r.chapter_id): r for r in cert_q.all()}
+        cert_pairs = set(cert_by_pair)
     now = datetime.now()
     meetings = {m.id:m for m in CampMeeting.query.filter(CampMeeting.id.in_(meeting_ids))}
     for mid in meeting_ids:
@@ -268,12 +271,18 @@ def _meeting_summaries(sid, meeting_ids, due_by_meeting, user, student_ids, lead
             summary['chapter_expected'] = sum(len(ids) for ids in expected_chapters.values())
             summary['chapter_certified'] = sum((uid,cid) in cert_pairs for cid,ids in expected_chapters.items() for uid in ids)
             summary['chapter_overdue_count'] = (summary['chapter_expected']-summary['chapter_certified']) if past_ch_due else 0
+            summary['chapter_late_certified_count'] = sum(
+                chapter_timing.payload(p, meeting, cert_by_pair.get((uid, p.chapter_id)))['status'] == 'certified_late'
+                for p in m_plans for uid in expected_chapters[p.chapter_id])
         else:
             summary['my_pending'] = sum(user.id in expected_tasks[t.id] and (t.id,user.id) not in done for t in m_tasks)
             summary['my_overdue'] = sum(user.id in expected_tasks[t.id] and (t.id,user.id) not in done
                 for t in m_tasks if t.required and t.due_at and now > t.due_at)
             summary['my_chapter_pending'] = sum(user.id in ids and (user.id,cid) not in cert_pairs for cid,ids in expected_chapters.items())
             summary['my_chapter_overdue'] = summary['my_chapter_pending'] if past_ch_due else 0
+            summary['my_chapter_late_certified'] = sum(
+                chapter_timing.payload(p, meeting, cert_by_pair.get((user.id, p.chapter_id)))['status'] == 'certified_late'
+                for p in m_plans if user.id in expected_chapters[p.chapter_id])
         out[mid] = summary
     return out
 
@@ -974,8 +983,9 @@ def _detail_payload(m, user, role):
         # 弹层查看下载——此前材料只在学员进度页可见，组会页无处可看）。
         # member 同步下发自己的份数：组员视图「未认证」与「已认证」之间补「已提交」
         # 态（材料已交、待导生认证），学员交完不再对着"未认证"干等
-        mat_uids = [u.id for u in students] if is_leader else ([user.id] if role == 'member' else [])
+        mat_uids = [u.id for u in students] if is_leader or role == 'staff' else [user.id]
         mat_counts = {}
+        mat_first = {}
         if plans and mat_uids:
             for r in CampChapterMaterial.query.filter(
                     CampChapterMaterial.camp_session_id == m.camp_session_id,
@@ -983,12 +993,18 @@ def _detail_payload(m, user, role):
                     CampChapterMaterial.student_user_id.in_(mat_uids)).all():
                 mat_counts[(r.student_user_id, r.chapter_id)] = \
                     mat_counts.get((r.student_user_id, r.chapter_id), 0) + 1
+                key = (r.student_user_id, r.chapter_id)
+                if r.created_at and (key not in mat_first or r.created_at < mat_first[key]):
+                    mat_first[key] = r.created_at
         for p in plans:
             expected = _expected_students(m, p, [u.id for u in students])
             ch = {"chapter_id": p.chapter_id, "course_id": p.course_id,
                   "chapter_title": ch_names.get(p.chapter_id, str(p.chapter_id)),
                   "course_title": course_titles.get(p.course_id, ""),
                   "expected_count": len(expected), "required_for_me": user.id in expected}
+            def timing(uid):
+                return chapter_timing.payload(p, m, certs.get((uid, p.chapter_id)),
+                    mat_first.get((uid, p.chapter_id)), required=uid in expected)
             if is_leader:
                 from services.camp_groups.training_history import manager
                 visible = {u.id for u in students if manager(m.camp_session_id, user)
@@ -996,19 +1012,23 @@ def _detail_payload(m, user, role):
                 ch['visible_user_ids'] = sorted(visible)
                 ch['expected_user_ids'] = sorted(expected & visible)
                 ch['expected_count'] = len(expected & visible)
+                ch['timings'] = {str(uid): timing(uid) for uid in visible}
                 ch["certs"] = {str(u.id): (None if (u.id, p.chapter_id) not in certs
                                            else {"score": certs[(u.id, p.chapter_id)].score})
                                for u in students if u.id in visible}
                 ch["material_counts"] = {str(u.id): mat_counts.get((u.id, p.chapter_id), 0)
                                          for u in students if u.id in visible}
                 ch["certified_count"] = sum((uid, p.chapter_id) in certs for uid in expected & visible)
+                ch['late_certified_count'] = sum(timing(uid)['status'] == 'certified_late' for uid in expected & visible)
             elif role == 'staff':
                 ch["certified_count"] = sum(
                     1 for uid in expected if (uid, p.chapter_id) in certs)
+                ch['late_certified_count'] = sum(timing(uid)['status'] == 'certified_late' for uid in expected)
             else:
                 r = certs.get((user.id, p.chapter_id))
                 ch["my_cert"] = None if r is None else {"score": r.score}
                 ch["my_material_count"] = mat_counts.get((user.id, p.chapter_id), 0)
+                ch['my_timing'] = timing(user.id)
             chapters_out.append(ch)
 
     out = {"code": 200, "is_leader": is_leader, "viewer_role": role,
@@ -1019,6 +1039,18 @@ def _detail_payload(m, user, role):
         out["students"] = [{"user_id": u.id, "username": u.username} for u in students]
     elif role == 'staff':
         out["student_total"] = len(students)
+    if role in ('leader', 'staff'):
+        from models import CampTeachingEvent
+        events = CampTeachingEvent.query.filter(
+            CampTeachingEvent.camp_session_id == m.camp_session_id,
+            CampTeachingEvent.action == 'chapter_assignment',
+            CampTeachingEvent.after['meeting_id'].as_integer() == m.id
+        ).order_by(CampTeachingEvent.id.desc()).limit(50).all()
+        names = _usernames({e.actor_user_id for e in events})
+        out['chapter_assignment_history'] = [dict(
+            actor=names.get(e.actor_user_id, str(e.actor_user_id)),
+            created_at=chapter_timing.iso(e.created_at),
+            before=e.before, after=e.after) for e in events]
     if is_leader and m.scope == 'team':
         out["chapter_catalog"] = _chapter_catalog(camp, m)
     return out
@@ -1106,6 +1138,10 @@ def meeting_assignments_save(mid):
         return err
     camp = CampSession.query.get(m.camp_session_id)
     user = _current_user()
+    if camp.training_groups_ready and m.scope == 'team':
+        from services.camp_groups import training
+        training.lock_camp(camp.id)
+        db.session.refresh(m)
     if not _can_manage(user, m):
         return jsonify({"code": 403, "message": "仅组长可布置任务"}), 403
     denied = _scope_write_denied(m, camp)
@@ -1186,8 +1222,10 @@ def meeting_assignments_save(mid):
                                            allow_late=allow_late, created_by=user.id))
             changed = True
 
-    old_plan_ids = {p.chapter_id for p in
-                    CampMeetingChapterPlan.query.filter_by(meeting_id=mid).all()}
+    old_plans = CampMeetingChapterPlan.query.filter_by(meeting_id=mid).all()
+    old_plan_ids = {p.chapter_id for p in old_plans}
+    old_assignment = dict(meeting_id=mid, due_at=chapter_timing.iso(m.chapter_due_at),
+                          chapters=[{'plan_id': p.id, 'chapter_id': p.chapter_id} for p in old_plans])
     if old_plan_ids != set(chapter_ids):
         changed = True
     if m.chapter_due_at != chapter_due_at:
@@ -1196,9 +1234,23 @@ def meeting_assignments_save(mid):
     # 保留仍在布置范围的行及首次布置时间，编辑截止或任务不重新向后来入组者派旧章。
     CampMeetingChapterPlan.query.filter_by(meeting_id=mid).filter(
         ~CampMeetingChapterPlan.chapter_id.in_(chapter_ids)).delete(synchronize_session=False)
+    new_plans = []
     for cid in set(chapter_ids) - old_plan_ids:
-        db.session.add(CampMeetingChapterPlan(meeting_id=mid,
-                                              course_id=ch_course[cid], chapter_id=cid))
+        plan = CampMeetingChapterPlan(meeting_id=mid, course_id=ch_course[cid], chapter_id=cid)
+        db.session.add(plan)
+        new_plans.append(plan)
+    db.session.flush()
+    for plan in new_plans:
+        for cert in CampChapterCertification.query.filter_by(
+                camp_session_id=camp.id, chapter_id=plan.chapter_id).all():
+            chapter_timing.capture(cert, [plan])
+    if old_plan_ids != set(chapter_ids) or old_assignment['due_at'] != chapter_timing.iso(chapter_due_at):
+        from services.camp_groups import training
+        current_plans = CampMeetingChapterPlan.query.filter_by(meeting_id=mid).all()
+        training.record(camp.id, user.id, user.id, 'chapter_assignment', old_assignment,
+            dict(meeting_id=mid, due_at=chapter_timing.iso(chapter_due_at),
+                 chapters=[{'plan_id': p.id, 'chapter_id': p.chapter_id} for p in current_plans]),
+            reason='组会章节布置或认证截止调整')
     if changed and (chapter_ids or norm):
         _notify_meeting_users(
             m, [u.id for u in _group_students(m)],
