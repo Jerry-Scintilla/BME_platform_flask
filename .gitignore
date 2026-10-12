@@ -27,6 +27,7 @@ dev_*.py
 docs/*
 !docs/deploy/
 !docs/group-core.md
+!docs/project-delivery.md
 !docs/legacy-group-retirement.md
 init_seats_*.py
 litellm_proxy_config.yaml

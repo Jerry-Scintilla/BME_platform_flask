@@ -387,24 +387,11 @@ def workbench_summary():
             .group_by(camp_column).all()}
 
     def delivery_counts(before=None):
-        # 待审交付 = team 模式全量 + member 模式负责人份额（与 delivery_admin 审队口径一致）
-        base = (db.session.query(CampUnit.camp_session_id, func.count(CampSubmissionVersion.id))
-                .select_from(CampSubmissionVersion)
-                .join(CampMilestone, CampSubmissionVersion.milestone_id == CampMilestone.id)
-                .join(CampUnit, CampMilestone.unit_id == CampUnit.id)
-                .filter(
-            CampSubmissionVersion.status == 'submitted',
-                    CampUnit.unit_type == 'project'))
+        from services.camp_groups.delivery import pending_reviews
+        base = pending_reviews().with_entities(CampUnit.camp_session_id, func.count(CampSubmissionVersion.id))
         if before:
             base = base.filter(CampSubmissionVersion.created_at < before)
-        team = base.filter(CampMilestone.submit_mode == 'team').group_by(CampUnit.camp_session_id).all()
-        member = base.filter(CampMilestone.submit_mode == 'member',
-                             CampSubmissionVersion.submitted_by == CampUnit.owner_user_id)
-        member = member.group_by(CampUnit.camp_session_id).all()
-        result = {sid: count for sid, count in team}
-        for sid, count in member:
-            result[sid] = result.get(sid, 0) + count
-        return result
+        return dict(base.group_by(CampUnit.camp_session_id).all())
 
     def _feedback_ticket_pending():
         # 工单模型随 6A 落地（migrate_50）；未建表前该域回 0，不阻塞工作台其余摘要

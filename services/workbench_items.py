@@ -43,15 +43,12 @@ def _pending_union():
                           ProjectApplicationVersion.name, ProjectApplicationVersion.camp_session_id,
                           ProjectApplicationVersion.created_at).filter(
                               ProjectApplicationVersion.status == 'pending')
+    from services.camp_groups.delivery import pending_reviews
     delivery = (_source('project_delivery', CampSubmissionVersion, CampMilestone.title,
                         CampUnit.camp_session_id, CampSubmissionVersion.created_at)
                 .join(CampMilestone, CampSubmissionVersion.milestone_id == CampMilestone.id)
                 .join(CampUnit, CampMilestone.unit_id == CampUnit.id)
-                .filter(CampSubmissionVersion.status == 'submitted',
-                        CampUnit.unit_type == 'project',
-                        or_(CampMilestone.submit_mode == 'team',
-                            and_(CampMilestone.submit_mode == 'member',
-                                 CampSubmissionVersion.submitted_by == CampUnit.owner_user_id))))
+                .filter(CampSubmissionVersion.id.in_(pending_reviews().with_entities(CampSubmissionVersion.id))))
     quota = _source('quota_request', LLMQuotaRequestModel, literal('API 配额申请'),
                     literal(None, type_=Integer), LLMQuotaRequestModel.created_at).filter(
                         LLMQuotaRequestModel.status == LLMQuotaRequestModel.STATUS_PENDING)

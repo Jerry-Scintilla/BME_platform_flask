@@ -3,9 +3,8 @@
 三层解耦的交付层与资产层：
 - ProjectTemplate 管共性：负责人三起点创建（空白/平台默认/复制历史）→ 实例化 CampMilestone；
   结营冻结时模板 archived（可复制=资产回流），cloned_from 溯源。
-- CampMilestone + CampSubmissionVersion 管交付：模板化多节点；节点级 submit_mode 双模式
-  （team=负责人提交老师审 / member=成员各交负责人审，负责人自己份额交老师审——防自审红线）；
-  退回重提=新版本（旧版 superseded）；附件走 MinIO。
+- CampMilestone + CampSubmissionVersion 管交付：多人由成员提交、负责人评价，
+  单人由负责人提交、管理员验收；submit_mode仅保留历史数据。重提保存新版本。
 - CampOutcome 成果核验：未核验不入档案。
 - CampArchive 结营冻结（close 迁移自动触发，幂等）+ CampArchiveRevision 受控修正。
 
@@ -17,7 +16,7 @@ import uuid
 from datetime import date, datetime
 from urllib.parse import quote
 
-from flask import Blueprint, request, jsonify, Response
+from flask import Blueprint, request, jsonify, Response, current_app
 from flask_jwt_extended import jwt_required
 
 from exts import db
@@ -32,6 +31,7 @@ from models import (
 )
 
 from services.camp_groups.reads import UnitMembershipRead
+from services.camp_groups.delivery import progress as delivery_progress, pending_reviews
 from . import camp_role, audit_log, _current_user
 from .camp import _camp_writable
 from .camp_project import (_camp_or_404, _unit_or_404, _is_unit_leader, _notify,
@@ -40,7 +40,10 @@ from .media_sign import media_token_response, resolve_media_request
 
 bp = Blueprint("camp_delivery", __name__, url_prefix="/camp")
 
-MAX_FILE_MB = 100
+# 总附件留出 multipart 开销，兼容生产代理的 50MiB 请求上限。
+MAX_FILE_MB = 48
+MAX_FILES = 20
+MAX_CONTENT_BYTES = 64 * 1024
 VALID_SUBMIT_MODES = ('team', 'member')
 
 
@@ -77,29 +80,21 @@ def _template_dict(t, nodes=None):
 
 def _latest_chain(milestone_id, submitted_by):
     q = CampSubmissionVersion.query.filter_by(milestone_id=milestone_id, submitted_by=submitted_by)
-    return q.order_by(CampSubmissionVersion.version.desc()).first()
+    # 写流程使用当前读，避免 MySQL REPEATABLE READ 在等锁后仍取旧版本。
+    return q.order_by(CampSubmissionVersion.version.desc()).populate_existing().with_for_update().first()
 
 
 def _recompute_milestone_status(m):
-    """里程碑状态聚合：team=负责人链最新版；member=全员链最新版（全员 approved 才 approved）。"""
-    if m.submit_mode == 'team':
-        unit = CampUnit.query.get(m.unit_id)
-        chain = _latest_chain(m.id, unit.owner_user_id) if unit else None
-        m.status = chain.status if chain else 'open'
-        return
-    members = _active_unit_members(m.unit_id)
-    statuses = []
-    for mem in members:
-        chain = _latest_chain(m.id, mem.user_id)
-        statuses.append(chain.status if chain else 'none')
-    if statuses and all(s == 'approved' for s in statuses):
-        m.status = 'approved'
-    elif 'submitted' in statuses:
-        m.status = 'submitted'
-    elif 'returned' in statuses:
-        m.status = 'returned'
-    else:
-        m.status = 'open'
+    db.session.flush()
+    m.status = delivery_progress(m, db.session.get(CampUnit, m.unit_id))['status']
+
+
+def _lock_delivery(m):
+    """与结营共用营期行锁，防止检查可写后发生归档；节点锁串行化版本链。"""
+    camp = CampSession.query.filter_by(id=m.camp_session_id).populate_existing().with_for_update().one()
+    unit = CampUnit.query.filter_by(id=m.unit_id).populate_existing().with_for_update().one()
+    m = CampMilestone.query.filter_by(id=m.id).populate_existing().with_for_update().one()
+    return unit, camp, m
 
 
 def _sub_dict(s, with_reviewer=True):
@@ -355,11 +350,9 @@ def unit_template_update(uid):
 # ─────────────────────────────────────────────
 
 def _eval_payload(m, unit, all_evals, members, user, names):
-    """节点评价块（09-13 评价制交付）：应评=active 成员除负责人本人（无自评）；
-    成员仅见本人评价；完成态读时派生（评齐=完），不落 milestone.status。"""
-    target_ids = [r.user_id for r in members if r.user_id != unit.owner_user_id]
-    target_set = set(target_ids)
-    evals = [e for e in all_evals if e.milestone_id == m.id and e.member_user_id in target_set]
+    """成员仅见本人评价；单人验收与多人评价共用完成状态计算。"""
+    state = delivery_progress(m, unit, members, all_evals)
+    evals = state['evaluations']
     is_leader = user.is_admin() or unit.owner_user_id == user.id
     visible = [e for e in evals if is_leader or e.member_user_id == user.id]
     return {
@@ -370,9 +363,7 @@ def _eval_payload(m, unit, all_evals, members, user, names):
             "leader_user_id": e.leader_user_id,
             "updated_at": e.updated_at.strftime("%Y-%m-%d %H:%M") if e.updated_at else None,
         } for e in sorted(visible, key=lambda x: x.member_user_id)],
-        "member_count": len(target_ids),
-        "evaluated_count": len({e.member_user_id for e in evals}),
-        "node_complete": bool(target_ids) and len({e.member_user_id for e in evals}) >= len(target_set),
+        **{k: state[k] for k in ('member_count', 'evaluated_count', 'node_complete', 'status', 'completion_mode')},
     }
 
 
@@ -412,6 +403,10 @@ def milestone_list(uid):
                     for r in members if r.user_id != unit.owner_user_id]
     return jsonify({"code": 200, "milestones": out,
                     "eval_members": eval_members,
+                    "can_submit": not user.is_admin() and (role == 'member' or
+                        (role == 'leader' and not eval_members)),
+                    "upload_limits": {"total_bytes": MAX_FILE_MB * 1024 * 1024,
+                                      "max_files": MAX_FILES, "content_bytes": MAX_CONTENT_BYTES},
                     "my_role": 'leader' if (user.is_admin() or unit.owner_user_id == user.id) else 'member'})
 
 
@@ -424,8 +419,7 @@ def node_evaluation_put(mid, member_uid):
     m = CampMilestone.query.get(mid)
     if not m:
         return jsonify({"code": 404, "message": "节点不存在"}), 404
-    unit = CampUnit.query.get(m.unit_id)
-    camp = CampSession.query.get(m.camp_session_id)
+    unit, camp, m = _lock_delivery(m)
     user = _current_user()
     if not _is_unit_leader(unit, user):
         return jsonify({"code": 403, "message": "仅项目负责人可评价节点"}), 403
@@ -435,7 +429,7 @@ def node_evaluation_put(mid, member_uid):
         return jsonify({"code": 400, "message": f"项目状态为 {unit.status}，不可评价"}), 400
     row = UnitMembershipRead.query.filter_by(
         unit_id=unit.id, user_id=member_uid, status='active').first()
-    if not row or member_uid == unit.owner_user_id:
+    if not row or member_uid == unit.owner_user_id or member_uid == user.id:
         return jsonify({"code": 400, "message": "评价对象须为本项目在职成员（不含负责人本人）"}), 400
     d = request.json or {}
     score = d.get("score")
@@ -461,6 +455,7 @@ def node_evaluation_put(mid, member_uid):
             f"「{camp.name}」项目「{unit.name}」节点「{m.title}」负责人给出了评价：{score} 分"
             + (f"——{comment}" if comment else ""),
             camp.id, source_id=unit.id)
+    _recompute_milestone_status(m)
     db.session.commit()
     return jsonify({"code": 200, "message": "评价已保存", "score": score})
 
@@ -554,8 +549,9 @@ def milestone_delete(mid):
         return jsonify({"code": 403, "message": "UNIT_MANAGEMENT_FORBIDDEN 仅项目负责人可管理里程碑"}), 403
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
-    if CampSubmissionVersion.query.filter_by(milestone_id=m.id).count():
-        return jsonify({"code": 400, "message": "已有提交记录的里程碑不可删（历史交付保留）"}), 400
+    if (CampSubmissionVersion.query.filter_by(milestone_id=m.id).count()
+            or CampNodeEvaluation.query.filter_by(milestone_id=m.id).count()):
+        return jsonify({"code": 400, "message": "已有提交或评价记录的里程碑不可删"}), 400
     db.session.delete(m)
     db.session.commit()
     return jsonify({"code": 200, "message": "已删除"})
@@ -569,31 +565,45 @@ def milestone_delete(mid):
 @jwt_required()
 @audit_log(operation="提交里程碑材料")
 def submission_create(mid):
-    """版本化提交（multipart：content 文本 + Files[] 附件）——成员提交制（09-14 用户复盘定）：
-    只有成员交付材料，负责人不提交（看成员交付+直接评价）；重提=新版本，旧版自动 superseded。
-    submit_mode 列保留历史数据，不再起提交门禁作用（team/member 分支与负责人份额语义已退役）。"""
+    """多人由成员提交；仅负责人一人的项目由负责人提交、管理员验收。"""
     m = CampMilestone.query.get(mid)
     if not m:
         return jsonify({"code": 404, "message": "里程碑不存在"}), 404
     unit, camp, err = _unit_or_404(m.unit_id)
     if err:
         return err
+    unit, camp, m = _lock_delivery(m)
     user = _current_user()
     if user.is_admin():
         return jsonify({"code": 400, "message": "管理员不提交材料"}), 400
     role = _unit_role(unit, user)
     if not role:
         return jsonify({"code": 403, "message": "仅项目成员可提交"}), 403
-    if role == 'leader':
-        return jsonify({"code": 400, "message": "负责人不提交材料——查看成员交付并直接评价即可"}), 400
+    state = delivery_progress(m, unit)
+    if role == 'leader' and state['completion_mode'] != 'leader_review':
+        return jsonify({"code": 400, "message": "多人项目由成员提交材料，负责人查看并评价"}), 400
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
     if unit.status != 'active':
         return jsonify({"code": 400, "message": f"项目状态为 {unit.status}，材料提交已冻结"}), 400
-    if m.status == 'approved':
+    if state['node_complete']:
         return jsonify({"code": 400, "message": "该里程碑已验收通过，不再接受提交"}), 400
+    request.max_content_length = (MAX_FILE_MB + 1) * 1024 * 1024
+    if request.content_length and request.content_length > request.max_content_length:
+        return jsonify({"code": 413, "message": "请求过大，附件合计不能超过48MB"}), 413
     content = (request.form.get("content") or "").strip() or None
     files = [f for f in request.files.getlist("Files") if f.filename]
+    if len((content or '').encode('utf-8')) > MAX_CONTENT_BYTES:
+        return jsonify({"code": 413, "message": "交付说明不能超过64KB"}), 413
+    if len(files) > MAX_FILES:
+        return jsonify({"code": 400, "message": f"一次最多上传{MAX_FILES}个附件"}), 400
+    sizes = []
+    for f in files:
+        f.stream.seek(0, 2)
+        sizes.append(f.stream.tell())
+        f.stream.seek(0)
+    if sum(sizes) > MAX_FILE_MB * 1024 * 1024:
+        return jsonify({"code": 413, "message": "附件合计不能超过48MB"}), 413
     if not content and not files:
         return jsonify({"code": 400, "message": "请填写说明或上传附件"}), 400
     prev = _latest_chain(m.id, user.id)
@@ -604,28 +614,36 @@ def submission_create(mid):
                               submitted_by=user.id, content=content)
     db.session.add(s)
     db.session.flush()
-    for f in files:
-        import os as _os
-        ext = _os.path.splitext(f.filename)[1].lower()[:20]
-        key = f"camp/{camp.id}/milestone/{m.id}/v{version}/{uuid.uuid4().hex}{ext}"
-        try:
+    uploaded = []
+    try:
+        for f, size in zip(files, sizes):
+            import os as _os
+            ext = _os.path.splitext(f.filename)[1].lower()[:20]
+            key = f"camp/{camp.id}/milestone/{m.id}/v{version}/{uuid.uuid4().hex}{ext}"
+            uploaded.append(key)
             storage.put_object(key, f.stream, content_type=f.mimetype or 'application/octet-stream')
-            size = storage.stat_object(key).size
-        except Exception:
-            db.session.rollback()
-            return jsonify({"code": 500, "message": "附件上传失败（存储服务不可用？），请稍后重试"}), 500
-        if size > MAX_FILE_MB * 1024 * 1024:
-            db.session.rollback()
-            return jsonify({"code": 400, "message": f"附件 {f.filename} 超过 {MAX_FILE_MB}MB 上限"}), 400
-        db.session.add(CampSubmissionAttachment(
-            submission_id=s.id, object_key=key, filename=f.filename[:200],
-            size=size, content_type=f.mimetype))
-    _recompute_milestone_status(m)
-    db.session.commit()
-    # 提交即通知负责人查看评价（09-14 撤审核后文案随之调整）
-    _notify(unit.owner_user_id, "有成员提交了节点材料",
-            f"「{unit.name}」成员 {user.username} 提交了节点「{m.title}」第 {version} 版，请查看并评价。",
-            camp.id, source_id=m.id)
+            db.session.add(CampSubmissionAttachment(
+                submission_id=s.id, object_key=key, filename=f.filename[:200],
+                size=size, content_type=f.mimetype))
+        _recompute_milestone_status(m)
+        recipients = ([u.id for u in UserModel.query.filter_by(role='super_admin', status='active',
+                                                             lifecycle='active').all()]
+                      if role == 'leader' else [unit.owner_user_id])
+        for recipient in recipients:
+            _notify(recipient, "有新的节点材料",
+                    f"「{unit.name}」{user.username} 提交了节点「{m.title}」第 {version} 版，"
+                    + ("请在管理端验收。" if role == 'leader' else "请查看并评价。"),
+                    camp.id, source_id=m.id)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        for key in uploaded:
+            try:
+                storage.remove_object(key)
+            except Exception:
+                current_app.logger.exception('项目交付失败后的附件清理失败')
+        current_app.logger.exception('项目交付保存失败')
+        return jsonify({"code": 500, "message": "材料保存失败，请稍后重试"}), 500
     return jsonify({"code": 200, "message": f"已提交（第 {version} 版）", "submission": _sub_dict(s)})
 
 
@@ -672,9 +690,15 @@ def submission_review(sid):
     unit, camp, err = _unit_or_404(m.unit_id)
     if err:
         return err
+    unit, camp, m = _lock_delivery(m)
+    s = CampSubmissionVersion.query.filter_by(id=sid).populate_existing().one()
     user = _current_user()
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
+    if unit.status != 'active':
+        return jsonify({"code": 400, "message": "项目已暂停或终止，不可审核"}), 400
+    if s.submitted_by == user.id:
+        return jsonify({"code": 403, "message": "不可审核本人提交的材料"}), 403
     # 审核人判定：负责人不可自审（红线）
     if s.submitted_by == unit.owner_user_id:
         if not user.is_admin():
@@ -682,7 +706,7 @@ def submission_review(sid):
     else:
         if not (user.is_admin() or unit.owner_user_id == user.id):
             return jsonify({"code": 403, "message": "仅负责人或管理员可审核"}), 403
-    if s.status != 'submitted':
+    if s.status != 'submitted' or _latest_chain(m.id, s.submitted_by).id != s.id:
         return jsonify({"code": 400, "message": f"该版本不可审（当前状态 {s.status}；如系退回后重提请审最新版）"}), 400
     d = request.json or {}
     action = d.get("action")
@@ -697,12 +721,12 @@ def submission_review(sid):
     else:
         return jsonify({"code": 400, "message": "action 仅支持 approve/return"}), 400
     _recompute_milestone_status(m)
-    db.session.commit()
     sub_name = _names({s.submitted_by}).get(s.submitted_by, '')
     tip = "已验收通过" if action == 'approve' else f"被退回：{note}"
     _notify(s.submitted_by, f"材料审核结果：{m.title}",
             f"你在「{unit.name}」节点「{m.title}」提交的第 {s.version} 版材料{tip}。",
             camp.id, source_id=m.id, important=(action == 'return'))
+    db.session.commit()
     return jsonify({"code": 200, "message": "已通过" if action == 'approve' else "已退回",
                     "milestone_status": m.status})
 
@@ -784,11 +808,15 @@ def outcome_create(uid):
     unit, camp, err = _unit_or_404(uid)
     if err:
         return err
+    camp = CampSession.query.filter_by(id=camp.id).populate_existing().with_for_update().one()
+    unit = CampUnit.query.filter_by(id=unit.id).populate_existing().with_for_update().one()
     user = _current_user()
     if not _is_unit_leader(unit, user):
         return jsonify({"code": 403, "message": "UNIT_MANAGEMENT_FORBIDDEN 仅项目负责人可登记成果"}), 403
     if not _camp_writable(camp):
         return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
+    if unit.status != 'active':
+        return jsonify({"code": 400, "message": "项目已暂停或终止，不可登记成果"}), 400
     d = request.json or {}
     title = (d.get("title") or "").strip()
     if not title:
@@ -816,6 +844,12 @@ def outcome_verify(oid):
     unit, camp, err = _unit_or_404(r.unit_id)
     if err:
         return err
+    camp = CampSession.query.filter_by(id=camp.id).populate_existing().with_for_update().one()
+    r = CampOutcome.query.filter_by(id=oid).populate_existing().with_for_update().one()
+    if not _camp_writable(camp):
+        return jsonify({"code": 400, "message": "CAMP_ARCHIVED_READ_ONLY 营期已归档，只读"}), 400
+    if unit.status != 'active':
+        return jsonify({"code": 400, "message": "项目已暂停或终止，不可核验"}), 400
     if r.status == 'verified':
         return jsonify({"code": 400, "message": "该成果已核验"}), 400
     d = request.json or {}
@@ -831,10 +865,10 @@ def outcome_verify(oid):
         r.status, r.reject_reason = 'rejected', reason[:500]
     else:
         return jsonify({"code": 400, "message": "action 仅支持 verify/reject"}), 400
-    db.session.commit()
     _notify(unit.owner_user_id, "成果核验结果",
             f"「{unit.name}」成果「{r.title}」{'已核验通过' if action == 'verify' else '被驳回：' + r.reject_reason}。",
             camp.id, source_id=unit.id, important=(action == 'reject'))
+    db.session.commit()
     return jsonify({"code": 200, "message": "已核验" if action == 'verify' else "已驳回"})
 
 
@@ -842,8 +876,7 @@ def outcome_verify(oid):
 @jwt_required()
 @camp_role()
 def delivery_admin(sid):
-    """admin 交付工作台聚合：待老师审的材料队列（team 模式全部 + member 模式负责人份额）
-    + 全营成果列表（核验入口）。老师审核动作走 /submissions/<id>/review 与 /outcomes/<id>/verify。"""
+    """管理员待验收的负责人材料与全营成果；与工作台待办使用同一查询。"""
     camp, err = _camp_or_404(sid)
     if err:
         return err
@@ -853,10 +886,7 @@ def delivery_admin(sid):
           .order_by(CampMilestone.unit_id, CampMilestone.order_no).all()) if units else []
     pending = []
     for m in ms:
-        if m.submit_mode == 'member':
-            continue        # member 模式成员材料由负责人在用户端审
-        for s in CampSubmissionVersion.query.filter_by(
-                milestone_id=m.id, status='submitted').all():
+        for s in pending_reviews().filter(CampMilestone.id == m.id).all():
             pending.append({"submission_id": s.id, "milestone_id": m.id,
                             "milestone_title": m.title, "unit_id": m.unit_id,
                             "unit_name": unit_map[m.unit_id].name if m.unit_id in unit_map else '',
@@ -865,20 +895,6 @@ def delivery_admin(sid):
                             "attachments": [{"id": a.id, "filename": a.filename} for a in
                                             CampSubmissionAttachment.query.filter_by(submission_id=s.id).all()],
                             "created_at": s.created_at.isoformat() if s.created_at else None})
-    # member 模式中负责人份额（submitted_by==owner）也待老师审
-    for m in ms:
-        if m.submit_mode != 'member':
-            continue
-        u = unit_map.get(m.unit_id)
-        if not u:
-            continue
-        for s in CampSubmissionVersion.query.filter_by(
-                milestone_id=m.id, status='submitted', submitted_by=u.owner_user_id).all():
-            pending.append({"submission_id": s.id, "milestone_id": m.id,
-                            "milestone_title": m.title, "unit_id": m.unit_id,
-                            "unit_name": u.name, "version": s.version,
-                            "submitted_by": s.submitted_by, "content": s.content,
-                            "attachments": [], "created_at": s.created_at.isoformat() if s.created_at else None})
     outcomes = []
     for u in units:
         for o in CampOutcome.query.filter_by(unit_id=u.id).order_by(CampOutcome.created_at).all():
@@ -897,7 +913,7 @@ def delivery_admin(sid):
 # 结营档案（冻结=close 迁移自动触发；此处读取+受控修正）
 # ─────────────────────────────────────────────
 
-def freeze_camp_archive(camp, operator_id):
+def freeze_camp_archive(camp, operator_id, *, commit=True):
     """幂等冻结结营档案（camp.py close 迁移调用；也可手动补触发）。返回 archive 或 None（已存在）。
     快照=关键事实 JSON；同时执行资产回流：unit 模板 status→archived（可复制），
     approved 提交的附件 is_asset→True。"""
@@ -915,25 +931,37 @@ def freeze_camp_archive(camp, operator_id):
         ms_rows = CampMilestone.query.filter_by(unit_id=unit.id).order_by(CampMilestone.order_no).all()
         ms_snap = []
         for m in ms_rows:
-            finals = [s for s in CampSubmissionVersion.query.filter_by(milestone_id=m.id).all()
-                      if s.status == 'approved']
+            state = delivery_progress(m, unit, [r for r in um_rows if r.status == 'active'])
+            finals = [s for s in state['latest_submissions'].values() if s.status == 'approved']
+            target_ids = ({unit.owner_user_id} if state['completion_mode'] == 'leader_review' else
+                          {e.member_user_id for e in state['evaluations']})
+            final_materials = [s for uid, s in state['latest_submissions'].items()
+                               if state['node_complete'] and uid in target_ids]
             ms_snap.append({"title": m.title, "submit_mode": m.submit_mode,
-                            "status": m.status, "due_date": m.due_date.isoformat() if m.due_date else None,
+                            "status": state['status'], "node_complete": state['node_complete'],
+                            "completion_mode": state['completion_mode'],
+                            "due_date": m.due_date.isoformat() if m.due_date else None,
+                            "evaluations": [{"member_user_id": e.member_user_id,
+                                             "score": e.score, "comment": e.comment,
+                                             "leader_user_id": e.leader_user_id,
+                                             "updated_at": e.updated_at.isoformat() if e.updated_at else None}
+                                            for e in state['evaluations']],
+                            "final_versions": [{"submission_id": s.id, "submitted_by": s.submitted_by,
+                                                "version": s.version} for s in final_materials],
                             "approved_versions": [{"submitted_by": s.submitted_by,
                                                    "submitted_by_name": names.get(s.submitted_by, str(s.submitted_by)),
                                                    "version": s.version} for s in finals]})
+            for s in final_materials:
+                CampSubmissionAttachment.query.filter_by(submission_id=s.id).update(
+                    {CampSubmissionAttachment.is_asset: True})
         outcomes = [o for o in CampOutcome.query.filter_by(unit_id=unit.id).all()
                     if o.status == 'verified']
         tpl = ProjectTemplate.query.filter_by(unit_id=unit.id).first()
         if tpl:
             tpl.status = 'archived'                       # 资产回流：模板可被复制起步
-        for s in CampSubmissionVersion.query.filter(
-                CampSubmissionVersion.milestone_id.in_([m.id for m in ms_rows]),
-                CampSubmissionVersion.status == 'approved').all():
-            CampSubmissionAttachment.query.filter_by(submission_id=s.id).update(
-                {CampSubmissionAttachment.is_asset: True})   # 资产回流：验收附件打标
         unit_snapshots.append({
             "name": unit.name, "status": unit.status,
+            "leader_user_id": unit.owner_user_id,
             "leader": names.get(unit.owner_user_id, str(unit.owner_user_id)),
             "members": [{"user": names.get(r.user_id, str(r.user_id)), "role": r.role,
                          "status": r.status} for r in um_rows],
@@ -955,7 +983,7 @@ def freeze_camp_archive(camp, operator_id):
     archive = CampArchive(camp_session_id=camp.id, snapshot=json.dumps(snapshot, ensure_ascii=False),
                           frozen_by=operator_id)
     db.session.add(archive)
-    db.session.commit()
+    db.session.flush()
     # 项目广场联动（功能扩展轮 §五）：已发布的营期条目随结营自动标「已完成」并挂档案引用（引用不复制）
     from models import ShowcaseProject
     for sp in ShowcaseProject.query.filter(
@@ -963,7 +991,8 @@ def freeze_camp_archive(camp, operator_id):
             ShowcaseProject.source_ref.in_([u.id for u in units])).all():
         sp.project_status = 'done'
         sp.archive_ref = archive.id
-    db.session.commit()
+    if commit:
+        db.session.commit()
     return archive
 
 
@@ -983,10 +1012,17 @@ def archive_get(sid):
         return jsonify({"code": 404, "message": "该营期尚未结营归档（无档案）"}), 404
     revisions = CampArchiveRevision.query.filter_by(archive_id=a.id).order_by(
         CampArchiveRevision.version).all()
+    snapshot = json.loads(a.snapshot or '{}')
+    if not user.is_admin():
+        for unit in snapshot.get('units', []):
+            if unit.get('leader_user_id') != user.id:
+                for milestone in unit.get('milestones', []):
+                    milestone['evaluations'] = [e for e in milestone.get('evaluations', [])
+                                                if e.get('member_user_id') == user.id]
     return jsonify({"code": 200,
                     "archive": {"id": a.id, "version": a.version,
                                 "frozen_at": a.frozen_at.isoformat() if a.frozen_at else None,
-                                "snapshot": json.loads(a.snapshot or '{}')},
+                                "snapshot": snapshot},
                     "revisions": [{"version": r.version, "reason": r.reason,
                                    "patch": json.loads(r.patch) if r.patch else None,
                                    "created_at": r.created_at.isoformat() if r.created_at else None}
@@ -1003,7 +1039,7 @@ def archive_revise(sid):
     camp, err = _camp_or_404(sid)
     if err:
         return err
-    a = CampArchive.query.filter_by(camp_session_id=sid).first()
+    a = CampArchive.query.filter_by(camp_session_id=sid).with_for_update().first()
     if not a:
         return jsonify({"code": 404, "message": "该营期尚未结营归档（无档案可修正）"}), 404
     d = request.json or {}
