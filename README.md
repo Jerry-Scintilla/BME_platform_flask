@@ -109,3 +109,22 @@ For details, view the [LICENSE](LICENSE) file or visit: [CC BY-NC-ND 4.0](https:
 阶段 4 运营收口已补充历史名单看板/考勤导出、历史材料只读权限、组会任务提醒口径和共享维护栅栏；定向检查见 `scripts/test_training_operations.py`。生产迁移及真实并发验收仍未执行。
 
 阶段 5 已完成兼容代码收口：新营招生归属改为绑定读投影，旧营保留兼容写入；项目旧实体只读保护及旧 API 营期上下文边界已加入。见 [旧小组退役清单](docs/legacy-group-retirement.md)。没有新增结构迁移或关闭历史蓝图。
+
+### 章节认证时效留痕
+
+认证截止仅用于提醒和时效判定，过期仍可认证。组会按每次章节布置展示待提交、待认证、
+逾期未提交、逾期待认证、按时认证及逾期补认证；无截止显示已认证，无可靠快照的存量记录
+显示历史已认证。当前逾期未完成数量与逾期补认证数量分别统计，完成后不再把截止时间标红。
+
+`camp_chapter_certification.meeting_timings` 按章节布置 ID 保存认证时的截止、认证人、
+认证时间及当时留存材料的首次提交时间。材料时间仅代表留存材料，不代表首次上传且已删除的
+材料，也不代表导生验收通过时间。改分或修改截止不覆盖已有结果；撤销的完整快照保存在
+`camp_teaching_event`，重新认证产生新结果。新增布置可基于当时已有认证生成该次布置的快照，
+不会追溯重算其他旧布置。布置与截止变更记录前后值、操作人和操作时间，导生/老师详情可查看
+最近 50 条记录。认证完成态仍仅由原有章节认证记录决定。
+
+部署新后端前需执行 `python scripts/migrate/migrate_77_chapter_certification_timing.py --apply`。
+省略 `--apply` 只输出 DDL；迁移可重复执行，不回填历史数据。迁移先于应用更新，旧应用忽略新增列。
+本次只提交代码及迁移脚本，未执行业务数据库迁移或部署。
+
+轻量验证：`PYTHONPATH=.:scripts python -m unittest test_chapter_certification_timing`。

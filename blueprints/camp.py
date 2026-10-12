@@ -3413,16 +3413,15 @@ def team_progress_certify(sid):
         camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id).first()
     if request.method == 'DELETE' and not row:
         raise GroupError('该章节尚未认证', status=404)
-    training.record(sid, student_uid, user.id,
-        'certification_revoke' if request.method == 'DELETE' else 'certification',
-        {'score': row.score, 'mentor_user_id': row.mentor_user_id} if row else None,
-        None if request.method == 'DELETE' else {'score': score if score is not None else row.score if row else None},
-        ch.course_id, chapter_id, reason='章节认证变更')
+    from services.camp_groups.chapter_timing import capture, cert_record
+    before = cert_record(row)
     course = CourseModel.query.get(ch.course_id)
     course_title = course.title if course else ''
     if request.method == "DELETE":
         if not row:
             return jsonify({"code": 404, "message": "该章节尚未认证"}), 404
+        training.record(sid, student_uid, user.id, 'certification_revoke', before, None,
+                        ch.course_id, chapter_id, reason='章节认证撤销（保留时效快照）')
         db.session.delete(row)
         # 完成态回算（2026-09-20，方案 §3.5；B2 跨营守卫）：本营撤销后不再满足全章认证
         # → 课程从 completed 退回在读并告知学员；但其它营认证仍完备时不降级（同课跨营，
@@ -3446,9 +3445,11 @@ def team_progress_certify(sid):
         db.session.commit()
         return jsonify({"code": 200, "message": "已撤销认证"})
     if not row:
-        db.session.add(CampChapterCertification(
+        row = CampChapterCertification(
             camp_session_id=sid, student_user_id=student_uid, chapter_id=chapter_id,
-            course_id=ch.course_id, mentor_user_id=user.id, score=score))
+            course_id=ch.course_id, mentor_user_id=user.id, score=score, certified_at=datetime.now())
+        db.session.add(row)
+        capture(row)
         # 章节认证反馈（2026-09-20 补齐，方案 §6.5）：学员第一时间知道导生认证结果
         create_notification(student_uid, "章节学习已认证",
                             f"「{camp.name}」课程「{course_title}」章节「{ch.name}」"
@@ -3462,6 +3463,8 @@ def team_progress_certify(sid):
                             f"评分已更新为 {score} 分。",
                             category='camp', source_type='camp_course',
                             source_id=ch.course_id, camp_session_id=sid)
+    training.record(sid, student_uid, user.id, 'certification', before, cert_record(row),
+                    ch.course_id, chapter_id, reason='章节认证变更（保留时效快照）')
     # 全章认证齐 → 该课课程级 completed；撤销走 DELETE 分支回算（方案 §3.5 派生一致性）
     chapters = _chapters_payload(camp, ch.course_id, student_uid)
     certified = sum(1 for c in chapters if c["certified"])

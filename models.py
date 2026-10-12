@@ -2238,6 +2238,7 @@ class CampChapterCertification(db.Model):
     course_id = db.Column(db.Integer, db.ForeignKey('course.id'), nullable=False, index=True)
     mentor_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)   # 认证导生（留痕）
     certified_at = db.Column(db.DateTime, default=datetime.now)
+    meeting_timings = db.Column(db.JSON)  # 每次布置认证时的截止/材料时间快照；旧数据为空，不回算
     score = db.Column(db.Integer)   # 章节评分 0-100（可空=认证未打分；重复 POST 带 score=改分）
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'student_user_id', 'chapter_id', name='uq_cert_camp_student_chapter'),
