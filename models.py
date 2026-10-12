@@ -2551,9 +2551,8 @@ class CampMilestone(db.Model):
 
 
 class CampSubmissionVersion(db.Model):
-    """版本化提交：退回重提=新版本（旧版 superseded）。member 模式每人一条版本链
-    （负责人自己份额交老师审——防自审红线），team 模式一条链（负责人交老师审）。
-    09-13 起前端入口下线（节点评价制替代），表与端点保留待文件提交管理上线复用。"""
+    """版本化提交：每人独立版本链。多人成员交付并由负责人评价，
+    单人项目负责人交付并由管理员验收。重提保存新版本，禁止自审。"""
     __tablename__ = 'camp_submission_version'
     id = db.Column(db.Integer, primary_key=True)
     milestone_id = db.Column(db.Integer, db.ForeignKey('camp_milestone.id'), nullable=False, index=True)
@@ -2572,10 +2571,10 @@ class CampSubmissionVersion(db.Model):
 
 class CampNodeEvaluation(db.Model):
     """项目营·节点评价（2026-09-13，migrate_29）：负责人对每位成员在各交付节点的
-    分数（0-100）+ 评语。评价制交付（文件提交入口本轮下线，老师验收退出）：
+    分数（0-100）+ 评语。多人项目的完成依据：
     - 评价对象 = active 单元成员中除负责人本人（无自评）
     - 可见性：成员仅见本人评价；负责人/admin 见全部
-    - 节点完成态读时派生（评齐=完成），不落 milestone.status
+    - 节点完成态读时按当前成员派生，写评价时同步 milestone.status
     - upsert 语义：重复 PUT 即改分改评（leader_user_id 留痕更新）"""
     __tablename__ = 'camp_node_evaluation'
     id = db.Column(db.Integer, primary_key=True)

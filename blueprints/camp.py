@@ -550,13 +550,23 @@ def session_transition(sid):
                                 source_type='camp_session', source_id=sid,
                                 camp_session_id=sid,
                                 is_important=(dst_status == 'running'))
-    db.session.commit()
+    # 项目营结营、快照及广场回流必须同事务，失败时仍保持进行中。
+    archived = False
+    if dst_status == 'archived' and camp.category == 'project':
+        try:
+            from .camp_delivery import freeze_camp_archive
+            archived = freeze_camp_archive(camp, _current_user().id, commit=False) is not None
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            return jsonify({"code": 500, "message": "结营档案生成失败，营期仍保持进行中，请稍后重试"}), 500
+    else:
+        db.session.commit()
     camp = CampSession.query.get(sid)
     # v1.3 阶段4：结营自动冻结档案（幂等；项目营快照含项目/里程碑/成果+资产回流打标）。
     # 延迟导入防循环依赖（camp_delivery 反向引用本模块的 _camp_writable）。
-    archived = False
     merged_lessons = 0
-    if dst_status == 'archived':
+    if dst_status == 'archived' and camp.category != 'project':
         try:
             from .camp_delivery import freeze_camp_archive
             archived = freeze_camp_archive(camp, _current_user().id) is not None
@@ -796,20 +806,10 @@ def session_admin_overview(sid):
             "archived": bool(CampArchive.query.filter_by(camp_session_id=sid).first()),
         }
         if unit_ids:
-            team_ms = CampMilestone.query.filter(
-                CampMilestone.unit_id.in_(unit_ids), CampMilestone.submit_mode == 'team').all()
-            pending_reviews = CampSubmissionVersion.query.filter(
-                CampSubmissionVersion.milestone_id.in_([m.id for m in team_ms]),
-                CampSubmissionVersion.status == 'submitted').count()
-            for u in units:  # member 模式负责人份额
-                owner_ms = CampMilestone.query.filter(
-                    CampMilestone.unit_id == u.id, CampMilestone.submit_mode == 'member').all()
-                for m in owner_ms:
-                    pending_reviews += CampSubmissionVersion.query.filter_by(
-                        milestone_id=m.id, status='submitted',
-                        submitted_by=u.owner_user_id).count()
-            overview["project_summary"]["pending_reviews"] = pending_reviews
-            overview["pending"]["delivery"] = pending_reviews
+            from services.camp_groups.delivery import pending_reviews
+            pending_count = pending_reviews().filter(CampUnit.camp_session_id == sid).count()
+            overview["project_summary"]["pending_reviews"] = pending_count
+            overview["pending"]["delivery"] = pending_count
             overview["project_summary"]["outcomes_submitted"] = CampOutcome.query.filter(
                 CampOutcome.unit_id.in_(unit_ids), CampOutcome.status == 'submitted').count()
     elif camp.category == 'learning':
