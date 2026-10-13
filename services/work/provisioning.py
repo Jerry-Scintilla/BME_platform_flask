@@ -119,6 +119,9 @@ def sync_user_workspace(user_id, workspace_id, operator_id=None, event='同步')
 
     返回动作名（granted/revoked/changed/unchanged/skipped/vetoed/manual_present/none），
     供回填脚本与调用方统计。"""
+    import os
+    if os.getenv('WORKBENCH_RETIRED', 'false').lower() == 'true':
+        return 'external_workbench'
     ws = WorkWorkspace.query.get(workspace_id)
     if not ws or ws.scope not in ('group', 'club'):
         return 'skipped'

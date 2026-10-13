@@ -44,6 +44,10 @@ def enforce_request_access():
     if request.method == "OPTIONS":
         return None
     path = request.path
+    import os
+    if os.getenv('WORKBENCH_RETIRED', 'false').lower() == 'true' and (path == '/work' or path.startswith('/work/')):
+        return jsonify(code=410, message='内部工作台已迁移到独立应用',
+                       workbench_url=os.getenv('WORKBENCH_PUBLIC_URL', '')), 410
     if path in PUBLIC_AUTH_PATHS or path in REFRESH_LOGOUT_PATHS:
         return None
 

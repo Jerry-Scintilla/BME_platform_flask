@@ -189,6 +189,19 @@ def archive_group(gid):
     if refs["members"]:
         return jsonify({"code": 409, "message": f"组内还有 {refs['members']} 名成员归属，请先迁出"}), 409
     # 内部工作台（方案 §5.4）：组工作区仍有未完成事项时提醒先处理/移交
+    import os
+    if os.getenv('WORKBENCH_RETIRED','false').lower()=='true':
+        try:
+            import requests
+            r=requests.post(os.environ['WORKBENCH_USAGE_URL'].rsplit('/',1)[0]+'/group-usage',
+                auth=(os.environ['WORKBENCH_CLIENT_ID'],os.environ['WORKBENCH_CLIENT_SECRET']),
+                json={'group_id':gid},timeout=(2,5),allow_redirects=False)
+            result=r.json()
+            if r.status_code!=200 or type(result.get('open_items')) is not int:raise ValueError('Invalid response')
+            if result['open_items']:
+                return jsonify(code=409,message='独立工作台仍有未完成事项，请先处理或移交'),409
+        except Exception:
+            return jsonify(code=503,message='暂时无法核对独立工作台，请稍后重试'),503
     from models import WorkItem, WorkWorkspace
     ws = WorkWorkspace.query.filter_by(club_group_id=gid).first()
     if ws:
