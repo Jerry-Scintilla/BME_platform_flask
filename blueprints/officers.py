@@ -13,7 +13,7 @@ admin 侧 CRUD：任命 / 编辑 / 卸任（状态化不删行）/ 批量导入�
 user 侧不设端点：user_index / profile/<id> 回包直接附任职与归属（见 user.py），
 社区 feed 的 author_badge 见 community.py——三者都 import 本文件的查询助手。
 """
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
@@ -25,6 +25,7 @@ from services.club_rules import ORG_SLOT_CLUB, ORG_SLOT_GROUP, position_org_slot
 from services.identity import enforcement, gates, matcher
 from services.work.events import record_org_event
 from services.work import provisioning
+from services.club_history import stamp_appointment, person_history, serialize_history
 
 bp = Blueprint("officers", __name__, url_prefix="/admin/officers")
 
@@ -237,8 +238,8 @@ def _officer_dict(o, user=None, positions=None):
         "avatar": _avatar_url(user.avatar_url) if user else "",
         "title": o.title,
         "title_id": o.title_id,
-        "org_slot": (position_org_slot(positions.get(o.title_id))
-                     if positions else None),
+        "org_slot": o.org_slot_snapshot or (position_org_slot(positions.get(o.title_id))
+                     if positions and o.title_id else None),
         "department": o.department,
         "group_id": o.group_id,
         "term_start": o.term_start.isoformat() if o.term_start else None,
@@ -247,6 +248,9 @@ def _officer_dict(o, user=None, positions=None):
         "end_reason": o.end_reason,
         "scope_note": o.scope_note,
         "created_at": o.created_at.isoformat() if o.created_at else None,
+        "record_source": o.record_source,
+        "source_note": o.source_note,
+        "historical_year": o.historical_year,
     }
 
 
@@ -368,11 +372,12 @@ def appoint_officer():
         scope_note=scope_note,
     )
     db.session.add(officer)
+    stamp_appointment(officer, user, pos)
     db.session.flush()          # 拿 id 供组织事件留痕
     record_org_event('officer_appointed', user_id=user.id, officer_id=officer.id,
                      to_group_id=officer.group_id,
                      operator_id=current.id if current else None,
-                     detail={'title': pos.name})
+                     detail={'title': pos.name, 'term_start': str(term_start)})
     # 授权自动化：任命即按组长类/分管规则派生工作区授权（同事务，方案 §3.2）
     provisioning.sync_after_officer(user.id, None, officer.group_id,
                                     current.id if current else None, event='任命')
@@ -569,7 +574,11 @@ def batch_appoint():
             appointed_by=current.id if current else None,
         )
         db.session.add(row)
+        stamp_appointment(row, user, pos)
         db.session.flush()          # 拿 id，同时让同批后续项能读到
+        record_org_event('officer_appointed', user_id=user.id, officer_id=row.id,
+                         to_group_id=row.group_id, operator_id=current.id if current else None,
+                         detail={'title': pos.name, 'term_start': str(term_start), 'via': 'batch'})
         provisioning.sync_after_officer(user.id, None, row.group_id,
                                         current.id if current else None, event='批量任命')
         results.append({"index": idx, "ok": True, "officer_id": row.id, "username": user.username,
@@ -586,16 +595,24 @@ def batch_appoint():
 @check_permission('system_management')
 @audit_log(operation="编辑社团干事任职")
 def edit_officer(officer_id):
-    """编辑：active 行可改职位/组/任期起（重跑规则校验）；ended 行仅许修正 term_end/end_reason。"""
+    """显式区分任职变更与纠错；真实变更结束旧任期并创建新任期。"""
     officer = ClubOfficer.query.get(officer_id)
     if not officer:
         return jsonify({"code": 404, "message": "任职记录不存在"}), 404
     data = request.get_json(silent=True) or {}
 
+    mode = data.get('mode', 'correction')
+    reason = str(data.get('reason') or '').strip()
+    if mode not in ('transition', 'correction') or not reason or len(reason) > 200:
+        return jsonify(code=400, message='请选择任职变更或信息纠错，并填写原因（至多200字）'), 400
+
     # 编辑前快照：组织事件留痕用（换届后仍可解释「当时为什么有权」，§10.1）
-    before = {'title': officer.title, 'group_id': officer.group_id,
+    before = {'title': officer.title, 'title_id': officer.title_id, 'group_id': officer.group_id,
+              'department': officer.department,
               'term_start': str(officer.term_start), 'term_end': str(officer.term_end or ''),
-              'end_reason': officer.end_reason or '', 'scope_note': officer.scope_note or ''}
+              'end_reason': officer.end_reason or '', 'scope_note': officer.scope_note or '',
+              'historical_year': officer.historical_year, 'source_note': officer.source_note or '',
+              'org_slot_snapshot': officer.org_slot_snapshot}
     if officer.status == 'active':
         # 入参只认一种轨道：显式 id 优先；传名则不带旧 id（否则 id 解析会盖掉改名入参）；
         # 都不传回落当前值（组转原组名解析）。department 显式 null = 清空（不挂组职位）。
@@ -637,6 +654,36 @@ def edit_officer(officer_id):
             if blocked:
                 return blocked
 
+        if mode == 'transition':
+            if term_start > date.today() or term_start < officer.term_start:
+                return jsonify(code=400, message='变更生效日须在原任期开始与今天之间'), 400
+            old_group = officer.group_id
+            officer.status = 'ended'
+            officer.term_end = max(officer.term_start, term_start - timedelta(days=1))
+            officer.ended_at = datetime.now()
+            officer.ended_by = _current_user().id
+            officer.end_reason = reason
+            record_org_event('officer_ended', user_id=officer.user_id, officer_id=officer.id,
+                             from_group_id=old_group, operator_id=officer.ended_by,
+                             detail={'term_end': str(officer.term_end), 'reason': reason, 'via': 'transition'})
+            scope_note = str(data.get('scope_note') or '').strip() or None
+            if scope_note and len(scope_note) > 200:
+                db.session.rollback()
+                return jsonify(code=400, message='任职范围描述不能超过200字'), 400
+            replacement = ClubOfficer(user_id=officer.user_id, title_id=pos.id, title=pos.name,
+                group_id=group.id if group else None, department=group.name if group else None,
+                term_start=term_start, status='active', appointed_by=officer.ended_by, scope_note=scope_note)
+            stamp_appointment(replacement, edit_user, pos)
+            db.session.add(replacement)
+            db.session.flush()
+            record_org_event('officer_appointed', user_id=replacement.user_id, officer_id=replacement.id,
+                to_group_id=replacement.group_id, operator_id=replacement.appointed_by,
+                detail={'title': replacement.title, 'term_start': str(term_start), 'previous_officer_id': officer.id, 'reason': reason})
+            provisioning.sync_after_officer(replacement.user_id, old_group, replacement.group_id,
+                                           replacement.appointed_by, event='任职变更')
+            db.session.commit()
+            return jsonify(code=200, message='已保留原任期并创建新任期', data=_officer_dict(replacement, edit_user, {pos.id: pos}))
+
         if "scope_note" in data:
             scope_note = (str(data.get("scope_note") or "").strip() or None)
             if scope_note and len(scope_note) > 200:
@@ -647,29 +694,73 @@ def edit_officer(officer_id):
         officer.group_id = group.id if group else None
         officer.department = group.name if group else None
         officer.term_start = term_start
+        officer.org_slot_snapshot = position_org_slot(pos)
     else:
-        # ended 行：受控修正，只动卸任留痕两字段
+        if mode != 'correction':
+            return jsonify(code=400, message='已结束的任期只能纠错，重新任职请创建新任期'), 400
+        # 已结束任期可以补齐未知日期，但不能重新激活或派生权限。
+        corrected_start, corrected_end = officer.term_start, officer.term_end
+        if 'term_start' in data:
+            if data['term_start']:
+                new_start, err = _parse_term_start(data['term_start'])
+                if err:
+                    return jsonify(code=400, message=err), 400
+                corrected_start = new_start
+            elif officer.record_source == 'backfill':
+                corrected_start = None
         if data.get("term_end"):
             try:
                 new_end = datetime.strptime(data["term_end"], "%Y-%m-%d").date()
             except (TypeError, ValueError):
                 return jsonify({"code": 400, "message": "任期止格式应为 YYYY-MM-DD"}), 400
-            if new_end < officer.term_start:
-                return jsonify({"code": 400, "message": "任期止不能早于任期起"}), 400
-            officer.term_end = new_end
+            corrected_end = new_end
+        elif 'term_end' in data and officer.record_source == 'backfill':
+            corrected_end = None
+        if any(d and d > date.today() for d in (corrected_start, corrected_end)):
+            return jsonify(code=400, message='历史任期日期不能晚于今天'), 400
+        if corrected_start and corrected_end and corrected_end < corrected_start:
+            return jsonify(code=400, message='任期止不能早于任期起'), 400
+        historical_updates = {}
+        if officer.record_source == 'backfill':
+            for field, limit, required in [('title', 30, True), ('department', 50, False), ('source_note', 500, True)]:
+                value = str(data.get(field) or '').strip() if field in data else getattr(officer, field)
+                if (required and not value) or (value and len(value) > limit):
+                    return jsonify(code=400, message='历史职位、组别或资料来源不符合要求'), 400
+                historical_updates[field] = value or None
+            slot = data.get('org_slot_snapshot', officer.org_slot_snapshot)
+            if slot not in ('club', 'group'):
+                return jsonify(code=400, message='请选择有效的职位类别'), 400
+            historical_updates['org_slot_snapshot'] = slot
+            year = data.get('historical_year', officer.historical_year)
+            if year not in (None, '') and (type(year) is not int or not 1900 <= year <= date.today().year):
+                return jsonify(code=400, message='历史年份格式不正确'), 400
+            historical_updates['historical_year'] = year or None
+            known_years = [d.year for d in (corrected_start, corrected_end) if d]
+            if year and known_years and not min(known_years) <= year <= max(known_years):
+                return jsonify(code=400, message='历史年份与已知日期不一致'), 400
+        officer.term_start, officer.term_end = corrected_start, corrected_end
+        for field, value in historical_updates.items():
+            setattr(officer, field, value)
         if "end_reason" in data:
-            officer.end_reason = (str(data.get("end_reason") or "").strip() or None)
+            end_reason = str(data.get('end_reason') or '').strip() or None
+            if end_reason and len(end_reason) > 200:
+                db.session.rollback()
+                return jsonify(code=400, message='卸任原因至多200字'), 400
+            officer.end_reason = end_reason
 
     current = _current_user()
-    after = {'title': officer.title, 'group_id': officer.group_id,
+    after = {'title': officer.title, 'title_id': officer.title_id, 'group_id': officer.group_id,
+             'department': officer.department,
              'term_start': str(officer.term_start), 'term_end': str(officer.term_end or ''),
-             'end_reason': officer.end_reason or '', 'scope_note': officer.scope_note or ''}
+             'end_reason': officer.end_reason or '', 'scope_note': officer.scope_note or '',
+             'historical_year': officer.historical_year, 'source_note': officer.source_note or '',
+             'org_slot_snapshot': officer.org_slot_snapshot}
     changed = {k: {'from': before[k], 'to': after[k]} for k in before if before[k] != after[k]}
     if changed:
         record_org_event('officer_edited', user_id=officer.user_id, officer_id=officer.id,
                          from_group_id=before['group_id'], to_group_id=officer.group_id,
                          operator_id=current.id if current else None,
-                         detail={'changes': changed})
+                         detail={'changes': changed, 'reason': reason, 'mode': 'correction'})
     # 授权自动化：换组/换职（组长类⇄分管）旧组新组各重算（同事务）
     provisioning.sync_after_officer(officer.user_id, before['group_id'], officer.group_id,
                                     current.id if current else None, event='任职编辑')
@@ -677,6 +768,79 @@ def edit_officer(officer_id):
     user = UserModel.query.get(officer.user_id)
     return jsonify({"code": 200, "message": "任职信息已更新",
                     "data": _officer_dict(officer, user, _rank_map())})
+
+
+@bp.get('/history/<int:user_id>')
+@jwt_required()
+@check_permission('system_management')
+def appointment_history(user_id):
+    user = db.session.get(UserModel, user_id)
+    if not user:
+        return jsonify(code=404, message='用户不存在'), 404
+    year = request.args.get('year', type=int)
+    if 'year' in request.args and (year is None or not 1900 <= year <= 9999):
+        return jsonify(code=400, message='年份格式不正确'), 400
+    records, events = person_history(user)
+    operator_ids = {e.operator_id for e in events if e.operator_id}
+    names = {u.id: u.username for u in UserModel.query.filter(UserModel.id.in_(operator_ids)).all()} if operator_ids else {}
+    return jsonify(code=200, data={'user_id': user.id, 'username': user.username,
+                                  **serialize_history(records, events, year, names)})
+
+
+@bp.post('/history')
+@jwt_required()
+@check_permission('system_management')
+@audit_log(operation='补录历史任职')
+def backfill_appointment():
+    data = request.get_json(silent=True) or {}
+    try:
+        user_id = int(data.get('user_id'))
+    except (ValueError, TypeError):
+        return jsonify(code=400, message='请选择用户'), 400
+    user = db.session.get(UserModel, user_id)
+    if not user or not user.person_id:
+        return jsonify(code=400, message='请选择已有人员身份的用户'), 400
+    title = str(data.get('title') or '').strip()
+    department = str(data.get('department') or '').strip() or None
+    source = str(data.get('source_note') or '').strip()
+    slot = data.get('org_slot', 'club')
+    if not title or len(title) > 30 or (department and len(department) > 50) or slot not in ('club', 'group'):
+        return jsonify(code=400, message='请填写有效的历史职位、组别和职位类别'), 400
+    if not source or len(source) > 500:
+        return jsonify(code=400, message='请填写历史资料来源（至多500字）'), 400
+    dates = {}
+    for field in ('term_start', 'term_end'):
+        try:
+            dates[field] = datetime.strptime(data[field], '%Y-%m-%d').date() if data.get(field) else None
+        except (ValueError, TypeError):
+            return jsonify(code=400, message='任期日期格式应为 YYYY-MM-DD'), 400
+        if dates[field] and dates[field] > date.today():
+            return jsonify(code=400, message='历史任期不能填写未来日期'), 400
+    if dates['term_start'] and dates['term_end'] and dates['term_end'] < dates['term_start']:
+        return jsonify(code=400, message='任期止不能早于任期起'), 400
+    year = data.get('historical_year')
+    if year not in (None, ''):
+        if isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= date.today().year:
+            return jsonify(code=400, message='历史年份必须是1900年至今年的整数'), 400
+        known_years = [v.year for v in dates.values() if v]
+        if known_years and not min(known_years) <= year <= max(known_years):
+            return jsonify(code=400, message='历史年份与已知日期不一致'), 400
+    else:
+        year = None
+    reason = str(data.get('end_reason') or '').strip() or None
+    if reason and len(reason) > 200:
+        return jsonify(code=400, message='卸任原因至多200字'), 400
+    row = ClubOfficer(user_id=user.id, person_id=user.person_id, title=title, department=department,
+        org_slot_snapshot=slot, status='ended', record_source='backfill', source_note=source,
+        historical_year=year, end_reason=reason, **dates)
+    db.session.add(row)
+    db.session.flush()
+    record_org_event('officer_backfilled', user_id=user.id, officer_id=row.id,
+        operator_id=_current_user().id, detail={'source_note': source, 'title': title,
+            'term_start': str(dates['term_start'] or ''), 'term_end': str(dates['term_end'] or ''),
+            'historical_year': year})
+    db.session.commit()
+    return jsonify(code=200, message='已补录历史任职，当前权限不变', data=_officer_dict(row, user))
 
 
 @bp.route("/<int:officer_id>/end", methods=["POST"])
@@ -700,6 +864,8 @@ def end_officer(officer_id):
             return jsonify({"code": 400, "message": "卸任日期格式应为 YYYY-MM-DD"}), 400
     if term_end < officer.term_start:
         return jsonify({"code": 400, "message": "卸任日期不能早于任期起"}), 400
+    if term_end > date.today():
+        return jsonify(code=400, message='卸任日期不能晚于今天'), 400
 
     reason = (str(data.get("end_reason") or "").strip() or None)
     if reason and len(reason) > 200:
@@ -710,6 +876,7 @@ def end_officer(officer_id):
     officer.term_end = term_end
     officer.end_reason = reason
     officer.ended_by = current.id if current else None
+    officer.ended_at = datetime.now()
     record_org_event('officer_ended', user_id=officer.user_id, officer_id=officer.id,
                      from_group_id=officer.group_id,
                      operator_id=current.id if current else None,

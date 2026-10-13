@@ -13,7 +13,8 @@ from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import jwt_required
 from sqlalchemy import select, update
 from exts import db, limiter
-from models import AuthSessionModel, ClubGroup, ClubMembership, ClubOfficer, ClubPosition, PersonModel, UserModel
+from models import AuthSessionModel, ClubGroup, ClubMembership, ClubOfficer, ClubPosition, ClubOrgEvent, PersonModel, UserModel
+from services.club_history import canonical_person_id
 from services.auth_context import AuthRejected, resolve_actor
 from workbench_sso_models import WorkbenchSSOCode
 
@@ -83,18 +84,23 @@ def directory_snapshot():
     positions = ClubPosition.query.all()
     officers = ClubOfficer.query.all()
     memberships = ClubMembership.query.all()
-    ids = {o.user_id for o in officers} | {m.user_id for m in memberships}
+    events = ClubOrgEvent.query.filter(ClubOrgEvent.officer_id.in_([o.id for o in officers])).all()
+    ids = {o.user_id for o in officers} | {m.user_id for m in memberships} | {e.operator_id for e in events if e.operator_id}
     def rows(items):
         return [{c.name: (getattr(row, c.name).isoformat() if isinstance(getattr(row, c.name), (date, datetime))
                          else getattr(row, c.name)) for c in row.__table__.columns} for row in items]
     users = []
     for user in UserModel.query.filter(UserModel.id.in_(ids)).all() if ids else []:
         person = db.session.get(PersonModel, user.person_id) if user.person_id else None
-        users.append({'id': user.id, 'username': user.username, 'person_id': user.person_id,
+        users.append({'id': user.id, 'username': user.username, 'person_id': canonical_person_id(user.person_id),
                       'avatar_url': user.avatar_url, 'status': user.status or 'active', 'lifecycle': user.lifecycle or 'active',
                       'verification_status': person.verification_status if person else 'unverified'})
-    return {'groups': rows(groups), 'positions': rows(positions), 'officers': rows(officers),
-            'memberships': rows(memberships), 'users': users}
+    projected_officers = rows(officers)
+    for row in projected_officers:
+        user = db.session.get(UserModel, row['user_id'])
+        row['person_id'] = canonical_person_id(row['person_id'] or (user.person_id if user else None))
+    return {'groups': rows(groups), 'positions': rows(positions), 'officers': projected_officers,
+            'memberships': rows(memberships), 'users': users, 'officer_events': rows(events)}
 
 
 @bp.get('/config')

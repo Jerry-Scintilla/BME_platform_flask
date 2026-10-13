@@ -10,7 +10,7 @@ POST groups/<id>/leader 原子换组长（卸旧任新 + 可选同步主要归�
 
 权限与 officers 一致：system_management；写操作过 audit_log。
 """
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
@@ -25,6 +25,7 @@ from services.identity import matcher
 from . import check_permission, audit_log, _current_user
 from .officers import (_parse_term_start, _validate_appointment, _officer_dict)
 from services.work.events import record_org_event
+from services.club_history import stamp_appointment
 
 bp = Blueprint("club_admin", __name__, url_prefix="/admin/club")
 
@@ -233,6 +234,19 @@ def delete_group(gid):
     if any(refs.values()):
         return jsonify({"code": 409, "message": "组仍有引用（子组/任职/归属），请改用归档",
                         "data": refs}), 409
+    import os
+    if os.getenv('WORKBENCH_RETIRED','false').lower()=='true':
+        try:
+            import requests
+            response=requests.post(os.environ['WORKBENCH_USAGE_URL'].rsplit('/',1)[0]+'/group-usage',
+                auth=(os.environ['WORKBENCH_CLIENT_ID'],os.environ['WORKBENCH_CLIENT_SECRET']),
+                json={'group_id':gid},timeout=(2,5),allow_redirects=False)
+            data=response.json()
+            if response.status_code!=200 or type(data.get('workspaces')) is not int:raise ValueError('Invalid response')
+            if data['workspaces']:
+                return jsonify(code=409,message='独立工作台仍有工作区引用，请改用归档'),409
+        except Exception:
+            return jsonify(code=503,message='暂时无法核对独立工作台，请稍后重试'),503
     db.session.delete(g)
     db.session.commit()
     return jsonify({"code": 200, "message": f"已删除组「{g.name}」"})
@@ -882,12 +896,15 @@ def appoint_group_leader(gid):
         return jsonify({"code": verr[0], "message": verr[1]}), verr[0]
 
     # 卸现任（状态化留痕）→ 授权联动逐个重算
+    if term_start > date.today() or any(i.term_start and term_start < i.term_start for i in incumbents):
+        return jsonify(code=400, message='更替生效日不能晚于今天或早于原任期'), 400
     ended_dict = None
     for inc in incumbents:
         inc.status = 'ended'
-        inc.term_end = date.today()
+        inc.term_end = max(inc.term_start, term_start - timedelta(days=1))
         inc.end_reason = (str(data.get("end_reason") or "").strip() or '组长更替')
         inc.ended_by = current.id if current else None
+        inc.ended_at = datetime.now()
         record_org_event('officer_ended', user_id=inc.user_id, officer_id=inc.id,
                          from_group_id=gid, operator_id=current.id if current else None,
                          detail={'term_end': str(inc.term_end), 'reason': inc.end_reason})
@@ -904,6 +921,7 @@ def appoint_group_leader(gid):
         appointed_by=current.id if current else None,
     )
     db.session.add(officer)
+    stamp_appointment(officer, user, pos)
     db.session.flush()          # 拿 id 供组织事件留痕
     record_org_event('officer_appointed', user_id=user.id, officer_id=officer.id,
                      to_group_id=gid, operator_id=current.id if current else None,

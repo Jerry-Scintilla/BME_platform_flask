@@ -33,6 +33,8 @@ class WorkbenchSSOTests(unittest.TestCase):
             WORKBENCH_ISSUER='bme-training')
         db.init_app(self.app); JWTManager(self.app); limiter.init_app(self.app)
         self.app.register_blueprint(bp)
+        from blueprints.club_admin import bp as club_bp
+        self.app.register_blueprint(club_bp)
         self.context = self.app.app_context(); self.context.push(); db.create_all()
         person = PersonModel(public_id='sso-test-person', record_status='active')
         db.session.add(person); db.session.flush()
@@ -100,6 +102,21 @@ class WorkbenchSSOTests(unittest.TestCase):
     def test_basic_auth_and_ordinary_account_are_denied(self):
         self.assertEqual(self.client.post('/workbench-sso/status',json={'audience':'workbench'}).status_code,401)
         db.session.delete(self.member);db.session.commit();self.assertEqual(self.authorize().status_code,403)
+
+    def test_group_delete_keeps_independent_workspace_references(self):
+        import os
+        from unittest.mock import patch, Mock
+        self.user.role='super_admin'
+        group=ClubGroup(name='独立工作区组');db.session.add(group);db.session.commit();gid=group.id
+        remote=Mock(status_code=200);remote.json.return_value={'workspaces':1,'open_items':0}
+        with patch.dict(os.environ,{'WORKBENCH_RETIRED':'true','WORKBENCH_USAGE_URL':'http://127.0.0.1:5003/api/integrations/account-usage','WORKBENCH_CLIENT_ID':'workbench','WORKBENCH_CLIENT_SECRET':'test-client'}):
+            with patch('requests.post',return_value=remote):
+                result=self.client.delete('/admin/club/groups/'+str(gid),headers={'Authorization':'Bearer '+self.token})
+                self.assertEqual(result.status_code,409,result.json)
+            with patch('requests.post',side_effect=RuntimeError('offline')):
+                result=self.client.delete('/admin/club/groups/'+str(gid),headers={'Authorization':'Bearer '+self.token})
+                self.assertEqual(result.status_code,503,result.json)
+        self.assertIsNotNone(db.session.get(ClubGroup,gid))
 
 
 if __name__ == '__main__': unittest.main()

@@ -2884,13 +2884,20 @@ class ClubOfficer(db.Model):
     group_id = db.Column(db.Integer, db.ForeignKey('club_group.id'), nullable=True, index=True)
     title = db.Column(db.String(30), nullable=False)              # 冗余：职位名（双写过渡）
     department = db.Column(db.String(50))                         # 冗余：组名（双写过渡；空=不挂组）
-    term_start = db.Column(db.Date, nullable=False)               # 任期起
+    term_start = db.Column(db.Date)                               # 历史补录允许日期不详；在任必填
     term_end = db.Column(db.Date)                                 # 任期止（空 = 在任）
     status = db.Column(db.String(20), nullable=False, default='active', index=True)  # active / ended
     appointed_by = db.Column(db.Integer)                          # 任命操作人（审计留痕，非 FK）
     ended_by = db.Column(db.Integer)                              # 卸任操作人
     end_reason = db.Column(db.String(200))                        # 卸任原因（选填）
     scope_note = db.Column(db.String(200))                        # 任职范围描述（选填；个人主页社团身份卡展示）
+    person_id = db.Column(db.Integer, index=True)                 # 任职时的人员身份，不随账号改写
+    org_slot_snapshot = db.Column(db.String(10))
+    record_source = db.Column(db.String(20), nullable=False, default='system', server_default='legacy')
+    source_note = db.Column(db.String(500))                       # 历史资料来源
+    historical_year = db.Column(db.Integer)                      # 仅知道年份时保留年份，不伪造日期
+    appointed_at = db.Column(db.DateTime)                        # 登记任命的时间，不等同生效日
+    ended_at = db.Column(db.DateTime)                            # 登记卸任的时间，不等同生效日
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
 
