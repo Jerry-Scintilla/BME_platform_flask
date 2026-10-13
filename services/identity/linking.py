@@ -265,7 +265,8 @@ def shell_scan(user_b):
             import requests
             response = requests.post(os.environ['WORKBENCH_USAGE_URL'],
                 auth=(os.environ['WORKBENCH_CLIENT_ID'], os.environ['WORKBENCH_CLIENT_SECRET']),
-                json={'issuer':os.getenv('WORKBENCH_ISSUER','bme-training'),'subject':str(user_b.id)},
+                json={'issuer':os.getenv('WORKBENCH_ISSUER','bme-training'),'subject':str(user_b.id),
+                      'person_id':str(user_b.person_id) if user_b.person_id else None},
                 timeout=(2,5),allow_redirects=False)
             payload=response.json()
             if response.status_code!=200 or type(payload.get('has_business_data')) is not bool:
