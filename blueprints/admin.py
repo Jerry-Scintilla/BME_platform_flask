@@ -422,6 +422,9 @@ def workbench_summary():
     # 内部工作台（feature/work-collab M5）：需接管事项计数（授权有效性为 Python 判定，
     # 不入 SQL 联合；处理入口在 组织架构→协作授权 的接管队列）
     def _work_takeover_count():
+        import os
+        if os.getenv('WORKBENCH_RETIRED','false').lower()=='true':
+            return None
         from services.work.tasks import takeover_candidates
         return len(takeover_candidates())
     pending['work_takeover'] = read('work_takeover', _work_takeover_count)
