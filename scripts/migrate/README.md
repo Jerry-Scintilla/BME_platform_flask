@@ -17,7 +17,13 @@ python scripts/migrate/migrate_06_check_record_indexes.py  # check_record (user_
 python scripts/migrate/migrate_09_mentor_selection.py     # camp_session 加选导生 6 列 + 3 张选导生表
 ```
 
+## 迁移 79：个人任职历史（2026-10-14，本地开发）
+
+`migrate_79_appointment_history.py` 追加人员/职位类别快照、来源说明、已知年份和登记时间，允许历史任职日期不详。已有记录标为 legacy；登记时间只从实际任命/卸任事件回填，没有事件时留空，保留旧任期日期和状态。
+
+默认不连接数据库；只有加 `--apply` 才操作 config 指向的库。先备份并确认目标。应先执行来源迁移 79 和独立工作台 Alembic 0003，再发布两边的新代码。MySQL 验证使用 `scripts/test_appointment_history_mysql.py --run`，严格限制回环主机、创建唯一临时测试库并在结束后清理；不修改本地业务库。新 schema 支持未知日期，回退旧 NOT NULL schema 需要单独制定保留数据的恢复方案。
 ## 顺序依赖
+
 - `migrate_05` 按 `role='super_admin'` 授权 → 必须在 `migrate_01`（加列 + 回填）之后。
 - `migrate_03/04` 依赖 `migrate_02` 建出 camp_session / camp_join_request。
 - 全部幂等，顺序错了也不报错，但推荐按序。
