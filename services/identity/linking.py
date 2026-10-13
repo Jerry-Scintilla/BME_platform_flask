@@ -259,6 +259,21 @@ def shell_scan(user_b):
         blockers.append('target_disputed')
 
     hits = {}
+    import os
+    if os.getenv('WORKBENCH_RETIRED', 'false').lower() == 'true':
+        try:
+            import requests
+            response = requests.post(os.environ['WORKBENCH_USAGE_URL'],
+                auth=(os.environ['WORKBENCH_CLIENT_ID'], os.environ['WORKBENCH_CLIENT_SECRET']),
+                json={'issuer':os.getenv('WORKBENCH_ISSUER','bme-training'),'subject':str(user_b.id)},
+                timeout=(2,5),allow_redirects=False)
+            payload=response.json()
+            if response.status_code!=200 or type(payload.get('has_business_data')) is not bool:
+                raise ValueError('Invalid workbench scan response')
+            if payload['has_business_data']:
+                hits['independent_workbench']=1
+        except Exception:
+            blockers.append('scan_error:independent_workbench')
     for name, (model, col) in SHELL_MODULES.items():
         try:
             n = model.query.filter(getattr(model, col) == user_b.id).count()
