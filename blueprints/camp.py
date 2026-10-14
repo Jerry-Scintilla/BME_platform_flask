@@ -3420,6 +3420,8 @@ def team_progress_certify(sid):
     if request.method == "DELETE":
         if not row:
             return jsonify({"code": 404, "message": "该章节尚未认证"}), 404
+        from services.points import revoke_certification
+        revoke_certification(sid, student_uid, chapter_id, user.id)
         training.record(sid, student_uid, user.id, 'certification_revoke', before, None,
                         ch.course_id, chapter_id, reason='章节认证撤销（保留时效快照）')
         db.session.delete(row)
@@ -3450,6 +3452,8 @@ def team_progress_certify(sid):
             course_id=ch.course_id, mentor_user_id=user.id, score=score, certified_at=datetime.now())
         db.session.add(row)
         capture(row)
+        from services.points import capture_certification
+        capture_certification(row)
         # 章节认证反馈（2026-09-20 补齐，方案 §6.5）：学员第一时间知道导生认证结果
         create_notification(student_uid, "章节学习已认证",
                             f"「{camp.name}」课程「{course_title}」章节「{ch.name}」"

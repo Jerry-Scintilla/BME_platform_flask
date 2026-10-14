@@ -61,6 +61,8 @@ LITELLM_DEFAULT_BUDGET_DURATION = os.getenv("LITELLM_DEFAULT_BUDGET_DURATION", "
 # 总开关默认关闭：关闭时 /points-sso/ticket 返回 503，客户端不解析私钥不连上游。
 # 配置完整性与格式校验统一在 points_center_client.init_points_center(app)（app.py 启动时调用），
 # 此处只做读取。回调地址不设内网默认值，开启前必须显式填写浏览器可达的商城地址。
+# 完成迁移 78 后显式开启；默认不查询奖励表、不运行积分任务。
+POINTS_REWARDS_ENABLED = os.getenv("POINTS_REWARDS_ENABLED", "false").lower() == "true"
 POINTS_CENTER_ENABLED = os.getenv("POINTS_CENTER_ENABLED", "false").lower() == "true"
 POINTS_CENTER_BASE_URL = os.getenv("POINTS_CENTER_BASE_URL", "http://172.25.56.83:18081")
 POINTS_PLATFORM_ID = os.getenv("POINTS_PLATFORM_ID", "")
