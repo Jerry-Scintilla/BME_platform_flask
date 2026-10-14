@@ -262,7 +262,8 @@ def meta():
         can_review=has_camp_access(user, c.id, 'reward.issue'), can_rules=user.is_admin(),
         readonly=c.status in ('archived', 'deleted') or c.training_migration_paused) for c in camps],
         kinds=[dict(value=k, label=v) for k,v in service.KINDS.items()],
-        platform_kinds=[dict(value=k, label=v) for k,v in service.PLATFORM_KINDS.items()])
+        platform_kinds=[dict(value=k, label=v) for k,v in service.PLATFORM_KINDS.items()],
+        platform_rules_admin=user.is_admin())
 
 
 @bp.get('/manage/rules')
@@ -404,7 +405,9 @@ def manage_rewards():
     q=PointsReward.query.filter_by(camp_id=sid)
     if not has_camp_access(user,sid,'reward.issue'): q=q.filter_by(proposed_by=user.id)
     status=request.args.get('status')
-    if status: q=q.filter_by(status=status)
+    # 入账异常视图同时含 failed 与 blocked（身份不合格待人工处理）
+    if status=='failed': q=q.filter(PointsReward.status.in_(['failed','blocked']))
+    elif status: q=q.filter_by(status=status)
     page=max(1,request.args.get('page',1,type=int)); total=q.count()
     rows=q.order_by(PointsReward.id.desc()).offset((page-1)*20).limit(20).all()
     return jsonify(code=200,items=[service.reward_data(r) for r in rows],total=total)
@@ -419,7 +422,8 @@ def platform_rewards():
     if not user.is_admin(): raise service.PointsError('无权查看',403)
     q=PointsReward.query.filter(PointsReward.camp_id.is_(None))
     status=request.args.get('status')
-    if status: q=q.filter_by(status=status)
+    if status=='failed': q=q.filter(PointsReward.status.in_(['failed','blocked']))
+    elif status: q=q.filter_by(status=status)
     page=max(1,request.args.get('page',1,type=int)); total=q.count()
     rows=q.order_by(PointsReward.id.desc()).offset((page-1)*20).limit(20).all()
     return jsonify(code=200,items=[service.reward_data(r) for r in rows],total=total)
