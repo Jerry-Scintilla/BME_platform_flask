@@ -45,6 +45,7 @@ STAFF_PERMISSIONS = {
         'mentor_selection.manage', # 选导生配置
         'mentor_selection.operate',# 选导生运营（指派/批量回填/导出；manage ⊃ operate）
         'learning.read_all',       # 全营学习进度
+        'project.read_all',        # 本营项目进度、材料与评价只读
         'attendance.read_all',     # 全营考勤
         'leave.override',          # 全营请假兜底审批
         'meeting.read_all',        # 全营组会
@@ -58,6 +59,7 @@ STAFF_PERMISSIONS = {
         'member.manage',
         'mentor_selection.operate',
         'learning.read_all',
+        'project.read_all',
         'attendance.read_all',
         'leave.escalation',
         'meeting.read_all',
