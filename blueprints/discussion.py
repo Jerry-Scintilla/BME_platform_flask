@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from flask_cors import cross_origin
 from sqlalchemy import and_, or_
 from datetime import datetime, timedelta
@@ -423,6 +423,15 @@ def create_thread():
     )
     db.session.add(thread)
     db.session.commit()
+
+    # 每日首帖即时积分（2026-10-15 用户拍板"发完秒入账"）：帖子已落库，
+    # 奖励独立事务尽力而为，失败不影响发帖（当日扫描兜底）
+    try:
+        from services.points import award_daily_post
+        award_daily_post(thread)
+    except Exception:
+        db.session.rollback()
+        current_app.logger.warning('每日首帖奖励触发失败 thread=%s', thread.id, exc_info=True)
 
     return jsonify({
         "code": 201,

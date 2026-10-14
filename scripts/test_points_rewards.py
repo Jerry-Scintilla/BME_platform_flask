@@ -277,11 +277,29 @@ class RewardsTest(unittest.TestCase):
         db.session.add(DiscussionThread(scope_type='global',title='t1',content='c1',author_id=self.student.id,status='normal',created_at=datetime.combine(day,time(10))))
         db.session.add(DiscussionThread(scope_type='global',title='t2',content='c2',author_id=self.student.id,status='normal',created_at=datetime.combine(day,time(15))))
         db.session.add(DiscussionThread(scope_type='global',title='today',content='c',author_id=self.student.id,status='normal',created_at=datetime.now()))
+        db.session.add(DiscussionThread(scope_type='global',title='today2',content='c2',author_id=self.student.id,status='normal',created_at=datetime.now()))
         db.session.commit()
         points.collect_automatic();points.collect_automatic()
         rewards=PointsReward.query.all()
-        self.assertEqual(len(rewards),1)
-        self.assertEqual(rewards[0].event_key,f'community_post:{self.student.id}:{day}')
+        # 窗口含当天：昨天首帖与今天首帖各一条，同日第二帖不重复
+        self.assertEqual({r.event_key for r in rewards},
+            {f'community_post:{self.student.id}:{day}',f'community_post:{self.student.id}:{date.today()}'})
+
+    def test_award_daily_post_immediate_and_idempotent(self):
+        # 发帖即时路径：award_daily_post 独立事务入队并派发，幂等键防当日重复
+        self.platform_rule_backdated('community_post',1)
+        thread=DiscussionThread(scope_type='global',title='now',content='c',author_id=self.student.id,status='normal',created_at=datetime.now())
+        db.session.add(thread);db.session.commit()
+        with patch('services.points.dispatch',return_value=False) as dispatch:
+            points.award_daily_post(thread)
+            points.award_daily_post(thread)   # 同日再发：命中既有记录，不重复派发
+            self.assertEqual(dispatch.call_count,2)
+        rewards=PointsReward.query.all()
+        self.assertEqual(len(rewards),1);self.assertEqual(rewards[0].status,'pending')
+        # 未配置规则时静默无动作
+        db.session.delete(rewards[0]);rule=PointsRule.query.filter_by(camp_id=None,kind='community_post').one();db.session.delete(rule);db.session.commit()
+        points.award_daily_post(thread)
+        self.assertEqual(PointsReward.query.count(),0)
 
     def test_identity_ineligible_blocks_and_manual_retry(self):
         self.platform_rule_backdated('community_post',1)

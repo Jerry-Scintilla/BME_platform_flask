@@ -19,7 +19,7 @@ HELP = {'attendance': '每日承诺考勤在次日按本营规则结算；迟到
 # 平台级规则（camp_id 为 NULL）：不挂营期、不校验营员身份，按事件日去重。
 PLATFORM_KINDS = {'daily_checkin': '每日打卡', 'community_post': '发布帖子', 'article': '文章过审'}
 PLATFORM_HELP = {'daily_checkin': '当日有已签退的自习签到段即奖励时长分，次日结算；时长分按规则每满 N 小时累加。',
-                 'community_post': '每日第一次发布讨论帖后发放。',
+                 'community_post': '每日第一次发布讨论帖后立即发放。',
                  'article': '每日第一次发布的文章通过审核后发放，以提交送审日计算"每日第一次"。'}
 RULE_TITLES = {**KINDS, **PLATFORM_KINDS}
 RULE_HELP = {**HELP, **PLATFORM_HELP}
@@ -262,8 +262,29 @@ def _collect_daily_checkin(rule, first, now):
             db.session.rollback()
 
 
+def award_daily_post(thread):
+    """发帖即时奖励（用户拍板"发完秒入账"）：发帖事务提交后调用，独立事务入队并立即派发。
+    任何失败只吞掉记日志——帖子已保存，积分由 collect_automatic 的当日扫描兜底。"""
+    if not current_app.config.get('POINTS_REWARDS_ENABLED'):
+        return
+    rule = PointsRule.query.filter_by(camp_id=None, kind='community_post').first()
+    if not rule or not thread.created_at:
+        return
+    try:
+        r = enqueue(rule, thread.author_id,
+            f'community_post:{thread.author_id}:{thread.created_at.date()}',
+            thread.created_at, '每日首帖奖励', source_path='/community')
+        db.session.commit()
+        if r is not None:
+            dispatch(r.id)
+    except (PointsError, IntegrityError) as exc:
+        db.session.rollback()
+        current_app.logger.warning('每日首帖奖励入队失败 thread=%s: %s', thread.id, exc)
+
+
 def _collect_community_post(rule, first, now):
-    """平台每日首帖：按（作者, 发帖日）去重，事件时刻取当日第一帖的创建时间。"""
+    """平台每日首帖：按（作者, 发帖日）去重，事件时刻取当日第一帖的创建时间。
+    窗口含当天——正常发放走 award_daily_post 即时路径，这里负责兜底与补漏。"""
     v = version_at(rule, now)
     if not v or not v.enabled:
         return
@@ -271,8 +292,7 @@ def _collect_community_post(rule, first, now):
     window_start = max(first.effective_at.date(), today - timedelta(days=PLATFORM_SCAN_DAYS))
     rows = db.session.query(DiscussionThread.author_id, DiscussionThread.created_at).filter(
         DiscussionThread.status != DiscussionThread.STATUS_DELETED,
-        DiscussionThread.created_at >= datetime.combine(window_start, time.min),
-        DiscussionThread.created_at < datetime.combine(today, time.min)).all()
+        DiscussionThread.created_at >= datetime.combine(window_start, time.min)).all()
     first_post = {}
     for uid, created in rows:
         if created is None:
