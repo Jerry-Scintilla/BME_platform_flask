@@ -131,16 +131,44 @@ def connect():
 @bp.get('/tasks')
 @jwt_required()
 def tasks():
-    actor()
-    # 平台常驻途径尚未配置分值；目录不与任何营期规则混用，也不触发发放。
-    return jsonify(code=200, scope='platform', items=[
-        dict(id='daily_checkin', scope='platform', kind='daily_checkin', title='每日打卡',
-             enabled=False, amount=None, status='unconfigured', frequency='每日任务',
-             help='平台每日打卡积分规则尚未配置，开放后展示奖励和上限。'),
-        dict(id='community_post', scope='platform', kind='community_post', title='发布帖子',
-             enabled=False, amount=None, status='unconfigured', frequency='社区参与',
-             help='社区发帖积分规则尚未配置，开放后展示有效发帖条件和奖励上限。'),
-    ])
+    user = actor()
+    # 平台常驻任务目录：已配置的平台规则返回真数据，未配置的保留占位卡；
+    # 不与任何营期规则混用。文章过审在送审通过后由审批动作即时入队。
+    placeholders = {
+        'daily_checkin': dict(frequency='每日任务',
+            help='平台每日打卡积分规则尚未配置，开放后展示奖励和上限。'),
+        'community_post': dict(frequency='每日首次',
+            help='社区发帖积分规则尚未配置，开放后展示有效发帖条件和奖励上限。'),
+        'article': dict(frequency='每日首次',
+            help='文章积分规则尚未配置，开放后展示过审奖励。'),
+    }
+    items, configured = [], set()
+    if current_app.config.get('POINTS_REWARDS_ENABLED'):
+        today = datetime.now().date().isoformat()
+        event_keys = {kind: f'{ek}:{user.id}:{today}' for kind, ek in
+                      (('daily_checkin', 'checkin'), ('community_post', 'community_post'), ('article', 'article'))}
+        done_kinds = {kind for kind, k in event_keys.items()
+                      if PointsReward.query.filter_by(user_id=user.id, event_key=k).first() is not None}
+        for r in PointsRule.query.filter(PointsRule.camp_id.is_(None)).all():
+            data = service.rule_data(r)
+            if not data or not data['enabled']:
+                continue
+            configured.add(r.kind)
+            item = {k: data[k] for k in ('id', 'kind', 'title', 'amount', 'enabled', 'version', 'help')}
+            item.update(scope='platform', status='configured',
+                frequency={'daily_checkin': '每日任务', 'community_post': '每日首次',
+                           'article': '每日首次'}[r.kind],
+                action_path={'community_post': '/community', 'article': '/article-editor-v2'}.get(r.kind),
+                done_today=r.kind in done_kinds)
+            if r.kind == 'daily_checkin':
+                unit = data.get('bonus_unit_hours') or 2
+                item.update(amount_desc=f'打卡 +{data["amount"]}，每满 {unit} 小时再 +{data.get("bonus_amount") or 1}')
+            items.append(item)
+    for kind, extra in placeholders.items():
+        if kind not in configured:
+            items.append(dict(id=kind, scope='platform', kind=kind, title=service.PLATFORM_KINDS[kind],
+                enabled=False, amount=None, status='unconfigured', **extra))
+    return jsonify(code=200, scope='platform', items=items)
 
 
 def readable_camp(user, sid):
@@ -233,23 +261,97 @@ def meta():
     return jsonify(code=200, camps=[dict(id=c.id, name=c.name,
         can_review=has_camp_access(user, c.id, 'reward.issue'), can_rules=user.is_admin(),
         readonly=c.status in ('archived', 'deleted') or c.training_migration_paused) for c in camps],
-        kinds=[dict(value=k, label=v) for k,v in service.KINDS.items()])
+        kinds=[dict(value=k, label=v) for k,v in service.KINDS.items()],
+        platform_kinds=[dict(value=k, label=v) for k,v in service.PLATFORM_KINDS.items()])
 
 
 @bp.get('/manage/rules')
 @jwt_required()
 @rewards_enabled
 def rule_list():
-    user = actor(); sid = request.args.get('camp_id', type=int)
+    user = actor()
+    if 'camp_id' not in request.args:
+        if not user.is_admin(): raise service.PointsError('无权查看', 403)
+        return jsonify(code=200, items=[service.rule_data(r, latest=True)
+            for r in PointsRule.query.filter(PointsRule.camp_id.is_(None))])
+    sid = request.args.get('camp_id', type=int)
     if sid not in manager_ids(user): raise service.PointsError('无权查看', 403)
     return jsonify(code=200, items=[service.rule_data(r, latest=True) for r in PointsRule.query.filter_by(camp_id=sid)])
+
+
+def _parse_effective(data):
+    try:
+        effective = datetime.fromisoformat(data.get('effective_at', ''))
+        if effective.tzinfo is not None or effective < datetime.now()-timedelta(minutes=1): raise ValueError()
+    except (TypeError, ValueError):
+        raise service.PointsError('生效时间必须为当前或未来的本地时间')
+    return effective
+
+
+def _optional_positive(data, key, name, maximum):
+    value = data.get(key)
+    if value is None:
+        return None
+    return positive(value, name, maximum)
+
+
+def _save_platform_rule(user, data):
+    """平台规则（camp_id 为 NULL）：仅管理员配置。uq(camp_id,kind) 对 NULL 行不生效，
+    MySQL 上用独立连接的命名锁串行化创建避免并发插重；SQLite（测试）退化为应用层检查。"""
+    if not user.is_admin():
+        raise service.PointsError('仅管理员可配置平台积分规则', 403)
+    kind = data.get('kind')
+    if kind not in service.PLATFORM_KINDS: raise service.PointsError('平台奖励类型无效')
+    amount = positive(data.get('amount'), '积分', 10000)
+    if type(data.get('enabled')) is not bool: raise service.PointsError('启用状态无效')
+    effective = _parse_effective(data)
+    bonus = {}
+    if kind == 'daily_checkin':
+        bonus = dict(
+            bonus_unit_hours=_optional_positive(data, 'bonus_unit_hours', '时长单位', 24),
+            bonus_amount=_optional_positive(data, 'bonus_amount', '时长奖励', 100),
+            bonus_cap=_optional_positive(data, 'bonus_cap', '时长封顶', 100))
+
+    def _apply():
+        r = PointsRule.query.filter_by(camp_id=None, kind=kind).first()
+        expected = data.get('version', 0)
+        if type(expected) is not int or expected != (r.version if r else 0):
+            raise service.PointsError('规则已更新，请刷新后重试', 409)
+        if not r:
+            r = PointsRule(camp_id=None, kind=kind, version=0); db.session.add(r); db.session.flush()
+        if r.version:
+            latest = PointsRuleVersion.query.filter_by(rule_id=r.id, version=r.version).one()
+            if effective < latest.effective_at:
+                raise service.PointsError('生效时间不能早于上一版本', 409)
+        r.version += 1
+        db.session.add(PointsRuleVersion(rule_id=r.id, version=r.version, amount=amount,
+            period_limit=1, enabled=data['enabled'], effective_at=effective,
+            created_by=user.id, **bonus))
+        db.session.commit()
+        return service.rule_data(r, latest=True)
+
+    if db.engine.dialect.name != 'mysql':
+        item = _apply()
+        return jsonify(code=200, item=item)
+    from sqlalchemy import text
+    with db.engine.connect() as lock_conn:
+        if lock_conn.execute(text("SELECT GET_LOCK('points_platform_rule', 5)")).scalar() != 1:
+            raise service.PointsError('规则保存冲突，请稍后重试', 409)
+        try:
+            item = _apply()
+        finally:
+            lock_conn.execute(text("SELECT RELEASE_LOCK('points_platform_rule')"))
+    return jsonify(code=200, item=item)
 
 
 @bp.post('/manage/rules')
 @jwt_required()
 @rewards_enabled
 def save_rule():
-    user = actor(); data = body(); sid = positive(data.get('camp_id'), '营期')
+    user = actor(); data = body()
+    if data.get('camp_id') is None:
+        return _save_platform_rule(user, data)
+    sid = positive(data.get('camp_id'), '营期')
     camp = require_camp(user, sid, 'rules'); kind = data.get('kind')
     if kind not in service.KINDS: raise service.PointsError('奖励类型无效')
     from .camp import _attendance_mode
@@ -260,11 +362,7 @@ def save_rule():
     amount = positive(data.get('amount'), '积分', 10000)
     limit = positive(data.get('period_limit', 1), '次数', 100) if kind == 'contribution' else 1
     if type(data.get('enabled')) is not bool: raise service.PointsError('启用状态无效')
-    try:
-        effective = datetime.fromisoformat(data.get('effective_at', ''))
-        if effective.tzinfo is not None or effective < datetime.now()-timedelta(minutes=1): raise ValueError()
-    except (TypeError, ValueError):
-        raise service.PointsError('生效时间必须为当前或未来的本地时间')
+    effective = _parse_effective(data)
     # 营期锁同时保护首次创建规则。
     db.session.query(CampSession).filter_by(id=sid).with_for_update().one()
     r = PointsRule.query.filter_by(camp_id=sid, kind=kind).first()
@@ -312,6 +410,21 @@ def manage_rewards():
     return jsonify(code=200,items=[service.reward_data(r) for r in rows],total=total)
 
 
+@bp.get('/manage/platform/rewards')
+@jwt_required()
+@rewards_enabled
+def platform_rewards():
+    # 平台级发放记录（无营期归属）：仅管理员可见，供身份不合格 blocked 记录手动重试与撤回。
+    user=actor()
+    if not user.is_admin(): raise service.PointsError('无权查看',403)
+    q=PointsReward.query.filter(PointsReward.camp_id.is_(None))
+    status=request.args.get('status')
+    if status: q=q.filter_by(status=status)
+    page=max(1,request.args.get('page',1,type=int)); total=q.count()
+    rows=q.order_by(PointsReward.id.desc()).offset((page-1)*20).limit(20).all()
+    return jsonify(code=200,items=[service.reward_data(r) for r in rows],total=total)
+
+
 @bp.post('/manage/rewards')
 @jwt_required()
 @rewards_enabled
@@ -341,7 +454,10 @@ def change_reward(rid,action):
     user=actor(); data=body()
     r=PointsReward.query.filter_by(id=rid).with_for_update().first()
     if not r: raise service.PointsError('记录不存在',404)
-    require_camp(user,r.camp_id,'review')
+    if r.camp_id is None:
+        if not user.is_admin(): raise service.PointsError('无权操作平台积分',403)
+    else:
+        require_camp(user,r.camp_id,'review')
     if action in ('approve','reject'):
         if r.status!='review': raise service.PointsError('该记录已处理，请刷新',409)
         if user.id == r.user_id or user.id == r.proposed_by: raise service.PointsError('不能审批自己提报或自己的奖励',403)
@@ -354,8 +470,9 @@ def change_reward(rid,action):
     elif action=='reverse':
         r=service.reverse(r,user.id,note(data))
     elif action=='retry':
-        if r.status!='failed': raise service.PointsError('只有未确认入账记录可以重试',409)
-        r.next_attempt_at=datetime.now(); service.event(r,'retry_requested',user.id)
+        if r.status not in ('failed','blocked'): raise service.PointsError('只有未确认入账记录可以重试',409)
+        # blocked（身份不合格）重试前先回 failed，否则不会被 worker 扫到。
+        r.status='failed'; r.next_attempt_at=datetime.now(); service.event(r,'retry_requested',user.id)
     else: raise service.PointsError('操作不存在',404)
     db.session.commit()
     if action in ('approve','retry','reverse'): service.dispatch(r.id)

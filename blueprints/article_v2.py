@@ -20,6 +20,7 @@ import wtforms
 from wtforms.validators import length
 
 from sqlalchemy import and_, or_
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 
 from exts import db, redis_client
@@ -27,9 +28,12 @@ from models import (
     ArticleV2Model, UserModel, PermissionModel, UserPermissionModel,
     DiscussionThread, DiscussionReply, DiscussionReaction,
 )
+from points_models import PointsRule
+from services import article_html
+from services.points import PointsError, enqueue as points_enqueue, dispatch as points_dispatch
+from .notification import create_notification
 from storage import storage
 import imaging
-from services import article_html
 
 # 导入token验证模块
 from flask_jwt_extended import get_jwt_identity, jwt_required
@@ -227,6 +231,9 @@ def _article_to_dict(a, with_author_avatar=False, summary=False):
         "created_at": a.created_at.strftime('%Y-%m-%d %H:%M:%S') if a.created_at else '',
         "updated_at": a.updated_at.strftime('%Y-%m-%d %H:%M:%S') if a.updated_at else '',
         "publish_time": a.publish_time.strftime('%Y-%m-%d %H:%M:%S') if a.publish_time else '',
+        "submitted_at": a.submitted_at.strftime('%Y-%m-%d %H:%M:%S') if a.submitted_at else '',
+        "reviewed_at": a.reviewed_at.strftime('%Y-%m-%d %H:%M:%S') if a.reviewed_at else '',
+        "reject_reason": a.reject_reason or '',
     }
     if summary:
         d['summary'] = (a.introduction or '')[:200]
@@ -319,12 +326,17 @@ def article_v2_public():
     if limited:
         return limited
 
+    # 先审后发（2026-10-15）：文章管理员直发；普通用户进待审核，由管理员审批后公开。
+    is_manager = _is_article_manager(user)
+    now = datetime.now()
     article = ArticleV2Model(
         title=title, introduction=introduction,
         content_md=content_md if ctype == ArticleV2Model.CONTENT_TYPE_MD else None,
         content_type=ctype, content_version=1,
         author_id=user.id,
-        status=ArticleV2Model.STATUS_PUBLISHED, publish_time=datetime.now(),
+        status=ArticleV2Model.STATUS_PUBLISHED if is_manager else ArticleV2Model.STATUS_PENDING_REVIEW,
+        publish_time=now if is_manager else None,
+        submitted_at=None if is_manager else now,
         is_official=bool(official),
         is_essence=bool(essence),
     )
@@ -339,7 +351,7 @@ def article_v2_public():
 
     return jsonify({
         "code": 200,
-        'message': '文章发布成功',
+        'message': '文章发布成功' if is_manager else '文章已提交审核，通过后公开',
         "id": article.id,
         "title": article.title,
         "introduction": article.introduction,
@@ -489,11 +501,18 @@ def article_v2_publish(article_id):
                 return jsonify({"code": 400, "message": "正文不能为空"}), 400
             if article_html.has_failed_images(article.content_html):
                 return jsonify({"code": 400, "message": "正文中仍有图片转存失败占位块，请处理后（删除或重传）再发布"}), 400
-        article.status = ArticleV2Model.STATUS_PUBLISHED
-        if not article.publish_time:
-            article.publish_time = datetime.now()
+        if _is_article_manager(user):
+            article.status = ArticleV2Model.STATUS_PUBLISHED
+            if not article.publish_time:
+                article.publish_time = datetime.now()
+        else:
+            # 普通用户发布走送审；每次送审刷新提交时间（驳回后改稿重投按新提交日计"每日第一次"）
+            article.status = ArticleV2Model.STATUS_PENDING_REVIEW
+            article.submitted_at = datetime.now()
     db.session.commit()
-    return jsonify({"code": 200, "message": "文章发布成功", "id": article.id}), 200
+    if article.status == ArticleV2Model.STATUS_PUBLISHED:
+        return jsonify({"code": 200, "message": "文章发布成功", "id": article.id}), 200
+    return jsonify({"code": 200, "message": "文章已提交审核，通过后公开", "id": article.id}), 200
 
 
 # 下架：已发布转草稿（admin 状态管理；publish_time 保留不重设，再次发布不覆盖）
@@ -521,8 +540,8 @@ def article_v2_get(article_id):
     article = ArticleV2Model.query.filter_by(id=article_id).first()
     if article is None:
         return jsonify({"code": 404, "message": "文章不存在"}), 404
-    # 草稿仅作者本人/管理员可见，其余视为不存在（不泄露草稿存在）
-    if article.status == ArticleV2Model.STATUS_DRAFT:
+    # 草稿/待审核仅作者本人/管理员可见，其余视为不存在（不泄露存在；先审后发 2026-10-15）
+    if article.status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PENDING_REVIEW):
         u = _current_user()
         if not (u is not None and (_is_article_manager(u) or article.author_id == u.id)):
             return jsonify({"code": 404, "message": "文章不存在"}), 404
@@ -840,7 +859,8 @@ def article_v2_my():
     if user is None:
         return jsonify({"code": 401, "message": "用户不存在"}), 401
     q = ArticleV2Model.query.filter_by(author_id=user.id)
-    if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PUBLISHED):
+    if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PENDING_REVIEW,
+                  ArticleV2Model.STATUS_PUBLISHED):
         q = q.filter_by(status=status)
     articles = q.order_by(ArticleV2Model.updated_at.desc()).all()
     data = [_article_to_dict(a) for a in articles]
@@ -858,7 +878,8 @@ def article_v2_admin_list():
     kw = request.args.get('q', '', type=str).strip()
     official = request.args.get('official')
     query = ArticleV2Model.query
-    if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PUBLISHED):
+    if status in (ArticleV2Model.STATUS_DRAFT, ArticleV2Model.STATUS_PENDING_REVIEW,
+                  ArticleV2Model.STATUS_PUBLISHED):
         query = query.filter_by(status=status)
     if author_id:
         query = query.filter_by(author_id=author_id)
@@ -871,3 +892,75 @@ def article_v2_admin_list():
     articles = query.order_by(ArticleV2Model.updated_at.desc()).all()
     data = [_article_to_dict(a) for a in articles]
     return jsonify({"code": 200, "data": data}), 200
+
+
+def _enqueue_article_reward(article, actor_id):
+    """文章过审积分（平台级 article 规则）：按提交送审日算"每日第一次"，
+    同日第二篇过审由 event_key 唯一约束天然去重。入队失败不阻塞审批（SAVEPOINT 隔离）。"""
+    if not current_app.config.get('POINTS_REWARDS_ENABLED') or not article.submitted_at:
+        return None
+    rule = PointsRule.query.filter_by(camp_id=None, kind='article').first()
+    if not rule:
+        return None
+    submitted = article.submitted_at
+    try:
+        with db.session.begin_nested():
+            r = points_enqueue(rule, article.author_id,
+                f'article:{article.author_id}:{submitted.date()}', submitted,
+                '文章过审奖励', source_id=str(article.id),
+                source_path=f'/article-v2/{article.id}', actor=actor_id)
+        return r
+    except (PointsError, IntegrityError):
+        return None
+
+
+# 审核待发布文章（先审后发 2026-10-15）：approve 公开并入队积分，reject 驳回回草稿
+@bp.route("/admin/<int:article_id>/review", methods=["POST"])
+@jwt_required()
+@audit_log(operation="审核文章")
+def article_v2_admin_review(article_id):
+    user = _current_user()
+    if not _is_article_manager(user):
+        return jsonify({"code": 403, "message": "需要文章管理权限"}), 403
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action not in ('approve', 'reject'):
+        return jsonify({"code": 400, "message": "action 须为 approve 或 reject"}), 400
+    reason = (data.get('reason') or '').strip()
+    if action == 'reject' and not reason:
+        return jsonify({"code": 400, "message": "驳回必须填写原因"}), 400
+    if len(reason) > 512:
+        return jsonify({"code": 400, "message": "原因过长（最多 512 字）"}), 400
+    # 行锁 + 状态复检：两个管理员并发审批只有前者生效，副作用（积分/通知）不双份
+    article = ArticleV2Model.query.filter_by(id=article_id).with_for_update().first()
+    if article is None:
+        return jsonify({"code": 404, "message": "文章不存在"}), 404
+    if article.status != ArticleV2Model.STATUS_PENDING_REVIEW:
+        return jsonify({"code": 409, "message": "该文章不在待审核状态，请刷新"}), 409
+    now = datetime.now()
+    article.reviewed_by = user.id
+    article.reviewed_at = now
+    reward = None
+    if action == 'approve':
+        article.status = ArticleV2Model.STATUS_PUBLISHED
+        article.reject_reason = None
+        if not article.publish_time:
+            article.publish_time = now
+        reward = _enqueue_article_reward(article, user.id)
+    else:
+        article.status = ArticleV2Model.STATUS_DRAFT
+        article.reject_reason = reason
+    db.session.commit()
+    title = article.title or ''
+    if action == 'approve':
+        create_notification(article.author_id, '文章审核通过',
+            f'你的文章《{title}》已通过审核并公开。', category='system',
+            source_type='admin', source_id=article.id)
+    else:
+        create_notification(article.author_id, '文章未通过审核',
+            f'你的文章《{title}》未通过审核，可修改后重新提交。原因：{reason}', category='system',
+            source_type='admin', source_id=article.id)
+    if reward is not None:
+        points_dispatch(reward.id)   # commit 后派发；失败由 worker 退避重试
+    return jsonify({"code": 200, "message": "审核完成",
+        "id": article.id, "status": article.status}), 200

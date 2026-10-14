@@ -730,12 +730,16 @@ class ArticleV2Model(db.Model):
     与旧 ArticleModel 完全隔离（独立表 article_v2）。backref 用 articles_v2，
     避免与 ArticleModel 的 backref="articles" 在 UserModel 上冲突。
 
-    status：draft（草稿，仅作者本人/管理员可见）/ published（已发布，公开）。
+    status：draft（草稿，仅作者本人/管理员可见）/ pending_review（已提交待审，可见性同
+    草稿）/ published（已发布，公开）。普通用户发布先进 pending_review，由文章管理员
+    审批通过后公开（先审后发，2026-10-15）；文章管理员本人发布（含官方推文）直发。
+    审核通过后作者仍可自由编辑、不重审（用户拍板：审核只是发布门槛）。
     草稿的内容字段允许空；created_at/updated_at 记录创建与最后编辑；
-    publish_time 仅已发布文章有（草稿为 None）。
+    publish_time 仅已发布有（草稿/待审为 None，submitted_at 记录提交送审时间）。
     """
     __tablename__ = 'article_v2'
     STATUS_DRAFT = 'draft'
+    STATUS_PENDING_REVIEW = 'pending_review'
     STATUS_PUBLISHED = 'published'
     # 官方富文本推文（2026-09-20 方案）：正文格式 markdown / html 二选一，与
     # is_official（运营身份）、is_essence（精选）正交。html 仅文章管理员可写，
@@ -757,6 +761,11 @@ class ArticleV2Model(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     publish_time = db.Column(db.DateTime, nullable=True)    # 仅已发布有；草稿为 None
+    # 先审后发留痕：submitted_at 提交送审时间；驳回回草稿保留 reject_reason 供作者查看
+    submitted_at = db.Column(db.DateTime, nullable=True)
+    reviewed_by = db.Column(db.Integer, nullable=True)      # 审批人 user.id
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    reject_reason = db.Column(db.String(512), nullable=True)
     # 外键
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     author = db.relationship(UserModel, backref="articles_v2")

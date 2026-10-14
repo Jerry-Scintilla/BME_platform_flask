@@ -298,6 +298,12 @@ def get_or_create_article_v2_thread(article_id):
     article = ArticleV2Model.query.get(article_id)
     if not article:
         return jsonify({"code": 404, "message": "文章不存在"}), 404
+    # 非公开文章（草稿/待审核）不提供评论区：仅作者本人与管理员可读，
+    # 且待审文章不创建公开评论区（先审后发 2026-10-15）
+    if article.status != ArticleV2Model.STATUS_PUBLISHED:
+        from .article_v2 import _is_article_manager
+        if not (_is_article_manager(user) or article.author_id == user.id):
+            return jsonify({"code": 404, "message": "文章不存在"}), 404
 
     thread = DiscussionThread.query.filter_by(
         scope_type='article_v2',
@@ -305,7 +311,7 @@ def get_or_create_article_v2_thread(article_id):
         status=DiscussionThread.STATUS_NORMAL
     ).order_by(DiscussionThread.created_at.asc()).first()
 
-    if not thread:
+    if not thread and article.status == ArticleV2Model.STATUS_PUBLISHED:
         thread = DiscussionThread(
             title=f"文章评论 · {article.title}",
             content="该文章的评论区（系统自动创建）",
@@ -1296,6 +1302,9 @@ def my_article_favorites():
             article = ArticleModel.query.get(thread.scope_id)
             version = 1
         if not article:
+            continue
+        # v2 文章已下架/待审时不对外泄露标题与简介（先审后发 2026-10-15）
+        if version == 2 and article.status != ArticleV2Model.STATUS_PUBLISHED:
             continue
         result.append({
             "article_id": article.id,

@@ -5,7 +5,7 @@ from datetime import datetime, date, timedelta, time
 from flask_jwt_extended import create_access_token
 from test_points_sso import _build_app
 from exts import db
-from models import UserModel, CampSession, CampMember, CampPolicy, CampStaff, CourseModel, Chapter, CampChapterCertification, CampAttendancePlan, CheckRecord
+from models import UserModel, CampSession, CampMember, CampPolicy, CampStaff, CourseModel, Chapter, CampChapterCertification, CampAttendancePlan, CheckRecord, DiscussionThread
 from points_models import PointsRule, PointsRuleVersion, PointsReward, PointsEvent
 from services import points
 from services.points_identity import PointsIdentity
@@ -211,9 +211,103 @@ class RewardsTest(unittest.TestCase):
         self.rule('chapter',20)
         response=self.client.get('/points/tasks',headers=self.headers)
         self.assertEqual(response.status_code,200)
-        self.assertEqual({r['kind'] for r in response.json['items']},{'daily_checkin','community_post'})
+        self.assertEqual({r['kind'] for r in response.json['items']},{'daily_checkin','community_post','article'})
         self.assertTrue(all(r['scope']=='platform' and not r['enabled'] and r['amount'] is None for r in response.json['items']))
         self.assertTrue(all('camp_id' not in r for r in response.json['items']))
+
+    def platform_rule(self,kind='daily_checkin',amount=1,**extra):
+        """API 路径创建平台规则（生效时间只能取当下/未来，验证保存与目录）。"""
+        self.actor=self.admin
+        response=self.post('/manage/rules',dict(kind=kind,amount=amount,enabled=True,
+            effective_at=datetime.now().isoformat(),version=0,**extra))
+        self.assertEqual(response.status_code,200)
+        return response.json['item']
+
+    def platform_rule_backdated(self,kind='daily_checkin',amount=1,**extra):
+        """直建回溯生效的平台规则（扫描公式测试用；API 不允许回溯生效）。"""
+        r=PointsRule(camp_id=None,kind=kind,version=1);db.session.add(r);db.session.flush()
+        db.session.add(PointsRuleVersion(rule_id=r.id,version=1,amount=amount,period_limit=1,
+            enabled=True,effective_at=datetime.now()-timedelta(days=3),created_by=self.admin.id,**extra))
+        db.session.commit();return r
+
+    def test_platform_rules_admin_only_and_daily_checkin_formula(self):
+        # 非管理员不能配平台规则；管理员经 API 配置成功（生效即刻，目录可见）
+        self.actor=self.teacher
+        self.assertEqual(self.post('/manage/rules',dict(kind='daily_checkin',amount=1,enabled=True,
+            effective_at=datetime.now().isoformat(),version=0)).status_code,403)
+        self.platform_rule('daily_checkin',1,bonus_unit_hours=2,bonus_amount=1,bonus_cap=5)
+        # 回溯生效的规则驱动扫描：前天两段已签退合计 4.5h（1+floor(4.5/2)=2 → 3 分），未签退段不计
+        self.platform_rule_backdated('daily_checkin',1,bonus_unit_hours=2,bonus_amount=1,bonus_cap=5)
+        day=date.today()-timedelta(days=2)
+        db.session.add(CheckRecord(user_id=self.student.id,date=day,check_in=datetime.combine(day,time(8)),check_out=datetime.combine(day,time(11)),duration=3))
+        db.session.add(CheckRecord(user_id=self.student.id,date=day,check_in=datetime.combine(day,time(13)),check_out=datetime.combine(day,time(14,30)),duration=1.5))
+        db.session.add(CheckRecord(user_id=self.student.id,date=day,check_in=datetime.combine(day,time(20))))
+        # 今天的不结算（次日口径）
+        db.session.add(CheckRecord(user_id=self.student.id,date=date.today(),check_in=datetime.combine(date.today(),time(9)),check_out=datetime.combine(date.today(),time(12)),duration=3))
+        # 平台规则不要求营员身份：非营员打卡同样结算（20 分钟 → 仅基础分）
+        db.session.add(CheckRecord(user_id=self.outsider.id,date=day,check_in=datetime.combine(day,time(9)),check_out=datetime.combine(day,time(9,20)),duration=1/3))
+        db.session.commit()
+        # 平台规则与营期规则共存时扫描不崩（回归：营期循环必须过滤 NULL camp）
+        self.rule('chapter',20)
+        points.collect_automatic();points.collect_automatic()
+        self.assertEqual({(r.user_id,r.amount) for r in PointsReward.query.all()},{(self.student.id,3),(self.outsider.id,1)})
+        # 任务目录返回真数据卡，且不带营期字段
+        self.actor=self.student
+        items=self.client.get('/points/tasks',headers=self.headers).json['items']
+        card=[r for r in items if r['kind']=='daily_checkin'][0]
+        self.assertTrue(card['enabled']);self.assertEqual(card['amount'],1);self.assertFalse(card['done_today'])
+        self.assertTrue(all('camp_id' not in r for r in items))
+
+    def test_platform_daily_checkin_respects_settle_cutoff(self):
+        self.platform_rule_backdated('daily_checkin',1)
+        yesterday=date.today()-timedelta(days=1)
+        db.session.add(CheckRecord(user_id=self.student.id,date=yesterday,check_in=datetime.combine(yesterday,time(9)),check_out=datetime.combine(yesterday,time(12)),duration=3))
+        db.session.commit()
+        rule=PointsRule.query.filter_by(camp_id=None,kind='daily_checkin').one()
+        first=PointsRuleVersion.query.filter_by(rule_id=rule.id).order_by(PointsRuleVersion.effective_at).first()
+        # 跨天签退保护：D+1 凌晨 04:00 前不结算 D 日（人可能还坐着或刚跨天签退）
+        points._collect_daily_checkin(rule,first,datetime.combine(date.today(),time(3,0)))
+        self.assertEqual(PointsReward.query.count(),0)
+        points._collect_daily_checkin(rule,first,datetime.combine(date.today(),time(5,0)))
+        self.assertEqual(PointsReward.query.count(),1)
+
+    def test_community_post_scan_first_per_day_only(self):
+        self.platform_rule_backdated('community_post',1)
+        day=date.today()-timedelta(days=1)
+        db.session.add(DiscussionThread(scope_type='global',title='t1',content='c1',author_id=self.student.id,status='normal',created_at=datetime.combine(day,time(10))))
+        db.session.add(DiscussionThread(scope_type='global',title='t2',content='c2',author_id=self.student.id,status='normal',created_at=datetime.combine(day,time(15))))
+        db.session.add(DiscussionThread(scope_type='global',title='today',content='c',author_id=self.student.id,status='normal',created_at=datetime.now()))
+        db.session.commit()
+        points.collect_automatic();points.collect_automatic()
+        rewards=PointsReward.query.all()
+        self.assertEqual(len(rewards),1)
+        self.assertEqual(rewards[0].event_key,f'community_post:{self.student.id}:{day}')
+
+    def test_identity_ineligible_blocks_and_manual_retry(self):
+        self.platform_rule_backdated('community_post',1)
+        visitor=UserModel(username='visitor',email='visitor@example.com',password='x',role='user',status='active',lifecycle='active')
+        db.session.add(visitor);db.session.flush()
+        day=date.today()-timedelta(days=1)
+        db.session.add(DiscussionThread(scope_type='global',title='v',content='c',author_id=visitor.id,status='normal',created_at=datetime.combine(day,time(10))))
+        db.session.commit()
+        points.collect_automatic()
+        r=PointsReward.query.one()
+        self.assertEqual(r.status,'pending')
+        # 身份不合格：落 blocked、不自动重试，也不被 worker 扫走
+        self.assertFalse(points.dispatch(r.id))
+        r=db.session.get(PointsReward,r.id)
+        self.assertEqual(r.status,'blocked');self.assertIsNone(r.next_attempt_at)
+        points.run_worker()
+        self.assertEqual(db.session.get(PointsReward,r.id).status,'blocked')
+        # 平台发放记录仅管理员可见；管理员手动 retry 后复位 failed 等待 worker
+        self.actor=self.teacher
+        self.assertEqual(self.client.get('/points/manage/platform/rewards',headers=self.headers).status_code,403)
+        self.actor=self.admin
+        self.assertEqual(self.client.get('/points/manage/platform/rewards',headers=self.headers).json['total'],1)
+        with patch('services.points.dispatch',return_value=False):
+            self.assertEqual(self.post(f'/manage/rewards/{r.id}/retry',{}).status_code,200)
+        r=db.session.get(PointsReward,r.id)
+        self.assertEqual(r.status,'failed');self.assertIsNotNone(r.next_attempt_at)
 
     def test_camp_progress_is_scoped_to_camp_and_current_user(self):
         first=self.reward(self.rule('chapter',20),'first:reward')

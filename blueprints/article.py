@@ -65,6 +65,11 @@ def article_public():
 
         User_Email = get_jwt_identity()
         user = UserModel.query.filter_by(email=User_Email).first()
+        # V1 发布入口收口（先审后发 2026-10-15）：V1 无审核体系，普通用户停用，
+        # 前端已重定向到 V2 编辑器；文章管理员保留导入旧文能力。历史 V1 文章展示不受影响。
+        if not _is_article_manager(user):
+            return jsonify({"code": 403,
+                "message": "旧版文章发布已停用，请使用新版文章编辑器（支持审核）"}), 403
         author_id = user.id
 
         article = ArticleModel(title=title, introduction=introduction, author_id=author_id)
