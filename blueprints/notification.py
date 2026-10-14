@@ -127,7 +127,11 @@ def _send_email_async(app, user_emails, title, content, html=None, attachments=N
                         msg.html = html
                         msg.body = content or title  # 纯文本 fallback
                     else:
-                        msg.body = f'{title}\n\n{content}\n\n— BME 卓越工程师在线教育平台'
+                        # 统一正式邮件结构（品牌头 + 分段正文 + 页脚），见 services/mail_templates.py
+                        from services.mail_templates import render_notification
+                        tpl = render_notification(title, content)
+                        msg.html = tpl['html']
+                        msg.body = tpl['text']
                     if attachments:
                         for att in attachments:
                             msg.attach(att['filename'], att['content_type'], att['data'])

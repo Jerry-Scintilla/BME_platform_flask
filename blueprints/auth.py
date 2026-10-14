@@ -812,8 +812,13 @@ def get_email_captcha():
             resp.headers["Retry-After"] = "60"
         return resp, status
     try:
-        mail.send(Message(subject="BME卓越工程师在线教育平台",
-                          recipients=[email], body=f"您的验证码是:{captcha}"))
+        # 统一验证码邮件模板（独立验证码展示区），见 services/mail_templates.py
+        from services.mail_templates import render_code_email
+        _label = '注册' if purpose == 'register' else '找回密码'
+        _tpl = render_code_email(captcha, title='BME 平台验证码',
+                                 purpose=f'您正在{_label} BME 平台账号', ttl_minutes=5)
+        mail.send(Message(subject=f'BME 平台{_label}验证码',
+                          recipients=[email], body=_tpl['text'], html=_tpl['html']))
     except Exception:
         # 邮件发送失败：challenge 不算成功（删除登记，用户可立即重发）
         from exts import redis_client as _rc

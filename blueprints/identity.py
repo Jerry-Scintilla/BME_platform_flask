@@ -99,10 +99,11 @@ def send_challenge(app_id):
     app = _load_app(actor, app_id)
     code, ch = verification.issue_challenge(actor.user, app)
     try:
+        from services.mail_templates import render_code_email
+        _tpl = render_code_email(code, title='身份核验验证码',
+                                 purpose='您正在完成教育邮箱身份核验', ttl_minutes=5)
         mail.send(Message(subject="BME 身份核验验证码",
-                          recipients=[app.contact_email],
-                          body=f"您的核验验证码是：{code}（5 分钟内有效）。"
-                               f"如非本人操作请忽略本邮件。"))
+                          recipients=[app.contact_email], body=_tpl['text'], html=_tpl['html']))
     except Exception:
         db.session.rollback()
         return jsonify({"code": 503, "message": "邮件发送失败，请稍后重试"}), 503
@@ -367,10 +368,11 @@ def roster_claim_start():
     entry, _invite, code = roster.start_claim(actor.user, payload.get("token") or "")
     preview = roster.claim_preview(payload.get("token") or "")
     try:
+        from services.mail_templates import render_code_email
+        _tpl = render_code_email(code, title='外校身份认领验证码',
+                                 purpose='您正在完成外校身份认领', ttl_minutes=5)
         mail.send(Message(subject="BME 外校身份认领验证码",
-                          recipients=[entry.contact_email],
-                          body=f"您的认领验证码是：{code}（5 分钟内有效）。"
-                               f"如非本人操作请忽略本邮件。"))
+                          recipients=[entry.contact_email], body=_tpl['text'], html=_tpl['html']))
     except Exception:
         db.session.rollback()
         return jsonify({"code": 503, "message": "邮件发送失败，请稍后重试"}), 503
@@ -415,10 +417,11 @@ def recovery_submit():
         contact_email=payload.get("contact_email") or "",
         statement=payload.get("statement") or "")
     try:
+        from services.mail_templates import render_code_email
+        _tpl = render_code_email(code, title='账号恢复验证码',
+                                 purpose='您正在申请恢复 BME 平台账号', ttl_minutes=10)
         mail.send(Message(subject="BME 账号恢复验证码",
-                          recipients=[case.contact_email],
-                          body=f"您的恢复申请验证码是：{code}（10 分钟内有效）。"
-                               f"如非本人操作请忽略本邮件。"))
+                          recipients=[case.contact_email], body=_tpl['text'], html=_tpl['html']))
     except Exception:
         db.session.rollback()
         return jsonify({"code": 503, "message": "邮件发送失败，请稍后重试"}), 503
