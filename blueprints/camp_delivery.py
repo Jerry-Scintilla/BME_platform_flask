@@ -34,6 +34,7 @@ from services.camp_groups.reads import UnitMembershipRead
 from services.camp_groups.delivery import progress as delivery_progress, pending_reviews
 from . import camp_role, audit_log, _current_user
 from .camp import _camp_writable
+from .camp_staff import camp_access, has_camp_access
 from .camp_project import (_camp_or_404, _unit_or_404, _is_unit_leader, _notify,
                            _norm_nodes, _write_nodes, _instantiate_milestones)
 from .media_sign import media_token_response, resolve_media_request
@@ -45,6 +46,25 @@ MAX_FILE_MB = 48
 MAX_FILES = 20
 MAX_CONTENT_BYTES = 64 * 1024
 VALID_SUBMIT_MODES = ('team', 'member')
+
+
+@bp.route('/projects/<int:sid>/dashboard')
+@bp.route('/projects/<int:sid>/dashboard/<project_key>')
+@jwt_required()
+@camp_access('project.read_all')
+def project_dashboard(sid, project_key=None):
+    camp, err = _camp_or_404(sid)
+    if err:
+        return err
+    if camp.category != 'project':
+        return jsonify({'code': 400, 'message': '项目总览仅适用于项目营'}), 400
+    from services.camp_groups.dashboard import build_dashboard
+    try:
+        return jsonify({'code': 200, **build_dashboard(camp, project_key)})
+    except LookupError as exc:
+        return jsonify({'code': 404, 'message': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'code': 409, 'message': str(exc)}), 409
 
 
 # ─────────────────────────────────────────────
@@ -745,8 +765,8 @@ def attachment_token(aid):
     if err:
         return err
     user = _current_user()
-    if not _unit_role(unit, user):
-        return jsonify({"code": 403, "message": "仅项目成员可下载附件"}), 403
+    if not _unit_role(unit, user) and not has_camp_access(user, camp.id, 'project.read_all'):
+        return jsonify({"code": 403, "message": "仅项目成员或本营管理老师可下载附件"}), 403
     return media_token_response('submission', aid, user.id)
 
 
@@ -765,8 +785,8 @@ def attachment_download(aid):
     user, auth_err = resolve_media_request('submission', aid)
     if auth_err:
         return auth_err
-    if not _unit_role(unit, user):
-        return jsonify({"code": 403, "message": "仅项目成员可下载附件"}), 403
+    if not _unit_role(unit, user) and not has_camp_access(user, camp.id, 'project.read_all'):
+        return jsonify({"code": 403, "message": "仅项目成员或本营管理老师可下载附件"}), 403
     try:
         obj = storage.get_object(a.object_key)
     except Exception:
@@ -937,7 +957,7 @@ def freeze_camp_archive(camp, operator_id, *, commit=True):
                           {e.member_user_id for e in state['evaluations']})
             final_materials = [s for uid, s in state['latest_submissions'].items()
                                if state['node_complete'] and uid in target_ids]
-            ms_snap.append({"title": m.title, "submit_mode": m.submit_mode,
+            ms_snap.append({"id": m.id, "title": m.title, "submit_mode": m.submit_mode,
                             "status": state['status'], "node_complete": state['node_complete'],
                             "completion_mode": state['completion_mode'],
                             "due_date": m.due_date.isoformat() if m.due_date else None,
@@ -961,9 +981,10 @@ def freeze_camp_archive(camp, operator_id, *, commit=True):
             tpl.status = 'archived'                       # 资产回流：模板可被复制起步
         unit_snapshots.append({
             "name": unit.name, "status": unit.status,
+            "unit_id": unit.id,
             "leader_user_id": unit.owner_user_id,
             "leader": names.get(unit.owner_user_id, str(unit.owner_user_id)),
-            "members": [{"user": names.get(r.user_id, str(r.user_id)), "role": r.role,
+            "members": [{"user": names.get(r.user_id, str(r.user_id)), "user_id": r.user_id, "role": r.role,
                          "status": r.status} for r in um_rows],
             "milestones": ms_snap,
             "verified_outcomes": [{"title": o.title, "description": o.description,
