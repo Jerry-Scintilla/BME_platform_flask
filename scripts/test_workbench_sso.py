@@ -103,6 +103,33 @@ class WorkbenchSSOTests(unittest.TestCase):
         self.assertEqual(self.client.post('/workbench-sso/status',json={'audience':'workbench'}).status_code,401)
         db.session.delete(self.member);db.session.commit();self.assertEqual(self.authorize().status_code,403)
 
+    def test_workbench_admission_without_group_slots_and_idempotence(self):
+        from workbench_sso_models import WorkbenchAdmission
+        from models import ClubMembership
+        person = db.session.get(PersonModel, self.user.person_id)
+        person.verification_status = 'verified'
+        self.user.account_kind = 'standard'
+        ClubMembership.query.delete()
+        db.session.commit()
+        payload = {'audience': 'workbench', 'issuer': 'bme-training', 'subject': str(self.user.id),
+            'person_id': str(person.id), 'operator_subject': str(self.user.id), 'reason': '正式内部成员名单'}
+        response = self.client.post('/workbench-sso/admission', json=payload, headers=self.basic)
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertTrue(response.json['community_active'])
+        self.assertEqual(self.client.post('/workbench-sso/admission', json=payload, headers=self.basic).status_code, 200)
+        self.assertEqual(WorkbenchAdmission.query.count(), 1)
+        self.assertEqual(ClubMembership.query.count(), 0)
+        row = WorkbenchAdmission.query.one()
+        row.status = 'revoked'
+        db.session.commit()
+        self.assertEqual(self.client.post('/workbench-sso/admission', json=payload, headers=self.basic).status_code, 409)
+
+    def test_workbench_admission_rejects_unverified_and_changed_person(self):
+        payload = {'audience': 'workbench', 'issuer': 'bme-training', 'subject': str(self.user.id),
+            'person_id': str(self.user.person_id), 'operator_subject': str(self.user.id), 'reason': '正式名单'}
+        self.assertEqual(self.client.post('/workbench-sso/admission', json=payload, headers=self.basic).status_code, 403)
+        self.assertEqual(self.client.post('/workbench-sso/admission', json=payload).status_code, 401)
+
     def test_group_delete_keeps_independent_workspace_references(self):
         import os
         from unittest.mock import patch, Mock

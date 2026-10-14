@@ -24,6 +24,10 @@ python scripts/migrate/migrate_09_mentor_selection.py     # camp_session 加选�
 默认不连接数据库；只有加 `--apply` 才操作 config 指向的库。先备份并确认目标。应先执行来源迁移 79 和独立工作台 Alembic 0003，再发布两边的新代码。MySQL 验证使用 `scripts/test_appointment_history_mysql.py --run`，严格限制回环主机、创建唯一临时测试库并在结束后清理；不修改本地业务库。新 schema 支持未知日期，回退旧 NOT NULL schema 需要单独制定保留数据的恢复方案。
 ## 顺序依赖
 
+### 迁移80：独立工作台应用准入
+
+`migrate_80_workbench_admission.py` 默认只展示计划，--apply 才建立 workbench_admission。新表仅记录认证账号、人员标识及准入审计，不保存工作台小组关系，不修改教学角色、正式职务或原两槽归属。已有准入被撤销后普通导入不能恢复。先迁移，再启动新版SSO提供端；工作台同时需升级0004。发布及名单录入交接见独立工作台deploy/README.md。
+
 - `migrate_05` 按 `role='super_admin'` 授权 → 必须在 `migrate_01`（加列 + 回填）之后。
 - `migrate_03/04` 依赖 `migrate_02` 建出 camp_session / camp_join_request。
 - 全部幂等，顺序错了也不报错，但推荐按序。
