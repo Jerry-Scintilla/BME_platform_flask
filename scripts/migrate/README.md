@@ -105,3 +105,5 @@ resume/restore/export。写操作需显式 `--apply --actor`，映射必须携�
 “未执行 apply”指当时状态，本轮也未对生产或共享业务库执行 apply。
 完整备份、停旧进程、发布及恢复顺序见 [上线指南](../../docs/deploy/营期小组上线指南-202610.md)。
 上面的通用 DROP COLUMN / DROP TABLE 说明不适用于已有组业务写入的营期小组升级。
+
+- `migrate_78_points_rewards.py`：积分规则版本、奖励队列和审计事件。默认打印 DDL，`--apply` 才建表；不发积分。上线后另行配置 `POINTS_REWARDS_ENABLED` 与规则。
