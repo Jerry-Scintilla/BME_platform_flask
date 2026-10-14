@@ -16,7 +16,7 @@ from exts import db, limiter
 from models import AuthSessionModel, ClubGroup, ClubMembership, ClubOfficer, ClubPosition, ClubOrgEvent, PersonModel, UserModel
 from services.club_history import canonical_person_id
 from services.auth_context import AuthRejected, resolve_actor
-from workbench_sso_models import WorkbenchSSOCode
+from workbench_sso_models import WorkbenchSSOCode, WorkbenchAdmission
 
 bp = Blueprint('workbench_sso', __name__, url_prefix='/workbench-sso')
 
@@ -63,6 +63,9 @@ def identity(user):
                        (ClubOfficer.term_end.is_(None)) | (ClubOfficer.term_end >= today)).first()) if user else None
     membership = (db.session.query(ClubMembership.id).join(ClubGroup, ClubGroup.id == ClubMembership.group_id)
                   .filter(ClubMembership.user_id == user.id, ClubGroup.status == 'active').first()) if user else None
+    enrollment = db.session.get(WorkbenchAdmission, user.id) if user else None
+    internal = bool(enrollment and enrollment.status == 'active' and user.person_id == enrollment.person_id
+                    and person_active and person.verification_status == 'verified')
     return {
         'issuer': setting('WORKBENCH_ISSUER', 'bme-training'),
         'audience': setting('WORKBENCH_CLIENT_ID'),
@@ -70,7 +73,7 @@ def identity(user):
         'display_name': (person.verified_name if person and person.verified_name else user.username).strip()[:100],
         'security_version': str(user.security_version or 0),
         'account_active': active, 'person_active': person_active,
-        'community_active': bool(officer or membership),
+        'community_active': bool(officer or membership or internal),
     }
 
 
@@ -86,13 +89,15 @@ def directory_snapshot():
     memberships = ClubMembership.query.all()
     events = ClubOrgEvent.query.filter(ClubOrgEvent.officer_id.in_([o.id for o in officers])).all()
     ids = {o.user_id for o in officers} | {m.user_id for m in memberships} | {e.operator_id for e in events if e.operator_id}
+    ids.update(a.user_id for a in WorkbenchAdmission.query.all())
     def rows(items):
         return [{c.name: (getattr(row, c.name).isoformat() if isinstance(getattr(row, c.name), (date, datetime))
                          else getattr(row, c.name)) for c in row.__table__.columns} for row in items]
     users = []
     for user in UserModel.query.filter(UserModel.id.in_(ids)).all() if ids else []:
         person = db.session.get(PersonModel, user.person_id) if user.person_id else None
-        users.append({'id': user.id, 'username': user.username, 'person_id': canonical_person_id(user.person_id),
+        display_name = person.verified_name if person and person.verification_status == 'verified' and person.verified_name else user.username
+        users.append({'id': user.id, 'username': display_name, 'person_id': canonical_person_id(user.person_id),
                       'avatar_url': user.avatar_url, 'status': user.status or 'active', 'lifecycle': user.lifecycle or 'active',
                       'verification_status': person.verification_status if person else 'unverified'})
     projected_officers = rows(officers)
@@ -207,6 +212,53 @@ def private_response(response):
 @client_required
 def directory():
     return jsonify(directory=directory_snapshot())
+
+
+@bp.post('/candidates')
+@client_required
+def member_candidates():
+    from services.identity.matcher import resolve_batch
+    names = request.get_json().get('names')
+    if not isinstance(names, list) or not names or len(names) > 200 or any(not isinstance(n, str) or len(n) > 100 for n in names):
+        return failure('INVALID_NAMES', '请提供至多200个姓名', 400)
+    return jsonify(matches=resolve_batch([{'real_name': n} for n in names]))
+
+
+@bp.post('/admission')
+@client_required
+def admit_internal_member():
+    body = request.get_json()
+    subject, person_id = body.get('subject'), body.get('person_id')
+    operator, reason = body.get('operator_subject'), str(body.get('reason') or '').strip()
+    if (body.get('issuer') != setting('WORKBENCH_ISSUER', 'bme-training')
+            or any(not isinstance(v, str) or not re.fullmatch(r'[1-9][0-9]{0,10}', v) for v in (subject, person_id, operator))
+            or not reason or len(reason) > 200):
+        return failure('INVALID_ADMISSION', '准入登记参数无效', 400)
+    user = db.session.get(UserModel, int(subject))
+    actor = db.session.get(UserModel, int(operator))
+    person = db.session.get(PersonModel, user.person_id) if user else None
+    if (not user or str(user.person_id) != person_id or not person
+            or person.record_status != 'active' or person.verification_status != 'verified'
+            or user.status != 'active' or (user.lifecycle or 'active') != 'active'
+            or (user.account_kind or 'standard') != 'standard'
+            or not actor or actor.status != 'active' or (actor.lifecycle or 'active') != 'active'):
+        return failure('VERIFIED_MEMBER_REQUIRED', '仅可登记身份一致且已认证的有效普通账号', 403)
+    row = db.session.get(WorkbenchAdmission, user.id)
+    if row and row.person_id != user.person_id:
+        return failure('PERSON_CHANGED', '账号人员身份已变化，需人工处理原准入', 409)
+    if row is None:
+        row = WorkbenchAdmission(user_id=user.id, person_id=user.person_id, granted_by=actor.id,
+            reason=reason, status='active', created_at=datetime.now())
+        db.session.add(row)
+        from services.work.events import record_org_event
+        record_org_event('workbench_admitted', user_id=user.id, operator_id=actor.id,
+                         detail={'reason': reason, 'client': setting('WORKBENCH_CLIENT_ID')})
+    elif row.status != 'active':
+        return failure('ADMISSION_REVOKED', '准入已撤销，普通成员导入不能恢复', 409)
+    db.session.commit()
+    claims = identity(user)
+    claims['directory'] = directory_snapshot()
+    return jsonify(claims)
 
 
 @bp.get('/me')
