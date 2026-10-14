@@ -1,4 +1,7 @@
-"""训练营积分规则版本、发放队列与操作留痕；可用余额仅由积分中心提供。"""
+"""训练营积分规则版本、发放队列与操作留痕；可用余额仅由积分中心提供。
+
+camp_id 为 NULL 表示平台级规则/发放（每日打卡、发帖、文章过审），不挂营期。
+"""
 from datetime import datetime
 from exts import db
 
@@ -6,7 +9,7 @@ from exts import db
 class PointsRule(db.Model):
     __tablename__ = 'points_rule'
     id = db.Column(db.Integer, primary_key=True)
-    camp_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False)
+    camp_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True)
     kind = db.Column(db.String(24), nullable=False)
     version = db.Column(db.Integer, nullable=False, default=0)
     __table_args__ = (db.UniqueConstraint('camp_id', 'kind', name='uq_points_rule_camp_kind'),)
@@ -23,6 +26,10 @@ class PointsRuleVersion(db.Model):
     effective_at = db.Column(db.DateTime, nullable=False)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    # 平台每日打卡的时长奖励参数（仅 daily_checkin 读；NULL = 默认每满 2 小时 +1、不封顶）
+    bonus_unit_hours = db.Column(db.Integer, nullable=True)
+    bonus_amount = db.Column(db.Integer, nullable=True)
+    bonus_cap = db.Column(db.Integer, nullable=True)
     __table_args__ = (db.UniqueConstraint('rule_id', 'version', name='uq_points_rule_version'),)
 
 
@@ -30,7 +37,7 @@ class PointsReward(db.Model):
     __tablename__ = 'points_reward'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
-    camp_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=False, index=True)
+    camp_id = db.Column(db.Integer, db.ForeignKey('camp_session.id'), nullable=True, index=True)
     rule_id = db.Column(db.Integer, db.ForeignKey('points_rule.id'), nullable=False)
     rule_version = db.Column(db.Integer, nullable=False)
     kind = db.Column(db.String(24), nullable=False)
