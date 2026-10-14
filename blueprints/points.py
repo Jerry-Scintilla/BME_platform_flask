@@ -4,7 +4,6 @@ from functools import wraps
 import re
 from flask import Blueprint, jsonify, request, current_app
 from flask_jwt_extended import jwt_required
-from sqlalchemy import func
 from exts import db
 from models import UserModel, CampSession, CampMember, CampStaff
 from points_models import PointsRule, PointsRuleVersion, PointsReward, PointsEvent
@@ -96,13 +95,9 @@ def note(data, key='reason'):
 def me():
     user = actor()
     identity = resolve_points_identity(user)
-    result = dict(code=200, status='unavailable', balance=None, pending_total=0,
+    result = dict(code=200, status='unavailable', balance=None,
         rewards_enabled=bool(current_app.config.get('POINTS_REWARDS_ENABLED')),
-        can_manage=bool(manager_ids(user)), store_history_available=False)
-    if result['rewards_enabled']:
-        result['pending_total'] = int(db.session.query(func.coalesce(func.sum(PointsReward.amount), 0)).filter(
-            PointsReward.user_id == user.id, PointsReward.amount > 0,
-            PointsReward.status.in_(['pending', 'processing', 'failed'])).scalar())
+        store_history_available=False)
     if not identity.eligible:
         return jsonify(**result, message=identity.message, error_code=identity.error_code, needs_identity=True)
     if not current_app.config.get('POINTS_CENTER_ENABLED'):
@@ -136,21 +131,58 @@ def connect():
 @bp.get('/tasks')
 @jwt_required()
 def tasks():
+    actor()
+    # 平台常驻途径尚未配置分值；目录不与任何营期规则混用，也不触发发放。
+    return jsonify(code=200, scope='platform', items=[
+        dict(id='daily_checkin', scope='platform', kind='daily_checkin', title='每日打卡',
+             enabled=False, amount=None, status='unconfigured', frequency='每日任务',
+             help='平台每日打卡积分规则尚未配置，开放后展示奖励和上限。'),
+        dict(id='community_post', scope='platform', kind='community_post', title='发布帖子',
+             enabled=False, amount=None, status='unconfigured', frequency='社区参与',
+             help='社区发帖积分规则尚未配置，开放后展示有效发帖条件和奖励上限。'),
+    ])
+
+
+def readable_camp(user, sid):
+    camp = db.session.get(CampSession, sid)
+    if not camp or camp.status == 'deleted':
+        raise service.PointsError('营期不存在', 404)
+    member = CampMember.query.filter_by(camp_session_id=sid, user_id=user.id).first()
+    if not member and not has_camp_access(user, sid, 'reward.issue'):
+        raise service.PointsError('无权查看该营期积分', 403)
+    return camp
+
+
+@bp.get('/camps/<int:sid>/tasks')
+@jwt_required()
+def camp_tasks(sid):
     user = actor()
+    camp = readable_camp(user, sid)
     if not current_app.config.get('POINTS_REWARDS_ENABLED'):
-        return jsonify(code=200, items=[])
-    ids = [m.camp_session_id for m in CampMember.query.filter_by(user_id=user.id) if m.is_learner]
+        return jsonify(code=200, items=[], enabled=False)
     items = []
-    for r in PointsRule.query.filter(PointsRule.camp_id.in_(ids)).all():
+    for r in PointsRule.query.filter_by(camp_id=sid).all():
         data = service.rule_data(r)
-        camp = db.session.get(CampSession, r.camp_id)
-        if not data or not data['enabled'] or camp.status in ('archived', 'deleted'):
+        if not data or not data['enabled']:
             continue
-        recent = PointsReward.query.filter_by(rule_id=r.id, user_id=user.id).order_by(PointsReward.id.desc()).first()
-        data['recent_status'] = recent.status if recent else None
-        data['action_path'] = f'/camp?sid={r.camp_id}&tab='+('attendance' if r.kind == 'attendance' else 'study')
+        data['scope'] = 'camp'
+        data['action_path'] = f'/camp?sid={sid}&tab='+('attendance' if r.kind == 'attendance' else 'study')
+        if camp.status == 'archived': data['action_path'] = None
         items.append(data)
-    return jsonify(code=200, items=items)
+    return jsonify(code=200, items=items, enabled=True)
+
+
+@bp.get('/camps/<int:sid>/rewards')
+@jwt_required()
+def camp_rewards(sid):
+    user = actor()
+    readable_camp(user, sid)
+    if not current_app.config.get('POINTS_REWARDS_ENABLED'):
+        return jsonify(code=200, items=[], total=0, enabled=False)
+    q = PointsReward.query.filter_by(user_id=user.id, camp_id=sid)
+    page = max(1, request.args.get('page', 1, type=int))
+    rows = q.order_by(PointsReward.id.desc()).offset((page-1)*20).limit(20).all()
+    return jsonify(code=200, items=[service.reward_data(r) for r in rows], total=q.count(), enabled=True)
 
 
 @bp.get('/records')
@@ -173,10 +205,16 @@ def records():
 @bp.get('/pending')
 @jwt_required()
 def pending():
+    # 兼容旧入口必须显式提供营期，不再提供个人中心的跨营待办汇总。
+    sid = request.args.get('camp_id', type=int)
+    if not sid:
+        raise service.PointsError('请选择营期')
     user = actor()
+    readable_camp(user, sid)
     if not current_app.config.get('POINTS_REWARDS_ENABLED'):
         return jsonify(code=200, items=[])
-    rows = PointsReward.query.filter(PointsReward.user_id == user.id, PointsReward.status != 'completed').order_by(PointsReward.id.desc()).limit(100)
+    rows = PointsReward.query.filter(PointsReward.user_id == user.id, PointsReward.camp_id == sid,
+        PointsReward.status != 'completed').order_by(PointsReward.id.desc()).limit(100)
     return jsonify(code=200, items=[service.reward_data(r) for r in rows])
 
 
@@ -185,7 +223,13 @@ def pending():
 @rewards_enabled
 def meta():
     user = actor()
-    camps = CampSession.query.filter(CampSession.id.in_(manager_ids(user))).all()
+    ids = manager_ids(user)
+    if 'camp_id' in request.args:
+        sid = request.args.get('camp_id', type=int)
+        if sid not in ids:
+            raise service.PointsError('无权管理该营期积分', 403)
+        ids = [sid]
+    camps = CampSession.query.filter(CampSession.id.in_(ids)).all()
     return jsonify(code=200, camps=[dict(id=c.id, name=c.name,
         can_review=has_camp_access(user, c.id, 'reward.issue'), can_rules=user.is_admin(),
         readonly=c.status in ('archived', 'deleted') or c.training_migration_paused) for c in camps],

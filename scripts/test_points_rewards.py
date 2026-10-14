@@ -127,7 +127,7 @@ class RewardsTest(unittest.TestCase):
     def test_personal_records_are_owned_and_pending_not_ledger(self):
         r=self.reward();self.actor=self.student
         self.assertEqual(self.client.get('/points/records',headers=self.headers).json['total'],0)
-        self.assertEqual(len(self.client.get('/points/pending',headers=self.headers).json['items']),1)
+        self.assertEqual(len(self.client.get(f'/points/pending?camp_id={self.camp.id}',headers=self.headers).json['items']),1)
         r.status='completed';r.completed_at=datetime.now();r.balance_after=30;db.session.commit()
         self.actor=self.outsider
         self.assertEqual(self.client.get('/points/records?user_id='+str(self.student.id),headers=self.headers).json['total'],0)
@@ -206,6 +206,41 @@ class RewardsTest(unittest.TestCase):
         self.app.config['POINTS_REWARDS_ENABLED']=False
         points.capture_certification(cert)
         self.assertEqual(PointsReward.query.count(),0)
+
+    def test_personal_catalog_contains_only_unconfigured_platform_paths(self):
+        self.rule('chapter',20)
+        response=self.client.get('/points/tasks',headers=self.headers)
+        self.assertEqual(response.status_code,200)
+        self.assertEqual({r['kind'] for r in response.json['items']},{'daily_checkin','community_post'})
+        self.assertTrue(all(r['scope']=='platform' and not r['enabled'] and r['amount'] is None for r in response.json['items']))
+        self.assertTrue(all('camp_id' not in r for r in response.json['items']))
+
+    def test_camp_progress_is_scoped_to_camp_and_current_user(self):
+        first=self.reward(self.rule('chapter',20),'first:reward')
+        original=self.camp
+        self.camp=CampSession(name='另一期',category='learning',status='running',start_date=date.today(),end_date=date.today()+timedelta(days=10))
+        db.session.add(self.camp);db.session.flush()
+        db.session.add(CampMember(camp_session_id=self.camp.id,user_id=self.student.id,role='student',status='active'))
+        db.session.commit()
+        self.reward(self.rule('chapter',50),'second:reward')
+        self.actor=self.student
+        result=self.client.get(f'/points/camps/{original.id}/rewards',headers=self.headers)
+        self.assertEqual([r['id'] for r in result.json['items']],[first.id])
+        tasks=self.client.get(f'/points/camps/{original.id}/tasks',headers=self.headers)
+        self.assertEqual([r['camp_id'] for r in tasks.json['items']],[original.id])
+        self.assertEqual(self.client.get('/points/pending',headers=self.headers).status_code,400)
+        self.actor=self.outsider
+        self.assertEqual(self.client.get(f'/points/camps/{original.id}/rewards',headers=self.headers).status_code,403)
+        self.assertEqual(self.client.get(f'/points/camps/{original.id}/tasks',headers=self.headers).status_code,403)
+        self.actor=self.teacher
+        self.assertEqual(self.client.get(f'/points/manage/meta?camp_id={self.camp.id}',headers=self.headers).status_code,403)
+        self.assertEqual([r['id'] for r in self.client.get(f'/points/manage/meta?camp_id={original.id}',headers=self.headers).json['camps']],[original.id])
+
+    def test_personal_summary_no_longer_contains_camp_administration(self):
+        with patch('points_center_client.get_user_points',return_value={'balance':1280}):
+            result=self.client.get('/points/me',headers=self.headers).json
+        self.assertNotIn('can_manage',result)
+        self.assertNotIn('pending_total',result)
 
 
 if __name__=='__main__':unittest.main()
