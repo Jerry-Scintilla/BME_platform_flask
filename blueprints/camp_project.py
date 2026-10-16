@@ -190,7 +190,11 @@ def _app_dict(a, names=None):
 
 
 def _project_dict(unit, profile, names, member_count=0, my_role=None, my_pref_rank=None):
+    from services.projects.legacy import mapping
+    linked=mapping(unit.id)
     return {
+        "project_id":linked.project_id if linked else None,
+        "binding_id":linked.binding_id if linked else None,
         "unit_id": unit.id, "name": unit.name, "status": unit.status,
         "visibility": unit.visibility,
         "leader_user_id": unit.owner_user_id,

@@ -140,3 +140,7 @@ For details, view the [LICENSE](LICENSE) file or visit: [CC BY-NC-ND 4.0](https:
 ### 项目营工作区
 
 项目营侧栏工作区、老师只读看板、节点通知定位及本地专项检查见 [工作区与灰测交付](docs/project-workspace.md)。本轮不新增结构迁移，配套前端与后端交付分支均为 `feature/camp-group-core`；部署前核对既有迁移77、78及生产配置。
+
+### 独立项目与项目日历
+
+长期项目、D0、日历、团队和参营关联见[部署交接](docs/deploy/独立项目与项目日历-202610.md)。此后续重构需要先执行迁移79，`PROJECT_CORE_ENABLED`默认关闭；既有项目按显式映射切换，不按名称自动合并。阶段进度保存在`docs/project-core-progress.json`，检查只覆盖相关功能和直接依赖。

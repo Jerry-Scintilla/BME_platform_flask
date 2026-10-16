@@ -13,6 +13,7 @@ for key in ['DB_HOST','DB_PORT','DB_USERNAME','DB_PASSWORD','REDIS_URL']:
 os.environ['JWT_SECRET']='local-workspace-preview-only-secret-20261016'
 os.environ['DEV_TEST_ACCOUNTS']='on';os.environ['AUTH_REFRESH_COOKIE_ENABLED']='false'
 os.environ['POINTS_CENTER_ENABLED']='false';os.environ['IDENTITY_ENFORCEMENT_MODE']='shadow'
+os.environ['PROJECT_CORE_ENABLED']='true'
 os.environ['IDENTITY_VERIFY_GATE_DEFAULT']='shadow';os.environ['STORAGE_BACKEND']='local'
 os.environ['DATA_ROOT']=str(root/'data/workspace-preview')
 database='bme_workspace_preview_20261016'
@@ -29,16 +30,21 @@ from storage import storage
 app=Flask(__name__);app.config.from_object(config)
 app.config.update(SQLALCHEMY_DATABASE_URI=URL.create('mysql+pymysql',username=env.get('DB_USERNAME'),password=env.get('DB_PASSWORD'),host=env.get('DB_HOST') or '127.0.0.1',port=int(env.get('DB_PORT') or 3306),database=database,query={'charset':'utf8mb4'}),RATELIMIT_ENABLED=False)
 db.init_app(app);mail.init_app(app);limiter.init_app(app);redis_client.init_app(app);storage.init_app(app);JWTManager(app)
-CORS(app,origins=['http://127.0.0.1:18096','http://localhost:18096'],supports_credentials=True)
-from blueprints import (auth_bp,user_bp,camp_bp,camp_staff_bp,camp_project_bp,camp_delivery_bp,camp_meeting_bp,camp_announcement_bp,notification_bp,medal_bp)
+CORS(app,origins=['http://127.0.0.1:18096','http://localhost:18096','http://127.0.0.1:15196'],supports_credentials=True)
+from blueprints import (auth_bp,user_bp,camp_bp,camp_staff_bp,camp_project_bp,camp_delivery_bp,camp_meeting_bp,camp_announcement_bp,notification_bp,medal_bp,project_core_bp)
 from blueprints.points import bp as points_bp
-for bp in [auth_bp,user_bp,camp_bp,camp_staff_bp,camp_project_bp,camp_delivery_bp,camp_meeting_bp,camp_announcement_bp,notification_bp,medal_bp,points_bp]:app.register_blueprint(bp)
+for bp in [auth_bp,user_bp,camp_bp,camp_staff_bp,camp_project_bp,camp_delivery_bp,camp_meeting_bp,camp_announcement_bp,notification_bp,medal_bp,points_bp,project_core_bp]:app.register_blueprint(bp)
 from services.request_guard import enforce_request_access
 app.before_request(enforce_request_access)
+from services.projects.legacy import install as install_project_fence
+install_project_fence(app)
 import models as m
 from services.identity.person import create_provisional
 from services.camp_groups import projects
 with app.app_context():
+ from sqlalchemy import inspect,text
+ if inspect(db.engine).has_table('project_core_project') and 'migration_ready' not in {c['name'] for c in inspect(db.engine).get_columns('project_core_project')}:
+  with db.engine.begin() as connection:connection.execute(text('ALTER TABLE project_core_project ADD COLUMN migration_ready BOOLEAN NOT NULL DEFAULT 1'))
  db.create_all()
  if not m.CampSession.query.filter_by(name='项目工作台 · 本地试用').first():
   def user(name,email,admin=False):
@@ -83,7 +89,37 @@ with app.app_context():
   snapshot={'camp':{'id':archived.id,'name':archived.name},'members':[{'user':leader.username,'role':'member'}],'units':[{'unit_id':999,'name':'历史项目','leader':leader.username,'leader_user_id':leader.id,'status':'active','members':[{'user':leader.username,'user_id':leader.id,'role':'leader','status':'active'}],'milestones':[{'id':999,'title':'历史交付记录','status':'approved','node_complete':True,'evaluations':[]}],'verified_outcomes':[{'title':'历史结题报告','description':'归档时冻结的成果。'}]}]}
   db.session.add(m.CampArchive(camp_session_id=archived.id,snapshot=json.dumps(snapshot,ensure_ascii=False),frozen_by=admin.id));db.session.commit()
  camp=m.CampSession.query.filter_by(name='项目工作台 · 本地试用').one()
+ from services.projects import core as project_core
+ standalone=m.Project.query.filter_by(title='独立项目 · 日历试用').first()
+ if standalone is None:
+  standalone_id=project_core.create(leader,{'title':'独立项目 · 日历试用','goal':'不依赖营期，持续记录研发节点和项目历史。','idempotency_key':'preview-standalone'})['project']['id']
+  standalone=db.session.get(m.Project,standalone_id)
+  project_core.change_member(leader,standalone_id,{'action':'add','user_id':m.UserModel.query.filter_by(email='workspace-member@seed.dev').one().id,'expected_version':standalone.version,'reason':'本地独立项目试用','idempotency_key':'preview-standalone-member'})
+  db.session.commit()
+ if standalone.zero_date is None:
+  from services.projects import calendar as project_calendar
+  project_calendar.change_zero(leader,standalone.id,{'zero_date':'2026-10-16','confirm':True,'reason':'本地演示启动日','expected_version':standalone.version,'idempotency_key':'preview-project-zero'})
+  db.session.commit()
+ if not m.ProjectMilestone.query.filter_by(project_id=standalone.id).first():
+  from services.projects import calendar as project_calendar
+  for index,(title,offset) in enumerate([('需求评审',7),('首版样机验证',21),('阶段成果确认',45)]):
+   project_calendar.save_item(leader,standalone.id,'milestone',{'title':title,'schedule_mode':'relative','offset_days':offset,'reason':'本地演示计划','expected_version':standalone.version,'idempotency_key':'preview-research-node-'+str(index)})
+  db.session.commit()
  preview_camp_ids={'running':camp.id,'training':training.id,'archived':archived.id}
+ core_camp=m.CampSession.query.filter_by(name='项目营 · 独立项目关联演示').first()
+ if core_camp is None:
+  core_camp=m.CampSession(name='项目营 · 独立项目关联演示',category='project',status='selecting',is_featured=True,start_date=date.today()-timedelta(days=7),end_date=date.today()+timedelta(days=90),policy=m.CampPolicy(capabilities=json.dumps({'attendance':False,'leave':False,'seat':False})))
+  db.session.add(core_camp);db.session.flush();db.session.add(m.CampStaff(camp_session_id=core_camp.id,user_id=teacher.id,role='teacher',status='active',assigned_by=admin.id))
+  from services.projects import camps as project_camps
+  request_data=project_camps.request_binding(admin,standalone.id,{'camp_id':core_camp.id,'user_ids':[leader.id,m.UserModel.query.filter_by(email='workspace-member@seed.dev').one().id],'reason':'独立项目参营演示','expected_version':standalone.version,'idempotency_key':'preview-core-binding'})
+  binding_data=request_data['binding']
+  approved=project_camps.operate(admin,standalone.id,binding_data['id'],{'action':'approve','expected_version':standalone.version,'expected_binding_version':binding_data['version'],'reason':'本地试用审批','idempotency_key':'preview-core-approve'})
+  mapped_unit=approved['binding']['unit_id']
+  node=m.CampMilestone(camp_session_id=core_camp.id,unit_id=mapped_unit,title='本期阶段汇报',due_date=date.today()+timedelta(days=14))
+  db.session.add(node);db.session.flush()
+  db.session.add(m.ProjectAssessmentLink(camp_milestone_id=node.id,binding_id=binding_data['id']))
+  db.session.commit()
+ preview_camp_ids['independent']=core_camp.id
  member=m.UserModel.query.filter_by(email='workspace-member@seed.dev').one()
  dual=m.UserModel.query.filter_by(email='workspace-dual@seed.dev').one()
  newcomer=m.UserModel.query.filter_by(email='workspace-newcomer@seed.dev').first()

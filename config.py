@@ -175,3 +175,6 @@ if IDENTITY_VERIFY_GATE_DEFAULT not in ("off", "shadow", "enforce"):
     raise RuntimeError(f"IDENTITY_VERIFY_GATE_DEFAULT 取值非法：{IDENTITY_VERIFY_GATE_DEFAULT}")
 IDENTITY_VERIFY_GATES_RAW = os.getenv("IDENTITY_VERIFY_GATES", "")
 VERIFY_GATE_GROUPS = ("appoint", "community", "camp_apply", "camp_submit", "publish")
+
+# 独立项目灰度入口；存量项目写模型另由服务器映射状态控制。
+PROJECT_CORE_ENABLED = os.getenv("PROJECT_CORE_ENABLED", "false").lower() in ("1", "on", "true")

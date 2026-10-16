@@ -10,6 +10,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from exts import db
 
+# 独立项目表由单独模块维护，外键在统一metadata中解析。
+from project_models import Project, ProjectChange, ProjectCommand, ProjectMilestone, ProjectCalendarEvent
+from project_models import ProjectCampBinding, ProjectCampParticipant, ProjectLegacyMap, ProjectAssessmentLink
+from project_models import ProjectRecord, ProjectRecordFile, ProjectBindingSnapshot, ProjectReminder
+
 
 class UserModel(db.Model):
     __tablename__ = 'user'
@@ -2326,6 +2331,7 @@ class CampUnit(db.Model):
     legacy_owner_user_id = db.Column('owner_user_id', db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     group_id = db.Column(db.Integer, db.ForeignKey('camp_group.id', name='fk_camp_unit_group'))
     camp_group = db.relationship('CampGroup', foreign_keys=[group_id])
+    project_link = db.relationship('ProjectLegacyMap',foreign_keys='ProjectLegacyMap.unit_id',uselist=False,lazy='joined')
     created_at = db.Column(db.DateTime, default=datetime.now)
     __table_args__ = (
         db.UniqueConstraint('camp_session_id', 'unit_type', 'name', name='uq_unit_camp_type_name'),
@@ -2334,6 +2340,9 @@ class CampUnit(db.Model):
 
     @hybrid_property
     def name(self):
+        if self.id:
+            row=self.project_link
+            if row and row.write_model=='project':return row.project.title
         return self.camp_group.name if self.group_id else self.legacy_name
 
     @name.setter
@@ -2344,11 +2353,14 @@ class CampUnit(db.Model):
 
     @name.expression
     def name(cls):
-        return db.func.coalesce(db.select(CampGroup.name).where(
+        return db.func.coalesce(db.select(Project.title).join(ProjectLegacyMap,ProjectLegacyMap.project_id==Project.id).where(ProjectLegacyMap.unit_id==cls.id,ProjectLegacyMap.write_model=='project').scalar_subquery(),db.select(CampGroup.name).where(
             CampGroup.id == cls.group_id).scalar_subquery(), cls.legacy_name)
 
     @hybrid_property
     def owner_user_id(self):
+        if self.id:
+            row=self.project_link
+            if row and row.write_model=='project':return row.binding.leader_user_id
         return self.camp_group.owner_user_id if self.group_id else self.legacy_owner_user_id
 
     @owner_user_id.setter
@@ -2359,7 +2371,8 @@ class CampUnit(db.Model):
 
     @owner_user_id.expression
     def owner_user_id(cls):
-        return db.func.coalesce(db.select(CampGroup.owner_user_id).where(
+        return db.func.coalesce(db.select(ProjectCampBinding.leader_user_id).join(ProjectLegacyMap,ProjectLegacyMap.binding_id==ProjectCampBinding.id).where(
+            ProjectLegacyMap.unit_id==cls.id,ProjectLegacyMap.write_model=='project').scalar_subquery(),db.select(CampGroup.owner_user_id).where(
             CampGroup.id == cls.group_id).scalar_subquery(), cls.legacy_owner_user_id)
 
 

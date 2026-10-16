@@ -21,6 +21,7 @@ from . import identity
 ROLES = {
     'training': frozenset({'learner', 'mentor'}),
     'project': frozenset({'project_leader', 'project_member'}),
+    'project_core': frozenset({'project_leader', 'project_member'}),
 }
 APPOINTED_ROLES = frozenset({'mentor', 'project_leader'})
 
@@ -63,7 +64,7 @@ class GroupService:
         self._policies = dict(policies or {})
         for kind, policy in self._policies.items():
             if kind not in ROLES or not isinstance(policy, GovernancePolicy):
-                raise ValueError('仅接受 training/project 的 GovernancePolicy 实现')
+                raise ValueError('仅接受已注册业务类型的 GovernancePolicy 实现')
 
     def _policy(self, context):
         if not isinstance(context, GovernanceContext) or not isinstance(context.kind, str):

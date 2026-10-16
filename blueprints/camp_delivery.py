@@ -41,6 +41,13 @@ from .media_sign import media_token_response, resolve_media_request
 
 bp = Blueprint("camp_delivery", __name__, url_prefix="/camp")
 
+from services.groups import GroupError
+
+@bp.errorhandler(GroupError)
+def group_error(exc):
+    db.session.rollback()
+    return jsonify({'code':exc.status,'message':str(exc),'error':exc.machine}),exc.status
+
 # 总附件留出 multipart 开销，兼容生产代理的 50MiB 请求上限。
 MAX_FILE_MB = 48
 MAX_FILES = 20
@@ -110,7 +117,18 @@ def _recompute_milestone_status(m):
 
 
 def _lock_delivery(m):
-    """与结营共用营期行锁，防止检查可写后发生归档；节点锁串行化版本链。"""
+    """与长期项目及结营共用持锁顺序，再串行化节点版本链。"""
+    from services.camp_groups.projects import lock_project
+    unit=db.session.get(CampUnit,m.unit_id)
+    recipients=set()
+    args=request.view_args or {}
+    if args.get('member_uid'):recipients.add(args['member_uid'])
+    if args.get('sid'):
+        submission=db.session.get(CampSubmissionVersion,args['sid'])
+        if submission:recipients.add(submission.submitted_by)
+    if request.endpoint=='camp_delivery.submission_create' and _current_user().id==unit.owner_user_id:
+        recipients.update(u.id for u in UserModel.query.filter(UserModel.role.in_(('admin','super_admin'))))
+    lock_project(unit,_current_user().id,recipients)
     camp = CampSession.query.filter_by(id=m.camp_session_id).populate_existing().with_for_update().one()
     unit = CampUnit.query.filter_by(id=m.unit_id).populate_existing().with_for_update().one()
     m = CampMilestone.query.filter_by(id=m.id).populate_existing().with_for_update().one()
@@ -765,7 +783,9 @@ def attachment_token(aid):
     if err:
         return err
     user = _current_user()
-    if not _unit_role(unit, user) and not has_camp_access(user, camp.id, 'project.read_all'):
+    viewer_role=_unit_role(unit,user)
+    from services.projects.legacy import historical_reader
+    if (not viewer_role or (viewer_role=='member' and s.submitted_by!=user.id)) and not has_camp_access(user, camp.id, 'project.read_all') and not historical_reader(unit.id,user,s):
         return jsonify({"code": 403, "message": "仅项目成员或本营管理老师可下载附件"}), 403
     return media_token_response('submission', aid, user.id)
 
@@ -785,7 +805,9 @@ def attachment_download(aid):
     user, auth_err = resolve_media_request('submission', aid)
     if auth_err:
         return auth_err
-    if not _unit_role(unit, user) and not has_camp_access(user, camp.id, 'project.read_all'):
+    viewer_role=_unit_role(unit,user)
+    from services.projects.legacy import historical_reader
+    if (not viewer_role or (viewer_role=='member' and s.submitted_by!=user.id)) and not has_camp_access(user, camp.id, 'project.read_all') and not historical_reader(unit.id,user,s):
         return jsonify({"code": 403, "message": "仅项目成员或本营管理老师可下载附件"}), 403
     try:
         obj = storage.get_object(a.object_key)
@@ -940,18 +962,21 @@ def freeze_camp_archive(camp, operator_id, *, commit=True):
     if CampArchive.query.filter_by(camp_session_id=camp.id).first():
         return None
     names = {}
-    member_rows = CampMember.query.filter_by(camp_session_id=camp.id).all()
+    member_rows = CampMember.query.filter_by(camp_session_id=camp.id).populate_existing().with_for_update().all()
     for u in UserModel.query.filter(UserModel.id.in_(
             {m.user_id for m in member_rows})).all():
         names[u.id] = u.username
-    units = CampUnit.query.filter_by(camp_session_id=camp.id, unit_type='project').all()
+    units = CampUnit.query.filter_by(camp_session_id=camp.id, unit_type='project').populate_existing().with_for_update().all()
     unit_snapshots = []
     for unit in units:
-        um_rows = UnitMembershipRead.query.filter_by(unit_id=unit.id).all()
-        ms_rows = CampMilestone.query.filter_by(unit_id=unit.id).order_by(CampMilestone.order_no).all()
+        from services.camp_groups.reads import current_members
+        um_rows = current_members(unit)
+        ms_rows = CampMilestone.query.filter_by(unit_id=unit.id).order_by(CampMilestone.order_no).populate_existing().with_for_update().all()
         ms_snap = []
         for m in ms_rows:
-            state = delivery_progress(m, unit, [r for r in um_rows if r.status == 'active'])
+            evaluations=CampNodeEvaluation.query.filter_by(milestone_id=m.id).populate_existing().with_for_update().all()
+            submissions=CampSubmissionVersion.query.filter_by(milestone_id=m.id).populate_existing().with_for_update().all()
+            state = delivery_progress(m, unit, [r for r in um_rows if r.status == 'active'],evaluations,submissions)
             finals = [s for s in state['latest_submissions'].values() if s.status == 'approved']
             target_ids = ({unit.owner_user_id} if state['completion_mode'] == 'leader_review' else
                           {e.member_user_id for e in state['evaluations']})
@@ -974,9 +999,9 @@ def freeze_camp_archive(camp, operator_id, *, commit=True):
             for s in final_materials:
                 CampSubmissionAttachment.query.filter_by(submission_id=s.id).update(
                     {CampSubmissionAttachment.is_asset: True})
-        outcomes = [o for o in CampOutcome.query.filter_by(unit_id=unit.id).all()
+        outcomes = [o for o in CampOutcome.query.filter_by(unit_id=unit.id).populate_existing().with_for_update().all()
                     if o.status == 'verified']
-        tpl = ProjectTemplate.query.filter_by(unit_id=unit.id).first()
+        tpl = ProjectTemplate.query.filter_by(unit_id=unit.id).populate_existing().with_for_update().first()
         if tpl:
             tpl.status = 'archived'                       # 资产回流：模板可被复制起步
         unit_snapshots.append({
@@ -1010,8 +1035,13 @@ def freeze_camp_archive(camp, operator_id, *, commit=True):
     for sp in ShowcaseProject.query.filter(
             ShowcaseProject.source == 'camp',
             ShowcaseProject.source_ref.in_([u.id for u in units])).all():
-        sp.project_status = 'done'
+        from services.projects.legacy import mapping
+        from models import Project
+        linked=mapping(sp.source_ref)
+        sp.project_status = ('done' if db.session.get(Project,linked.project_id).status=='completed' else 'ongoing') if linked else 'done'
         sp.archive_ref = archive.id
+    from services.projects.camps import close_camp_bindings
+    close_camp_bindings(camp.id,operator_id)
     if commit:
         db.session.commit()
     return archive

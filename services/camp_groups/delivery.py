@@ -2,7 +2,7 @@
 from sqlalchemy.orm import aliased
 
 from exts import db
-from models import CampMilestone, CampNodeEvaluation, CampSession, CampSubmissionVersion, CampUnit
+from models import CampMilestone, CampNodeEvaluation, CampSession, CampSubmissionVersion, CampUnit,ProjectLegacyMap,Project,ProjectCampBinding
 from services.camp_groups.reads import UnitMembershipRead
 
 
@@ -46,6 +46,9 @@ def pending_reviews():
                     CampSubmissionVersion.submitted_by == CampUnit.owner_user_id,
                     CampUnit.unit_type == 'project', CampUnit.status == 'active',
                     CampSession.status.notin_(('archived', 'deleted')),
+                    ~db.session.query(ProjectLegacyMap.unit_id).join(Project,Project.id==ProjectLegacyMap.project_id).join(ProjectCampBinding,ProjectCampBinding.id==ProjectLegacyMap.binding_id).filter(
+                        ProjectLegacyMap.unit_id==CampUnit.id,ProjectLegacyMap.write_model=='project',
+                        db.or_(Project.status!='active',ProjectCampBinding.status!='active')).exists(),
                     ~db.session.query(newer.id).filter(
                         newer.milestone_id == CampSubmissionVersion.milestone_id,
                         newer.submitted_by == CampSubmissionVersion.submitted_by,

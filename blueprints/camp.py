@@ -521,6 +521,14 @@ def session_transition(sid):
     if action not in CAMP_TRANSITIONS:
         return jsonify({"code": 400, "message": f"未知动作；支持 {'/'.join(CAMP_TRANSITIONS)}"}), 400
     src_status, dst_status = CAMP_TRANSITIONS[action]
+    close_catalog=None
+    if action == 'close':
+        from services.projects.camps import lock_camp_projects
+        from services.groups import GroupError
+        try:close_catalog=lock_camp_projects(sid,_current_user().id)
+        except GroupError as exc:
+            db.session.rollback()
+            return jsonify({'code':exc.status,'message':str(exc),'error':exc.machine}),exc.status
     # 条件更新：并发/重复提交时 rowcount=0 → 读库给出真实状态
     n = CampSession.query.filter(CampSession.id == sid, CampSession.status == src_status)\
         .update({"status": dst_status, "updated_at": datetime.now()})
@@ -532,6 +540,12 @@ def session_transition(sid):
     # 生命周期通知（2026-09-20 补齐，方案 §6.2）：开营/结营对全营成员不再静默变更——
     # 与状态翻转同事务落库；发布/撤回/开放报名阶段成员尚未成形（招募靠 is_featured 指针），不发。
     camp = CampSession.query.get(sid)
+    if action=='close':
+        from services.projects.camps import check_camp_catalog
+        try:check_camp_catalog(sid,close_catalog)
+        except GroupError as exc:
+            db.session.rollback()
+            return jsonify({'code':exc.status,'message':str(exc),'error':exc.machine}),exc.status
     if dst_status in ('running', 'archived'):
         is_learning = camp.category != 'project'
         if dst_status == 'running':

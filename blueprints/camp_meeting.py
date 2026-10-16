@@ -140,7 +140,8 @@ def _can_view(user, m):
         mentor = UserModel.query.get(m.mentor_id)
         return bool(mentor and _in_my_team(m.camp_session_id, mentor, user.id))
     unit = CampUnit.query.get(m.unit_id)
-    return bool(unit and _unit_role(unit, user))
+    from services.projects.legacy import historical_reader
+    return bool(unit and (_unit_role(unit, user) or historical_reader(unit.id,user)))
 
 
 def _can_manage(user, m):
