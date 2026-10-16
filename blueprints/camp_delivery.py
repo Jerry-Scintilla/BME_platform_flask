@@ -474,7 +474,7 @@ def node_evaluation_put(mid, member_uid):
     _notify(member_uid, "节点评价已出",
             f"「{camp.name}」项目「{unit.name}」节点「{m.title}」负责人给出了评价：{score} 分"
             + (f"——{comment}" if comment else ""),
-            camp.id, source_id=unit.id)
+            camp.id, source_id=unit.id, node_id=m.id)
     _recompute_milestone_status(m)
     db.session.commit()
     return jsonify({"code": 200, "message": "评价已保存", "score": score})
@@ -653,7 +653,7 @@ def submission_create(mid):
             _notify(recipient, "有新的节点材料",
                     f"「{unit.name}」{user.username} 提交了节点「{m.title}」第 {version} 版，"
                     + ("请在管理端验收。" if role == 'leader' else "请查看并评价。"),
-                    camp.id, source_id=m.id)
+                    camp.id, source_id=m.id, node_id=m.id)
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -745,7 +745,7 @@ def submission_review(sid):
     tip = "已验收通过" if action == 'approve' else f"被退回：{note}"
     _notify(s.submitted_by, f"材料审核结果：{m.title}",
             f"你在「{unit.name}」节点「{m.title}」提交的第 {s.version} 版材料{tip}。",
-            camp.id, source_id=m.id, important=(action == 'return'))
+            camp.id, source_id=m.id, important=(action == 'return'), node_id=m.id)
     db.session.commit()
     return jsonify({"code": 200, "message": "已通过" if action == 'approve' else "已退回",
                     "milestone_status": m.status})

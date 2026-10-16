@@ -206,14 +206,45 @@ def _project_dict(unit, profile, names, member_count=0, my_role=None, my_pref_ra
     }
 
 
-def _notify(user_id, title, content, camp_id, source_id=None, important=False):
+def _notify(user_id, title, content, camp_id, source_id=None, important=False, node_id=None):
     try:
         create_notification(user_id, title, content, category='camp',
-                            source_type=PROJECT_SOURCE_TYPE,
-                            source_id=source_id or camp_id, camp_session_id=camp_id,
+                            source_type='project_node' if node_id else PROJECT_SOURCE_TYPE,
+                            source_id=node_id or source_id or camp_id, camp_session_id=camp_id,
                             is_important=important)
     except Exception:   # 通知失败不阻断主流程
         pass
+
+
+@bp.route('/projects/<int:sid>/node-target/<int:mid>')
+@jwt_required()
+def node_target(sid, mid):
+    milestone = db.session.get(CampMilestone, mid)
+    if not milestone or milestone.camp_session_id != sid:
+        return jsonify({'code': 404, 'message': '节点不存在或不属于本营期'}), 404
+    unit, camp, err = _unit_or_404(milestone.unit_id)
+    if err:
+        return err
+    if camp.id != sid:
+        return jsonify({'code': 404, 'message': '节点项目不属于本营期'}), 404
+    from .camp_staff import has_camp_access
+    if not project_groups.unit_role(unit, _current_user()) and not has_camp_access(_current_user(), sid, 'project.read_all'):
+        return jsonify({'code': 403, 'message': '无权访问此项目节点'}), 403
+    return jsonify({'code': 200, 'unit_id': unit.id, 'milestone_id': milestone.id})
+
+
+@bp.route('/units/<int:uid>/members')
+@jwt_required()
+def project_members_read(uid):
+    unit, camp, err = _unit_or_404(uid)
+    if err:
+        return err
+    from .camp_staff import has_camp_access
+    if not project_groups.unit_role(unit, _current_user()) and not has_camp_access(_current_user(), camp.id, 'project.read_all'):
+        return jsonify({'code': 403, 'message': '仅项目成员及本营管理老师可查看'}), 403
+    rows = UnitMembershipRead.query.filter_by(unit_id=uid, status='active').all()
+    names = _usernames({row.user_id for row in rows})
+    return jsonify({'code': 200, 'members': [{'user_id': r.user_id, 'username': names.get(r.user_id, str(r.user_id)), 'role': r.role} for r in rows]})
 
 
 # ─────────────────────────────────────────────

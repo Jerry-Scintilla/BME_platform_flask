@@ -136,3 +136,7 @@ For details, view the [LICENSE](LICENSE) file or visit: [CC BY-NC-ND 4.0](https:
 个人余额、训练营奖励规则、发放审核与记录见 [积分联动上线说明](docs/deploy/积分联动-上线与接口.md)。
 部署时先执行迁移 78，再显式开启 `POINTS_REWARDS_ENABLED`；默认不创建奖励规则或发放积分。
 商城全量消费流水接口尚未向训练营开放，目前通过商城入口查看。
+
+### 项目营工作区
+
+项目营侧栏工作区、老师只读看板、节点通知定位及本地专项检查见 [工作区与灰测交付](docs/project-workspace.md)。本轮不新增结构迁移，配套前端与后端交付分支均为 `feature/camp-group-core`；部署前核对既有迁移77、78及生产配置。
