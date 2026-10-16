@@ -468,6 +468,10 @@ def init_camp_scheduler(app):
         trigger=CronTrigger(hour=8, minute=30, timezone=tz_name),
         args=[app], id="camp_attendance_daily_digest",
         coalesce=True, max_instances=1, misfire_grace_time=7200, replace_existing=True)
+    if app.config.get('POINTS_REWARDS_ENABLED'):
+        sched.add_job(_job_points_rewards, trigger=IntervalTrigger(minutes=5, timezone=tz_name),
+            args=[app], id='camp_points_rewards', coalesce=True, max_instances=1,
+            misfire_grace_time=300, replace_existing=True)
     sched.start()
     _scheduler = sched
     app.logger.info(f"[camp_scheduler] 已启动：志愿/任务/课内截止提醒（30 分钟扫描）+ "
@@ -482,3 +486,13 @@ def _chapter_responsibility_matches(meeting, uid, chapter_id):
     chapter = db.session.get(Chapter, chapter_id)
     return bool(chapter and CampCourseAssignment.query.filter_by(camp_session_id=meeting.camp_session_id,
         student_user_id=uid, course_id=chapter.course_id, status='active', unit_id=meeting_unit_id(meeting)).first())
+
+
+def _job_points_rewards(app):
+    from services.points import run_worker
+    with app.app_context():
+        try:
+            run_worker()
+        except Exception:
+            db.session.rollback()
+            app.logger.exception('积分奖励处理失败，将在下一轮重试')

@@ -295,3 +295,34 @@ def create_sso_ticket(platform_user_id):
             category="CONTRACT",
         )
     return ticket, expires_in
+
+
+def _number(value):
+    import math
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def get_user_points(platform_user_id, email):
+    """只读余额；不以读请求自动开户，始终核对当前平台身份。"""
+    from urllib.parse import quote
+    data = _request('GET', f'/platform-api/v1/users/{quote(platform_user_id, safe="")}/points')
+    if (data.get('platform_user_id') != platform_user_id or
+            _norm_email(data.get('email')) != _norm_email(email) or
+            type(data.get('user_id')) is not int or not _number(data.get('balance'))):
+        raise PointsCenterError('积分账户响应不匹配', category='CONTRACT')
+    return data
+
+
+def change_points(platform_user_id, amount, reason, idempotency_key):
+    """按已核验的 OpenAPI 发放或扣减；重试始终沿用队列中的同一个幂等键。"""
+    if type(amount) is not int or amount == 0:
+        raise PointsCenterError('积分必须为非零整数', category='REQUEST')
+    path = '/platform-api/v1/points/grant' if amount > 0 else '/platform-api/v1/points/consume'
+    data = _request('POST', path, dict(platform_user_id=platform_user_id,
+        amount=abs(amount), reason=reason, idempotency_key=idempotency_key))
+    if (data.get('idempotency_key') != idempotency_key or
+            not isinstance(data.get('transaction_uuid'), str) or not data['transaction_uuid'] or
+            not _number(data.get('amount')) or abs(data['amount']) != abs(amount) or
+            not _number(data.get('balance_after'))):
+        raise PointsCenterError('积分入账结果未确认', category='CONTRACT')
+    return data

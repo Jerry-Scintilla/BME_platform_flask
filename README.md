@@ -130,3 +130,9 @@ For details, view the [LICENSE](LICENSE) file or visit: [CC BY-NC-ND 4.0](https:
 本次只提交代码及迁移脚本，未执行业务数据库迁移或部署。
 
 轻量验证：`PYTHONPATH=.:scripts python -m unittest test_chapter_certification_timing`。
+
+### 积分联动
+
+个人余额、训练营奖励规则、发放审核与记录见 [积分联动上线说明](docs/deploy/积分联动-上线与接口.md)。
+部署时先执行迁移 78，再显式开启 `POINTS_REWARDS_ENABLED`；默认不创建奖励规则或发放积分。
+商城全量消费流水接口尚未向训练营开放，目前通过商城入口查看。
