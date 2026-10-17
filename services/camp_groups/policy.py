@@ -29,6 +29,9 @@ class ProjectGovernancePolicy(GovernancePolicy):
         unit, camp = self._resolve(context, lock=not reading)
         if context.kind != 'project':
             return None
+        if not reading:
+            from services.projects.legacy import assert_legacy_team_write
+            assert_legacy_team_write(unit.id)
         if group is None:
             if action != 'create_group' or unit.group_id is not None:
                 return None

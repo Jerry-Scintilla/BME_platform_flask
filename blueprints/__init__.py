@@ -437,6 +437,7 @@ from .camp_staff import bp as camp_staff_bp
 from .camp_announcement import bp as camp_announcement_bp
 from .camp_ms import bp as camp_ms_bp
 from .camp_project import bp as camp_project_bp
+from .project_core import bp as project_core_bp
 from .camp_delivery import bp as camp_delivery_bp
 from .camp_material import bp as camp_material_bp
 from .camp_meeting import bp as camp_meeting_bp
@@ -483,6 +484,7 @@ __all__ = [
     'camp_announcement_bp',
     'camp_ms_bp',
     'camp_project_bp',
+    'project_core_bp',
     'camp_delivery_bp',
     'camp_material_bp',
     'camp_meeting_bp',

@@ -24,14 +24,27 @@ def require_bound(unit):
 
 
 def lock_project(unit, actor_id, user_ids=()):
-    """统一顺序：所有账号、人员、核心组、单元、营期。"""
-    ids = sorted(set(user_ids) | {actor_id})
-    users = UserModel.query.filter(UserModel.id.in_(ids)).order_by(UserModel.id).populate_existing().with_for_update().all()
-    person_ids = sorted({user.person_id for user in users if user.person_id})
-    if person_ids:
-        PersonModel.query.filter(PersonModel.id.in_(person_ids)).order_by(PersonModel.id).populate_existing().with_for_update().all()
-    if unit.group_id:
-        CampGroup.query.filter_by(id=unit.group_id).populate_existing().with_for_update().one()
+    """统一顺序：账号、人员、核心组、长期项目、单元、营期。"""
+    from services.projects import core as project_core
+    from services.projects.legacy import mapping
+    from models import Project,ProjectLegacyMap
+    linked=mapping(unit.id)
+    if linked:
+        project=project_core.lock(db.session.get(Project,linked.project_id),db.session.get(UserModel,actor_id),additional_user_ids=user_ids)
+        if project._snapshot_stale:
+            raise GroupError('项目在等待期间已变化，请刷新重试',machine='PROJECT_VERSION_CONFLICT')
+    else:
+        group=db.session.get(CampGroup,unit.group_id) if unit.group_id else None
+        version=group.version if group else None
+        ids=set(user_ids)|{actor_id,unit.owner_user_id}
+        if group:ids.update(m.user_id for m in GroupMembership.query.filter_by(group_id=group.id,status='active'))
+        project_core.lock_accounts(ids)
+        if group:
+            CampGroup.query.filter_by(id=group.id).populate_existing().with_for_update().one()
+            if group.version!=version:raise GroupError('项目名单已变化，请刷新重试',machine='GROUP_VERSION_CONFLICT')
+        current=ProjectLegacyMap.query.filter_by(unit_id=unit.id).populate_existing().with_for_update().first()
+        if current and current.write_model=='project':
+            raise GroupError('项目入口已切换，请刷新后重试',machine='PROJECT_CORE_WRITE_REQUIRED')
     CampUnit.query.filter_by(id=unit.id).populate_existing().with_for_update().one()
     CampSession.query.filter_by(id=unit.camp_session_id).populate_existing().with_for_update().one()
 
@@ -176,6 +189,15 @@ def unit_role(unit, user):
         return None
     if user.is_admin():
         return 'leader'
+    from services.projects.legacy import binding_for
+    binding=binding_for(unit.id)
+    if binding:
+        from models import ProjectCampParticipant,Project
+        from services.projects.core import role as project_role
+        if not CampMember.query.filter_by(camp_session_id=unit.camp_session_id,user_id=user.id,status='active').first():return None
+        part=ProjectCampParticipant.query.filter_by(binding_id=binding.id,user_id=user.id,status='active').first()
+        if not part or not project_role(db.session.get(Project,binding.project_id),user):return None
+        return 'leader' if binding.leader_user_id==user.id else 'member'
     if not unit.group_id:
         if not CampMember.query.filter_by(camp_session_id=unit.camp_session_id,
                                           user_id=user.id, status='active').first():
@@ -256,9 +278,15 @@ def select_members(unit, actor_id, operations, key, expected_version):
 def end_camp_participations(sid, user_id, actor_id, reason):
     """退营先结束绑定组参与；仍为负责人时要求先转交，不留下隐形复活职务。"""
     GroupService._lock_users(actor_id, user_id)
+    from models import ProjectLegacyMap,ProjectCampParticipant,ProjectCampBinding
+    owned=db.session.query(ProjectLegacyMap.unit_id).filter(ProjectLegacyMap.write_model=='project')
+    parts=ProjectCampParticipant.query.join(ProjectCampBinding).filter(ProjectCampBinding.camp_session_id==sid,ProjectCampParticipant.user_id==user_id,ProjectCampParticipant.status=='active').all()
+    if any(db.session.get(ProjectCampBinding,p.binding_id).leader_user_id==user_id and db.session.get(ProjectCampBinding,p.binding_id).status=='active' for p in parts):
+        raise GroupError('请先交接本期负责人，再结束本期参与',machine='PROJECT_BINDING_HANDOFF_REQUIRED')
+    for part in parts:part.status='ended';part.ended_at=datetime.now()
     units = CampUnit.query.join(GroupMembership, GroupMembership.group_id == CampUnit.group_id).filter(
         CampUnit.camp_session_id == sid, CampUnit.unit_type == 'project', GroupMembership.user_id == user_id,
-        GroupMembership.status == 'active').order_by(CampUnit.id).all()
+        GroupMembership.status == 'active',~CampUnit.id.in_(owned)).order_by(CampUnit.id).all()
     if any(unit.owner_user_id == user_id for unit in units):
         raise GroupError('请先转交该成员负责的项目，再移出营期', machine='GROUP_OWNER_REQUIRED')
     if units and not db.session.get(UserModel, actor_id).is_admin():

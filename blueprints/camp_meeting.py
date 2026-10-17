@@ -140,7 +140,8 @@ def _can_view(user, m):
         mentor = UserModel.query.get(m.mentor_id)
         return bool(mentor and _in_my_team(m.camp_session_id, mentor, user.id))
     unit = CampUnit.query.get(m.unit_id)
-    return bool(unit and _unit_role(unit, user))
+    from services.projects.legacy import historical_reader
+    return bool(unit and (_unit_role(unit, user) or historical_reader(unit.id,user)))
 
 
 def _can_manage(user, m):
@@ -475,6 +476,13 @@ def camp_meetings_all(sid):
         return jsonify({"code": 400, "message": "page_size 需在 1-50 之间"}), 400
 
     q = CampMeeting.query.filter_by(camp_session_id=sid)
+
+    unit_id = request.args.get('unit_id')
+    if unit_id:
+        unit = db.session.get(CampUnit, int(unit_id)) if unit_id.isdigit() else None
+        if not unit or unit.camp_session_id != sid or unit.unit_type != 'project':
+            return jsonify({'code': 400, 'message': '项目不属于本营期'}), 400
+        q = q.filter(CampMeeting.scope == 'unit', CampMeeting.unit_id == unit.id)
 
     # mentor_id 筛选：须为本营导生（跨营 400）；语义=培训组（scope='team'）
     mentor_id = request.args.get('mentor_id')

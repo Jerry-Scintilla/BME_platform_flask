@@ -31,6 +31,8 @@ class CampGroupAdapterSmoke(unittest.TestCase):
                       CampMembershipEvent, CampPersonParticipationModel, UnitPersonParticipationModel,
                       LegacyUnitMembershipMap):
             include(model.__table__)
+        from models import ProjectLegacyMap, ProjectCampParticipant
+        include(ProjectLegacyMap.__table__); include(ProjectCampParticipant.__table__)
         db.metadata.create_all(db.engine, tables=list(tables))
         self.camp = CampSession(name='项目适配检查', category='project', status='selecting',
                                 start_date=date(2026, 10, 1), end_date=date(2026, 12, 1))

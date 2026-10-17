@@ -32,7 +32,7 @@ from . import audit_log, _current_user
 bp = Blueprint("showcase", __name__, url_prefix="/showcase")
 
 PROJECT_STATUS = ('idea', 'ongoing', 'done')
-SOURCE_TEXT = {'camp': '营期项目', 'community': '自由分享'}
+SOURCE_TEXT = {'camp': '营期项目', 'community': '自由分享', 'project':'长期项目'}
 STATUS_TEXT = {'idea': '构思中', 'ongoing': '进行中', 'done': '已完成'}
 GALLERY_MAX = 9          # 图集上限（单次+存量合计）
 IMG_EXTS = ("jpg", "jpeg", "png", "webp")
@@ -91,7 +91,7 @@ def _p_dict(p, user=None, favorited=None, owner=None, fav_count=None):
     }
     if user is not None:
         out["favorited"] = bool(favorited)
-        out["can_manage"] = user.is_admin() or p.owner_user_id == user.id
+        out["can_manage"] = _can_manage(p,user)
     # camp 溯源：营期名 + 周期（列表路径由调用方批量补齐，见 project_list）
     if p.source == 'camp' and p.source_ref:
         unit = CampUnit.query.get(p.source_ref)
@@ -104,6 +104,11 @@ def _p_dict(p, user=None, favorited=None, owner=None, fav_count=None):
 
 
 def _can_manage(p, user):
+    if p.source=='project':
+        from models import Project
+        from services.projects.core import role
+        project=db.session.get(Project,p.source_ref)
+        return bool(project and role(project,user) in ('admin','leader'))
     return user.is_admin() or p.owner_user_id == user.id
 
 

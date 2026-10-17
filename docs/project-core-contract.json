@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "baseline": {"frontend": "390ed3a", "backend": "ed40f70"},
+  "domains": {
+    "project": ["identity", "team", "lifecycle", "day_zero", "research_milestones", "calendar", "shared_records"],
+    "camp": ["admission", "staff", "attendance", "leave", "points", "assessment", "camp_archive"],
+    "binding": ["camp_participants", "assessment_scope", "shared_content_scope"]
+  },
+  "invariants": [
+    "project_can_exist_without_camp",
+    "camp_closure_does_not_close_project",
+    "camp_exit_does_not_end_project_membership",
+    "research_completion_is_not_camp_assessment_completion",
+    "legacy_ids_are_not_project_ids",
+    "one_project_team_write_source",
+    "private_submissions_keep_original_acl",
+    "points_keys_and_camp_ids_unchanged"
+  ],
+  "write_models": ["legacy", "shadow", "project"],
+  "new_api_prefix": "/project-core",
+  "project_route": "/project-workspace/:projectId",
+  "public_showcase_route_unchanged": "/projects/:id",
+  "rollback": "After project writes begin, use the compatibility release; do not restore an arbitrary legacy writer.",
+  "verification": "Targeted checks per stage; no full regression."
+}

@@ -29,6 +29,9 @@ docs/*
 !docs/group-core.md
 !docs/project-delivery.md
 !docs/project-dashboard.md
+!docs/project-workspace.md
+!docs/project-core-contract.json
+!docs/project-core-progress.json
 !docs/legacy-group-retirement.md
 init_seats_*.py
 litellm_proxy_config.yaml
