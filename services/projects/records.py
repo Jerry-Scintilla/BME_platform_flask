@@ -160,9 +160,22 @@ def extra_calendar(project,user,binding=None,start=None,end=None,force_binding=F
     for b in bindings:
         visible=camps.staff(user,b.camp_session_id) or db.session.query(camps.ProjectCampParticipant.id).filter_by(binding_id=b.id,user_id=user.id).first()
         if not visible or not b.legacy_unit_id:continue
-        query=CampMilestone.query.filter_by(unit_id=b.legacy_unit_id)
-        if start:query=query.filter(CampMilestone.due_date.between(start,end))
-        for node in query.limit(501):
-            items.append({'id':node.id,'key':f'assessment:{node.id}','source':'assessment','kind':'assessment','title':node.title+' · '+db.session.get(camps.CampSession,b.camp_session_id).name,
-                'content':'本期考核记录；研发完成状态单独管理。','due_on':node.due_date.isoformat() if node.due_date else None,'actual_on':None,'schedule_mode':'absolute','offset_days':None,'status':'done' if node.status=='approved' else 'planned','day_number':(node.due_date-basis).days if node.due_date and basis else None,'actual_day_number':None,'overdue':False,'can_edit':False,'binding_id':b.id,'unit_id':b.legacy_unit_id})
+        node_basis=basis
+        if b.status=='ended':
+            frozen=db.session.get(ProjectBindingSnapshot,b.id)
+            if not frozen:continue
+            snapshot=frozen.snapshot
+            node_basis=core.day(snapshot.get('zero_date',snapshot.get('project',{}).get('zero_date')))
+            nodes=[node for node in snapshot.get('assessment_nodes',[]) if not start or (
+                node.get('due_date') and start.isoformat()<=node['due_date']<=end.isoformat())][:501]
+        else:
+            query=CampMilestone.query.filter_by(unit_id=b.legacy_unit_id)
+            if start:query=query.filter(CampMilestone.due_date.between(start,end))
+            nodes=[{'id':node.id,'title':node.title,'due_date':node.due_date.isoformat() if node.due_date else None,
+                    'node_complete':node.status=='approved'} for node in query.limit(501)]
+        camp_name=db.session.get(camps.CampSession,b.camp_session_id).name
+        for node in nodes:
+            due=core.day(node.get('due_date'))
+            items.append({'id':node['id'],'key':f'assessment:{node["id"]}','source':'assessment','kind':'assessment','title':node['title']+' · '+camp_name,
+                'content':'本期考核记录；研发完成状态单独管理。','due_on':node.get('due_date'),'actual_on':None,'schedule_mode':'absolute','offset_days':None,'status':'done' if node.get('node_complete') else 'planned','day_number':(due-node_basis).days if due and node_basis else None,'actual_day_number':None,'overdue':False,'can_edit':False,'binding_id':b.id,'unit_id':b.legacy_unit_id})
     return items

@@ -179,8 +179,9 @@ def project_context(pid):
     user=_current_user();bid=binding_arg()
     if bid:
         binding,camp,project=camps.get_binding(pid,bid,user)
-        projected=camps.project_view(project,user,binding,request.args.get('view')=='camp')
-        return result({'project':projected,'binding':camps.summary(binding,user)})
+        camp_view=request.args.get('view')=='camp'
+        projected=camps.project_view(project,user,binding,camp_view)
+        return result({'project':projected,'binding':camps.context_summary(binding,user,project,camp,camp_view=camp_view)})
     return result({'project':core.serialize(core.get_project(pid,user),user),'binding':None})
 
 

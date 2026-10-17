@@ -63,6 +63,81 @@ class ProjectRecordsTest(fixtures.ProjectCampsTest):
         self.assertEqual(retry.status_code,409,retry.json)
         self.assertEqual(db.session.get(m.ProjectCampBinding,binding.id).status,'ended')
 
+    def frozen_calendar_binding(self):
+        p,b=self.setup_binding();self.approve(p,b)
+        project=db.session.get(m.Project,p['id']);binding=db.session.get(m.ProjectCampBinding,b['id'])
+        project.zero_date=date(2026,10,1)
+        node=m.CampMilestone(camp_session_id=self.camp.id,unit_id=binding.legacy_unit_id,
+                            title='本期已完成验收',due_date=date(2026,10,8),status='open')
+        db.session.add(node);db.session.flush()
+        db.session.add(m.CampNodeEvaluation(camp_session_id=self.camp.id,unit_id=binding.legacy_unit_id,
+                       milestone_id=node.id,member_user_id=self.student.id,leader_user_id=self.owner.id,score=80))
+        db.session.commit()
+        result=self.call(self.teacher,'post',f'/project-core/projects/{project.id}/camps/{binding.id}',json={
+            'action':'end','expected_version':project.version,'expected_binding_version':binding.version,
+            'reason':'冻结本期日历','idempotency_key':'freeze-calendar'})
+        self.assertEqual(result.status_code,200,result.json)
+        self.assertTrue(db.session.get(m.ProjectBindingSnapshot,binding.id).snapshot['assessment_nodes'][0]['node_complete'])
+        return project,binding,node
+
+    def test_ended_calendar_uses_frozen_assessment_fields_and_dates(self):
+        project,binding,node=self.frozen_calendar_binding()
+        node.title='冻结后的实时标题';node.due_date=date(2026,11,8);node.status='open'
+        project.zero_date=date(2026,10,10)
+        db.session.add(m.CampMilestone(camp_session_id=self.camp.id,unit_id=binding.legacy_unit_id,
+                                      title='冻结后的新增节点',due_date=date(2026,10,15)))
+        db.session.commit()
+        path=f'/project-core/projects/{project.id}/calendar'
+        for user,suffix in ((self.owner,''),(self.teacher,f'&binding={binding.id}&camp_view=1')):
+            response=self.call(user,'get',path+'?from=2026-10-01&to=2026-10-31'+suffix)
+            self.assertEqual(response.status_code,200,response.json)
+            nodes=[item for item in response.json['items'] if item['source']=='assessment']
+            self.assertEqual(len(nodes),1)
+            item=nodes[0]
+            self.assertEqual(item['id'],node.id);self.assertEqual(item['key'],f'assessment:{node.id}')
+            self.assertEqual(item['title'],'本期已完成验收 · '+self.camp.name)
+            self.assertEqual(item['due_on'],'2026-10-08');self.assertEqual(item['status'],'done')
+            self.assertEqual(item['day_number'],7);self.assertFalse(item['can_edit'])
+            self.assertEqual(item['binding_id'],binding.id);self.assertEqual(item['unit_id'],binding.legacy_unit_id)
+            outside=self.call(user,'get',path+'?from=2026-11-01&to=2026-11-30'+suffix)
+            self.assertEqual(outside.status_code,200,outside.json)
+            self.assertFalse(any(item['source']=='assessment' for item in outside.json['items']))
+
+    def test_mixed_calendar_keeps_active_live_and_ended_frozen(self):
+        project,ended,node=self.frozen_calendar_binding()
+        p,b=self.setup_binding(self.other);self.approve(p,b)
+        active=db.session.get(m.ProjectCampBinding,b['id'])
+        project.zero_date=date(2026,10,10)
+        node.title='不应进入日历的实时旧期标题';node.due_date=date(2026,11,8)
+        current=m.CampMilestone(camp_session_id=self.other.id,unit_id=active.legacy_unit_id,
+                               title='当前营期节点',due_date=date(2026,10,20),status='approved')
+        db.session.add(current);db.session.commit()
+        path=f'/project-core/projects/{project.id}/calendar?from=2026-10-01&to=2026-10-31'
+        response=self.call(self.owner,'get',path)
+        self.assertEqual(response.status_code,200,response.json)
+        nodes={item['binding_id']:item for item in response.json['items'] if item['source']=='assessment'}
+        self.assertEqual(set(nodes),{ended.id,active.id})
+        self.assertEqual(nodes[ended.id]['due_on'],'2026-10-08')
+        self.assertEqual(nodes[ended.id]['day_number'],7)
+        self.assertEqual(nodes[active.id]['title'],'当前营期节点 · '+self.other.name)
+        self.assertEqual(nodes[active.id]['due_on'],'2026-10-20')
+        self.assertEqual(nodes[active.id]['day_number'],10)
+        self.assertEqual(nodes[active.id]['status'],'done')
+        current.title='当前营期更新';current.due_date=date(2026,10,21);current.status='open';db.session.commit()
+        response=self.call(self.owner,'get',path+f'&binding={active.id}')
+        self.assertEqual(response.status_code,200,response.json)
+        item=next(item for item in response.json['items'] if item['source']=='assessment')
+        self.assertEqual(item['title'],'当前营期更新 · '+self.other.name)
+        self.assertEqual(item['due_on'],'2026-10-21');self.assertEqual(item['status'],'planned')
+
+    def test_ended_calendar_does_not_fall_back_without_snapshot(self):
+        project,binding,node=self.frozen_calendar_binding()
+        db.session.delete(db.session.get(m.ProjectBindingSnapshot,binding.id));db.session.commit()
+        response=self.call(self.owner,'get',f'/project-core/projects/{project.id}/calendar')
+        self.assertEqual(response.status_code,200,response.json)
+        self.assertFalse(any(item['source']=='assessment' for item in response.json['items']))
+        self.assertIsNotNone(db.session.get(m.CampMilestone,node.id))
+
     def test_reminder_dry_run_and_idempotence(self):
         p=self.create_project();row=db.session.get(m.Project,p['id'])
         db.session.add(m.ProjectMilestone(project_id=row.id,title='今日验收',due_on=date.today(),schedule_mode='absolute',status='planned',created_by=self.owner.id));db.session.commit()

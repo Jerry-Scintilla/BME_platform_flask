@@ -46,7 +46,37 @@ def summary(binding,user):
         if frozen:result['participants']=frozen.snapshot.get('participants',[])
     allowed=staff(user,camp.id) or core.role(db.session.get(Project,binding.project_id),user) in ('leader','admin')
     result['requested_users']=[{'user_id':uid,'name':db.session.get(UserModel,uid).username} for uid in (binding.requested_users or [])] if allowed else []
-    result['change_pending']=binding.status=='active' and sorted(binding.requested_users or [])!=sorted(p['user_id'] for p in result['participants'])
+    # 迁入关系没有人员调整申请；真实申请不允许空名单。
+    result['change_pending']=binding.status=='active' and bool(binding.requested_users) and sorted(binding.requested_users)!=sorted(p['user_id'] for p in result['participants'])
+    return result
+
+
+def context_summary(binding,user,project,camp,*,camp_view=False):
+    """工作台只读能力投影；长期角色与本期角色分别返回，写端点仍独立鉴权。"""
+    from blueprints.camp_staff import has_camp_access
+    from services.camp_groups.projects import unit_role
+    from .legacy import historical_reader
+
+    result=summary(binding,user)
+    unit=db.session.get(CampUnit,binding.legacy_unit_id) if binding.legacy_unit_id else None
+    long_role=core.role(project,user)
+    period_role=unit_role(unit,user) if unit else None
+    participant=ProjectCampParticipant.query.filter_by(binding_id=binding.id,user_id=user.id,status='active').first()
+    active_member=CampMember.query.filter_by(camp_session_id=camp.id,user_id=user.id,status='active').first()
+    is_participant=bool(binding.status=='active' and participant and active_member and long_role and period_role)
+    period_open=binding.status=='active' and project.status=='active' and camp.status not in ('archived','deleted')
+    historical=bool(unit and binding.status=='ended' and (
+        historical_reader(unit.id,user) or (long_role and binding.leader_user_id==user.id)))
+    result.update(
+        my_role=period_role if is_participant else None,
+        is_participant=is_participant,
+        can_read_work=bool(unit and binding.status in ('active','ended') and (
+            period_role or historical or has_camp_access(user,camp.id,'project.read_all'))),
+        can_write_work=bool(period_open and unit and unit.status=='active' and period_role and not camp_view),
+        can_manage_participants=bool(result['can_manage'] and project.status=='active'
+            and binding.status in ('requested','active') and camp.status not in ('archived','deleted')),
+        can_request_participants=bool(period_open and long_role in ('leader','admin') and not camp_view),
+    )
     return result
 
 
