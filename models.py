@@ -1601,6 +1601,35 @@ class UserPermissionModel(db.Model):
 
 # ==================== 讨论区模块 ====================
 
+class CommunityTag(db.Model):
+    __tablename__ = 'community_tag'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)
+    description = db.Column(db.String(500), nullable=False, default='')
+    is_reading = db.Column(db.Boolean, nullable=False, default=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    suggested_words = db.Column(db.Integer, nullable=False, default=500)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+
+
+class CommunityBook(db.Model):
+    __tablename__ = 'community_book'
+    id = db.Column(db.Integer, primary_key=True)
+    tag_id = db.Column(db.Integer, db.ForeignKey('community_tag.id'), nullable=False)
+    title = db.Column(db.String(150), nullable=False)
+    normalized_title = db.Column(db.String(150), nullable=False)
+    author = db.Column(db.String(100), nullable=False, default='')
+    __table_args__ = (db.UniqueConstraint('tag_id', 'normalized_title', name='uq_community_book_name'),)
+
+
+class DiscussionThreadTag(db.Model):
+    __tablename__ = 'discussion_thread_tag'
+    thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), primary_key=True)
+    tag_id = db.Column(db.Integer, db.ForeignKey('community_tag.id'), primary_key=True)
+    __table_args__ = (db.Index('ix_thread_tag_tag_thread', 'tag_id', 'thread_id'),)
+
+
 class DiscussionThread(db.Model):
     """讨论主题帖"""
     __tablename__ = 'discussion_thread'
@@ -1611,6 +1640,8 @@ class DiscussionThread(db.Model):
     STATUS_LOCKED = 'locked'
     STATUS_DELETED = 'deleted'
 
+    STATUS_CLOSED = 'closed'
+
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     scope_type = db.Column(db.String(20), nullable=False)  # global/article/course/group/task
     scope_id = db.Column(db.Integer, nullable=True)  # 关联对象ID，global时为空
@@ -1619,8 +1650,12 @@ class DiscussionThread(db.Model):
     images_json = db.Column(db.Text, nullable=True)  # 帖子图集 '/media/discussions/...' URL 数组 ≤4（社区重设计 09-19，global 帖用）
     category = db.Column(db.String(20), nullable=True)   # 话题标签（闲聊/提问/分享/招人；global 帖用，Phase 2 09-20）
     project_id = db.Column(db.Integer, nullable=True, index=True)  # 关联 XLAB 项目（帖子导流项目详情）
+    book_id = db.Column(db.Integer, db.ForeignKey('community_book.id'), nullable=True, index=True)
+    author_closed_at = db.Column(db.DateTime, nullable=True)
+    client_request_id = db.Column(db.String(64), nullable=True)
     pinned_until = db.Column(db.DateTime, nullable=True)  # 置顶过期（到点自动失效；空=不过期）
     is_essence = db.Column(db.Boolean, nullable=False, default=False)  # 精华帖（热度 ×2，Phase 3 质量分层）
+    featured_at = db.Column(db.DateTime, nullable=True)
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
     is_pinned = db.Column(db.Boolean, default=False)
@@ -1635,10 +1670,13 @@ class DiscussionThread(db.Model):
     __table_args__ = (
         db.Index('idx_thread_scope_status', 'scope_type', 'scope_id', 'status', 'last_reply_at'),
         db.Index('idx_thread_author', 'author_id', 'created_at'),
+        db.UniqueConstraint('author_id', 'client_request_id', name='uq_thread_request'),
     )
 
     # 关系
     author = db.relationship('UserModel', backref=db.backref('discussion_threads', lazy='dynamic'))
+    tags = db.relationship('CommunityTag', secondary='discussion_thread_tag', lazy='selectin')
+    book = db.relationship('CommunityBook', lazy='joined')
     replies = db.relationship('DiscussionReply', backref='thread', lazy='dynamic',
                              cascade='all, delete-orphan', order_by='DiscussionReply.created_at')
 
@@ -1654,6 +1692,8 @@ class DiscussionReply(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), nullable=False)
     parent_reply_id = db.Column(db.Integer, db.ForeignKey('discussion_reply.id'), nullable=True)  # 楼中楼
+    root_reply_id = db.Column(db.Integer, nullable=True, index=True)
+    client_request_id = db.Column(db.String(64), nullable=True)
     author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     content = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(20), default=STATUS_NORMAL)
@@ -1665,6 +1705,8 @@ class DiscussionReply(db.Model):
     __table_args__ = (
         db.Index('idx_reply_thread', 'thread_id', 'created_at'),
         db.Index('idx_reply_parent', 'parent_reply_id', 'created_at'),
+        db.Index('ix_reply_root_status_created', 'root_reply_id', 'status', 'created_at', 'id'),
+        db.UniqueConstraint('author_id', 'client_request_id', name='uq_reply_request'),
     )
 
     # 关系
@@ -1741,6 +1783,15 @@ class LLMQuotaRequestModel(db.Model):
     user = db.relationship('UserModel', foreign_keys=[user_id],
                            backref=db.backref('llm_quota_requests', lazy='dynamic'))
     reviewer = db.relationship('UserModel', foreign_keys=[reviewed_by])
+
+
+class CommunityVisit(db.Model):
+    """Recent detail reads, separate from lifetime feed impression counters."""
+    __tablename__ = 'community_visit'
+    thread_id = db.Column(db.Integer, db.ForeignKey('discussion_thread.id'), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    last_seen_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    __table_args__ = (db.Index('ix_community_visit_recent', 'last_seen_at', 'thread_id'),)
 
 
 class DiscussionReaction(db.Model):

@@ -1,0 +1,8 @@
+# Local isolated runner and export. The application dependencies remain in requirements.txt.
+-r requirements.txt
+fakeredis==2.40.0
+openpyxl==3.1.5
+minio==7.2.20
+feedparser==6.0.14
+trafilatura==2.3.1
+python-dotenv==1.2.4

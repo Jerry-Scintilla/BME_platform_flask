@@ -13,8 +13,32 @@ from flask_jwt_extended import get_jwt_identity, jwt_required
 
 from storage import storage
 import imaging
+from services import community_reading as reading
 
 bp = Blueprint("discussion", __name__, url_prefix="/discussions")
+
+
+@bp.errorhandler(reading.CommunityError)
+def reading_error(error):
+    db.session.rollback()
+    response = jsonify(code=error.status, message=error.message, **error.extra)
+    if error.status == 429:
+        response.headers['Retry-After'] = str(error.extra.get('retry_after', 60))
+    return response, error.status
+
+
+@bp.route('/replies/<int:reply_id>/children', methods=['GET'])
+@jwt_required()
+def reply_children(reply_id):
+    root = db.session.get(DiscussionReply, reply_id)
+    user = get_current_user()
+    if not user:
+        return jsonify(code=401, message='用户不存在'), 401
+    if not root or root.parent_reply_id is not None:
+        return jsonify(code=404, message='评论不存在'), 404
+    if not can_view_thread(root.thread, user):
+        return jsonify(code=403, message='无权限查看'), 403
+    return jsonify(reading.list_comments(root.thread, request.args, user, root=root))
 
 # CORS 配置
 _cors_config = {
@@ -41,6 +65,9 @@ CATEGORY_TEXT = {'chat': '闲聊', 'ask': '提问', 'share': '分享', 'recruit'
 
 def _thread_images(thread):
     """帖子图集 URL 数组（json 列解析；旧帖无图为空数组）。"""
+    db.session.refresh(thread, with_for_update=True)
+    if reading.closed(thread):
+        return []
     try:
         return json.loads(thread.images_json) if thread.images_json else []
     except (TypeError, ValueError):
@@ -99,6 +126,7 @@ def _thread_extra(t, project_titles=None):
         "category_text": CATEGORY_TEXT.get(t.category) if t.category else None,
         "project_id": t.project_id,
         "project_title": title,
+        **reading.thread_extra(t),
     }
 
 
@@ -348,8 +376,14 @@ def create_thread():
 
     title = data.get('title')
     content = data.get('content')
+    if not isinstance(data, dict):
+        raise reading.CommunityError('请求参数错误')
     scope_type = data.get('scope_type', 'global')
     scope_id = data.get('scope_id')  # global 时可为空
+    if scope_type == 'global':
+        thread, replayed = reading.create_topic(data, user)
+        status = 200 if replayed else 201
+        return jsonify(code=status, message='created', data=reading.thread_data(thread, user)), status
 
     # 校验 scope_type（提前：title 校验按 scope 分支，project=留言式无标题）
     valid_scopes = ['global', 'article', 'article_v2', 'course', 'group', 'task', 'project']  # project=项目广场（功能扩展轮 §五）
@@ -598,31 +632,9 @@ def get_thread(thread_id):
         ))
         db.session.commit()
 
-    return jsonify({
-        "code": 200,
-        "data": {
-            "id": thread.id,
-            "title": thread.title,
-            "content": thread.content,
-            "images": _thread_images(thread),
-            **_thread_extra(thread),
-            "pinned_effective": _pin_active(thread),
-            "is_essence": bool(thread.is_essence),
-            "scope_type": thread.scope_type,
-            "scope_id": thread.scope_id,
-            "author_id": thread.author_id,
-            "author_name": thread.author.username if thread.author else "",
-            "author_avatar": get_avatar_url(thread.author.avatar_url) if thread.author else "",
-            "status": thread.status,
-            "is_pinned": thread.is_pinned,
-            "reply_count": thread.reply_count,
-            "like_count": thread.like_count,
-            "view_count": thread.view_count,
-            "last_reply_at": thread.last_reply_at.strftime('%Y-%m-%d %H:%M:%S') if thread.last_reply_at else None,
-            "created_at": thread.created_at.strftime('%Y-%m-%d %H:%M:%S'),
-            "updated_at": thread.updated_at.strftime('%Y-%m-%d %H:%M:%S') if thread.updated_at else None
-        }
-    })
+    from services.community_discovery import record_read
+    record_read(thread, user)
+    return jsonify(code=200, data=reading.thread_data(thread, user))
 
 
 # 批量记录浏览 POST /discussions/threads/view_batch
@@ -689,6 +701,10 @@ def update_thread(thread_id):
         return jsonify({"code": 403, "message": "无权限编辑"}), 403
 
     data = request.get_json(silent=True) or {}
+    if thread.scope_type == 'global':
+        if not isinstance(data, dict):
+            raise reading.CommunityError('请求参数错误')
+        return jsonify(code=200, message='updated', data=reading.thread_data(reading.update_topic(thread, data), user))
 
     if 'title' in data:
         thread.title = data['title']
@@ -743,6 +759,11 @@ def delete_thread(thread_id):
     if thread.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限删除"}), 403
 
+    if thread.scope_type == 'global' and thread.author_id == user.id:
+        reading.stop_topic(thread)
+        return jsonify(code=200, message='closed', data=reading.thread_data(thread, user))
+
+    db.session.refresh(thread, with_for_update=True)
     # 软删除
     thread.status = DiscussionThread.STATUS_DELETED
     db.session.commit()
@@ -809,8 +830,9 @@ def hide_thread(thread_id):
     if not can_moderate_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
 
+    db.session.refresh(thread, with_for_update=True)
     if thread.status == DiscussionThread.STATUS_HIDDEN:
-        thread.status = DiscussionThread.STATUS_NORMAL
+        thread.status = 'closed' if thread.author_closed_at else DiscussionThread.STATUS_NORMAL
     else:
         thread.status = DiscussionThread.STATUS_HIDDEN
     db.session.commit()
@@ -835,6 +857,7 @@ def essence_thread(thread_id):
     if not can_moderate_thread(thread, user):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
     thread.is_essence = not thread.is_essence
+    thread.featured_at = datetime.now() if thread.is_essence else None
     db.session.commit()
     return jsonify({
         "code": 200,
@@ -861,6 +884,9 @@ def lock_thread(thread_id):
         return jsonify({"code": 403, "message": "无权限操作"}), 403
 
     # 切换锁帖状态
+    db.session.refresh(thread, with_for_update=True)
+    if reading.closed(thread):
+        return jsonify(code=403, message='作者已停止讨论，无法重新开放'), 403
     if thread.status == DiscussionThread.STATUS_LOCKED:
         thread.status = DiscussionThread.STATUS_NORMAL
     else:
@@ -883,230 +909,57 @@ def lock_thread(thread_id):
 @bp.route("/threads/<int:thread_id>/replies", methods=["POST"])
 @jwt_required()
 def create_reply(thread_id):
-    """回复主题帖"""
     user = get_current_user()
+    thread = db.session.get(DiscussionThread, thread_id)
     if not user:
-        return jsonify({"code": 401, "message": "用户不存在"}), 401
-
-    thread = DiscussionThread.query.get(thread_id)
+        return jsonify(code=401, message='用户不存在'), 401
     if not thread:
-        return jsonify({"code": 404, "message": "帖子不存在"}), 404
-
-    # 权限检查
+        return jsonify(code=404, message='帖子不存在'), 404
     if not can_view_thread(thread, user):
-        return jsonify({"code": 403, "message": "无权限查看"}), 403
-
-    # 锁帖状态下不允许回复
-    if thread.status == DiscussionThread.STATUS_LOCKED:
-        return jsonify({"code": 403, "message": "帖子已锁定，无法回复"}), 403
-
-    data = request.get_json(silent=True) or {}
-    content = data.get('content')
-    parent_reply_id = data.get('parent_reply_id')  # 楼中楼回复
-
-    if not content:
-        return jsonify({"code": 400, "message": "回复内容不能为空"}), 400
-
-    if len((content or '').strip()) < 2:
-        return jsonify({"code": 400, "message": "回复内容至少 2 个字"}), 400
-
-    # 权限检查：发帖权限
-    if not can_post_thread(thread.scope_type, thread.scope_id, user):
-        return jsonify({"code": 403, "message": "无权限回复"}), 403
-
-    # 楼中楼回复：检查父回复是否存在
-    if parent_reply_id:
-        parent_reply = DiscussionReply.query.get(parent_reply_id)
-        if not parent_reply or parent_reply.thread_id != thread_id:
-            return jsonify({"code": 400, "message": "无效的父回复"}), 400
-
-    reply = DiscussionReply(
-        thread_id=thread_id,
-        parent_reply_id=parent_reply_id,
-        author_id=user.id,
-        content=content
-    )
-    db.session.add(reply)
-
-    # 更新主题帖的回复计数和最后回复时间
-    thread.reply_count += 1
-    thread.last_reply_at = datetime.now()
-
-    db.session.commit()
-
-    # 互动通知（Phase 3 09-20）：回复产生 community 通知——
-    # 普通帖通知楼主；文章评论（scope=article/article_v2）通知文章作者；
-    # 楼中楼额外通知父回复作者。自己回自己/通知对象=操作人时跳过。
-    try:
-        from .notification import create_notification_once_unread
-        from models import ArticleModel, ArticleV2Model
-        targets = set()
-        if thread.scope_type in ('article', 'article_v2'):
-            model = ArticleV2Model if thread.scope_type == 'article_v2' else ArticleModel
-            art = model.query.get(thread.scope_id)
-            if art:
-                targets.add(art.author_id)
-        else:
-            targets.add(thread.author_id)
-        if parent_reply_id:
-            pr = DiscussionReply.query.get(parent_reply_id)
-            if pr:
-                targets.add(pr.author_id)
-        targets.discard(user.id)
-        for uid in targets:
-            # L2：source_id 用帖子 id（深链/去重键）；未读合并防刷屏
-            create_notification_once_unread(
-                uid,
-                title='你的内容有新回复',
-                content=f"{user.username or '有人'} 回复了你：{content.strip()[:80]}",
-                category='community',
-                source_type='discussion_reply',
-                source_id=reply.thread_id,
-            )
-        db.session.commit()
-    except Exception:
-        db.session.rollback()   # 通知失败不影响回复本身
-
-    return jsonify({
-        "code": 201,
-        "message": "created",
-        "data": {
-            "id": reply.id,
-            "thread_id": reply.thread_id,
-            "parent_reply_id": reply.parent_reply_id,
-            "author_id": reply.author_id,
-            "content": reply.content,
-            "status": reply.status,
-            "like_count": reply.like_count,
-            "created_at": reply.created_at.strftime('%Y-%m-%d %H:%M:%S')
-        }
-    }), 201
+        return jsonify(code=403, message='无权限查看'), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise reading.CommunityError('请求参数错误')
+    reply, replayed = reading.create_comment(thread, user, data)
+    status = 200 if replayed else 201
+    return jsonify(code=status, data=reading.reply_data(reply), message='created'), status
 
 
 # 回复列表 GET /discussions/threads/{thread_id}/replies
 @bp.route("/threads/<int:thread_id>/replies", methods=["GET"])
 @jwt_required()
 def list_replies(thread_id):
-    """获取回复列表"""
     user = get_current_user()
+    thread = db.session.get(DiscussionThread, thread_id)
     if not user:
-        return jsonify({"code": 401, "message": "用户不存在"}), 401
-
-    thread = DiscussionThread.query.get(thread_id)
+        return jsonify(code=401, message='用户不存在'), 401
     if not thread:
-        return jsonify({"code": 404, "message": "帖子不存在"}), 404
-
-    # 权限检查
+        return jsonify(code=404, message='帖子不存在'), 404
     if not can_view_thread(thread, user):
-        return jsonify({"code": 403, "message": "无权限查看"}), 403
-
-    # 分页参数
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 20, type=int)
-    per_page = min(per_page, 50)
-
-    # 只返回正常状态的回复
-    query = DiscussionReply.query.filter_by(
-        thread_id=thread_id,
-        status=DiscussionReply.STATUS_NORMAL
-    )
-
-    # 楼中楼需要特殊处理：先查顶级回复，再关联子回复
-    # 为简化，首期只返回一级回复（不含楼中楼）
-    query = query.filter(DiscussionReply.parent_reply_id == None)
-
-    query = query.order_by(DiscussionReply.created_at.asc())
-
-    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
-
-    # 预取每个顶级回复的正常子回复（避免下面逐条重复查询，也便于批量取点赞状态）
-    top_replies = []
-    for reply in pagination.items:
-        children = reply.children.filter_by(status=DiscussionReply.STATUS_NORMAL).all()
-        top_replies.append((reply, children))
-
-    # 批量查当前用户对本页回复（含楼中楼）的点赞状态，组装时回填 liked 字段
-    all_reply_ids = [r.id for r, _ in top_replies]
-    for _, children in top_replies:
-        all_reply_ids.extend(c.id for c in children)
-
-    liked_ids = set()
-    if all_reply_ids:
-        liked_rows = DiscussionReaction.query.filter(
-            DiscussionReaction.user_id == user.id,
-            DiscussionReaction.target_type == 'reply',
-            DiscussionReaction.target_id.in_(all_reply_ids),
-            DiscussionReaction.reaction_type == 'like'
-        ).all()
-        liked_ids = {row.target_id for row in liked_rows}
-
-    result = []
-    for reply, children in top_replies:
-        children_data = [{
-            "id": c.id,
-            "author_id": c.author_id,
-            "author_name": c.author.username if c.author else "",
-            "author_avatar": get_avatar_url(c.author.avatar_url) if c.author else "",
-            "content": c.content,
-            "like_count": c.like_count,
-            "liked": c.id in liked_ids,
-            "created_at": c.created_at.strftime('%Y-%m-%d %H:%M:%S')
-        } for c in children]
-
-        result.append({
-            "id": reply.id,
-            "author_id": reply.author_id,
-            "author_name": reply.author.username if reply.author else "",
-            "author_avatar": get_avatar_url(reply.author.avatar_url) if reply.author else "",
-            "content": reply.content,
-            "like_count": reply.like_count,
-            "liked": reply.id in liked_ids,
-            "created_at": reply.created_at.strftime('%Y-%m-%d %H:%M:%S'),
-            "children": children_data
-        })
-
-    return jsonify({
-        "code": 200,
-        "data": result,
-        "total": pagination.total,
-        "page": page,
-        "per_page": per_page,
-        "pages": pagination.pages
-    })
+        return jsonify(code=403, message='无权限查看'), 403
+    return jsonify(reading.list_comments(thread, request.args, user))
 
 
 # 编辑回复 PUT /discussions/replies/{reply_id}
 @bp.route("/replies/<int:reply_id>", methods=["PUT"])
 @jwt_required()
 def update_reply(reply_id):
-    """编辑回复"""
     user = get_current_user()
+    reply = db.session.get(DiscussionReply, reply_id)
     if not user:
-        return jsonify({"code": 401, "message": "用户不存在"}), 401
-
-    reply = DiscussionReply.query.get(reply_id)
+        return jsonify(code=401, message='用户不存在'), 401
     if not reply:
-        return jsonify({"code": 404, "message": "回复不存在"}), 404
-
-    # 权限检查：作者或管理员
+        return jsonify(code=404, message='回复不存在'), 404
     if reply.author_id != user.id and not user.is_admin():
-        return jsonify({"code": 403, "message": "无权限编辑"}), 403
-
-    data = request.get_json(silent=True) or {}
-    if 'content' in data:
-        reply.content = data['content']
-
+        return jsonify(code=403, message='无权限编辑'), 403
+    if not can_view_thread(reply.thread, user) or reply.status != 'normal':
+        return jsonify(code=403, message='该回复不可编辑'), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise reading.CommunityError('请求参数错误')
+    reply.content = reading.text_value(data.get('content'), '回复', 2)
     db.session.commit()
-
-    return jsonify({
-        "code": 200,
-        "message": "updated",
-        "data": {
-            "id": reply.id,
-            "content": reply.content,
-            "updated_at": reply.updated_at.strftime('%Y-%m-%d %H:%M:%S')
-        }
-    })
+    return jsonify(code=200, data=reading.reply_data(reply), message='updated')
 
 
 # 删除回复 DELETE /discussions/replies/{reply_id}
@@ -1126,6 +979,12 @@ def delete_reply(reply_id):
     if reply.author_id != user.id and not user.is_admin():
         return jsonify({"code": 403, "message": "无权限删除"}), 403
 
+    if not can_view_thread(reply.thread, user):
+        return jsonify(code=403, message='无权限查看'), 403
+    db.session.refresh(reply.thread, with_for_update=True)
+    db.session.refresh(reply, with_for_update=True)
+    if reply.status == DiscussionReply.STATUS_DELETED:
+        return jsonify(code=200, message='deleted')
     # 软删除
     reply.status = DiscussionReply.STATUS_DELETED
 
@@ -1176,6 +1035,8 @@ def toggle_reaction():
         target = DiscussionReply.query.get(target_id)
         if not target:
             return jsonify({"code": 404, "message": "回复不存在"}), 404
+        if target.status != 'normal' or not can_view_thread(target.thread, user):
+            return jsonify(code=403, message='无权限'), 403
 
     # 检查是否已点赞
     existing = DiscussionReaction.query.filter_by(
@@ -1343,7 +1204,10 @@ def upload_image():
     if file.content_length and file.content_length > 10 * 1024 * 1024:
         return jsonify({"code": 400, "message": "图片不能超过 10MB"}), 400
     try:
-        data = imaging.showcase_gallery_bytes(file.stream)
+        raw = file.stream.read(10 * 1024 * 1024 + 1)
+        if len(raw) > 10 * 1024 * 1024:
+            return jsonify(code=400, message='图片不能超过 10MB'), 400
+        data = imaging.showcase_gallery_bytes(io.BytesIO(raw))
     except imaging.ImageError as e:
         return jsonify({"code": 400, "message": f"图片无效：{e}"}), 400
     uid = uuid.uuid4()
