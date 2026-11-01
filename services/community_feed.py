@@ -9,6 +9,13 @@ from models import (DiscussionThread as Thread, DiscussionReply as Reply, UserMo
 from services import community_reading as reading
 
 
+def cover_thumbnail(key):
+    if not key or '.' not in key:
+        return key
+    # Match the existing media naming contract used by article and project cards.
+    return key.split('.', 1)[0] + '_thumb.' + key.rsplit('.', 1)[1]
+
+
 def build_page(args, user):
     page, size = reading.page_values(args)
     kind, sort = args.get('type', 'all'), args.get('sort', 'hot')
@@ -38,7 +45,8 @@ def build_page(args, user):
                        User.role.label('role'), literal(14).label('half_life'),
                        (Thread.like_count + 2 * Thread.reply_count).label('interaction'),
                        Thread.id.label('like_tid')).join(User, User.id == Thread.author_id).where(
-                           Thread.scope_type == 'global', Thread.status.in_(reading.PUBLIC_STATUSES))
+                           Thread.scope_type == 'global',
+                           Thread.status != 'deleted' if user.is_admin() else Thread.status.in_(reading.PUBLIC_STATUSES))
         if tag_id:
             query = query.where(Thread.tags.any(CommunityTag.id == tag_id))
         if category:
@@ -82,7 +90,7 @@ def build_page(args, user):
     score *= case((feed.c.role == 'super_admin', 1.5), else_=1.) * case((feed.c.essence.is_(True), 2.), else_=1.)
     order = [feed.c.pin.desc()]
     if sort == 'hot':
-        order.append(score.desc())
+        order.extend([score.desc(), feed.c.rc.desc()])
     order.extend([feed.c.rank_dt.desc(), feed.c.rc.desc(), feed.c.kind, feed.c.id.desc()])
     total = db.session.scalar(select(func.count()).select_from(feed))
     ranks = db.session.execute(select(feed).order_by(*order).limit(size).offset((page - 1) * size)).mappings().all()
@@ -110,9 +118,9 @@ def build_page(args, user):
             project = projects.get(entity.project_id)
             if project:
                 item.update(project_title=project.title, project_summary=project.summary,
-                            project_cover_thumb=project.cover, project_status=project.project_status,
-                            project_status_text=STATUS_TEXT.get(project.project_status),
-                            project_source=project.source, project_source_text=SOURCE_TEXT.get(project.source),
+                            project_cover_thumb=cover_thumbnail(project.cover), project_status=project.project_status,
+                            project_status_text=STATUS_TEXT.get(project.project_status, project.project_status),
+                            project_source=project.source, project_source_text=SOURCE_TEXT.get(project.source, project.source),
                             project_view_count=project.view_count)
                 try:
                     item['project_tags'] = json.loads(project.tags or '[]')
@@ -122,22 +130,31 @@ def build_page(args, user):
             v2 = rank['kind'] == 'article_v2'
             cover = entity.cover_image_key if v2 else None
             item = dict(type='article', id=entity.id, article_id=entity.id, article_version=2 if v2 else None,
-                        title=entity.title, summary=(entity.introduction or '')[:200], cover=cover, cover_thumb=cover,
+                        title=entity.title, summary=(entity.introduction or '')[:200], cover=cover, cover_thumb=cover_thumbnail(cover),
                         author_id=entity.author_id, author_name=entity.author.username,
                         author_avatar=public_avatar_url(entity.author.avatar_url),
                         created_at=reading.stamp(entity.publish_time), reply_count=rank['rc'],
                         like_count=rank['lc'], view_count=rank['vc'], is_pinned=False, is_essence=bool(rank['essence']))
         item['liked'] = rank['like_tid'] in likes
         items.append(item)
+    from blueprints.officers import badge_map
+    badges = badge_map(list({item['author_id'] for item in items if item.get('author_id')}))
+    for item in items:
+        badge = badges.get(item['author_id'])
+        if badge:
+            item.update(author_badge=badge['text'], author_badge_tier=badge['tier'])
     # Window query limits previews in SQL even for topics with thousands of comments.
     if threads:
         ranked = select(Reply.id.label('id'), func.row_number().over(partition_by=Reply.thread_id,
                         order_by=(Reply.created_at.desc(), Reply.id.desc())).label('n')).where(
                             Reply.thread_id.in_(threads), Reply.parent_reply_id.is_(None), Reply.status == 'normal').subquery()
         previews = Reply.query.options(joinedload(Reply.author)).join(ranked, ranked.c.id == Reply.id).filter(ranked.c.n <= 2).order_by(Reply.created_at, Reply.id).all()
+        preview_ids = [reply.id for reply in previews]
+        liked_replies = {r.target_id for r in Reaction.query.filter_by(
+            user_id=user.id, target_type='reply', reaction_type='like').filter(Reaction.target_id.in_(preview_ids))}
         by_thread = {}
         for reply in previews:
-            by_thread.setdefault(reply.thread_id, []).append(reading.reply_data(reply))
+            by_thread.setdefault(reply.thread_id, []).append(reading.reply_data(reply, liked_replies))
         for item in items:
             if item['type'] == 'discussion':
                 item['replies'] = by_thread.get(item['id'], [])

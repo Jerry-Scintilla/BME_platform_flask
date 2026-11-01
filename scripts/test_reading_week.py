@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest.mock import patch
+from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.run_reading_local import create_local_app
@@ -65,6 +67,74 @@ class ReadingSmoke(unittest.TestCase):
 
     def comment(self, tid, parent=None, user='stu2', content='读过之后，我开始重新思考人与人的关系。', key=None, status=201):
         return self.call('POST',f'/discussions/threads/{tid}/replies', {'content':content, 'parent_reply_id':parent, 'client_request_id':key or uuid.uuid4().hex},user=user,status=status).get('data', {})
+
+    def test_noncommunity_comments_keep_complete_children_and_original_contract(self):
+        admin = User.query.filter_by(email='admin@seed.dev').one()
+        # These legacy clients have no "load more children" control and must receive all replies.
+        for scope in ('article', 'article_v2', 'course', 'group', 'task', 'project'):
+            with self.subTest(scope=scope), patch.object(reading, 'enforce_rate', side_effect=AssertionError('community-only limiter')):
+                thread = Thread(scope_type=scope, scope_id=999999, author_id=admin.id,
+                                title='原有模块讨论', content='原有讨论正文')
+                db.session.add(thread); db.session.commit()
+                tid = thread.id
+                parent = self.comment(tid, user='admin')
+                children = [self.comment(tid, parent=parent['id'], user='admin')['id'] for _ in range(5)]
+                rows = self.call('GET', f'/discussions/threads/{tid}/replies', user='admin')['data']
+                self.assertEqual([c['id'] for c in rows[0]['children']], children)
+                detail = self.call('GET', f'/discussions/threads/{tid}', user='admin')['data']
+                self.assertNotIn('book', detail)
+                edited = self.call('PUT', f"/discussions/replies/{parent['id']}", {'content':'原有编辑行为'}, user='admin')['data']
+                self.assertEqual(set(edited), {'id', 'content', 'updated_at'})
+
+    def test_article_comment_notifies_article_author_not_thread_creator(self):
+        author = User.query.filter_by(email='stu1@seed.dev').one()
+        creator = User.query.filter_by(email='admin@seed.dev').one()
+        article = ArticleModel(title='评论通知兼容性', introduction='说明', author_id=author.id)
+        db.session.add(article); db.session.flush()
+        thread = Thread(scope_type='article', scope_id=article.id, author_id=creator.id,
+                        title='自动创建的评论区', content='文章评论')
+        db.session.add(thread); db.session.commit()
+        with patch('blueprints.notification.create_notification_once_unread') as notify:
+            self.comment(thread.id, user='stu2')
+        self.assertEqual([call.args[0] for call in notify.call_args_list], [author.id])
+        db.session.delete(article); db.session.commit()
+
+    def test_project_reply_actions_keep_existing_author_permissions(self):
+        user = User.query.filter_by(email='stu1@seed.dev').one()
+        thread = Thread(scope_type='project', scope_id=999999, author_id=user.id,
+                        title='项目留言区', content='项目讨论', reply_count=1)
+        db.session.add(thread); db.session.flush()
+        reply = Reply(thread_id=thread.id, author_id=user.id, content='项目内原有留言')
+        db.session.add(reply); db.session.commit()
+        self.call('POST', '/discussions/reactions', {'target_type':'reply', 'target_id':reply.id, 'reaction_type':'like'})
+        self.call('PUT', f'/discussions/replies/{reply.id}', {'content':'作者编辑项目留言'})
+        self.call('DELETE', f'/discussions/replies/{reply.id}')
+        self.assertEqual(db.session.get(Reply, reply.id).status, 'deleted')
+
+    def test_feed_preserves_author_badge_liked_preview_and_cover_thumbnail(self):
+        from models import ClubGroup, ClubMembership, DiscussionReaction
+        row, _, tag = self.topic()
+        author_id = row['author_id']
+        group = ClubGroup(name='兼容性核对组'+uuid.uuid4().hex[:6])
+        db.session.add(group); db.session.flush()
+        membership = ClubMembership(user_id=author_id, group_id=group.id, slot='primary', joined_at=datetime.now())
+        db.session.add(membership); db.session.commit()
+        comment = self.comment(row['id'])
+        db.session.add(DiscussionReaction(user_id=author_id, target_type='reply', target_id=comment['id'], reaction_type='like'))
+        article = ArticleV2Model(title='封面兼容性', introduction='说明', content_md='正文', author_id=author_id,
+                                 status='published', is_official=False, cover_image_key='media/articles/a.webp')
+        db.session.add(article); db.session.commit()
+        feed = self.call('GET', f"/community/feed?tag_id={tag['id']}")['data'][0]
+        self.assertEqual(feed['author_badge'], group.name)
+        self.assertEqual(feed['author_badge_tier'], 3)
+        self.assertTrue(feed['replies'][0]['liked'])
+        thread = db.session.get(Thread, row['id']); thread.status = 'hidden'; db.session.commit()
+        self.assertEqual(self.call('GET', f"/community/feed?tag_id={tag['id']}")['total'], 0)
+        self.assertEqual(self.call('GET', f"/community/feed?tag_id={tag['id']}", user='admin')['total'], 1)
+        articles = self.call('GET', '/community/feed?type=article&sort=latest&per_page=50')['data']
+        projected = next(a for a in articles if a['id'] == article.id and a['article_version'] == 2)
+        self.assertEqual(projected['cover_thumb'], 'media/articles/a_thumb.webp')
+        db.session.delete(membership); db.session.delete(group); db.session.delete(article); db.session.commit()
 
     def test_tag_directory_permissions_and_empty_activity(self):
         tag = self.new_tag()
