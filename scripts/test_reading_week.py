@@ -74,7 +74,46 @@ class ReadingSmoke(unittest.TestCase):
         self.call('PUT',f"/community/tags/{tag['id']}",{'name':'禁止修改'},status=403)
         self.call('PUT',f"/community/tags/{tag['id']}",{'is_active':False},user='admin')
         self.assertNotIn(tag['id'],[t['id'] for t in self.call('GET','/community/tags')['data']])
-        self.call('PUT',f"/community/tags/{tag['id']}",{'is_reading':False},user='admin',status=400)
+        changed = self.call('PUT',f"/community/tags/{tag['id']}",{'is_reading':False},user='admin')['data']
+        self.assertFalse(changed['is_reading'])
+
+    def test_tag_delete_permissions_unused_books_and_stale_selection(self):
+        tag = self.new_tag(); url = f"/community/tags/{tag['id']}"
+        self.call('DELETE', url, status=403)
+        self.call('POST', url+'/books', {'books':[{'title':'未使用书籍'}]}, user='admin')
+        self.call('PUT', url, {'is_reading':False}, user='admin', status=409)
+        self.call('DELETE', url, user='admin')
+        self.call('GET', url, status=404)
+        self.call('DELETE', url, user='admin', status=404)
+        self.assertEqual(Book.query.filter_by(tag_id=tag['id']).count(), 0)
+        self.call('POST', '/discussions/threads', {'title':'标签已删除的旧草稿', 'content':'旧草稿提交时应明确提示标签已经不可用。',
+                  'scope_type':'global', 'tag_ids':[tag['id']]}, status=400)
+
+    def test_tag_delete_and_type_change_preserve_hidden_history(self):
+        row, data, tag = self.topic()
+        comment = self.comment(row['id'])
+        url = f"/community/tags/{tag['id']}"
+        self.call('DELETE', url, user='admin', status=409)
+        self.call('PUT', url, {'is_reading':False}, user='admin', status=409)
+        thread = db.session.get(Thread, row['id'])
+        thread.status = 'deleted'
+        thread.tags = []
+        db.session.commit()
+        self.call('DELETE', url, user='admin', status=409)
+        self.assertIsNotNone(db.session.get(Reply, comment['id']))
+        self.call('PUT', url, {'is_active':False}, user='admin')
+
+    def test_normal_tag_default_and_empty_type_change(self):
+        tag = self.call('POST', '/community/tags', {'name':'普通标签'+uuid.uuid4().hex[:8]}, user='admin', status=201)['data']
+        self.assertFalse(tag['is_reading'])
+        url = f"/community/tags/{tag['id']}"
+        self.assertTrue(self.call('PUT', url, {'is_reading':True}, user='admin')['data']['is_reading'])
+        self.assertFalse(self.call('PUT', url, {'is_reading':False}, user='admin')['data']['is_reading'])
+        row = self.call('POST', '/discussions/threads', {'title':'项目实践交流记录', 'content':'普通标签可以自由交流，不需要选择书籍和上传图片。',
+                        'scope_type':'global', 'tag_ids':[tag['id']]}, status=201)['data']
+        self.call('PUT', url, {'is_reading':True}, user='admin', status=409)
+        self.call('DELETE', url, user='admin', status=409)
+        self.assertIsNotNone(db.session.get(Thread, row['id']))
 
     def test_book_import_normalization_atomic_validation(self):
         tag = self.new_tag(); url=f"/community/tags/{tag['id']}/books"

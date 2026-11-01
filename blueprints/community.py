@@ -38,7 +38,7 @@ def community_tags():
     return jsonify(code=201, data=reading.tag_data(tag)), 201
 
 
-@bp.route('/tags/<int:tag_id>', methods=['GET', 'PUT'])
+@bp.route('/tags/<int:tag_id>', methods=['GET', 'PUT', 'DELETE'])
 @jwt_required()
 def update_community_tag(tag_id):
     user = get_current_user()
@@ -51,6 +51,9 @@ def update_community_tag(tag_id):
         return jsonify(code=200, data=reading.tag_data(tag))
     if not user.is_admin():
         return jsonify(code=403, message='只有管理员可以维护标签'), 403
+    if request.method == 'DELETE':
+        reading.delete_tag(tag)
+        return jsonify(code=200, message='标签已删除')
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         raise reading.CommunityError('请求参数错误')

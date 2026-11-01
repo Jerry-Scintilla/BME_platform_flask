@@ -148,11 +148,13 @@ def validate_images(images, required=False):
     return images
 
 
-def selected_tags(ids, existing=None):
+def selected_tags(ids, existing=None, lock=True):
     if not isinstance(ids, list) or len(ids) > 5:
         raise CommunityError('最多选择 5 个标签')
     ids = list(dict.fromkeys(positive_id(i, '标签') for i in ids))
     tags = CommunityTag.query.filter(CommunityTag.id.in_(ids)).order_by(CommunityTag.id).all() if ids else []
+    if lock and len(tags) == len(ids):
+        tags = [lock_activity(t.id) for t in tags]
     if len(tags) != len(ids) or any(not t.is_active and t.id not in {x.id for x in (existing or [])} for t in tags):
         raise CommunityError('标签不存在或已停用')
     if sum(t.is_reading for t in tags) > 1:
@@ -164,7 +166,11 @@ def lock_activity(tag_id):
     if db.engine.dialect.name == 'sqlite':
         # SQLite has no SELECT FOR UPDATE; take its writer lock for local parity.
         db.session.execute(update(CommunityTag).where(CommunityTag.id == tag_id).values(is_active=CommunityTag.is_active))
-    return db.session.execute(select(CommunityTag).where(CommunityTag.id == tag_id).with_for_update()).scalar_one()
+    tag = db.session.execute(select(CommunityTag).where(CommunityTag.id == tag_id).with_for_update()
+                             .execution_options(populate_existing=True)).scalar_one_or_none()
+    if tag is None:
+        raise CommunityError('标签不存在或已删除', 404)
+    return tag
 
 
 def resolve_book(data, tags):
@@ -317,8 +323,8 @@ def update_topic(thread, data):
         raise CommunityError('该帖子已停止讨论或不可编辑', 403)
     # Creation locks activity before topic rows; keep the same order on edits.
     # Include both activities when moving a topic so opposite moves cannot invert locks.
-    tags = selected_tags(data.get('tag_ids', [t.id for t in thread.tags]), thread.tags)
-    activity_ids = {t.id for t in [*thread.tags, *tags] if t.is_reading}
+    tags = selected_tags(data.get('tag_ids', [t.id for t in thread.tags]), thread.tags, lock=False)
+    activity_ids = {t.id for t in [*thread.tags, *tags]}
     for tag_id in sorted(activity_ids):
         lock_activity(tag_id)
     db.session.refresh(thread, with_for_update=True)
@@ -459,13 +465,16 @@ def list_tags(include_inactive=False):
 
 
 def save_tag(data, user, tag=None):
+    if tag is not None:
+        tag = lock_activity(tag.id)
     name = text_value(data.get('name', tag.name if tag else ''), '标签名称', 1, 50)
     description = text_value(data.get('description', tag.description if tag else ''), '标签说明', 0, 500)
     for flag in ('is_reading', 'is_active'):
         if flag in data and not isinstance(data[flag], bool):
             raise CommunityError('标签选项格式错误')
     if tag and 'is_reading' in data and data['is_reading'] != tag.is_reading:
-        raise CommunityError('创建后不能改变标签类型，请新建标签')
+        if tag_has_posts(tag.id) or CommunityBook.query.filter_by(tag_id=tag.id).with_for_update().first():
+            raise CommunityError('已有帖子或书单的标签不能修改类型；可停用后新建标签', 409)
     suggested = data.get('suggested_words', tag.suggested_words if tag else 500)
     if isinstance(suggested, bool) or not isinstance(suggested, int) or not 1 <= suggested <= MAX_CONTENT:
         raise CommunityError('建议字数须为 1 至 10000 的整数')
@@ -484,7 +493,30 @@ def save_tag(data, user, tag=None):
     return tag
 
 
+def tag_has_posts(tag_id):
+    # Include hidden/deleted history and book references even if the tag was detached.
+    # Locking reads see commits made while waiting for the tag under MySQL REPEATABLE READ.
+    if DiscussionThreadTag.query.filter_by(tag_id=tag_id).with_for_update().first():
+        return True
+    books = CommunityBook.query.filter_by(tag_id=tag_id).with_for_update().all()
+    return bool(books) and Thread.query.filter(Thread.book_id.in_([b.id for b in books])).with_for_update().first() is not None
+
+
+def delete_tag(tag):
+    tag = lock_activity(tag.id)
+    if tag_has_posts(tag.id):
+        raise CommunityError('该标签已关联帖子或历史内容，不能删除；请在编辑中停用', 409)
+    CommunityBook.query.filter_by(tag_id=tag.id).delete(synchronize_session='fetch')
+    db.session.delete(tag)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        raise CommunityError('该标签已被使用，不能删除；请刷新后停用', 409)
+
+
 def import_books(tag, rows):
+    tag = lock_activity(tag.id)
     if not tag.is_reading:
         raise CommunityError('只有阅读活动可导入书单')
     if not isinstance(rows, list) or not 1 <= len(rows) <= 500:
@@ -499,7 +531,6 @@ def import_books(tag, rows):
         if not norm:
             raise CommunityError('书名无效')
         prepared.append((title, author, norm))
-    lock_activity(tag.id)
     created = 0
     for title, author, norm in prepared:
         if not CommunityBook.query.filter_by(tag_id=tag.id, normalized_title=norm).first():
