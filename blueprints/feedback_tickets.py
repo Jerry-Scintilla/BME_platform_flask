@@ -14,6 +14,7 @@
 管理侧见 feedback_tickets_admin.py；旧 /information/error/* 三端点内部转调本模块服务。
 """
 import uuid
+import json
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -25,7 +26,7 @@ from . import _current_user, audit_log
 from .media_sign import media_signed_url, resolve_media_request
 from .notification import create_notification
 from flask import Response
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 
 bp = Blueprint("feedback_tickets", __name__, url_prefix="/feedback-tickets")
 
@@ -48,6 +49,50 @@ VALID_TRANSITIONS = {
 
 MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024   # 单附件 5MB
 ALLOWED_IMAGE_TYPES = {'image/png', 'image/jpeg', 'image/webp', 'image/gif'}
+RESOLUTION_CODES = {'fixed', 'wont_fix', 'duplicate', 'need_more_info', 'not_reproducible', 'by_design'}
+TERMINAL_STATUSES = {'resolved', 'closed', 'rejected'}
+
+
+def _page_context(raw):
+    """只接受定位所需字段；不保存 URL 中的认证票据或任意请求参数。"""
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError('页面信息格式不正确')
+    result = {}
+    for key, limit in {'title': 200, 'app_version': 50, 'user_agent': 500,
+                       'captured_at': 50, 'theme': 20}.items():
+        if isinstance(raw.get(key), str):
+            result[key] = raw[key][:limit]
+    if isinstance(raw.get('url'), str):
+        url = urlsplit(raw['url'][:2000])
+        if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password:
+            raise ValueError('页面地址不正确')
+        allowed = {'sid', 'tab', 'scope', 'unit', 'unit_id', 'binding', 'node', 'page', 'view',
+                   'record', 'entry', 'month', 'chapterId', 'lessonId', 'perspective'}
+        query = urlencode([(k, v[:100]) for k, v in parse_qsl(url.query) if k in allowed])
+        result['url'] = urlunsplit((url.scheme, url.netloc, url.path, query, ''))
+    for key in ('viewport_width', 'viewport_height', 'scroll_y'):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+            result[key] = value
+    return result
+
+
+def _capture_metadata(ticket):
+    event = FeedbackTicketEvent.query.filter_by(ticket_id=ticket.id, event_type='created').order_by(FeedbackTicketEvent.id).first()
+    try:
+        data = json.loads(event.metadata_json) if event and event.metadata_json else {}
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _clear_resolution(ticket):
+    ticket.resolution_code = None
+    ticket.resolution_summary = None
+    ticket.resolved_at = None
+    ticket.closed_at = None
 
 
 def _ticket_dict(t, reporter=None, assignee=None, attachment_count=0, message_count=0):
@@ -77,39 +122,40 @@ def _ticket_dict(t, reporter=None, assignee=None, attachment_count=0, message_co
 def _attachment_dicts(ticket, uid):
     """附件元数据 + 短签查看 URL（列表不回 Base64 正文）。"""
     out = []
+    snapshot_id = _capture_metadata(ticket).get('snapshot_attachment_id')
     for a in FeedbackTicketAttachment.query.filter_by(ticket_id=ticket.id).all():
         out.append({
             "id": a.id,
             "original_name": a.original_name,
             "mime_type": a.mime_type,
             "size": a.size,
+            "kind": 'snapshot' if a.id == snapshot_id else 'upload',
             "url": media_signed_url('feedback_ticket', a.id, uid),
         })
     return out
 
 
-def _save_attachment(ticket, file):
-    """multipart 文件 → storage 双后端 + Attachment 行。返回错误响应或 None。"""
-    if not file or not file.filename:
-        return None
-    if (file.mimetype or '') not in ALLOWED_IMAGE_TYPES:
-        return jsonify({"code": 400, "message": "附件仅支持 png/jpg/webp/gif 图片"}), 400
-    data = file.read()
-    if len(data) > MAX_ATTACHMENT_SIZE:
-        return jsonify({"code": 400, "message": "附件超过 5MB 上限"}), 400
-    ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'png'
+def _save_attachment(ticket, file, data, saved_keys):
+    """已校验文件 → storage；调用方在写入前校验全部附件。"""
+    ext = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif'}[file.mimetype]
     key = f"feedback-tickets/{ticket.id}/{uuid.uuid4().hex}.{ext}"
+    # 先登记清理目标，覆盖存储已写入后报错或附件行 flush 失败的情况。
+    saved_keys.append(key)
     # storage 双后端契约收流（local 用 copyfileobj、minio 收 fileobj）
     import io as _io
     storage.put_object(key, _io.BytesIO(data), length=len(data), content_type=file.mimetype)
-    db.session.add(FeedbackTicketAttachment(
+    attachment = FeedbackTicketAttachment(
         ticket_id=ticket.id, storage_key=key,
-        original_name=file.filename[:200], mime_type=file.mimetype, size=len(data)))
-    return None
+        original_name=file.filename[:200], mime_type=file.mimetype, size=len(data))
+    db.session.add(attachment)
+    db.session.flush()
+    return attachment
 
 
 def _add_event(ticket, actor_id, event_type, from_status=None, to_status=None, meta=None):
     import json as _json
+    from datetime import datetime
+    ticket.updated_at = datetime.now()
     db.session.add(FeedbackTicketEvent(
         ticket_id=ticket.id, actor_user_id=actor_id, event_type=event_type,
         from_status=from_status, to_status=to_status,
@@ -128,7 +174,7 @@ def _notify(user_id, title, content, ticket_id):
 @jwt_required()
 @audit_log(operation="提交反馈工单")
 def create_ticket():
-    """提交反馈工单（multipart：title/description/category/severity?/image?）。"""
+    """提交反馈工单；兼容 image，新增独立 snapshot + page_context，不新增数据库列。"""
     user = _current_user()
     title = (request.form.get('title') or '').strip()
     description = (request.form.get('description') or '').strip() or None
@@ -140,6 +186,28 @@ def create_ticket():
         return jsonify({"code": 400, "message": f"category 须为 {'/'.join(CATEGORIES)}"}), 400
     if severity not in SEVERITIES:
         severity = 'normal'
+
+    try:
+        raw_context = request.form.get('page_context', '')
+        if len(raw_context.encode('utf-8')) > 8192:
+            raise ValueError('页面信息过长')
+        context = _page_context(json.loads(raw_context) if raw_context else {})
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "页面信息格式不正确"}), 400
+
+    files = []
+    for field in ('image', 'snapshot'):
+        if len(request.files.getlist(field)) > 1:
+            return jsonify({"code": 400, "message": "快照和补充图片各限一张"}), 400
+        file = request.files.get(field)
+        if not file or not file.filename:
+            continue
+        if file.mimetype not in ALLOWED_IMAGE_TYPES:
+            return jsonify({"code": 400, "message": "附件仅支持 png/jpg/webp/gif 图片"}), 400
+        data = file.read(MAX_ATTACHMENT_SIZE + 1)
+        if not data or len(data) > MAX_ATTACHMENT_SIZE:
+            return jsonify({"code": 400, "message": "图片不能为空且不得超过 5MB"}), 400
+        files.append((field, file, data))
 
     # 幂等保护：同用户同标题 60 秒内重复提交（双击/重试）返回原工单
     from datetime import datetime, timedelta
@@ -157,13 +225,23 @@ def create_ticket():
     db.session.add(ticket)
     db.session.flush()   # 拿 id 供附件 key 与事件使用
 
-    err = _save_attachment(ticket, request.files.get('image'))
-    if err:
+    metadata = {'page_context': context} if context else {}
+    saved_keys = []
+    try:
+        for field, file, data in files:
+            attachment = _save_attachment(ticket, file, data, saved_keys)
+            if field == 'snapshot':
+                metadata['snapshot_attachment_id'] = attachment.id
+        _add_event(ticket, user.id, 'created', to_status='new', meta=metadata)
+        db.session.commit()
+    except Exception:
         db.session.rollback()
-        return err
-
-    _add_event(ticket, user.id, 'created', to_status='new')
-    db.session.commit()
+        for key in saved_keys:
+            try:
+                storage.remove_object(key)
+            except Exception:
+                pass
+        return jsonify({'code': 503, 'message': '附件保存失败，请稍后重试'}), 503
     return jsonify({"code": 200, "message": "反馈已提交，我们会在处理时通知你",
                     "data": {"id": ticket.id}})
 
@@ -220,6 +298,7 @@ def ticket_detail(tid):
                        attachment_count=len(_attachment_dicts(t, user.id)),
                        message_count=len(messages)),
         "description": t.description,
+        "page_context": _capture_metadata(t).get('page_context', {}),
         "attachments": _attachment_dicts(t, user.id),
         "messages": [{
             "id": m.id, "author_user_id": m.author_user_id,
@@ -308,8 +387,10 @@ def reopen_ticket(tid):
         return jsonify({"code": 400, "message": "仅已解决/已关闭的工单可重新打开"}), 400
 
     reason = ((request.json or {}).get('reason') or '').strip() or None
+    from_status = t.status
     t.status = 'reopened'
-    _add_event(t, user.id, 'reopened', from_status='resolved' if t.resolved_at else 'closed',
+    _clear_resolution(t)
+    _add_event(t, user.id, 'reopened', from_status=from_status,
                to_status='reopened', meta={'reason': reason} if reason else None)
     db.session.commit()
     if t.assignee_user_id:

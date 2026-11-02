@@ -38,3 +38,5 @@ litellm_proxy_config.yaml
 log/
 mock_*.py
 seed.py
+
+!docs/feedback-tickets.md
