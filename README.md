@@ -4,6 +4,15 @@
 
 这个项目是一个服务于训练营学生和老师，实现资源共享，进度管理，讨论交流，个人生涯的在线教学平台 同时也是软件二组网页开发组学习网页开发的试点项目。该项目是在线教学平台的后端项目。
 
+## 分支与维护入口
+
+开发前阅读 [AGENTS.md](AGENTS.md) 与 [团队协作约定](CONTRIBUTING.md)。
+`master` 是生产发布主线，`develop` 是团队集成/共享测试来源，`Icebear` 是可选个人分支；功能使用 `feature/*`，版本使用发布后保留的 `release/<版本号>`，服务器现场修复使用 `hotfix/*`。
+
+2026-11-02 已将旧 `Develop` 统一为小写 `develop`、`Icebear_develop` 改为 `Icebear`；新 develop 初始取最新已提交维护线，不表示已部署测试环境。
+本次 Icebear 维护工作区检出为 `hotfix/server-maintenance`，其他贡献者不必切入；远端 `codex/server-maintenance` 暂留给现有同事协作，两者不自动同步。
+本次未移动 master 或发布；首次按新流程上线前先核对实际生产提交。其他贡献者分支、仍有未推送进度或被 worktree 占用的功能分支继续保留。
+
 ## 特性
 
 * 后端主要使用Flask框架，数据库为MySQL，使用gunicorn作为WAGI服务器，使用redis作为缓存

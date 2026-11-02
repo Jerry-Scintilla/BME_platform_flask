@@ -1,9 +1,28 @@
-# BME backend maintenance rules
+# BME 后端公共开发规则
 
+适用于本仓库所有贡献者及编码助手。维护日期：2026-11-02。
 
-## Server maintenance branch
+## 开始任务
 
-For maintenance on server 172.25.56.83, use `codex/server-maintenance` in both BME repositories.
-Make fixes and commits on that branch and deploy its committed versions.
-Do not merge, cherry-pick, push changes to, or deploy from master until the user explicitly approves synchronization.
-Preserve unrelated local changes and record the deployed commit IDs.
+1. 阅读 [团队协作约定](CONTRIBUTING.md) 与 [运行说明](README.md)，再阅读目标模块及相关部署/契约文档。
+2. 检查当前分支、`git status --short`、远端进度和 worktree；保留已有未提交改动。上层 BME 工作区不是 Git 仓库。
+3. 修改接口时对照 blueprint、服务层、模型及相关测试；跨前后端还要读前端 AGENTS、实际服务封装与界面逻辑，不能用历史 mock 推定真实契约。
+
+## 分支与维护
+
+- 普通功能在 `feature/*` 开发，团队测试集成到 `develop`；个人分支可选。生产主线为 `master`，每个版本用 `release/<版本号>` 留存，服务器现场修复使用 `hotfix/*`。完整合入、回流与清理规则见 CONTRIBUTING。
+- 2026-11-02 整理的 Icebear 维护工作区已改名为 `hotfix/server-maintenance`；其他贡献者不必切入此分支。远端 `codex/server-maintenance` 暂留，jiayuan 仍在使用；它与 develop/hotfix 不自动同步，使用前核对提交差异。此约定替代旧的“所有维护固定在 codex/server-maintenance”要求。
+- 分支整理不等于授权同步 master 或部署。未经当前任务明确授权，不自动合入、cherry-pick、推送到 master 或从其发布；发布时记录前后端实际部署提交，不能根据分支名认定生产状态。
+- 尊重其他贡献者的分支和未推送内容；不因分支已合入就删除同事分支。个人偏好保留在个人配置中，冲突按 CONTRIBUTING 说明来源与影响。
+
+## 实现与验证
+
+- 沿用现有 Flask blueprint、服务和 SQLAlchemy 模型边界；接口变化说明字段、权限、分页、错误、兼容与迁移依赖，保持旧客户端在约定兼容期内可用。
+- 权限由服务端校验；修改工单、身份、营期等范围数据时，检查所有权/作用域，不能依赖前端显隐。数据库写入明确事务边界，异常不得留下半完成数据。
+- 数据结构变化使用现有迁移约定并说明执行顺序、幂等性和回退限制，不靠正常启动时的自动建表推定旧表迁移已完成。
+- 按改动运行相关测试；优先用隔离数据或现有测试工具，检查权限、兼容和失败路径。文档改动检查链接、路径与差异即可；不声称未运行的检查通过。
+- 读取环境配置时避免输出密钥或连接口令。没有当前任务授权，不操作生产数据、自动提交、推送或发布；部署使用已验证的固定提交并记录结果。
+
+## 规范分层
+
+本文件维护后端开发入口，CONTRIBUTING 维护跨仓公共协作，README 和领域文档维护运行/业务要求。模块例外限定目录与适用范围；历史部署记录、个人记忆和工具 skill 不覆盖现行约定。不要将前端端口、构建命令或视觉规则套用到后端。
