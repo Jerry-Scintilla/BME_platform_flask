@@ -60,6 +60,10 @@
 点击一键登录；数据来自 `GET /auth/dev_accounts`（debug 模式自动可用，非 debug 需
 `.env` 设 `DEV_TEST_ACCOUNTS=on`，生产一律 404）。
 
+## 反馈工单
+
+反馈工单的页面快照、附件兼容与管理处理契约见 [反馈工单说明](docs/feedback-tickets.md)。本轮不新增数据库迁移，后端兼容旧客户端，发布时先后端后前端。
+
 ## 教学与项目共用小组核心
 
 项目营交付、单人项目验收、附件限制与结营事务的当前约定见 [项目营交付与归档](docs/project-delivery.md)。
