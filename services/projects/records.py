@@ -149,13 +149,20 @@ def extra_calendar(project,user,binding=None,start=None,end=None,force_binding=F
     items=[]
     basis=core.day(camps.project_view(project,user,binding,force_binding)['zero_date']) if binding else project.zero_date
     start,end=calendar.bounds(start,end)
+    if basis and (not start or start<=basis<=end):
+        items.append({'id':project.id,'key':f'project_start:{project.id}','source':'project_start','kind':'project_start',
+            'title':'正式启动 D0','content':'项目正式启动日，研发相对计划以此为日期基准。',
+            'due_on':basis.isoformat(),'actual_on':None,'schedule_mode':'absolute','offset_days':None,
+            'status':'done' if basis<=calendar.today(project) else 'planned','status_label':'正式启动日',
+            'day_number':0,'actual_day_number':None,'overdue':False,'can_edit':False})
     for r in read(project,user,binding,start,end,force_binding):
         happened=core.day(r['occurred_on'])
         items.append({'id':r['id'],'key':f'record:{r["id"]}','source':'record','kind':r['kind'],'title':r['title'],'content':r['content'],
           'due_on':r['occurred_on'],'actual_on':r['occurred_on'],'schedule_mode':'absolute','offset_days':None,
           'status':'planned' if r['status']=='pending' else 'cancelled' if r['status']=='rejected' else 'done',
-          'day_number':(happened-basis).days if basis else None,'actual_day_number':(happened-basis).days if basis else None,'overdue':False,'can_edit':False})
-    from models import CampMilestone
+          'day_number':(happened-basis).days if basis else None,'actual_day_number':(happened-basis).days if basis else None,'overdue':False,'can_edit':False,
+          'status_label':{'published':'已记录','pending':'待核验','verified':'已核验','rejected':'待补充'}.get(r['status'],'已记录')})
+    from models import CampMilestone,CampMeeting
     bindings=ProjectCampBinding.query.filter_by(project_id=project.id).all() if not binding else [binding]
     for b in bindings:
         visible=camps.staff(user,b.camp_session_id) or db.session.query(camps.ProjectCampParticipant.id).filter_by(binding_id=b.id,user_id=user.id).first()
@@ -168,14 +175,34 @@ def extra_calendar(project,user,binding=None,start=None,end=None,force_binding=F
             node_basis=core.day(snapshot.get('zero_date',snapshot.get('project',{}).get('zero_date')))
             nodes=[node for node in snapshot.get('assessment_nodes',[]) if not start or (
                 node.get('due_date') and start.isoformat()<=node['due_date']<=end.isoformat())][:501]
+            can_read_meetings=camps.staff(user,b.camp_session_id) or any(
+                person['user_id']==user.id for person in snapshot.get('participants',[]))
+            meetings=snapshot.get('camp_meetings',[]) if can_read_meetings else []
         else:
             query=CampMilestone.query.filter_by(unit_id=b.legacy_unit_id)
             if start:query=query.filter(CampMilestone.due_date.between(start,end))
             nodes=[{'id':node.id,'title':node.title,'due_date':node.due_date.isoformat() if node.due_date else None,
                     'node_complete':node.status=='approved'} for node in query.limit(501)]
+            from blueprints.camp_meeting import _can_view
+            meeting_query=CampMeeting.query.filter_by(camp_session_id=b.camp_session_id,unit_id=b.legacy_unit_id,scope='unit')
+            if start:meeting_query=meeting_query.filter(CampMeeting.meeting_date.between(start,end))
+            meetings=[{'id':meeting.id,'title':meeting.title,'date':meeting.meeting_date.isoformat(),'content':meeting.content}
+                for meeting in meeting_query.order_by(CampMeeting.meeting_date,CampMeeting.id).limit(501)
+                if _can_view(user,meeting)] if b.status=='active' else []
         camp_name=db.session.get(camps.CampSession,b.camp_session_id).name
+        for meeting in meetings:
+            happened=core.day(meeting.get('date'))
+            if not happened or (start and not start<=happened<=end):continue
+            items.append({'id':meeting['id'],'key':f'camp_meeting:{meeting["id"]}','source':'camp_meeting','kind':'meeting',
+                'title':meeting['title']+' · '+camp_name,'content':meeting.get('content') or '',
+                'due_on':happened.isoformat(),'actual_on':None,'schedule_mode':'absolute','offset_days':None,
+                'status':'done' if happened<=calendar.today(project) else 'planned',
+                'status_label':'冻结组会' if b.status=='ended' else '组会记录',
+                'day_number':(happened-node_basis).days if node_basis else None,'actual_day_number':None,
+                'overdue':False,'can_edit':False,'binding_id':b.id,'unit_id':b.legacy_unit_id,
+                'camp_id':b.camp_session_id,'frozen':b.status=='ended'})
         for node in nodes:
             due=core.day(node.get('due_date'))
             items.append({'id':node['id'],'key':f'assessment:{node["id"]}','source':'assessment','kind':'assessment','title':node['title']+' · '+camp_name,
                 'content':'本期考核记录；研发完成状态单独管理。','due_on':node.get('due_date'),'actual_on':None,'schedule_mode':'absolute','offset_days':None,'status':'done' if node.get('node_complete') else 'planned','day_number':(due-node_basis).days if due and node_basis else None,'actual_day_number':None,'overdue':False,'can_edit':False,'binding_id':b.id,'unit_id':b.legacy_unit_id})
-    return items
+    return sorted(items,key=lambda entry:(entry['due_on'] or '9999',entry['key']))

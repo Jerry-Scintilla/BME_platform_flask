@@ -138,6 +138,61 @@ class ProjectRecordsTest(fixtures.ProjectCampsTest):
         self.assertFalse(any(item['source']=='assessment' for item in response.json['items']))
         self.assertIsNotNone(db.session.get(m.CampMilestone,node.id))
 
+    def test_calendar_includes_start_records_and_scoped_camp_meetings(self):
+        p,b=self.setup_binding();self.approve(p,b)
+        project=db.session.get(m.Project,p['id']);project.zero_date=date(2026,10,1)
+        unit_id=db.session.get(m.ProjectCampBinding,b['id']).legacy_unit_id
+        meeting=m.CampMeeting(camp_session_id=self.camp.id,unit_id=unit_id,scope='unit',
+            title='样机联调组会',meeting_date=date(2026,10,3),content='确认下周的联调方案',created_by=self.owner.id)
+        db.session.add_all([meeting,
+            m.CampMeeting(camp_session_id=self.other.id,unit_id=unit_id,scope='unit',title='其他营期组会',meeting_date=date(2026,10,3),created_by=self.owner.id),
+            m.CampMeeting(camp_session_id=self.camp.id,scope='team',mentor_id=self.owner.id,title='培训组会',meeting_date=date(2026,10,3),created_by=self.owner.id),
+            m.CampMeeting(camp_session_id=self.camp.id,unit_id=unit_id,scope='unit',title='其他月份组会',meeting_date=date(2026,11,3),created_by=self.owner.id),
+            m.ProjectRecord(project_id=project.id,kind='record',title='研发日志',occurred_on=date(2026,10,4),created_by=self.owner.id,status='published'),
+            m.ProjectRecord(project_id=project.id,kind='outcome',title='成果登记',occurred_on=date(2026,10,5),created_by=self.owner.id,status='pending')])
+        db.session.commit();before=m.ProjectChange.query.count()
+        path=f'/project-core/projects/{project.id}/calendar?from=2026-10-01&to=2026-10-31'
+        response=self.call(self.owner,'get',path)
+        self.assertEqual(response.status_code,200,response.json)
+        items=response.json['items'];meetings=[item for item in items if item['source']=='camp_meeting']
+        self.assertEqual([item['id'] for item in meetings],[meeting.id])
+        self.assertEqual(meetings[0]['day_number'],2)
+        self.assertEqual(meetings[0]['binding_id'],b['id']);self.assertFalse(meetings[0]['can_edit'])
+        self.assertEqual(next(item for item in items if item['source']=='project_start')['due_on'],'2026-10-01')
+        self.assertEqual({item['kind'] for item in items},{'project_start','meeting','record','outcome'})
+        self.assertEqual(next(item for item in items if item['kind']=='outcome')['status_label'],'待核验')
+        self.assertEqual(m.ProjectChange.query.count(),before)
+
+    def test_calendar_meetings_freeze_and_do_not_expose_other_participants(self):
+        p,b=self.setup_binding();self.approve(p,b)
+        project=db.session.get(m.Project,p['id']);project.zero_date=date(2026,10,1)
+        binding=db.session.get(m.ProjectCampBinding,b['id'])
+        meeting=m.CampMeeting(camp_session_id=self.camp.id,unit_id=binding.legacy_unit_id,scope='unit',
+            title='冻结前的组会',meeting_date=date(2026,10,3),content='冻结前的纪要',created_by=self.owner.id)
+        db.session.add(meeting);db.session.commit()
+        response=self.call(self.teacher,'post',f'/project-core/projects/{project.id}/camps/{binding.id}',json={
+            'action':'end','expected_version':project.version,'expected_binding_version':binding.version,
+            'reason':'结束本期','idempotency_key':'freeze-meeting-calendar'})
+        self.assertEqual(response.status_code,200,response.json)
+        meeting.title='结束后的实时修改';meeting.content='不能覆盖历史';meeting.meeting_date=date(2026,11,3)
+        project.zero_date=date(2026,10,10);db.session.commit()
+        path=f'/project-core/projects/{project.id}/calendar?from=2026-10-01&to=2026-10-31&binding={binding.id}'
+        for user,suffix in ((self.owner,''),(self.teacher,'&camp_view=1')):
+            result=self.call(user,'get',path+suffix)
+            self.assertEqual(result.status_code,200,result.json)
+            item=next(item for item in result.json['items'] if item['source']=='camp_meeting')
+            self.assertIn('冻结前的组会',item['title']);self.assertEqual(item['content'],'冻结前的纪要')
+            self.assertEqual(item['due_on'],'2026-10-03');self.assertEqual(item['day_number'],2)
+            self.assertTrue(item['frozen']);self.assertFalse(item['can_edit'])
+        frozen=db.session.get(m.ProjectBindingSnapshot,binding.id)
+        frozen.snapshot={**frozen.snapshot,'participants':[person for person in frozen.snapshot['participants'] if person['user_id']!=self.student.id]}
+        db.session.commit()
+        result=self.call(self.student,'get',path)
+        self.assertFalse(any(item['source']=='camp_meeting' for item in result.json['items']))
+        db.session.delete(frozen);db.session.commit()
+        result=self.call(self.owner,'get',path)
+        self.assertFalse(any(item['source']=='camp_meeting' for item in result.json['items']))
+
     def test_reminder_dry_run_and_idempotence(self):
         p=self.create_project();row=db.session.get(m.Project,p['id'])
         db.session.add(m.ProjectMilestone(project_id=row.id,title='今日验收',due_on=date.today(),schedule_mode='absolute',status='planned',created_by=self.owner.id));db.session.commit()
