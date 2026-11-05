@@ -223,7 +223,9 @@ def project_records(pid,rid=None):
         if bid:binding,_,project=camps.get_binding(pid,bid,user)
         else:project=core.get_project(pid,user)
         record_id=core.number(request.args.get('record_id',type=int),'记录ID') if 'record_id' in request.args else None
-        return result({'records':records.read(project,user,binding,force_binding=request.args.get('camp_view')=='1',record_id=record_id),'project':camps.project_view(project,user,binding,request.args.get('camp_view')=='1')})
+        force_binding=request.args.get('camp_view')=='1'
+        listing=records.browse(project,user,request.args,binding,force_binding) if not record_id and any(key in request.args for key in ('page','page_size','q','kind','from','to')) else {'records':records.read(project,user,binding,force_binding=force_binding,record_id=record_id)}
+        return result({**listing,'project':camps.project_view(project,user,binding,force_binding)})
     uploaded=[]
     try:
         if request.content_length and request.content_length>49*1024*1024:raise core.ProjectError('请求总量不能超过49MB',status=413)

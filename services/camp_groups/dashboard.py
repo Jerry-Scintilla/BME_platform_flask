@@ -163,7 +163,7 @@ def _live_projects(camp, today, detail_key):
                                 'attachments': attachments[s.id]} for s in state['latest_submissions'].values() if s.submitted_by in {r.user_id for r in roster}])
             project['nodes'].append(node)
         if detail_key == str(unit.id):
-            project['outcomes'] = [{'title': o.title, 'description': o.description, 'status': o.status} for o in outcomes_by_unit[unit.id]]
+            project['outcomes'] = [{'id': o.id, 'title': o.title, 'description': o.description, 'status': o.status, 'created_at': _iso(o.created_at)} for o in outcomes_by_unit[unit.id]]
         _finish_project(project, today)
         projects.append(project)
     return projects, CampMember.query.filter_by(camp_session_id=camp.id, status='active').count()

@@ -2,6 +2,7 @@
 import hashlib
 import os
 import uuid
+from sqlalchemy import or_
 from exts import db
 from storage import storage
 from models import Project,ProjectRecord,ProjectRecordFile,ProjectBindingSnapshot,ProjectCampBinding,ProjectChange,UserModel
@@ -19,20 +20,67 @@ def serialize(row,user=None,project=None,current=False):
             'files':[{'id':f.id,'filename':f.filename,'size':f.size} for f in files]}
 
 
+def _read_source(project,user,binding,force_binding):
+    if core.role(project,user) and not force_binding:
+        return ProjectRecord.query.filter_by(project_id=project.id),None,True
+    if not binding:raise ProjectError('无权读取项目记录',status=403)
+    frozen=db.session.get(ProjectBindingSnapshot,binding.id)
+    if binding.status=='ended':
+        allowed=camps.staff(user,binding.camp_session_id) or (frozen and any(p['user_id']==user.id for p in frozen.snapshot.get('participants',[])))
+        return None,(frozen.snapshot.get('records',[]) if allowed and frozen else []),False
+    if not camps.staff(user,binding.camp_session_id):raise ProjectError('无权读取项目记录',status=403)
+    return ProjectRecord.query.filter_by(project_id=project.id,binding_id=binding.id),None,False
+
+
 def read(project,user,binding=None,start=None,end=None,force_binding=False,record_id=None):
     def query(q):
         if record_id:q=q.filter_by(id=record_id)
         if start:q=q.filter(ProjectRecord.occurred_on.between(start,end))
         return q.order_by(ProjectRecord.occurred_on.desc(),ProjectRecord.id.desc()).limit(501 if start else 200)
-    if core.role(project,user) and not force_binding:
-        return [serialize(r,user,project) for r in query(ProjectRecord.query.filter_by(project_id=project.id))]
-    if not binding:raise ProjectError('无权读取项目记录',status=403)
-    frozen=db.session.get(ProjectBindingSnapshot,binding.id)
-    if binding.status=='ended':
-        if not camps.staff(user,binding.camp_session_id) and not (frozen and any(p['user_id']==user.id for p in frozen.snapshot.get('participants',[]))):return []
-        return [r for r in (frozen.snapshot.get('records',[]) if frozen else []) if (not record_id or r['id']==record_id) and (not start or start.isoformat()<=r['occurred_on']<=end.isoformat())]
-    if not camps.staff(user,binding.camp_session_id):raise ProjectError('无权读取项目记录',status=403)
-    return [serialize(r) for r in query(ProjectRecord.query.filter_by(project_id=project.id,binding_id=binding.id))]
+    source,frozen,editable=_read_source(project,user,binding,force_binding)
+    if frozen is not None:
+        return [r for r in frozen if (not record_id or r['id']==record_id) and (not start or start.isoformat()<=r['occurred_on']<=end.isoformat())]
+    return [serialize(r,user if editable else None,project if editable else None) for r in query(source)]
+
+
+def browse(project,user,args,binding=None,force_binding=False):
+    """授权范围内先搜索/筛选再分页，不将最近200条当作完整历史。"""
+    keyword=(args.get('q') or '').strip()
+    kind=args.get('kind') or None
+    if len(keyword)>120:raise ProjectError('搜索内容最多120字',status=400)
+    if kind and kind not in ('meeting','record','outcome'):raise ProjectError('记录类型无效',status=400)
+    start=core.day(args.get('from'));end=core.day(args.get('to'))
+    if start and end and start>end:raise ProjectError('开始日期不能晚于结束日期',status=400)
+    def positive(key,default,maximum=None):
+        value=args.get(key,str(default))
+        if not str(value).isdigit() or int(value)<1 or (maximum and int(value)>maximum):
+            raise ProjectError('分页参数无效',status=400)
+        return int(value)
+    page=positive('page',1);page_size=positive('page_size',20,100)
+    source,frozen,editable=_read_source(project,user,binding,force_binding)
+    if frozen is not None:
+        def matches(row):
+            if kind and row['kind']!=kind:return False
+            if start and row['occurred_on']<start.isoformat():return False
+            if end and row['occurred_on']>end.isoformat():return False
+            text=' '.join(str(row.get(k) or '') for k in ('title','content','author'))
+            text+=' '+' '.join(f.get('filename','') for f in row.get('files',[]))
+            return keyword.casefold() in text.casefold()
+        rows=sorted((r for r in frozen if matches(r)),key=lambda r:(r['occurred_on'],r['id']),reverse=True)
+        total=len(rows);items=rows[(page-1)*page_size:page*page_size]
+    else:
+        if kind:source=source.filter_by(kind=kind)
+        if start:source=source.filter(ProjectRecord.occurred_on>=start)
+        if end:source=source.filter(ProjectRecord.occurred_on<=end)
+        if keyword:
+            escaped=keyword.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
+            pattern='%'+escaped+'%'
+            source=source.filter(or_(ProjectRecord.title.ilike(pattern,escape='\\'),ProjectRecord.content.ilike(pattern,escape='\\'),
+                ProjectRecord.created_by.in_(db.session.query(UserModel.id).filter(UserModel.username.ilike(pattern,escape='\\'))),
+                ProjectRecord.id.in_(db.session.query(ProjectRecordFile.record_id).filter(ProjectRecordFile.filename.ilike(pattern,escape='\\')))))
+        total=source.count()
+        items=[serialize(r,user if editable else None,project if editable else None) for r in source.order_by(ProjectRecord.occurred_on.desc(),ProjectRecord.id.desc()).offset((page-1)*page_size).limit(page_size)]
+    return {'records':items,'total':total,'page':page,'page_size':page_size,'has_more':page*page_size<total}
 
 
 def freeze(binding,actor_id):
@@ -59,7 +107,7 @@ def freeze(binding,actor_id):
                 'submissions':[{'id':s.id,'submitted_by':s.submitted_by,'name':db.session.get(UserModel,s.submitted_by).username,'version':s.version,'content':s.content,'status':s.status,
                     'attachments':[{'id':a.id,'filename':a.filename} for a in CampSubmissionAttachment.query.filter_by(submission_id=s.id).populate_existing().with_for_update()]} for s in state['latest_submissions'].values()]})
         data['assessment_nodes']=nodes
-        data['camp_outcomes']=[{'title':o.title,'description':o.description,'status':o.status} for o in CampOutcome.query.filter_by(unit_id=unit.id).populate_existing().with_for_update()]
+        data['camp_outcomes']=[{'id':o.id,'title':o.title,'description':o.description,'status':o.status,'created_at':o.created_at.isoformat() if o.created_at else None} for o in CampOutcome.query.filter_by(unit_id=unit.id).populate_existing().with_for_update()]
         data['camp_meetings']=[{'id':m.id,'title':m.title,'date':m.meeting_date.isoformat(),'content':m.content} for m in CampMeeting.query.filter_by(unit_id=unit.id,scope='unit').populate_existing().with_for_update()]
     db.session.add(ProjectBindingSnapshot(binding_id=binding.id,snapshot=data,frozen_by=actor_id))
 

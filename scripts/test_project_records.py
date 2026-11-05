@@ -1,6 +1,6 @@
 """项目记录、附件权限、冻结共享与提醒去重的定向检查。"""
 import io,json,unittest
-from datetime import date
+from datetime import date,datetime
 from unittest.mock import patch
 import test_project_camps as fixtures
 from exts import db
@@ -9,6 +9,51 @@ from services.projects import core,records,reminders
 
 
 class ProjectRecordsTest(fixtures.ProjectCampsTest):
+    def test_browse_searches_history_before_pagination_and_validates_filters(self):
+        p=self.create_project();pid=p['id']
+        for index in range(205):
+            db.session.add(m.ProjectRecord(project_id=pid,kind='record',title='近期记录'+str(index),occurred_on=date(2026,10,20),created_by=self.owner.id,status='published'))
+        old=m.ProjectRecord(project_id=pid,kind='outcome',title='历史样机100%_完成',content='压力标定',occurred_on=date(2026,9,12),created_by=self.owner.id,status='pending')
+        db.session.add(old);db.session.flush()
+        db.session.add(m.ProjectRecordFile(record_id=old.id,object_key='history/file',filename='标定报告.pdf',size=12,sha256='a'*64));db.session.commit()
+        path=f'/project-core/projects/{pid}/records'
+        for params in ({'q':'100%_'},{'q':'压力标定'},{'q':'标定报告.pdf'},{'kind':'outcome','from':'2026-09-12','to':'2026-09-12'}):
+            response=self.call(self.owner,'get',path,query_string={'page':1,**params})
+            self.assertEqual(response.status_code,200,response.json)
+            self.assertEqual(response.json['total'],1);self.assertEqual(response.json['records'][0]['id'],old.id)
+        first=self.call(self.owner,'get',path,query_string={'page':1,'page_size':20}).json
+        second=self.call(self.owner,'get',path,query_string={'page':2,'page_size':20}).json
+        self.assertEqual(first['total'],206);self.assertTrue(first['has_more'])
+        self.assertFalse({r['id'] for r in first['records']} & {r['id'] for r in second['records']})
+        author=self.call(self.owner,'get',path,query_string={'q':self.owner.username,'page':1}).json
+        self.assertEqual(author['total'],206)
+        for params in ({'from':'2026-10-10','to':'2026-09-01'},{'from':'2026-02-30'},{'page':'x'},{'page_size':101},{'kind':'private'},{'q':'a'*121}):
+            self.assertEqual(self.call(self.owner,'get',path,query_string=params).status_code,400,params)
+
+    def test_browse_keeps_teacher_scope_and_frozen_search_content(self):
+        p,b=self.setup_binding();self.approve(p,b);project=db.session.get(m.Project,p['id'])
+        shared=m.ProjectRecord(project_id=project.id,binding_id=b['id'],kind='outcome',title='共享样机',content='冻结前标定',occurred_on=date(2026,9,12),created_by=self.owner.id,status='pending')
+        private=m.ProjectRecord(project_id=project.id,kind='outcome',title='私有样机',content='冻结前标定',occurred_on=date(2026,9,12),created_by=self.owner.id,status='pending')
+        outcome=m.CampOutcome(unit_id=db.session.get(m.ProjectCampBinding,b['id']).legacy_unit_id,title='样机验收成果',submitted_by=self.owner.id,created_at=datetime(2026,9,12,10,0))
+        db.session.add_all([shared,private,outcome]);db.session.commit()
+        path=f'/project-core/projects/{project.id}/records'
+        args={'binding':b['id'],'camp_view':1,'page':1,'q':'样机'}
+        result=self.call(self.teacher,'get',path,query_string=args)
+        self.assertEqual(result.status_code,200,result.json);self.assertEqual(result.json['total'],1)
+        self.assertEqual(result.json['records'][0]['id'],shared.id);self.assertFalse(result.json['records'][0]['can_edit'])
+        binding=db.session.get(m.ProjectCampBinding,b['id'])
+        ended=self.call(self.teacher,'post',f'/project-core/projects/{project.id}/camps/{binding.id}',json={
+            'action':'end','expected_version':project.version,'expected_binding_version':binding.version,'reason':'冻结成果','idempotency_key':'browse-freeze'})
+        self.assertEqual(ended.status_code,200,ended.json)
+        frozen_outcome=db.session.get(m.ProjectBindingSnapshot,b['id']).snapshot['camp_outcomes'][0]
+        self.assertEqual(frozen_outcome['id'],outcome.id);self.assertEqual(frozen_outcome['created_at'],'2026-09-12T10:00:00')
+        shared.title='实时修改';shared.content='不能被搜索';shared.occurred_on=date(2026,10,20);db.session.commit()
+        args.update(q='冻结前标定',**{'from':'2026-09-12','to':'2026-09-12'})
+        result=self.call(self.teacher,'get',path,query_string=args)
+        self.assertEqual(result.json['total'],1);self.assertEqual(result.json['records'][0]['title'],'共享样机')
+        self.assertEqual(self.call(self.teacher,'get',path,query_string={**args,'q':'不能被搜索'}).json['total'],0)
+        self.assertEqual(self.call(self.teacher,'get',path,query_string={'page':1}).status_code,403)
+
     def save_record(self,p,b=None,files=False,title='项目记录'):
         row=db.session.get(m.Project,p['id'])
         args={'kind':'meeting','title':title,'content':'本次验证结论','occurred_on':date.today().isoformat(),'reason':'研发留痕','binding_id':b['id'] if b else None,'expected_version':row.version,'idempotency_key':'record-'+str(row.version)}
