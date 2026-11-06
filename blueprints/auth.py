@@ -804,6 +804,10 @@ def get_email_captcha():
     if purpose not in ("register", "findpwd"):
         return jsonify({"code": 400,
                         "message": "缺少 purpose 参数（register/findpwd），请刷新页面后重试"}), 400
+    # 找回密码先确认账号存在（2026-11-06 现场修复）：未注册邮箱不发码，
+    # 避免用户收到验证码后在重置步才撞「账号或验证码有误」的死胡同。
+    if purpose == "findpwd" and UserModel.query.filter_by(email=email).first() is None:
+        return jsonify({"code": 404, "message": "该邮箱未注册，请先注册"}), 404
     try:
         captcha = issue_captcha(email, purpose)
     except AuthRejected as exc:
@@ -837,7 +841,9 @@ def get_email_captcha():
 @audit_log(operation="找回密码", is_login=True)
 def find_password():
     data = request.get_json()
-    email = data['User_Email']
+    # 邮箱去除首尾空白再查库（2026-11-06 现场修复）：移动端输入带尾随空格时
+    # 曾被误判为「账号或验证码有误」（captcha/email 侧本来就会 strip）。
+    email = (data.get('User_Email') or '').strip()
     password = data['Password']
     captcha = data['Captcha']
     user = UserModel.query.filter_by(email=email).first()
